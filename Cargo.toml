@@ -1,0 +1,12 @@
+[package]
+name = "matrix-rust-rtc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+matrix-sdk = "0.14.0"
+tokio = "1.47.1"
+log = "0.4.29"
+
+[dev-dependencies]
+assert_matches = "1.5.0"
