@@ -102,6 +102,12 @@ impl RtcSession {
         self.tx.subscribe()
     }
 
+    /// Returns true if there are any active participants in the session and if the current slot is active.
+    pub fn is_active(&self) -> bool {
+        // TODO check if the slot is active
+        !self.members.is_empty()
+    }
+
     pub fn update_membership_info(&mut self, info: impl Into<CallMembershipInfo>) {
         let info = info.into();
 
@@ -184,7 +190,7 @@ mod tests {
         let mut rx = s.subscribe();
 
         s.update_membership_info(CallMembershipInfo::Joined(JoinedInfo {
-            slot_id: "slotXX".to_owned(),
+            slot_id: s.slot_id.to_owned(),
             event_id: owned_event_id!("$00"),
             sticky_key: "key0".to_string(),
             application: ApplicationKind::Call,
@@ -197,7 +203,7 @@ mod tests {
             timestamp: MilliSecondsSinceUnixEpoch::now(),
         }));
         s.update_membership_info(CallMembershipInfo::Joined(JoinedInfo {
-            slot_id: "slotXX".to_owned(),
+            slot_id: s.slot_id.to_owned(),
             event_id: owned_event_id!("$01"),
             sticky_key: "key1".to_string(),
             application: ApplicationKind::Call,
@@ -243,7 +249,7 @@ mod tests {
         let mut rx = s.subscribe();
 
         s.update_membership_info(CallMembershipInfo::Joined(JoinedInfo {
-            slot_id: "slotXX".to_owned(),
+            slot_id: s.slot_id.to_owned(),
             event_id: owned_event_id!("$00"),
             sticky_key: "key0".to_string(),
             application: ApplicationKind::Call,
@@ -257,7 +263,7 @@ mod tests {
         }));
 
         s.update_membership_info(CallMembershipInfo::Joined(JoinedInfo {
-            slot_id: "slotXX".to_owned(),
+            slot_id: s.slot_id.to_owned(),
             event_id: owned_event_id!("$01"),
             sticky_key: "key1".to_string(),
             application: ApplicationKind::Call,
@@ -275,7 +281,7 @@ mod tests {
         assert_eq!(s.members.len(), 2);
 
         s.update_membership_info(CallMembershipInfo::Left(LeftInfo {
-            slot_id: "slotXX".to_owned(),
+            slot_id: s.slot_id.to_owned(),
             event_id: owned_event_id!("$01"),
             sender: a_user_id.clone(),
             sticky_key: "key1".to_string(),

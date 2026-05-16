@@ -31,19 +31,11 @@ impl InnerMachine {
 
     pub async fn handle_processed_to_device(&self, _to_device: Vec<ProcessedToDeviceEvent>) {}
 
-    // async fn on_state_event(event: &AnySyncStateEvent, _room_id: &RoomId) {
-    //     match event {
-    //         AnySyncStateEvent::CallMember(event) => {
-    //             let Some(o_ev) = event.as_original() else {
-    //                 return;
-    //             };
-    //             let _state_key = &o_ev.state_key;
-    //         }
-    //         _ => {
-    //
-    //         }
-    //     }
-    // }
+
+    pub fn start_rtc_session(&self, slot_id: &str,  room_id: &RoomId) {
+
+    }
+
 
     /// This method processes one or more membership changes (joins/leaves) for a specific room.
     /// Each item in the iterator is converted into a [`CallMembershipInfo`] and processed.
