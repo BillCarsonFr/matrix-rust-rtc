@@ -119,3 +119,8 @@ gh pr create --title "<type>(<scope>): <description>" --body-file agent-workspac
 
 The PR title should match the primary commit's subject line.
 
+If the repository has no configured remote, skip this step and stop after
+writing `agent-workspace/pr-body.md` and committing the changes. In that case,
+report the branch name and PR body content to the user so they can push/create
+the PR later once a remote is available.
+
