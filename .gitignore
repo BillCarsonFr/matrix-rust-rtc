@@ -9,4 +9,6 @@
 
 .DS_Store
 
+agent-workspace/
+
 .idea/
