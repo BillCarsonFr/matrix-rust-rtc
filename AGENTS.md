@@ -85,6 +85,7 @@ Before committing **any** code change (new feature, bug fix, PR comment fix, ref
 `cargo check`
 `cargo fmt`
 `cargo clippy --all-targets --all-features -- -D warnings`
+`cargo test`
 
 Do not commit if any of these steps fail. Fix the issue first, then re-run the full checklist before committing.
 
