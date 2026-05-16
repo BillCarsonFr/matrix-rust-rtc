@@ -110,6 +110,14 @@ Template:
 <Which commands to run and what to verify in the UI>
 ```
 
+### 4.5 Self-review (mandatory)
+
+Run the self-review step from `skills/self-review/SKILL.md` now, before any push/PR action.
+This is mandatory even when no remote is configured.
+
+- If findings exist: fix them, then re-run the relevant checks.
+- If no findings: record `Self-review clean — no pattern matches found.` and continue.
+
 ### 5. Push and create the PR
 
 ```sh
@@ -119,8 +127,12 @@ gh pr create --title "<type>(<scope>): <description>" --body-file agent-workspac
 
 The PR title should match the primary commit's subject line.
 
-If the repository has no configured remote, skip this step and stop after
-writing `agent-workspace/pr-body.md` and committing the changes. In that case,
-report the branch name and PR body content to the user so they can push/create
-the PR later once a remote is available.
+If the repository has no configured remote, skip only this step (push/create PR)
+and stop after:
+1. Writing `agent-workspace/pr-body.md`
+2. Completing Step 4.5 Self-review
+3. Committing the changes
+
+In that case, report the branch name and PR body content to the user so they
+can push/create the PR later once a remote is available.
 
