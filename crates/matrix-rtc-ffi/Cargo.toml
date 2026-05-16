@@ -1,0 +1,15 @@
+[package]
+name = "matrix-rtc-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+
+[dev-dependencies]
+serde.workspace = true
+

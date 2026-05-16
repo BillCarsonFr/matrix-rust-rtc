@@ -1,0 +1,15 @@
+[package]
+name = "matrix-rtc-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+serde.workspace = true
+wasm-bindgen.workspace = true
+serde-wasm-bindgen.workspace = true
+
