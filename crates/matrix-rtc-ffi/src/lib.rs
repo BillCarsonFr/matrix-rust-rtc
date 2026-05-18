@@ -255,6 +255,11 @@ pub unsafe extern "C" fn matrix_rtc_membership_snapshot_subscription_next_json(
         return RESULT_INVALID_POINTER;
     }
 
+    // SAFETY: out_json is validated above and always reset so callers never keep stale pointers.
+    unsafe {
+        *out_json = std::ptr::null_mut();
+    }
+
     // SAFETY: pointers are validated above.
     let subscription = unsafe { &mut *subscription };
 
@@ -649,7 +654,8 @@ mod tests {
             matrix_rtc_string_free(joined_json_ptr);
         }
 
-        let mut no_update_json_ptr = std::ptr::null_mut();
+        // Start from a non-null sentinel to assert the API clears stale pointers.
+        let mut no_update_json_ptr = std::ptr::NonNull::<c_char>::dangling().as_ptr();
         // SAFETY: pointers are valid for this test.
         let no_update_result = unsafe {
             matrix_rtc_membership_snapshot_subscription_next_json(

@@ -103,7 +103,8 @@ impl RtcSession {
     }
 
     fn publish_membership_snapshot(&self) {
-        let _ = self.membership_snapshots_tx.send(self.members.clone());
+        self.membership_snapshots_tx
+            .send_replace(self.members.clone());
     }
 
     /// Returns the number of currently tracked joined members.

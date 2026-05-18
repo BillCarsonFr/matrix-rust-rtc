@@ -224,3 +224,86 @@ impl From<WasmStickyEvent> for RawStickyEvent {
         }
     }
 }
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+    use serde_json::Value;
+    use wasm_bindgen_test::*;
+
+    #[derive(Serialize)]
+    struct TestStickyEvent {
+        room_id: String,
+        sender: String,
+        #[serde(rename = "type")]
+        event_type: String,
+        content: TestStickyEventContent,
+    }
+
+    #[derive(Serialize)]
+    struct TestStickyEventContent {
+        slot_id: String,
+        sticky_key: String,
+        application: Option<TestApplication>,
+        member: Option<TestMember>,
+        disconnect_reason: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct TestApplication {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+
+    #[derive(Serialize)]
+    struct TestMember {
+        id: String,
+    }
+
+    fn joined_event() -> TestStickyEvent {
+        TestStickyEvent {
+            room_id: "!room:example.org".to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            event_type: "m.rtc.member".to_owned(),
+            content: TestStickyEventContent {
+                slot_id: "m.call#ROOM".to_owned(),
+                sticky_key: "alice-device-a".to_owned(),
+                application: Some(TestApplication {
+                    kind: "m.call".to_owned(),
+                }),
+                member: Some(TestMember {
+                    id: "alice-device-a".to_owned(),
+                }),
+                disconnect_reason: None,
+            },
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn next_snapshot_returns_current_snapshot_on_first_poll() {
+        let mut session = WasmRtcSession::new();
+        let events = serde_wasm_bindgen::to_value(&vec![joined_event()]).unwrap();
+        session.on_sticky_events_snapshot_received(events).unwrap();
+
+        let mut subscription = session.subscribe_membership_snapshots();
+        let first = subscription.next_snapshot().unwrap();
+        let parsed: Vec<Value> = serde_wasm_bindgen::from_value(first).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["sender"], "@alice:example.org");
+    }
+
+    #[wasm_bindgen_test]
+    fn next_snapshot_returns_null_when_unchanged() {
+        let session = WasmRtcSession::new();
+        let mut subscription = session.subscribe_membership_snapshots();
+
+        let first = subscription.next_snapshot().unwrap();
+        let parsed: Vec<Value> = serde_wasm_bindgen::from_value(first).unwrap();
+        assert!(parsed.is_empty());
+
+        let second = subscription.next_snapshot().unwrap();
+        assert!(second.is_null());
+    }
+}
