@@ -23,9 +23,10 @@ This step catches the categories of issues that generate the most Copilot review
 Before each commit (Step 3), pass the build/lint/test checklist:
 
 ```sh
-npm run build   # must produce no errors
-npm run lint    # must produce no warnings or errors
-npm test -- --run --coverage  # coverage thresholds must pass
+cargo check
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
 ```
 
 Do not proceed if any step fails. Fix the issue first.
@@ -51,6 +52,14 @@ git checkout -b <type>/<short-description>
 
 Use the same type prefix as the primary commit. Lowercase, hyphen-separated.
 Examples: `feat/search-filter`, `fix/parser-crash`, `chore/update-deps`
+
+Branch policy (mandatory):
+- First check current branch with `git rev-parse --abbrev-ref HEAD`.
+- If on `main` or `master`, always create a new branch before committing.
+- If already on a typed branch (`feat/*`, `fix/*`, `docs/*`, `refactor/*`, `test/*`, `chore/*`, `perf/*`, `style/*`):
+  - Reuse it only when the current diff is scoped to the same task.
+  - Otherwise create a new typed branch for the current task.
+- Never commit PR work directly on `main`/`master`.
 
 ### 3. Commit each logical group
 
@@ -110,6 +119,17 @@ Template:
 <Which commands to run and what to verify in the UI>
 ```
 
+### 4.5 Self-review (mandatory)
+
+Run the self-review step from `skills/self-review/SKILL.md` now, before any push/PR action.
+This is mandatory even when no remote is configured.
+
+If `origin/main` is unavailable, run self-review against the best local base branch
+(typically `main` or `master`) and state which base was used.
+
+- If findings exist: fix them, then re-run the relevant checks.
+- If no findings: record `Self-review clean — no pattern matches found.` and continue.
+
 ### 5. Push and create the PR
 
 ```sh
@@ -118,4 +138,13 @@ gh pr create --title "<type>(<scope>): <description>" --body-file agent-workspac
 ```
 
 The PR title should match the primary commit's subject line.
+
+If the repository has no configured remote (or no pushable upstream), skip only this step (push/create PR)
+and stop after:
+1. Writing `agent-workspace/pr-body.md`
+2. Completing Step 4.5 Self-review
+3. Committing the changes
+
+In that case, report the branch name and PR body content to the user so they
+can push/create the PR later once a remote is available.
 

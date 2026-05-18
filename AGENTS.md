@@ -29,6 +29,14 @@ can be used to record calls via a headless bot
 ## Audience & Scope
 This document is a lightweight guide for contributors and automated agents. It focuses on stable concepts and boundaries, not implementation details.
 
+## Development Phase
+
+This project is in active development.
+
+- Source and API/ABI breaking changes are acceptable for now.
+- Prioritize clarity and fast iteration over backward compatibility.
+- Prefer direct renames/removals instead of compatibility shims unless explicitly requested.
+
 ## Tech Stack (High-Level)
 - Rust for core rtc sdk
 - Wasm for web bindings
@@ -50,7 +58,7 @@ Always read the karpathy-guidelines skill before coding (`skills/karpathy-guidel
 
 // TBD 
 // Cargo check
-// Cargo clippy
+// Cargo clippy --all-targets --all-features -- -D warnings
 // Cargo test
 
 ## AI Working Folder (`agent-workspace/`)
@@ -84,6 +92,8 @@ Before committing **any** code change (new feature, bug fix, PR comment fix, ref
 
 `cargo check`
 `cargo fmt`
+`cargo clippy --all-targets --all-features -- -D warnings`
+`cargo test`
 
 Do not commit if any of these steps fail. Fix the issue first, then re-run the full checklist before committing.
 
@@ -120,7 +130,12 @@ When asked to commit and create a PR, follow `skills/create-pr/SKILL.md`. Core s
 // TODO
 
 ## Contribution Guidelines
-- Use camelCase for identifiers (lint enforced).
-- Prefer additive changes over refactors unless necessary.
-- Every new feature must be represented in [`public/demo/demo.log`](public/demo/demo.log).
 - Always pass the [Pre-Commit Checklist](#pre-commit-checklist-for-agents) (`cargo check`, `cargo fmt`) before committing.
+
+## Comments and Module Documentation
+
+- Add a short module-level rustdoc comment (`//!`) in each new Rust module and in modified modules when missing.
+- Module comments should explain intent and boundaries, not line-by-line behavior.
+- For boundary/transport modules, explicitly mention DTO rationale: DTOs are used to decouple core logic from platform-specific SDK or FFI types.
+- Keep comments concise (2-6 lines is usually enough), factual, and maintenance-friendly.
+
