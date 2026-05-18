@@ -4,10 +4,11 @@
 //! Keeping this conversion here lets the core remain independent from wasm/JS types.
 
 use matrix_rtc_core::{
-    RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate, RtcSessionManager,
-    StickyEventsUpdate,
+    JoinedMembership, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate, RtcSession,
+    RtcSessionManager, StickyEventsUpdate,
 };
 use serde::Deserialize;
+use tokio::sync::watch;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -73,6 +74,95 @@ impl WasmRtcSessionManager {
 impl Default for WasmRtcSessionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[wasm_bindgen]
+/// WebAssembly-facing single-session API.
+pub struct WasmRtcSession {
+    inner: RtcSession,
+}
+
+#[wasm_bindgen]
+impl WasmRtcSession {
+    #[wasm_bindgen(constructor)]
+    /// Creates an empty RTC session instance.
+    pub fn new() -> Self {
+        Self {
+            inner: RtcSession::new(),
+        }
+    }
+
+    /// Applies initial sticky events for this single session.
+    pub fn on_sticky_events_snapshot_received(&mut self, events: JsValue) -> Result<(), JsError> {
+        let input: Vec<WasmStickyEvent> = serde_wasm_bindgen::from_value(events)
+            .map_err(|err| JsError::new(&format!("invalid sticky snapshot payload: {err}")))?;
+
+        self.inner
+            .initial_events(input.into_iter().map(Into::into))
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Applies one sticky diff payload for this single session.
+    pub fn on_sticky_events_update_received(&mut self, update: JsValue) -> Result<(), JsError> {
+        let input: WasmStickyEventsUpdate = serde_wasm_bindgen::from_value(update)
+            .map_err(|err| JsError::new(&format!("invalid sticky event payload: {err}")))?;
+
+        let mapped = StickyEventsUpdate {
+            added: input.added.into_iter().map(Into::into).collect(),
+            updated: input
+                .updated
+                .into_iter()
+                .map(|item| RawStickyEventUpdate {
+                    current: item.current.into(),
+                    previous: item.previous.into(),
+                })
+                .collect(),
+            removed: input.removed.into_iter().map(Into::into).collect(),
+        };
+
+        self.inner
+            .handle_update(mapped)
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Subscribes to full membership snapshots for this session.
+    pub fn subscribe_membership_snapshots(&self) -> WasmMembershipSnapshotSubscription {
+        WasmMembershipSnapshotSubscription {
+            inner: self.inner.subscribe_membership_snapshots(),
+            initial_pending: true,
+        }
+    }
+}
+
+impl Default for WasmRtcSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[wasm_bindgen]
+/// Poll-based subscription for session membership snapshots.
+pub struct WasmMembershipSnapshotSubscription {
+    inner: watch::Receiver<Vec<JoinedMembership>>,
+    initial_pending: bool,
+}
+
+#[wasm_bindgen]
+impl WasmMembershipSnapshotSubscription {
+    /// Returns the next full snapshot if available, or `null` if unchanged.
+    pub fn next_snapshot(&mut self) -> Result<JsValue, JsError> {
+        if self.initial_pending {
+            self.initial_pending = false;
+            return serde_wasm_bindgen::to_value(&self.inner.borrow().clone())
+                .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}")));
+        }
+
+        match self.inner.has_changed() {
+            Ok(true) => serde_wasm_bindgen::to_value(&self.inner.borrow_and_update().clone())
+                .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}"))),
+            Ok(false) | Err(_) => Ok(JsValue::NULL),
+        }
     }
 }
 

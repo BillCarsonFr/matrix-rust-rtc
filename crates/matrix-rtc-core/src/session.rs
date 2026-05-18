@@ -4,19 +4,32 @@
 //! applies joined/left transitions derived from sticky event DTO conversion.
 
 use crate::event::{EventConversionError, RawStickyEvent, StickyEventsUpdate};
+use serde::Serialize;
+use tokio::sync::watch;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession {
     members: Vec<JoinedMembership>,
+    membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
 }
 
 impl RtcSession {
     /// Creates an empty session.
     pub fn new() -> Self {
+        let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
+
         Self {
             members: Vec::new(),
+            membership_snapshots_tx,
         }
+    }
+
+    /// Subscribes to full membership snapshots for this session as a watch receiver.
+    ///
+    /// This is used by bindings that implement their own polling/callback model.
+    pub fn subscribe_membership_snapshots(&self) -> watch::Receiver<Vec<JoinedMembership>> {
+        self.membership_snapshots_tx.subscribe()
     }
 
     /// Applies the initial sticky events for this single session.
@@ -59,17 +72,38 @@ impl RtcSession {
     fn apply_membership_event(&mut self, event: CallMembershipEvent) {
         match event {
             CallMembershipEvent::Joined(joined) => {
-                self.members.retain(|member| {
-                    !(member.sender == joined.sender && member.sticky_key == joined.sticky_key)
-                });
-                self.members.push(joined);
+                let key_sender = joined.sender.clone();
+                let key_sticky = joined.sticky_key.clone();
+
+                if let Some(index) = self.members.iter().position(|member| {
+                    member.sender == key_sender && member.sticky_key == key_sticky
+                }) {
+                    if self.members[index] == joined {
+                        return;
+                    }
+
+                    self.members[index] = joined;
+                } else {
+                    self.members.push(joined);
+                }
+
+                self.publish_membership_snapshot();
             }
             CallMembershipEvent::Left(left) => {
+                let before = self.members.len();
                 self.members.retain(|member| {
                     !(member.sender == left.sender && member.sticky_key == left.sticky_key)
                 });
+
+                if self.members.len() != before {
+                    self.publish_membership_snapshot();
+                }
             }
         }
+    }
+
+    fn publish_membership_snapshot(&self) {
+        let _ = self.membership_snapshots_tx.send(self.members.clone());
     }
 
     /// Returns the number of currently tracked joined members.
@@ -87,7 +121,7 @@ pub enum CallMembershipEvent {
     Left(LeftMembership),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 /// Connected membership payload.
 pub struct JoinedMembership {
     /// Room where the membership is active.
@@ -102,7 +136,7 @@ pub struct JoinedMembership {
     pub application: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 /// Disconnected membership payload.
 pub struct LeftMembership {
     /// Room where the membership was active.
@@ -115,4 +149,10 @@ pub struct LeftMembership {
     pub sticky_key: String,
     /// Optional machine-readable reason provided by the sender.
     pub disconnect_reason: Option<String>,
+}
+
+impl Default for RtcSession {
+    fn default() -> Self {
+        Self::new()
+    }
 }

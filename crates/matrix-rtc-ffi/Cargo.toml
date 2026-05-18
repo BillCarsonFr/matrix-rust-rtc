@@ -9,6 +9,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 serde.workspace = true

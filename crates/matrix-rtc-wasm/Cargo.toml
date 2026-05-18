@@ -12,4 +12,5 @@ matrix-rtc-core = { path = "../matrix-rtc-core" }
 serde.workspace = true
 wasm-bindgen.workspace = true
 serde-wasm-bindgen.workspace = true
+tokio.workspace = true
 

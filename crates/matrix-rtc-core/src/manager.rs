@@ -17,6 +17,8 @@ pub struct RtcSessionManager {
 }
 
 impl RtcSessionManager {
+    // TODO(msc4143): add a manager-level lifecycle subscription API that emits
+    // when sessions are created/removed (separate from per-session membership snapshots).
     /// Creates an empty session manager.
     pub fn new() -> Self {
         Self::default()
