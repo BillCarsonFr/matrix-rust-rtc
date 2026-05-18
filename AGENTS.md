@@ -110,19 +110,30 @@ When asked to commit and create a PR, follow `skills/create-pr/SKILL.md`. Core s
 
 
 ## PR Review Workflow (for Agents)
+When prompted to **"review-pr"**, follow `skills/review-pr/SKILL.md`. This is an offline review flow and does not require GitHub/GitLab.
 
-[//]: # TODO
-[//]: # (When prompted **"Review PR comments"**, follow `skills/fix-review-comments/SKILL.md` &#40;also available as `/fix-review-comments` in Copilot&#41;. Core steps:)
+Expected state before running this workflow:
+- Feature/fix work is already committed on a branch (typically via `skills/create-pr/SKILL.md`)
+- PR description exists at `agent-workspace/pr-body.md`
 
-[//]: # (1. Run `npm run pr:comments` → read `agent-workspace/pr-comments-for-agent.md`.)
+Core steps:
+1. Read `agent-workspace/pr-body.md` to understand intent/scope.
+2. Compute diff from current branch to `master`:
+   - `git diff master`
+   - `git diff --stat master`
+3. Conduct an independent review of changed files against:
+   - PR description accuracy and completeness
+   - Repository guidance in this file and `ARCHITECTURE.md`
+   - Consistency with existing codebase patterns
+   - Refactoring opportunities that improve clarity/maintainability
+4. Write findings to `agent-workspace/review-pr-findings.md` with this structure:
+   - Quick summary
+   - One section per file, with comments referencing line numbers
+5. Reviewer is read-only: never edit code, stage files, commit, or push.
 
-[//]: # (2. Create a to-do list and address each comment &#40;fix or reject&#41;.)
-
-[//]: # (3. Run the [Pre-Commit Checklist]&#40;#pre-commit-checklist-for-agents&#41; before each commit.)
-
-[//]: # (4. Fill `agent-workspace/pr-replies-template.json` with one reply per comment.)
-
-[//]: # (5. Send replies with `npm run pr:reply:batch`.)
+Output contract:
+- If findings exist: provide actionable, respectful comments with file + line references.
+- If no findings: write exactly `Review Completed - No findings`.
 
 
 ## Performance Regression Detection
