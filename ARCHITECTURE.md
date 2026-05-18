@@ -17,7 +17,7 @@ This keeps the core reusable and testable while avoiding platform-specific depen
 1. A Matrix client receives a sticky event (`MSC4354`) for MatrixRTC membership (`MSC4143`).
 2. Platform binding converts the incoming shape into a core input event.
 3. `RtcSessionManager` ingests a room-scoped initial sticky snapshot or incremental sticky update.
-4. The manager groups events by `(room_id, slot_id)` and forwards each batch once to a single-session `MatrixRtcMachine`.
+4. The manager groups events by `(room_id, slot_id)` and forwards each batch once to a single-session `RtcSession`.
 
 At this stage there is no persistence, network transport, or encryption key distribution logic yet.
 
@@ -26,9 +26,9 @@ At this stage there is no persistence, network transport, or encryption key dist
 ## `crates/matrix-rtc-core`
 
 - Public API:
-  - `MatrixRtcMachine::new` (single session)
-  - `MatrixRtcMachine::initial_events` (single session)
-  - `MatrixRtcMachine::handle_update` (single session)
+  - `RtcSession::new` (single session)
+  - `RtcSession::initial_events` (single session)
+  - `RtcSession::handle_update` (single session)
   - `RtcSessionManager::on_sticky_events_snapshot_received` (multi session)
   - `RtcSessionManager::on_sticky_events_update_received` (multi session)
   - `RtcSessionManager::initial_sticky_for_room` (room-scoped)
@@ -38,23 +38,23 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Conversion:
   - Converts only RTC membership event types (`m.rtc.member` and `org.matrix.msc4143.rtc.member`) into `CallMembershipEvent`.
 - Session state:
-  - In-memory `RtcSession` is owned by `MatrixRtcMachine`.
-  - `RtcSessionManager` owns multiple `MatrixRtcMachine` instances keyed by `(room_id, slot_id)`.
+  - In-memory membership is owned directly by `RtcSession`.
+  - `RtcSessionManager` owns multiple `RtcSession` instances keyed by `(room_id, slot_id)`.
 
 ## `crates/matrix-rtc-wasm`
 
-- Exposes `WasmMatrixRtcMachine` to JavaScript.
+- Exposes `WasmRtcSessionManager` to JavaScript.
 - Accepts `JsValue` payloads for snapshots and updates and deserializes via `serde-wasm-bindgen`.
 - Maps JSON fields to core sticky event DTOs.
 
 ## `crates/matrix-rtc-ffi`
 
 - Exposes C ABI functions:
-  - `matrix_rtc_machine_new`
-  - `matrix_rtc_machine_on_sticky_event_received`
-  - `matrix_rtc_machine_on_sticky_events_snapshot_received`
-  - `matrix_rtc_machine_on_sticky_events_update_received`
-  - `matrix_rtc_machine_free`
+  - `matrix_rtc_session_manager_new`
+  - `matrix_rtc_session_manager_on_sticky_event_received`
+  - `matrix_rtc_session_manager_on_sticky_events_snapshot_received`
+  - `matrix_rtc_session_manager_on_sticky_events_update_received`
+  - `matrix_rtc_session_manager_free`
 - Uses a flat `#[repr(C)]` event struct.
 - Converts C strings and enum values into core event types.
 

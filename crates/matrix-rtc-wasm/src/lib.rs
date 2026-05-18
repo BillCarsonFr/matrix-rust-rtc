@@ -12,14 +12,14 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 /// WebAssembly-facing wrapper around `RtcSessionManager`.
-pub struct WasmMatrixRtcMachine {
+pub struct WasmRtcSessionManager {
     inner: RtcSessionManager,
 }
 
 #[wasm_bindgen]
-impl WasmMatrixRtcMachine {
+impl WasmRtcSessionManager {
     #[wasm_bindgen(constructor)]
-    /// Creates an empty machine instance for JS consumers.
+    /// Creates an empty session manager instance for JS consumers.
     pub fn new() -> Self {
         Self {
             inner: RtcSessionManager::new(),
@@ -70,7 +70,7 @@ impl WasmMatrixRtcMachine {
     }
 }
 
-impl Default for WasmMatrixRtcMachine {
+impl Default for WasmRtcSessionManager {
     fn default() -> Self {
         Self::new()
     }

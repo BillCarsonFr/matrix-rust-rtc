@@ -5,7 +5,6 @@
 //! is decoupled from SDK-specific event types (JS SDK objects, FFI structs, etc.).
 
 mod event;
-mod machine;
 mod manager;
 mod session;
 
@@ -13,9 +12,8 @@ pub use event::{
     EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     StickyEventsUpdate,
 };
-pub use machine::MatrixRtcMachine;
 pub use manager::RtcSessionManager;
-pub use session::{CallMembershipEvent, JoinedMembership, LeftMembership};
+pub use session::{CallMembershipEvent, JoinedMembership, LeftMembership, RtcSession};
 
 #[cfg(test)]
 mod tests {
@@ -92,10 +90,10 @@ mod tests {
     }
 
     #[test]
-    fn machine_is_single_session_only() {
-        let mut machine = MatrixRtcMachine::new();
+    fn session_is_single_session_only() {
+        let mut session = RtcSession::new();
 
-        machine
+        session
             .initial_events(vec![RawStickyEvent {
                 room_id: "!room:example.org".to_owned(),
                 sender: "@alice:example.org".to_owned(),
@@ -110,14 +108,14 @@ mod tests {
             }])
             .unwrap();
 
-        assert_eq!(machine.member_count(), 1);
+        assert_eq!(session.member_count(), 1);
     }
 
     #[test]
     fn removed_events_clear_membership_even_if_content_looks_connected() {
-        let mut machine = MatrixRtcMachine::new();
+        let mut session = RtcSession::new();
 
-        machine
+        session
             .initial_events(vec![RawStickyEvent {
                 room_id: "!room:example.org".to_owned(),
                 sender: "@alice:example.org".to_owned(),
@@ -132,7 +130,7 @@ mod tests {
             }])
             .unwrap();
 
-        machine
+        session
             .handle_update(StickyEventsUpdate {
                 added: Vec::new(),
                 updated: Vec::new(),
@@ -151,7 +149,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(machine.member_count(), 0);
+        assert_eq!(session.member_count(), 0);
     }
 
     #[test]

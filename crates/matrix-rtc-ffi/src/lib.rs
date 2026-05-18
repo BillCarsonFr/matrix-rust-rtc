@@ -46,51 +46,53 @@ pub struct FfiStickyEventUpdate {
 }
 
 #[unsafe(no_mangle)]
-/// Allocates and returns a new machine handle.
-pub extern "C" fn matrix_rtc_machine_new() -> *mut RtcSessionManager {
+/// Allocates and returns a new session manager handle.
+pub extern "C" fn matrix_rtc_session_manager_new() -> *mut RtcSessionManager {
     Box::into_raw(Box::new(RtcSessionManager::new()))
 }
 
 #[unsafe(no_mangle)]
-/// Frees a machine handle previously returned by `matrix_rtc_machine_new`.
+/// Frees a session manager handle previously returned by
+/// `matrix_rtc_session_manager_new`.
 ///
 /// Passing a null pointer is a no-op.
 ///
 /// # Safety
 ///
 /// `ptr` must either be null or a pointer returned by
-/// `matrix_rtc_machine_new` that has not been freed yet.
-pub unsafe extern "C" fn matrix_rtc_machine_free(ptr: *mut RtcSessionManager) {
+/// `matrix_rtc_session_manager_new` that has not been freed yet.
+pub unsafe extern "C" fn matrix_rtc_session_manager_free(ptr: *mut RtcSessionManager) {
     if ptr.is_null() {
         return;
     }
 
-    // SAFETY: ptr is checked for null and was allocated by Box::into_raw in matrix_rtc_machine_new.
+    // SAFETY: ptr is checked for null and was allocated by Box::into_raw in matrix_rtc_session_manager_new.
     unsafe {
         drop(Box::from_raw(ptr));
     }
 }
 
 #[unsafe(no_mangle)]
-/// Applies one sticky event to the machine.
+/// Applies one sticky event to the session manager.
 ///
 /// Returns an integer status code (`0` means success).
 ///
 /// # Safety
 ///
-/// `machine` must be a valid pointer returned by `matrix_rtc_machine_new`.
+/// `session_manager` must be a valid pointer returned by
+/// `matrix_rtc_session_manager_new`.
 /// `event` must be non-null and point to a valid `FfiStickyEvent` whose string
 /// pointers are either null (for optional fields) or valid NUL-terminated UTF-8.
-pub unsafe extern "C" fn matrix_rtc_machine_on_sticky_event_received(
-    machine: *mut RtcSessionManager,
+pub unsafe extern "C" fn matrix_rtc_session_manager_on_sticky_event_received(
+    session_manager: *mut RtcSessionManager,
     event: *const FfiStickyEvent,
 ) -> i32 {
-    if machine.is_null() || event.is_null() {
+    if session_manager.is_null() || event.is_null() {
         return RESULT_INVALID_POINTER;
     }
 
     // SAFETY: pointers are checked for null above and expected to outlive this call.
-    let machine = unsafe { &mut *machine };
+    let session_manager = unsafe { &mut *session_manager };
     // SAFETY: pointers are checked for null above and expected to outlive this call.
     let event = unsafe { &*event };
 
@@ -99,35 +101,36 @@ pub unsafe extern "C" fn matrix_rtc_machine_on_sticky_event_received(
         Err(code) => return code,
     };
 
-    match machine.on_sticky_event_received(parsed) {
+    match session_manager.on_sticky_event_received(parsed) {
         Ok(()) => RESULT_OK,
         Err(_) => RESULT_CONVERSION_ERROR,
     }
 }
 
 #[unsafe(no_mangle)]
-/// Applies an initial sticky snapshot to the machine.
+/// Applies an initial sticky snapshot to the session manager.
 ///
 /// Returns an integer status code (`0` means success).
 ///
 /// # Safety
 ///
-/// `machine` must be a valid pointer returned by `matrix_rtc_machine_new`.
+/// `session_manager` must be a valid pointer returned by
+/// `matrix_rtc_session_manager_new`.
 /// `room_id` must be a valid NUL-terminated UTF-8 C string.
 /// If `events_len > 0`, `events` must be non-null and point to `events_len`
 /// valid `FfiStickyEvent` entries with valid string pointers.
-pub unsafe extern "C" fn matrix_rtc_machine_on_sticky_events_snapshot_received(
-    machine: *mut RtcSessionManager,
+pub unsafe extern "C" fn matrix_rtc_session_manager_on_sticky_events_snapshot_received(
+    session_manager: *mut RtcSessionManager,
     room_id: *const c_char,
     events: *const FfiStickyEvent,
     events_len: usize,
 ) -> i32 {
-    if machine.is_null() || room_id.is_null() {
+    if session_manager.is_null() || room_id.is_null() {
         return RESULT_INVALID_POINTER;
     }
 
-    // SAFETY: machine is checked for null above and expected to outlive this call.
-    let machine = unsafe { &mut *machine };
+    // SAFETY: session_manager is checked for null above and expected to outlive this call.
+    let session_manager = unsafe { &mut *session_manager };
     let room_id = match c_string_required(room_id) {
         Ok(room_id) => room_id,
         Err(code) => return code,
@@ -138,25 +141,26 @@ pub unsafe extern "C" fn matrix_rtc_machine_on_sticky_events_snapshot_received(
         Err(code) => return code,
     };
 
-    match machine.initial_sticky_for_room(&room_id, parsed) {
+    match session_manager.initial_sticky_for_room(&room_id, parsed) {
         Ok(()) => RESULT_OK,
         Err(_) => RESULT_CONVERSION_ERROR,
     }
 }
 
 #[unsafe(no_mangle)]
-/// Applies one sticky diff batch to the machine.
+/// Applies one sticky diff batch to the session manager.
 ///
 /// Returns an integer status code (`0` means success).
 ///
 /// # Safety
 ///
-/// `machine` must be a valid pointer returned by `matrix_rtc_machine_new`.
+/// `session_manager` must be a valid pointer returned by
+/// `matrix_rtc_session_manager_new`.
 /// `room_id` must be a valid NUL-terminated UTF-8 C string.
 /// For each array, if its length is greater than zero, the pointer must be
 /// non-null and point to a contiguous region of valid entries.
-pub unsafe extern "C" fn matrix_rtc_machine_on_sticky_events_update_received(
-    machine: *mut RtcSessionManager,
+pub unsafe extern "C" fn matrix_rtc_session_manager_on_sticky_events_update_received(
+    session_manager: *mut RtcSessionManager,
     room_id: *const c_char,
     added: *const FfiStickyEvent,
     added_len: usize,
@@ -165,12 +169,12 @@ pub unsafe extern "C" fn matrix_rtc_machine_on_sticky_events_update_received(
     removed: *const FfiStickyEvent,
     removed_len: usize,
 ) -> i32 {
-    if machine.is_null() || room_id.is_null() {
+    if session_manager.is_null() || room_id.is_null() {
         return RESULT_INVALID_POINTER;
     }
 
-    // SAFETY: machine is checked for null above and expected to outlive this call.
-    let machine = unsafe { &mut *machine };
+    // SAFETY: session_manager is checked for null above and expected to outlive this call.
+    let session_manager = unsafe { &mut *session_manager };
     let room_id = match c_string_required(room_id) {
         Ok(room_id) => room_id,
         Err(code) => return code,
@@ -191,7 +195,7 @@ pub unsafe extern "C" fn matrix_rtc_machine_on_sticky_events_update_received(
         Err(code) => return code,
     };
 
-    match machine.sticky_update_for_room(
+    match session_manager.sticky_update_for_room(
         &room_id,
         StickyEventsUpdate {
             added,
@@ -331,15 +335,16 @@ mod tests {
             disconnect_reason: std::ptr::null(),
         };
 
-        let machine = matrix_rtc_machine_new();
+        let session_manager = matrix_rtc_session_manager_new();
 
         // SAFETY: pointers are valid for the duration of the call.
-        let result = unsafe { matrix_rtc_machine_on_sticky_event_received(machine, &event) };
+        let result =
+            unsafe { matrix_rtc_session_manager_on_sticky_event_received(session_manager, &event) };
         assert_eq!(result, RESULT_OK);
 
-        // SAFETY: machine was created by matrix_rtc_machine_new.
+        // SAFETY: session_manager was created by matrix_rtc_session_manager_new.
         unsafe {
-            matrix_rtc_machine_free(machine);
+            matrix_rtc_session_manager_free(session_manager);
         }
     }
 }

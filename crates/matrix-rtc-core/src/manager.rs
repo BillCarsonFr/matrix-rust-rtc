@@ -1,19 +1,19 @@
 //! Multi-session routing for MatrixRTC sticky events.
 //!
-//! The manager owns many `MatrixRtcMachine` instances and dispatches room-scoped
-//! sticky snapshots/updates to the right machine by `(room_id, slot_id)`.
+//! The manager owns many `RtcSession` instances and dispatches room-scoped
+//! sticky snapshots/updates to the right session by `(room_id, slot_id)`.
 
 use std::collections::HashMap;
 
 use crate::event::{
     EventConversionError, RawStickyEvent, RawStickyEventUpdate, StickyEventsUpdate,
 };
-use crate::machine::MatrixRtcMachine;
+use crate::session::RtcSession;
 
 /// Holds and routes all active RTC sessions.
 #[derive(Default)]
 pub struct RtcSessionManager {
-    sessions: HashMap<SessionKey, MatrixRtcMachine>,
+    sessions: HashMap<SessionKey, RtcSession>,
 }
 
 impl RtcSessionManager {
@@ -22,7 +22,7 @@ impl RtcSessionManager {
         Self::default()
     }
 
-    /// Applies one sticky event routed to the appropriate session machine.
+    /// Applies one sticky event routed to the appropriate session.
     pub fn on_sticky_event_received(
         &mut self,
         event: RawStickyEvent,
@@ -49,7 +49,7 @@ impl RtcSessionManager {
         }
 
         for (key, batch) in batches {
-            self.machine_for_key(key).initial_events(batch)?;
+            self.session_for_key(key).initial_events(batch)?;
         }
 
         Ok(())
@@ -97,7 +97,7 @@ impl RtcSessionManager {
         }
 
         for (key, batch) in batches {
-            self.machine_for_key(key).handle_update(batch)?;
+            self.session_for_key(key).handle_update(batch)?;
         }
 
         Ok(())
@@ -170,10 +170,10 @@ impl RtcSessionManager {
     /// Returns the member count for one `(room_id, slot_id)` session.
     pub fn member_count(&self, room_id: &str, slot_id: &str) -> Option<usize> {
         let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
-        self.sessions.get(&key).map(MatrixRtcMachine::member_count)
+        self.sessions.get(&key).map(RtcSession::member_count)
     }
 
-    fn machine_for_key(&mut self, key: SessionKey) -> &mut MatrixRtcMachine {
+    fn session_for_key(&mut self, key: SessionKey) -> &mut RtcSession {
         self.sessions.entry(key).or_default()
     }
 }

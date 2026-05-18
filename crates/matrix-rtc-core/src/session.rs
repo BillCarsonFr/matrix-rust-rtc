@@ -3,22 +3,60 @@
 //! This module stores the current participant view per `(room_id, slot_id)` and
 //! applies joined/left transitions derived from sticky event DTO conversion.
 
+use crate::event::{EventConversionError, RawStickyEvent, StickyEventsUpdate};
+
 #[derive(Clone, Debug, Default)]
-/// In-memory view of members currently associated with one RTC session.
+/// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession {
     members: Vec<JoinedMembership>,
 }
 
 impl RtcSession {
-    /// Creates an empty session membership view.
+    /// Creates an empty session.
     pub fn new() -> Self {
         Self {
             members: Vec::new(),
         }
     }
 
+    /// Applies the initial sticky events for this single session.
+    pub fn initial_events(
+        &mut self,
+        events: impl IntoIterator<Item = RawStickyEvent>,
+    ) -> Result<(), EventConversionError> {
+        for event in events {
+            self.apply_membership_event(event.try_into_call_membership_event()?);
+        }
+
+        Ok(())
+    }
+
+    /// Applies a sticky update batch for this single session.
+    pub fn handle_update(
+        &mut self,
+        update: StickyEventsUpdate,
+    ) -> Result<(), EventConversionError> {
+        for event in update.added {
+            self.apply_membership_event(event.try_into_call_membership_event()?);
+        }
+
+        for changed in update.updated {
+            self.apply_membership_event(changed.current.try_into_call_membership_event()?);
+        }
+
+        for event in update.removed {
+            self.apply_membership_event(event.try_into_left_membership_event()?);
+        }
+
+        Ok(())
+    }
+
     /// Applies one membership event to this session.
     pub fn update(&mut self, event: CallMembershipEvent) {
+        self.apply_membership_event(event);
+    }
+
+    fn apply_membership_event(&mut self, event: CallMembershipEvent) {
         match event {
             CallMembershipEvent::Joined(joined) => {
                 self.members.retain(|member| {
