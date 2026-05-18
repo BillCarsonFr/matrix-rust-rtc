@@ -29,6 +29,14 @@ can be used to record calls via a headless bot
 ## Audience & Scope
 This document is a lightweight guide for contributors and automated agents. It focuses on stable concepts and boundaries, not implementation details.
 
+## Development Phase
+
+This project is in active development.
+
+- Source and API/ABI breaking changes are acceptable for now.
+- Prioritize clarity and fast iteration over backward compatibility.
+- Prefer direct renames/removals instead of compatibility shims unless explicitly requested.
+
 ## Tech Stack (High-Level)
 - Rust for core rtc sdk
 - Wasm for web bindings
