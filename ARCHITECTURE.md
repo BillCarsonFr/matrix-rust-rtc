@@ -40,6 +40,8 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Session state:
   - In-memory membership is owned directly by `RtcSession`.
   - `RtcSessionManager` owns multiple `RtcSession` instances keyed by `(room_id, slot_id)`.
+  - `RtcSession` exposes reactive membership snapshot subscriptions for a single session.
+  - TODO: add a manager-level lifecycle subscription API for session added/removed events.
 
 ## `crates/matrix-rtc-wasm`
 
@@ -79,6 +81,7 @@ Current implementation only establishes event intake and membership state wiring
 2. Introduce explicit machine outputs (commands/events) to communicate with host clients.
 3. Add persistence abstraction for sessions and sticky membership maps.
 4. Add transport discovery and focus modeling (`MSC4195`).
+5. Model `rtc_transports` in sticky membership DTOs and membership projections (`MSC4143` / `MSC4195`).
 
 
 

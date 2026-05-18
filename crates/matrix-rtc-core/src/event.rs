@@ -33,6 +33,8 @@ pub struct RawStickyEventContent {
     pub member_id: Option<String>,
     /// Optional disconnect reason for disconnected membership updates.
     pub disconnect_reason: Option<String>,
+    // TODO(msc4143, msc4195): model `rtc_transports` from m.rtc.member once
+    // transport selection/LiveKit integration is implemented.
 }
 
 #[derive(Clone, Debug)]
