@@ -6,8 +6,8 @@
 use std::ffi::{CStr, c_char};
 
 use matrix_rtc_core::{
-    JoinedMembership, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate, RtcSession,
-    RtcSessionManager, StickyEventsUpdate,
+    CallMembershipEvent, EventConversionError, JoinedMembership, RawStickyEvent,
+    RawStickyEventContent, RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
 };
 use tokio::sync::watch;
 
@@ -133,10 +133,14 @@ pub unsafe extern "C" fn matrix_rtc_session_on_sticky_events_snapshot_received(
         Err(code) => return code,
     };
 
-    match session.initial_events(parsed) {
-        Ok(()) => RESULT_OK,
-        Err(_) => RESULT_CONVERSION_ERROR,
-    }
+    let parsed = match to_core_membership_events(parsed) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+
+    session.initial_events(parsed);
+
+    RESULT_OK
 }
 
 #[unsafe(no_mangle)]
@@ -180,14 +184,28 @@ pub unsafe extern "C" fn matrix_rtc_session_on_sticky_events_update_received(
         Err(code) => return code,
     };
 
-    match session.handle_update(StickyEventsUpdate {
-        added,
-        updated,
-        removed,
-    }) {
-        Ok(()) => RESULT_OK,
-        Err(_) => RESULT_CONVERSION_ERROR,
-    }
+    let mut membership_events = match to_core_membership_events(added) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+
+    let updated =
+        match to_core_membership_events(updated.into_iter().map(|update| update.current).collect())
+        {
+            Ok(value) => value,
+            Err(code) => return code,
+        };
+    membership_events.extend(updated);
+
+    let removed = match to_core_left_membership_events(removed) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    membership_events.extend(removed);
+
+    session.handle_update(membership_events);
+
+    RESULT_OK
 }
 
 #[unsafe(no_mangle)]
@@ -310,41 +328,6 @@ pub unsafe extern "C" fn matrix_rtc_string_free(ptr: *mut c_char) {
     // SAFETY: ptr is checked for null and must originate from CString::into_raw in this crate.
     unsafe {
         drop(std::ffi::CString::from_raw(ptr));
-    }
-}
-
-#[unsafe(no_mangle)]
-/// Applies one sticky event to the session manager.
-///
-/// Returns an integer status code (`0` means success).
-///
-/// # Safety
-///
-/// `session_manager` must be a valid pointer returned by
-/// `matrix_rtc_session_manager_new`.
-/// `event` must be non-null and point to a valid `FfiStickyEvent` whose string
-/// pointers are either null (for optional fields) or valid NUL-terminated UTF-8.
-pub unsafe extern "C" fn matrix_rtc_session_manager_on_sticky_event_received(
-    session_manager: *mut RtcSessionManager,
-    event: *const FfiStickyEvent,
-) -> i32 {
-    if session_manager.is_null() || event.is_null() {
-        return RESULT_INVALID_POINTER;
-    }
-
-    // SAFETY: pointers are checked for null above and expected to outlive this call.
-    let session_manager = unsafe { &mut *session_manager };
-    // SAFETY: pointers are checked for null above and expected to outlive this call.
-    let event = unsafe { &*event };
-
-    let parsed = match to_core_event(event) {
-        Ok(parsed) => parsed,
-        Err(code) => return code,
-    };
-
-    match session_manager.on_sticky_event_received(parsed) {
-        Ok(()) => RESULT_OK,
-        Err(_) => RESULT_CONVERSION_ERROR,
     }
 }
 
@@ -517,6 +500,34 @@ fn to_core_updates(
         .collect()
 }
 
+fn to_core_membership_events(events: Vec<RawStickyEvent>) -> Result<Vec<CallMembershipEvent>, i32> {
+    events.into_iter().try_fold(Vec::new(), |mut acc, event| {
+        match event.try_into_call_membership_event() {
+            Ok(event) => {
+                acc.push(event);
+                Ok(acc)
+            }
+            Err(EventConversionError::UnsupportedEventType { .. }) => Ok(acc),
+            Err(_) => Err(RESULT_CONVERSION_ERROR),
+        }
+    })
+}
+
+fn to_core_left_membership_events(
+    events: Vec<RawStickyEvent>,
+) -> Result<Vec<CallMembershipEvent>, i32> {
+    events.into_iter().try_fold(Vec::new(), |mut acc, event| {
+        match event.try_into_left_membership_event() {
+            Ok(event) => {
+                acc.push(event);
+                Ok(acc)
+            }
+            Err(EventConversionError::UnsupportedEventType { .. }) => Ok(acc),
+            Err(_) => Err(RESULT_CONVERSION_ERROR),
+        }
+    })
+}
+
 fn c_string_required(ptr: *const c_char) -> Result<String, i32> {
     if ptr.is_null() {
         return Err(RESULT_INVALID_POINTER);
@@ -556,7 +567,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ffi_entrypoint_accepts_join_event() {
+    fn ffi_session_snapshot_entrypoint_accepts_join_event() {
         let room_id = CString::new("!room:example.org").unwrap();
         let sender = CString::new("@alice:example.org").unwrap();
         let event_type = CString::new("m.rtc.member").unwrap();
@@ -576,16 +587,16 @@ mod tests {
             disconnect_reason: std::ptr::null(),
         };
 
-        let session_manager = matrix_rtc_session_manager_new();
+        let session = matrix_rtc_session_new();
 
         // SAFETY: pointers are valid for the duration of the call.
         let result =
-            unsafe { matrix_rtc_session_manager_on_sticky_event_received(session_manager, &event) };
+            unsafe { matrix_rtc_session_on_sticky_events_snapshot_received(session, &event, 1) };
         assert_eq!(result, RESULT_OK);
 
-        // SAFETY: session_manager was created by matrix_rtc_session_manager_new.
+        // SAFETY: session was created by matrix_rtc_session_new.
         unsafe {
-            matrix_rtc_session_manager_free(session_manager);
+            matrix_rtc_session_free(session);
         }
     }
 

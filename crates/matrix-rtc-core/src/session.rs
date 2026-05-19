@@ -1,9 +1,9 @@
 //! In-memory RTC session membership model.
 //!
-//! This module stores the current participant view per `(room_id, slot_id)` and
-//! applies joined/left transitions derived from sticky event DTO conversion.
+//! This module stores the current participant view for a single RTC session and
+//! applies joined/left transitions from domain membership events produced by the
+//! manager layer.
 
-use crate::event::{EventConversionError, RawStickyEvent, StickyEventsUpdate};
 use serde::Serialize;
 use tokio::sync::watch;
 
@@ -32,36 +32,18 @@ impl RtcSession {
         self.membership_snapshots_tx.subscribe()
     }
 
-    /// Applies the initial sticky events for this single session.
-    pub fn initial_events(
-        &mut self,
-        events: impl IntoIterator<Item = RawStickyEvent>,
-    ) -> Result<(), EventConversionError> {
+    /// Applies the initial membership events for this single session.
+    pub fn initial_events(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
         for event in events {
-            self.apply_membership_event(event.try_into_call_membership_event()?);
+            self.apply_membership_event(event);
         }
-
-        Ok(())
     }
 
-    /// Applies a sticky update batch for this single session.
-    pub fn handle_update(
-        &mut self,
-        update: StickyEventsUpdate,
-    ) -> Result<(), EventConversionError> {
-        for event in update.added {
-            self.apply_membership_event(event.try_into_call_membership_event()?);
+    /// Applies a membership update batch for this single session.
+    pub fn handle_update(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
+        for event in events {
+            self.apply_membership_event(event);
         }
-
-        for changed in update.updated {
-            self.apply_membership_event(changed.current.try_into_call_membership_event()?);
-        }
-
-        for event in update.removed {
-            self.apply_membership_event(event.try_into_left_membership_event()?);
-        }
-
-        Ok(())
     }
 
     /// Applies one membership event to this session.

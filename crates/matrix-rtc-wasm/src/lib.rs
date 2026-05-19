@@ -4,8 +4,8 @@
 //! Keeping this conversion here lets the core remain independent from wasm/JS types.
 
 use matrix_rtc_core::{
-    JoinedMembership, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate, RtcSession,
-    RtcSessionManager, StickyEventsUpdate,
+    EventConversionError, JoinedMembership, RawStickyEvent, RawStickyEventContent,
+    RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
 };
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -98,9 +98,19 @@ impl WasmRtcSession {
         let input: Vec<WasmStickyEvent> = serde_wasm_bindgen::from_value(events)
             .map_err(|err| JsError::new(&format!("invalid sticky snapshot payload: {err}")))?;
 
-        self.inner
-            .initial_events(input.into_iter().map(Into::into))
-            .map_err(|err| JsError::new(&err.to_string()))
+        let mut membership_events = Vec::new();
+        for event in input.into_iter() {
+            let event = RawStickyEvent::from(event);
+            match event.try_into_call_membership_event() {
+                Ok(event) => membership_events.push(event),
+                Err(EventConversionError::UnsupportedEventType { .. }) => continue,
+                Err(err) => return Err(JsError::new(&err.to_string())),
+            }
+        }
+
+        self.inner.initial_events(membership_events);
+
+        Ok(())
     }
 
     /// Applies one sticky diff payload for this single session.
@@ -108,22 +118,35 @@ impl WasmRtcSession {
         let input: WasmStickyEventsUpdate = serde_wasm_bindgen::from_value(update)
             .map_err(|err| JsError::new(&format!("invalid sticky event payload: {err}")))?;
 
-        let mapped = StickyEventsUpdate {
-            added: input.added.into_iter().map(Into::into).collect(),
-            updated: input
-                .updated
-                .into_iter()
-                .map(|item| RawStickyEventUpdate {
-                    current: item.current.into(),
-                    previous: item.previous.into(),
-                })
-                .collect(),
-            removed: input.removed.into_iter().map(Into::into).collect(),
-        };
+        let mut membership_events = Vec::new();
 
-        self.inner
-            .handle_update(mapped)
-            .map_err(|err| JsError::new(&err.to_string()))
+        for event in input.added {
+            match RawStickyEvent::from(event).try_into_call_membership_event() {
+                Ok(event) => membership_events.push(event),
+                Err(EventConversionError::UnsupportedEventType { .. }) => continue,
+                Err(err) => return Err(JsError::new(&err.to_string())),
+            }
+        }
+
+        for item in input.updated {
+            match RawStickyEvent::from(item.current).try_into_call_membership_event() {
+                Ok(event) => membership_events.push(event),
+                Err(EventConversionError::UnsupportedEventType { .. }) => continue,
+                Err(err) => return Err(JsError::new(&err.to_string())),
+            }
+        }
+
+        for event in input.removed {
+            match RawStickyEvent::from(event).try_into_left_membership_event() {
+                Ok(event) => membership_events.push(event),
+                Err(EventConversionError::UnsupportedEventType { .. }) => continue,
+                Err(err) => return Err(JsError::new(&err.to_string())),
+            }
+        }
+
+        self.inner.handle_update(membership_events);
+
+        Ok(())
     }
 
     /// Subscribes to full membership snapshots for this session.

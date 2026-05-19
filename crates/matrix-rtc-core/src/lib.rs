@@ -59,6 +59,16 @@ mod tests {
         sticky_event(sender, slot_id, sticky_key, None, None, Some("ice_failed"))
     }
 
+    fn left_membership(sender: &str, slot_id: &str, sticky_key: &str) -> CallMembershipEvent {
+        CallMembershipEvent::Left(LeftMembership {
+            room_id: ROOM_ID.to_owned(),
+            slot_id: slot_id.to_owned(),
+            sender: sender.to_owned(),
+            sticky_key: sticky_key.to_owned(),
+            disconnect_reason: Some("ice_failed".to_owned()),
+        })
+    }
+
     #[test]
     fn manager_routes_snapshot_and_diff_update_membership() {
         let mut manager = RtcSessionManager::new();
@@ -105,13 +115,11 @@ mod tests {
     fn session_is_single_session_only() {
         let mut session = RtcSession::new();
 
-        session
-            .initial_events(vec![joined_event(
-                "@alice:example.org",
-                "m.call#ROOM",
-                "alice-device-a",
-            )])
+        let event = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a")
+            .try_into_call_membership_event()
             .unwrap();
+
+        session.initial_events(vec![event]);
 
         assert_eq!(session.member_count(), 1);
     }
@@ -120,25 +128,17 @@ mod tests {
     fn removed_events_clear_membership_even_if_content_looks_connected() {
         let mut session = RtcSession::new();
 
-        session
-            .initial_events(vec![joined_event(
-                "@alice:example.org",
-                "m.call#ROOM",
-                "alice-device-a",
-            )])
+        let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a")
+            .try_into_call_membership_event()
             .unwrap();
 
-        session
-            .handle_update(StickyEventsUpdate {
-                added: Vec::new(),
-                updated: Vec::new(),
-                removed: vec![joined_event(
-                    "@alice:example.org",
-                    "m.call#ROOM",
-                    "alice-device-a",
-                )],
-            })
-            .unwrap();
+        session.initial_events(vec![joined]);
+
+        session.handle_update(vec![left_membership(
+            "@alice:example.org",
+            "m.call#ROOM",
+            "alice-device-a",
+        )]);
 
         assert_eq!(session.member_count(), 0);
     }
@@ -167,35 +167,69 @@ mod tests {
         let initial = subscription.borrow().clone();
         assert!(initial.is_empty());
 
-        session
-            .initial_events(vec![joined_event(
-                "@alice:example.org",
-                "m.call#ROOM",
-                "alice-device-a",
-            )])
+        let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a")
+            .try_into_call_membership_event()
             .unwrap();
+
+        session.initial_events(vec![joined]);
 
         assert!(subscription.has_changed().unwrap());
         let after_join = subscription.borrow_and_update().clone();
         assert_eq!(after_join.len(), 1);
         assert_eq!(after_join[0].sender, "@alice:example.org");
 
-        session
-            .handle_update(StickyEventsUpdate {
-                added: Vec::new(),
-                updated: Vec::new(),
-                removed: vec![joined_event(
-                    "@alice:example.org",
-                    "m.call#ROOM",
-                    "alice-device-a",
-                )],
-            })
-            .unwrap();
+        session.handle_update(vec![left_membership(
+            "@alice:example.org",
+            "m.call#ROOM",
+            "alice-device-a",
+        )]);
 
         assert!(subscription.has_changed().unwrap());
         let after_leave = subscription.borrow_and_update().clone();
         assert!(after_leave.is_empty());
 
         assert!(!subscription.has_changed().unwrap());
+    }
+
+    #[test]
+    fn manager_accepts_stable_and_unstable_rtc_member_event_types() {
+        let mut manager = RtcSessionManager::new();
+
+        let stable = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
+
+        let unstable = RawStickyEvent {
+            event_type: "org.matrix.msc4143.rtc.member".to_owned(),
+            ..joined_event("@bob:example.org", "m.call#ROOM", "bob-device-a")
+        };
+
+        manager
+            .initial_sticky_for_room(ROOM_ID, vec![stable, unstable])
+            .unwrap();
+
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(2));
+    }
+
+    #[test]
+    fn manager_ignores_non_membership_event_types() {
+        let mut manager = RtcSessionManager::new();
+
+        let event = RawStickyEvent {
+            room_id: ROOM_ID.to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            event_type: "m.not.rtc.member".to_owned(),
+            content: RawStickyEventContent {
+                slot_id: "m.call#ROOM".to_owned(),
+                sticky_key: "alice-device-a".to_owned(),
+                application_type: None,
+                member_id: None,
+                disconnect_reason: None,
+            },
+        };
+
+        manager
+            .initial_sticky_for_room(ROOM_ID, vec![event])
+            .unwrap();
+
+        assert_eq!(manager.session_count(), 0);
     }
 }
