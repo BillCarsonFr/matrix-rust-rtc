@@ -115,7 +115,7 @@ impl RawStickyEvent {
     ///
     /// This is used for sticky removals/expiry, where the event should always
     /// be interpreted as a left membership regardless of its content shape.
-    pub(crate) fn try_into_left_membership_event(
+    pub fn try_into_left_membership_event(
         self,
     ) -> Result<CallMembershipEvent, EventConversionError> {
         if self.event_type != "m.rtc.member" && self.event_type != "org.matrix.msc4143.rtc.member" {
