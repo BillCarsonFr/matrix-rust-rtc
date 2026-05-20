@@ -49,6 +49,12 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Accepts `JsValue` payloads for snapshots and updates and deserializes via `serde-wasm-bindgen`.
 - Maps JSON fields to core sticky event DTOs.
 
+## `web`
+
+- Browser-first JavaScript packaging around `crates/matrix-rtc-wasm`.
+- Uses `wasm-pack` to generate browser and Node.js runtime bundles into ignored `pkg/` subdirectories.
+- Keeps generated JavaScript/WASM artifacts out of git while providing a small JS test surface.
+
 ## `crates/matrix-rtc-ffi`
 
 - Exposes UniFFI objects and records for Swift/Kotlin consumers.
@@ -77,7 +83,3 @@ Current implementation only establishes event intake and membership state wiring
 3. Add persistence abstraction for sessions and sticky membership maps.
 4. Add transport discovery and focus modeling (`MSC4195`).
 5. Model `rtc_transports` in sticky membership DTOs and membership projections (`MSC4143` / `MSC4195`).
-
-
-
-
