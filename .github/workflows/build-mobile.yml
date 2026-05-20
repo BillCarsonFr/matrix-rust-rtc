@@ -1,0 +1,89 @@
+name: Build Mobile Libraries
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Build Android AAR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Install uniffi-bindgen
+        run: cargo install uniffi_bindgen
+
+      - name: Build Android AAR
+        run: ./scripts/build-android-aar.sh
+
+      - name: Upload AAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-rtc-android-aar
+          path: mobile/android/matrixrtc/build/outputs/aar/
+
+  build-ios:
+    name: Build iOS XCFramework
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Install uniffi-bindgen
+        run: cargo install uniffi_bindgen
+
+      - name: Build iOS XCFramework
+        run: ./scripts/build-ios-xcframework.sh
+
+      - name: Upload XCFramework artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-rtc-ios-xcframework
+          path: mobile/ios/build/MatrixRtcFFI.xcframework/
+
+      - name: Upload Swift bindings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-rtc-swift-bindings
+          path: mobile/ios/generated/
+
+  test:
+    name: Test FFI Bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run FFI tests
+        run: cargo test -p matrix-rtc-ffi
+
+      - name: Run all tests
+        run: cargo test --all
+
