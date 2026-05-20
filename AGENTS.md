@@ -29,6 +29,57 @@ can be used to record calls via a headless bot
 ## Audience & Scope
 This document is a lightweight guide for contributors and automated agents. It focuses on stable concepts and boundaries, not implementation details.
 
+## AI Working Folder (`agent-workspace/`)
+
+A git-ignored sandbox for all transient AI-generated files. **Use only paths under the workspace and keep transient files in `agent-workspace/`.**
+
+### Rules
+
+- **Write files** using file tools; use shell commands for execution tasks only.
+- **Overwriting**: replace entire files for generated docs like `pr-body.md`.
+- **Store only transient workflow artifacts** here; keep source code and reviewable files in tracked project paths.
+- **Commit messages**: write to `agent-workspace/<feature-slug>/commit-msg.txt` and use `git commit -F agent-workspace/<feature-slug>/commit-msg.txt`
+- **PR descriptions**: write to `agent-workspace/<feature-slug>/pr-body.md` and use `gh pr create --body-file agent-workspace/<feature-slug>/pr-body.md`
+
+### Per-Feature Subfolder Convention
+
+Every agent task that spans more than a single trivial edit **must** create a dedicated subfolder:
+
+```
+agent-workspace/<feature-slug>/
+```
+
+`feature-slug` is a short kebab-case label matching the branch name (e.g., `membership-routing`, `e2ee-key-dist`).
+
+**Required files** (create as the work progresses, omit only if genuinely not applicable):
+
+| File | Purpose |
+|---|---|
+| `plan.md` | Agreed approach before coding starts. Written after the user confirms direction. |
+| `implementation-summary.md` | What was built, key decisions made, trade-offs. Written before handoff. |
+| `commit-msg.txt` | Conventional commit message(s), one file per logical commit if batched. |
+| `pr-body.md` | Full PR description. |
+
+**Optional files:**
+
+| File | Purpose |
+|---|---|
+| `NN-prompt.md` | Raw prompt text (numbered, e.g. `01-initial.md`, `02-debug.md`). Keep as many as useful for knowledge sharing with teammates. |
+| `review-pr-findings.md` | Output of the PR self-review step. |
+| `decisions.md` | Architectural/design decisions and the reasoning behind them. |
+
+## First-Pass Handoff (for Agents)
+
+After implementing a requested change, stop and hand the result to the user before doing the full code-quality pass.
+
+- Default workflow: implement the change, do only the narrowest sanity check needed to avoid an obviously broken handoff, then ask whether the user is happy with the result.
+- Run only the narrow sanity checks needed before handoff; run full build/coverage/benchmark/broad suites after direction is confirmed.
+- Add follow-up work (wider refactors, extra tests, documentation polish) after the user confirms direction or explicitly asks for the quality pass.
+- If a validation step is needed before user feedback, keep it targeted to the touched code and state why that check is necessary.
+- Once the user confirms the direction, complete the remaining quality work needed for the requested end state.
+
+Commit after the first implementation handoff cycle: write the code, show what changed, gather feedback, then commit once the user confirms direction (or explicitly asks for a commit).
+
 ## Development Phase
 
 This project is in active development.
@@ -51,7 +102,6 @@ Level 1: On startup reads only the name and description from every `SKILL.md`.
 Level 2: When a skill is relevant to a task, the agent loads the full markdown and executes according to its instructions.
 Level 3: Some skills folder have a `references/` subfolder for static files (docs, templates, checklists), Agent should only read them when relevant (load on demand).
 
-
 Always read the karpathy-guidelines skill before coding (`skills/karpathy-guidelines/SKILL.md`).
 
 ## Useful Commands
@@ -64,32 +114,9 @@ Always read the karpathy-guidelines skill before coding (`skills/karpathy-guidel
 - Android bindings: `./scripts/build-android-aar.sh`
 - iOS bindings (macOS): `./scripts/build-ios-xcframework.sh`
 
-## AI Working Folder (`agent-workspace/`)
-
-A git-ignored sandbox for all transient AI-generated files. **Never use `/tmp/` or paths outside the workspace.**
-
-- Use for planning notes, PR script outputs, commit messages, and PR descriptions
-- **Write files** using file tools — never shell workarounds (`echo >>`, heredoc, etc.)
-- **Overwriting**: always replace entire files; never partial `replace_string_in_file` edits on files like `pr-body.md`
-- **Commit messages**: write to `agent-workspace/commit-msg.txt` and use `git commit -F agent-workspace/commit-msg.txt`
-- **PR descriptions**: write to `agent-workspace/pr-body.md` and use `gh pr create --body-file agent-workspace/pr-body.md`
-- **Never store source code** or files meant to be reviewed here
-
-Do **not** commit on the first iteration. Write the code, show the user what changed, and wait for feedback. Only commit once the user confirms the direction is correct — or explicitly asks you to commit.
-
-## First-Pass Handoff (for Agents)
-
-After implementing a requested change, stop and hand the result to the user before doing the full code-quality pass.
-
-- Default workflow: implement the change, do only the narrowest sanity check needed to avoid an obviously broken handoff, then ask whether the user is happy with the result.
-- Do **not** automatically run the full build, coverage, benchmark, or broad test suite immediately after implementation.
-- Do **not** add follow-up work like wider refactors, extra tests or documentation polish until the user confirms the implementation direction or explicitly asks for the quality pass.
-- If a validation step is needed before user feedback, keep it targeted to the touched code and state why that check is necessary.
-- Once the user confirms the direction, complete the remaining quality work needed for the requested end state.
-
 ## Pre-Commit Checklist (for Agents)
 
-This checklist is for commit/PR readiness, not for the initial implementation handoff.
+Use this checklist for commit/PR readiness after the initial implementation handoff.
 
 Before committing **any** code change (new feature, bug fix, PR comment fix, refactor, etc.), always run the following commands and resolve all errors before proceeding:
 
@@ -109,50 +136,10 @@ Then run binding tasks for any touched binding surface:
 
 If a required platform/toolchain is not available locally, document the skip reason in the PR description and ensure the corresponding CI job passes before merge.
 
-Do not commit if any of these steps fail. Fix the issue first, then re-run the full checklist before committing.
+Commit only after every checklist step passes; fix failures and re-run the full checklist until green.
 
 **Manual review** — before committing, scan the diff against each pillar in [Code Quality Standards](#code-quality-standards) and verify all apply.
 
-## Creating PRs (for Agents)
-
-When asked to commit and create a PR, follow `skills/create-pr/SKILL.md`. Core steps:
-1. Pass the Pre-Commit Checklist above before each commit.
-2. Analyze `git diff` and group changes into logical commits.
-3. Create a branch (`feat/`, `fix/`, etc.) and commit each group with a conventional commit message: `type(scope): description`.
-4. Write PR description to `agent-workspace/pr-body.md`.
-5. **Self-review** — load `skills/self-review/SKILL.md` (`/self-review`) and resolve all findings before pushing.
-
-
-## PR Review Workflow (for Agents)
-When prompted to **"review-pr"**, follow `skills/review-pr/SKILL.md`. This is an offline review flow and does not require GitHub/GitLab.
-
-Expected state before running this workflow:
-- Feature/fix work is already committed on a branch (typically via `skills/create-pr/SKILL.md`)
-- PR description exists at `agent-workspace/pr-body.md`
-
-Core steps:
-1. Read `agent-workspace/pr-body.md` to understand intent/scope.
-2. Compute diff from current branch to `master`:
-   - `git diff master`
-   - `git diff --stat master`
-3. Conduct an independent review of changed files against:
-   - PR description accuracy and completeness
-   - Repository guidance in this file and `ARCHITECTURE.md`
-   - Consistency with existing codebase patterns
-   - Refactoring opportunities that improve clarity/maintainability
-4. Write findings to `agent-workspace/review-pr-findings.md` with this structure:
-   - Quick summary
-   - One section per file, with comments referencing line numbers
-5. Reviewer is read-only: never edit code, stage files, commit, or push.
-
-Output contract:
-- If findings exist: provide actionable, respectful comments with file + line references.
-- If no findings: write exactly `Review Completed - No findings`.
-
-
-## Performance Regression Detection
-
-// TODO
 
 ## Contribution Guidelines
 - Always pass the full [Pre-Commit Checklist](#pre-commit-checklist-for-agents), including binding build/test tasks for touched binding surfaces, before committing.
