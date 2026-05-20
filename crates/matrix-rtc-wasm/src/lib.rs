@@ -69,6 +69,18 @@ impl WasmRtcSessionManager {
             .sticky_update_for_room(&room_id, mapped)
             .map_err(|err| JsError::new(&err.to_string()))
     }
+
+    /// Returns the number of active sessions currently tracked by the manager.
+    pub fn session_count(&self) -> u32 {
+        self.inner.session_count() as u32
+    }
+
+    /// Returns the number of joined members for one `(room_id, slot_id)` session.
+    pub fn member_count(&self, room_id: String, slot_id: String) -> Option<u32> {
+        self.inner
+            .member_count(&room_id, &slot_id)
+            .map(|count| count as u32)
+    }
 }
 
 impl Default for WasmRtcSessionManager {

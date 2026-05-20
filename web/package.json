@@ -1,0 +1,24 @@
+{
+  "name": "matrix-rtc-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-first JavaScript package generated from the MatrixRTC wasm bindings.",
+  "main": "./pkg/node/matrix_rtc_wasm.js",
+  "module": "./pkg/browser/matrix_rtc_wasm.js",
+  "browser": "./pkg/browser/matrix_rtc_wasm.js",
+  "exports": {
+    ".": {
+      "browser": "./pkg/browser/matrix_rtc_wasm.js",
+      "node": "./pkg/node/matrix_rtc_wasm.js",
+      "default": "./pkg/browser/matrix_rtc_wasm.js"
+    }
+  },
+  "scripts": {
+    "build": "./scripts/build-bindings.sh",
+    "build:browser": "wasm-pack build ../crates/matrix-rtc-wasm --release --target web --out-dir pkg/browser --out-name matrix_rtc_wasm",
+    "build:node": "wasm-pack build ../crates/matrix-rtc-wasm --release --target nodejs --out-dir pkg/node --out-name matrix_rtc_wasm",
+    "test": "node --test test/*.test.mjs"
+  }
+}
+
+
