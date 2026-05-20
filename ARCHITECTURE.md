@@ -8,7 +8,7 @@ The goal is to keep protocol logic in one Rust core crate and make all platform 
 
 - `matrix-rtc-core` owns RTC domain behavior.
 - `matrix-rtc-wasm` owns JavaScript-facing conversion and wasm export details.
-- `matrix-rtc-ffi` owns native ABI-facing conversion and pointer safety.
+- `matrix-rtc-ffi` owns native binding-facing conversion and UniFFI boundary types.
 
 This keeps the core reusable and testable while avoiding platform-specific dependencies in core.
 
@@ -51,14 +51,9 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 ## `crates/matrix-rtc-ffi`
 
-- Exposes C ABI functions:
-  - `matrix_rtc_session_manager_new`
-  - `matrix_rtc_session_manager_on_sticky_event_received`
-  - `matrix_rtc_session_manager_on_sticky_events_snapshot_received`
-  - `matrix_rtc_session_manager_on_sticky_events_update_received`
-  - `matrix_rtc_session_manager_free`
-- Uses a flat `#[repr(C)]` event struct.
-- Converts C strings and enum values into core event types.
+- Exposes UniFFI objects and records for Swift/Kotlin consumers.
+- Keeps FFI DTOs local to the crate and converts them into core DTOs.
+- Preserves session subscription semantics through a polling subscription object.
 
 ## Spec alignment
 

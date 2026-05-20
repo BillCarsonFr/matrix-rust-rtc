@@ -1,0 +1,3 @@
+include ':matrixrtc'
+project(':matrixrtc').projectDir = new File(rootDir, 'matrixrtc')
+
