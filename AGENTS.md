@@ -56,10 +56,13 @@ Always read the karpathy-guidelines skill before coding (`skills/karpathy-guidel
 
 ## Useful Commands
 
-// TBD 
-// Cargo check
-// Cargo clippy --all-targets --all-features -- -D warnings
-// Cargo test
+- `cargo check`
+- `cargo fmt`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test`
+- Web bindings: `cd web && npm run build && npm test`
+- Android bindings: `./scripts/build-android-aar.sh`
+- iOS bindings (macOS): `./scripts/build-ios-xcframework.sh`
 
 ## AI Working Folder (`agent-workspace/`)
 
@@ -94,6 +97,17 @@ Before committing **any** code change (new feature, bug fix, PR comment fix, ref
 `cargo fmt`
 `cargo clippy --all-targets --all-features -- -D warnings`
 `cargo test`
+
+Then run binding tasks for any touched binding surface:
+
+- If changes touch `crates/matrix-rtc-wasm/**` or `web/**`:
+  - `cd web && npm run build`
+  - `cd web && npm test`
+- If changes touch `crates/matrix-rtc-ffi/**`, `mobile/**`, or `scripts/build-*.sh`:
+  - `./scripts/build-android-aar.sh`
+  - `./scripts/build-ios-xcframework.sh` (on macOS)
+
+If a required platform/toolchain is not available locally, document the skip reason in the PR description and ensure the corresponding CI job passes before merge.
 
 Do not commit if any of these steps fail. Fix the issue first, then re-run the full checklist before committing.
 
@@ -141,7 +155,7 @@ Output contract:
 // TODO
 
 ## Contribution Guidelines
-- Always pass the [Pre-Commit Checklist](#pre-commit-checklist-for-agents) (`cargo check`, `cargo fmt`) before committing.
+- Always pass the full [Pre-Commit Checklist](#pre-commit-checklist-for-agents), including binding build/test tasks for touched binding surfaces, before committing.
 
 ## Comments and Module Documentation
 
