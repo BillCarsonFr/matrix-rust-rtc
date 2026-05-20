@@ -31,13 +31,13 @@ This document is a lightweight guide for contributors and automated agents. It f
 
 ## AI Working Folder (`agent-workspace/`)
 
-A git-ignored sandbox for all transient AI-generated files. **Never use `/tmp/` or paths outside the workspace.**
+A git-ignored sandbox for all transient AI-generated files. **Use only paths under the workspace and keep transient files in `agent-workspace/`.**
 
 ### Rules
 
-- **Write files** using file tools — never shell workarounds (`echo >>`, heredoc, etc.)
-- **Overwriting**: always replace entire files; never partial edits on files like `pr-body.md`
-- **Never store source code** or files meant to be reviewed here
+- **Write files** using file tools; use shell commands for execution tasks only.
+- **Overwriting**: replace entire files for generated docs like `pr-body.md`.
+- **Store only transient workflow artifacts** here; keep source code and reviewable files in tracked project paths.
 - **Commit messages**: write to `agent-workspace/<feature-slug>/commit-msg.txt` and use `git commit -F agent-workspace/<feature-slug>/commit-msg.txt`
 - **PR descriptions**: write to `agent-workspace/<feature-slug>/pr-body.md` and use `gh pr create --body-file agent-workspace/<feature-slug>/pr-body.md`
 
@@ -73,12 +73,12 @@ agent-workspace/<feature-slug>/
 After implementing a requested change, stop and hand the result to the user before doing the full code-quality pass.
 
 - Default workflow: implement the change, do only the narrowest sanity check needed to avoid an obviously broken handoff, then ask whether the user is happy with the result.
-- Do **not** automatically run the full build, coverage, benchmark, or broad test suite immediately after implementation.
-- Do **not** add follow-up work like wider refactors, extra tests or documentation polish until the user confirms the implementation direction or explicitly asks for the quality pass.
+- Run only the narrow sanity checks needed before handoff; run full build/coverage/benchmark/broad suites after direction is confirmed.
+- Add follow-up work (wider refactors, extra tests, documentation polish) after the user confirms direction or explicitly asks for the quality pass.
 - If a validation step is needed before user feedback, keep it targeted to the touched code and state why that check is necessary.
 - Once the user confirms the direction, complete the remaining quality work needed for the requested end state.
 
-Do **not** commit on the first iteration. Write the code, show the user what changed, and wait for feedback. Only commit once the user confirms the direction is correct — or explicitly asks you to commit.
+Commit after the first implementation handoff cycle: write the code, show what changed, gather feedback, then commit once the user confirms direction (or explicitly asks for a commit).
 
 ## Development Phase
 
@@ -116,7 +116,7 @@ Always read the karpathy-guidelines skill before coding (`skills/karpathy-guidel
 
 ## Pre-Commit Checklist (for Agents)
 
-This checklist is for commit/PR readiness, not for the initial implementation handoff.
+Use this checklist for commit/PR readiness after the initial implementation handoff.
 
 Before committing **any** code change (new feature, bug fix, PR comment fix, refactor, etc.), always run the following commands and resolve all errors before proceeding:
 
@@ -136,7 +136,7 @@ Then run binding tasks for any touched binding surface:
 
 If a required platform/toolchain is not available locally, document the skip reason in the PR description and ensure the corresponding CI job passes before merge.
 
-Do not commit if any of these steps fail. Fix the issue first, then re-run the full checklist before committing.
+Commit only after every checklist step passes; fix failures and re-run the full checklist until green.
 
 **Manual review** — before committing, scan the diff against each pillar in [Code Quality Standards](#code-quality-standards) and verify all apply.
 
