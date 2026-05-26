@@ -1,6 +1,12 @@
 # matrix-rust-rtc
 
-Initial Rust workspace for a Matrix RTC SDK skeleton.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+> **Note:** This project is developed with AI assistance.
+
+A Rust implementation of a Matrix RTC (Real-Time Communication) client SDK.
+
+This project provides a core RTC SDK in Rust that can be used across multiple platforms, with bindings for web (via WebAssembly) and native mobile platforms (via FFI). This allows maintaining a single codebase for the core RTC functionality while enabling broad platform support.
 
 ## Workspace crates
 
@@ -102,4 +108,8 @@ cd web && npm test
 (`./scripts/build-ios-xcframework.sh` is macOS-only.)
 
 If a required platform/toolchain is not available locally, document the skip reason in the PR description and ensure the corresponding CI job passes before merge.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
 

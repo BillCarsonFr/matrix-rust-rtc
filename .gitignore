@@ -1,12 +1,22 @@
 /target
 
+# Build artifacts
+/build
+/pkg
+
+# Static and shared libraries
+*.a
+*.so
+*.dylib
+*.dll
+
+# XCFramework
+*.xcframework
+
+# Node.js
+node_modules/
 
 # Added by cargo
-#
-# already existing elements were commented out
-
-#/target
-
 .DS_Store
 
 agent-workspace/
