@@ -111,5 +111,5 @@ If a required platform/toolchain is not available locally, document the skip rea
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [AGPL-3.0](LICENSE).
 
