@@ -24,6 +24,8 @@
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::transport::RtcTransport;
+
 #[derive(Clone, Debug)]
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession {
@@ -134,6 +136,8 @@ pub struct JoinedMembership {
     pub sticky_key: String,
     /// Application type, usually `m.call`.
     pub application: Option<String>,
+    /// RTC transports for this member (MSC4143 / MSC4195).
+    pub transports: Vec<RtcTransport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

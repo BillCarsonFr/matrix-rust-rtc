@@ -22,6 +22,7 @@
 //! Conversion then interprets DTO content as MatrixRTC membership events.
 
 use crate::session::{CallMembershipEvent, JoinedMembership, LeftMembership};
+use crate::transport::RawRtcTransport;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -50,8 +51,8 @@ pub struct RawStickyEventContent {
     pub member_id: Option<String>,
     /// Optional disconnect reason for disconnected membership updates.
     pub disconnect_reason: Option<String>,
-    // TODO(msc4143, msc4195): model `rtc_transports` from m.rtc.member once
-    // transport selection/LiveKit integration is implemented.
+    /// RTC transports from `content.rtc_transports` (MSC4143 / MSC4195).
+    pub rtc_transports: Option<Vec<RawRtcTransport>>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +108,15 @@ impl RawStickyEvent {
             });
         }
 
+        let transports = self
+            .content
+            .rtc_transports
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.into_typed())
+            .collect();
+
         let event = if self.content.is_valid_connect_content() {
             CallMembershipEvent::Joined(JoinedMembership {
                 room_id: self.room_id,
@@ -114,6 +124,7 @@ impl RawStickyEvent {
                 sender: self.sender,
                 sticky_key: self.content.sticky_key,
                 application: self.content.application_type,
+                transports,
             })
         } else {
             CallMembershipEvent::Left(LeftMembership {
