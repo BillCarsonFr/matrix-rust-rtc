@@ -21,7 +21,7 @@
 //! Keeping this conversion here lets the core remain independent from wasm/JS types.
 
 use matrix_rtc_core::{
-    EventConversionError, JoinedMembership, RawStickyEvent, RawStickyEventContent,
+    EventConversionError, JoinedMembership, RawRtcTransport, RawStickyEvent, RawStickyEventContent,
     RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
 };
 use serde::Deserialize;
@@ -234,6 +234,16 @@ struct WasmStickyEventContent {
     application: Option<WasmApplication>,
     member: Option<WasmMember>,
     disconnect_reason: Option<String>,
+    #[serde(default)]
+    rtc_transports: Option<Vec<WasmRawRtcTransport>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WasmRawRtcTransport {
+    #[serde(rename = "type")]
+    transport_type: String,
+    #[serde(flatten)]
+    extra_fields: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +270,15 @@ struct WasmStickyEventsUpdate {
     removed: Vec<WasmStickyEvent>,
 }
 
+impl From<WasmRawRtcTransport> for RawRtcTransport {
+    fn from(value: WasmRawRtcTransport) -> Self {
+        RawRtcTransport {
+            transport_type: value.transport_type,
+            extra_fields: value.extra_fields,
+        }
+    }
+}
+
 impl From<WasmStickyEvent> for RawStickyEvent {
     fn from(value: WasmStickyEvent) -> Self {
         RawStickyEvent {
@@ -272,6 +291,10 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                 application_type: value.content.application.map(|app| app.kind),
                 member_id: value.content.member.map(|member| member.id),
                 disconnect_reason: value.content.disconnect_reason,
+                rtc_transports: value
+                    .content
+                    .rtc_transports
+                    .map(|v| v.into_iter().map(Into::into).collect()),
             },
         }
     }

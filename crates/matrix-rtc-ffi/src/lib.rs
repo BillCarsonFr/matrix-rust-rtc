@@ -260,6 +260,7 @@ fn to_core_event(event: StickyEvent) -> RawStickyEvent {
             application_type: event.application_type,
             member_id: event.member_id,
             disconnect_reason: event.disconnect_reason,
+            rtc_transports: None,
         },
     }
 }

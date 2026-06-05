@@ -24,6 +24,7 @@
 mod event;
 mod manager;
 mod session;
+mod transport;
 
 pub use event::{
     EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
@@ -31,6 +32,7 @@ pub use event::{
 };
 pub use manager::RtcSessionManager;
 pub use session::{CallMembershipEvent, JoinedMembership, LeftMembership, RtcSession};
+pub use transport::{LiveKitTransport, RawRtcTransport, RtcTransport, UnsupportedTransport};
 
 #[cfg(test)]
 mod tests {
@@ -57,6 +59,7 @@ mod tests {
                 application_type: application_type.map(str::to_owned),
                 member_id: member_id.map(str::to_owned),
                 disconnect_reason: disconnect_reason.map(str::to_owned),
+                rtc_transports: None,
             },
         }
     }
@@ -105,6 +108,7 @@ mod tests {
                 application_type: Some("m.call".to_owned()),
                 member_id: Some("alice-device-a".to_owned()),
                 disconnect_reason: None,
+                rtc_transports: None,
             },
             ..joined.clone()
         };
@@ -240,6 +244,7 @@ mod tests {
                 application_type: None,
                 member_id: None,
                 disconnect_reason: None,
+                rtc_transports: None,
             },
         };
 
@@ -248,5 +253,97 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.session_count(), 0);
+    }
+
+    #[test]
+    fn joined_event_with_livekit_transport_is_parsed_correctly() {
+        use crate::transport::{RawRtcTransport, RtcTransport};
+        use std::collections::BTreeMap;
+
+        let mut extra_fields = BTreeMap::new();
+        extra_fields.insert(
+            "livekit_service_url".to_owned(),
+            serde_json::Value::String("https://example.com/livekit/jwt".to_owned()),
+        );
+
+        let event = RawStickyEvent {
+            room_id: ROOM_ID.to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            event_type: "m.rtc.member".to_owned(),
+            content: RawStickyEventContent {
+                slot_id: "m.call#ROOM".to_owned(),
+                sticky_key: "alice-device-a".to_owned(),
+                application_type: Some("m.call".to_owned()),
+                member_id: Some("alice-device-a".to_owned()),
+                disconnect_reason: None,
+                rtc_transports: Some(vec![RawRtcTransport {
+                    transport_type: "livekit".to_owned(),
+                    extra_fields,
+                }]),
+            },
+        };
+
+        let membership_event = event.try_into_call_membership_event().unwrap();
+
+        match membership_event {
+            CallMembershipEvent::Joined(joined) => {
+                assert_eq!(joined.transports.len(), 1);
+                match &joined.transports[0] {
+                    RtcTransport::LiveKit(livekit) => {
+                        assert_eq!(
+                            livekit.livekit_service_url,
+                            "https://example.com/livekit/jwt"
+                        );
+                    }
+                    RtcTransport::Unsupported(_) => panic!("Expected LiveKit transport"),
+                }
+            }
+            CallMembershipEvent::Left(_) => panic!("Expected Joined membership"),
+        }
+    }
+
+    #[test]
+    fn joined_event_with_unknown_transport_is_preserved_as_unsupported() {
+        use crate::transport::{RawRtcTransport, RtcTransport};
+        use std::collections::BTreeMap;
+
+        let mut extra_fields = BTreeMap::new();
+        extra_fields.insert(
+            "custom_field".to_owned(),
+            serde_json::Value::String("custom_value".to_owned()),
+        );
+
+        let event = RawStickyEvent {
+            room_id: ROOM_ID.to_owned(),
+            sender: "@alice:example.org".to_owned(),
+            event_type: "m.rtc.member".to_owned(),
+            content: RawStickyEventContent {
+                slot_id: "m.call#ROOM".to_owned(),
+                sticky_key: "alice-device-a".to_owned(),
+                application_type: Some("m.call".to_owned()),
+                member_id: Some("alice-device-a".to_owned()),
+                disconnect_reason: None,
+                rtc_transports: Some(vec![RawRtcTransport {
+                    transport_type: "unknown_transport".to_owned(),
+                    extra_fields,
+                }]),
+            },
+        };
+
+        let membership_event = event.try_into_call_membership_event().unwrap();
+
+        match membership_event {
+            CallMembershipEvent::Joined(joined) => {
+                assert_eq!(joined.transports.len(), 1);
+                match &joined.transports[0] {
+                    RtcTransport::Unsupported(unsupported) => {
+                        assert_eq!(unsupported.transport_type, "unknown_transport");
+                        assert!(unsupported.extra_fields.contains_key("custom_field"));
+                    }
+                    RtcTransport::LiveKit(_) => panic!("Expected Unsupported transport"),
+                }
+            }
+            CallMembershipEvent::Left(_) => panic!("Expected Joined membership"),
+        }
     }
 }
