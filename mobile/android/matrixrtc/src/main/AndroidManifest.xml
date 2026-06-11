@@ -1,8 +1,0 @@
-# AndroidManifest.xml placeholder for matrixrtc AAR library
-
-This is a placeholder. When setting up the actual Android Gradle module,
-replace this with the proper AndroidManifest.xml with the required package
-and permissions declarations.
-
-The build process will generate this file automatically when needed.
-

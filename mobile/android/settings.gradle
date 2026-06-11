@@ -24,6 +24,14 @@ pluginManagement {
     }
 }
 
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()      // For AndroidX, Material, etc.
+        mavenCentral() // For Kotlin, JUnit, etc.
+    }
+}
+
 include ':matrixrtc'
 project(':matrixrtc').projectDir = new File(rootDir, 'matrixrtc')
 
