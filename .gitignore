@@ -22,3 +22,7 @@ node_modules/
 agent-workspace/
 
 .idea/
+
+mobile/android/.gradle/
+
+mobile/android/local.properties
