@@ -21,11 +21,19 @@
 //! (`RawStickyEvent`, `StickyEventsUpdate`). DTOs are used on purpose so the core
 //! is decoupled from SDK-specific event types (JS SDK objects, FFI structs, etc.).
 
+mod commands;
+mod error;
 mod event;
+mod join;
+mod keepalive;
 mod manager;
 mod session;
 mod transport;
 
+pub use commands::{CommandCallback, RtcCommandSender, SendEventCallback};
+pub use error::{CommandError, JoinError, LeaveError};
+pub use join::{JoinSessionParams, LeaveSessionParams, DEFAULT_KEEP_ALIVE_TIMEOUT_MS};
+pub use keepalive::{KeepAliveInfo, KeepAliveMachine, KeepAliveMachineBuilder, KeepAliveState, DEFAULT_KEEP_ALIVE_TIMEOUT_MS as KEEP_ALIVE_DEFAULT_TIMEOUT_MS};
 pub use event::{
     EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     StickyEventsUpdate,
