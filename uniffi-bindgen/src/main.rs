@@ -15,9 +15,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
 
-// Top-level build file where you can add configuration options common to all sub-projects/modules.
-
-plugins {
-    id 'com.android.library' version '8.13.2' apply false
-    id 'org.jetbrains.kotlin.android' version '1.9.25' apply false
+fn main() {
+    uniffi::uniffi_bindgen_main()
 }

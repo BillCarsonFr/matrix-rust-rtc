@@ -32,8 +32,8 @@ use tokio::sync::watch;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MatrixRtcFfiError {
-    #[error("invalid input: {message}")]
-    InvalidInput { message: String },
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("internal lock poisoned")]
     InternalLockPoisoned,
 }
@@ -320,9 +320,7 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
 }
 
 fn map_conversion_error(err: EventConversionError) -> MatrixRtcFfiError {
-    MatrixRtcFfiError::InvalidInput {
-        message: err.to_string(),
-    }
+    MatrixRtcFfiError::InvalidInput(err.to_string())
 }
 
 fn lock_mutex<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, MatrixRtcFfiError> {

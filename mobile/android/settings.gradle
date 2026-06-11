@@ -15,6 +15,23 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
 
+// settings.gradle
+pluginManagement {
+    repositories {
+        google()  // <-- This is required for AGP
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()      // For AndroidX, Material, etc.
+        mavenCentral() // For Kotlin, JUnit, etc.
+    }
+}
+
 include ':matrixrtc'
 project(':matrixrtc').projectDir = new File(rootDir, 'matrixrtc')
 

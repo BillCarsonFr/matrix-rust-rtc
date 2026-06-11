@@ -44,7 +44,7 @@ help:
 	@echo ""
 
 setup:
-	cargo install uniffi_bindgen cargo-ndk
+	cargo install cargo-ndk
 	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 	rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 	@echo "✅ Setup complete!"

@@ -67,7 +67,7 @@ xcodebuild -create-xcframework \
 echo "Generating Swift bindings..."
 SWIFT_OUT="$PROJECT_ROOT/mobile/ios/generated"
 mkdir -p "$SWIFT_OUT"
-uniffi-bindgen generate \
+cargo run -p uniffi-bindgen -- generate \
   --library "$PROJECT_ROOT/target/aarch64-apple-ios/release/libmatrix_rtc_ffi.a" \
   --language swift \
   --out-dir "$SWIFT_OUT"

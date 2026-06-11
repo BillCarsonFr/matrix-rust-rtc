@@ -22,3 +22,11 @@ node_modules/
 agent-workspace/
 
 .idea/
+
+mobile/android/.gradle/
+
+mobile/android/local.properties
+
+mobile/android/build/
+
+mobile/android/matrixrtc/build/
