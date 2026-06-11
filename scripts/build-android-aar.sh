@@ -53,7 +53,7 @@ cargo ndk \
 echo "Generating Kotlin bindings..."
 KOTLIN_OUT="$ANDROID_MODULE_ROOT/src/main/java"
 mkdir -p "$KOTLIN_OUT"
-uniffi-bindgen generate \
+cargo run -p uniffi-bindgen -- generate \
   --library "$PROJECT_ROOT/target/aarch64-linux-android/release/libmatrix_rtc_ffi.so" \
   --language kotlin \
   --out-dir "$KOTLIN_OUT"
