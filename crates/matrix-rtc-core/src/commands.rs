@@ -136,12 +136,7 @@ impl RtcCommandSender for NoopCommandSender {
         callback(Ok("mock-event-id".to_string()));
     }
 
-    fn cancel_delayed_event(
-        &self,
-        _room_id: String,
-        _event_id: String,
-        callback: CommandCallback,
-    ) {
+    fn cancel_delayed_event(&self, _room_id: String, _event_id: String, callback: CommandCallback) {
         callback(Ok(()));
     }
 }
@@ -163,10 +158,12 @@ impl MockCommandSender {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn last_sticky_event(&self) -> Option<(String, String, Value)> {
         self.sticky_events.lock().unwrap().last().cloned()
     }
 
+    #[allow(dead_code)]
     pub fn last_delayed_event(&self) -> Option<(String, String, Value, u64)> {
         self.delayed_events.lock().unwrap().last().cloned()
     }
@@ -196,10 +193,12 @@ impl RtcCommandSender for MockCommandSender {
         delay_ms: u64,
         callback: SendEventCallback,
     ) {
-        self.delayed_events
-            .lock()
-            .unwrap()
-            .push((room_id.clone(), event_type.clone(), content, delay_ms));
+        self.delayed_events.lock().unwrap().push((
+            room_id.clone(),
+            event_type.clone(),
+            content,
+            delay_ms,
+        ));
         callback(Ok(format!("delayed-{}-{}", room_id, event_type)));
     }
 

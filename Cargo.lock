@@ -399,6 +399,7 @@ dependencies = [
 name = "matrix-rtc-wasm"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "matrix-rtc-core",
  "serde",
  "serde-wasm-bindgen",
@@ -406,6 +407,7 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-test",
+ "web-sys",
 ]
 
 [[package]]

@@ -83,13 +83,13 @@ impl RtcSessionManager {
         let command_sender = self
             .command_sender
             .as_ref()
-            .ok_or(JoinError::CommandError(crate::error::CommandError::from_message(
-                "no command sender configured",
-            )))?
+            .ok_or(JoinError::CommandError(
+                crate::error::CommandError::from_message("no command sender configured"),
+            ))?
             .clone();
 
         let key = SessionKey::new(params.room_id.clone(), params.slot_id.clone());
-        
+
         // Get or create the session
         let session = self.sessions.entry(key).or_insert_with(|| {
             let mut session = RtcSession::new();
@@ -127,12 +127,9 @@ impl RtcSessionManager {
         params: LeaveSessionParams,
     ) -> Result<(), LeaveError> {
         let key = SessionKey::new(room_id, slot_id);
-        let session = self
-            .sessions
-            .get_mut(&key)
-            .ok_or(LeaveError::CommandError(crate::error::CommandError::from_message(
-                "session not found",
-            )))?;
+        let session = self.sessions.get_mut(&key).ok_or(LeaveError::CommandError(
+            crate::error::CommandError::from_message("session not found"),
+        ))?;
 
         session.leave(params)
     }

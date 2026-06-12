@@ -134,7 +134,11 @@ impl KeepAliveMachine {
 
     /// Gets the delayed event ID, if one is active.
     pub fn delayed_event_id(&self) -> Option<String> {
-        self.info.lock().unwrap().as_ref().map(|info| info.delayed_event_id.clone())
+        self.info
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|info| info.delayed_event_id.clone())
     }
 
     /// Starts the keep-alive mechanism by scheduling a delayed cleanup event.
@@ -234,7 +238,9 @@ impl KeepAliveMachine {
     pub fn cancel(&self) -> bool {
         let delayed_event_id = {
             let info_guard = self.info.lock().unwrap();
-            info_guard.as_ref().map(|info| info.delayed_event_id.clone())
+            info_guard
+                .as_ref()
+                .map(|info| info.delayed_event_id.clone())
         };
 
         if let Some(event_id) = delayed_event_id {

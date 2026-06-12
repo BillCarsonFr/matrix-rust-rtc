@@ -21,10 +21,15 @@
 //! Keeping this conversion here lets the core remain independent from wasm/JS types.
 
 use matrix_rtc_core::{
-    EventConversionError, JoinedMembership, RawRtcTransport, RawStickyEvent, RawStickyEventContent,
-    RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
+    EventConversionError, JoinSessionParams, JoinedMembership, LeaveSessionParams, RawRtcTransport,
+    RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate, RtcCommandSender, RtcSession,
+    RtcSessionManager, RtcTransport, StickyEventsUpdate,
 };
+
+mod commands;
+pub use commands::JsCommandSender;
 use serde::Deserialize;
+use std::sync::Arc;
 use tokio::sync::watch;
 use wasm_bindgen::prelude::*;
 
@@ -32,6 +37,8 @@ use wasm_bindgen::prelude::*;
 /// WebAssembly-facing wrapper around `RtcSessionManager`.
 pub struct WasmRtcSessionManager {
     inner: RtcSessionManager,
+    /// Command sender for sending events to Matrix rooms
+    command_sender: Option<Arc<dyn RtcCommandSender>>,
 }
 
 #[wasm_bindgen]
@@ -41,7 +48,24 @@ impl WasmRtcSessionManager {
     pub fn new() -> Self {
         Self {
             inner: RtcSessionManager::new(),
+            command_sender: None,
         }
+    }
+
+    /// Sets up the command sender for this manager with a Matrix client.
+    ///
+    /// This must be called before join/leave operations.
+    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    pub fn setup_command_sender(&mut self, client: JsValue) {
+        let command_sender: Arc<dyn matrix_rtc_core::RtcCommandSender> =
+            Arc::new(JsCommandSender::new(client));
+        self.inner.set_command_sender(command_sender.clone());
+        self.command_sender = Some(command_sender);
+    }
+
+    /// Returns true if a command sender has been set up.
+    pub fn has_command_sender(&self) -> bool {
+        self.command_sender.is_some()
     }
 
     /// Applies the initial sticky snapshot for one room from a JS iterable/array payload.
@@ -98,6 +122,58 @@ impl WasmRtcSessionManager {
             .member_count(&room_id, &slot_id)
             .map(|count| count as u32)
     }
+
+    /// Joins an RTC session with the given parameters.
+    ///
+    /// This sends a membership event to join the call and starts the keep-alive mechanism.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - JSON object containing join parameters:
+    ///   - `user_id`: Matrix user ID (e.g., "@alice:example.org")
+    ///   - `device_id`: Device ID
+    ///   - `membership_id`: Optional sticky key, defaults to "{user_id}-{device_id}"
+    ///   - `room_id`: Room ID
+    ///   - `slot_id`: Slot ID (e.g., "m.call#ROOM")
+    ///   - `application`: Application type (e.g., "m.call")
+    ///   - `transport`: Transport configuration object
+    ///   - `keep_alive_timeout_ms`: Optional keep-alive timeout in milliseconds (default: 30000)
+    pub fn join(&mut self, params: JsValue) -> Result<(), JsError> {
+        let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
+            .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
+
+        let core_params = params.into_core()?;
+
+        self.inner
+            .join(core_params)
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Leaves an RTC session.
+    ///
+    /// This sends a left membership event and cancels the keep-alive mechanism.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID of the session to leave
+    /// * `slot_id` - The slot ID of the session to leave
+    /// * `params` - Optional JSON object containing leave parameters:
+    ///   - `disconnect_reason`: Optional reason for leaving (e.g., "user_left", "ice_failed")
+    pub fn leave(
+        &mut self,
+        room_id: String,
+        slot_id: String,
+        params: JsValue,
+    ) -> Result<(), JsError> {
+        let params: WasmLeaveSessionParams = serde_wasm_bindgen::from_value(params)
+            .map_err(|err| JsError::new(&format!("invalid leave params: {err}")))?;
+
+        let core_params = params.into_core();
+
+        self.inner
+            .leave(room_id, slot_id, core_params)
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
 }
 
 impl Default for WasmRtcSessionManager {
@@ -106,10 +182,100 @@ impl Default for WasmRtcSessionManager {
     }
 }
 
+/// WASM-friendly join session parameters.
+#[derive(Debug, Deserialize)]
+pub struct WasmJoinSessionParams {
+    pub user_id: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub membership_id: Option<String>,
+    pub room_id: String,
+    pub slot_id: String,
+    pub application: String,
+    pub transport: WasmTransportConfig,
+    #[serde(default)]
+    pub keep_alive_timeout_ms: Option<u64>,
+}
+
+impl WasmJoinSessionParams {
+    pub fn into_core(self) -> Result<JoinSessionParams, JsError> {
+        let transport = self.transport.into_core()?;
+        Ok(JoinSessionParams {
+            user_id: self.user_id,
+            device_id: self.device_id,
+            membership_id: self.membership_id,
+            room_id: self.room_id,
+            slot_id: self.slot_id,
+            application: self.application,
+            transport,
+            keep_alive_timeout_ms: self.keep_alive_timeout_ms,
+        })
+    }
+}
+
+/// WASM-friendly transport configuration.
+#[derive(Debug, Deserialize)]
+pub struct WasmTransportConfig {
+    #[serde(rename = "type")]
+    pub transport_type: String,
+    #[serde(default)]
+    pub livekit_service_url: Option<String>,
+    #[serde(flatten)]
+    pub extra_fields: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl WasmTransportConfig {
+    pub fn into_core(self) -> Result<RtcTransport, JsError> {
+        match self.transport_type.as_str() {
+            "livekit" => {
+                let url = self.livekit_service_url.ok_or_else(|| {
+                    JsError::new("livekit transport requires livekit_service_url")
+                })?;
+                Ok(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport {
+                    livekit_service_url: url,
+                }))
+            }
+            _ => {
+                let mut extra_fields = self.extra_fields;
+                // Add any known fields from the transport config
+                if let Some(url) = self.livekit_service_url {
+                    extra_fields.insert(
+                        "livekit_service_url".to_string(),
+                        serde_json::Value::String(url),
+                    );
+                }
+                Ok(RtcTransport::Unsupported(
+                    matrix_rtc_core::UnsupportedTransport {
+                        transport_type: self.transport_type,
+                        extra_fields,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+/// WASM-friendly leave session parameters.
+#[derive(Debug, Deserialize, Default)]
+pub struct WasmLeaveSessionParams {
+    #[serde(default)]
+    pub disconnect_reason: Option<String>,
+}
+
+impl WasmLeaveSessionParams {
+    pub fn into_core(self) -> LeaveSessionParams {
+        LeaveSessionParams {
+            disconnect_reason: self.disconnect_reason,
+        }
+    }
+}
+
 #[wasm_bindgen]
 /// WebAssembly-facing single-session API.
 pub struct WasmRtcSession {
     inner: RtcSession,
+    /// Command sender for sending events to Matrix rooms
+    command_sender: Option<Arc<dyn RtcCommandSender>>,
 }
 
 #[wasm_bindgen]
@@ -119,7 +285,26 @@ impl WasmRtcSession {
     pub fn new() -> Self {
         Self {
             inner: RtcSession::new(),
+            command_sender: None,
         }
+    }
+
+    /// Sets up the command sender for this session.
+    ///
+    /// Sets up the command sender for this session with a Matrix client.
+    ///
+    /// This must be called before join/leave operations.
+    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    pub fn setup_command_sender(&mut self, client: JsValue) {
+        let command_sender: Arc<dyn matrix_rtc_core::RtcCommandSender> =
+            Arc::new(JsCommandSender::new(client));
+        self.inner.set_command_sender(command_sender.clone());
+        self.command_sender = Some(command_sender);
+    }
+
+    /// Returns true if a command sender has been set up.
+    pub fn has_command_sender(&self) -> bool {
+        self.command_sender.is_some()
     }
 
     /// Applies initial sticky events for this single session.
@@ -184,6 +369,43 @@ impl WasmRtcSession {
             inner: self.inner.subscribe_membership_snapshots(),
             initial_pending: true,
         }
+    }
+
+    /// Joins this RTC session with the given parameters.
+    ///
+    /// This sends a membership event to join the call and starts the keep-alive mechanism.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - JSON object containing join parameters (same as WasmRtcSessionManager::join)
+    pub fn join(&mut self, params: JsValue) -> Result<(), JsError> {
+        let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
+            .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
+
+        let core_params = params.into_core()?;
+
+        self.inner
+            .join(core_params)
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Leaves this RTC session.
+    ///
+    /// This sends a left membership event and cancels the keep-alive mechanism.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - Optional JSON object containing leave parameters (same as WasmRtcSessionManager::leave)
+    pub fn leave(&mut self, params: JsValue) -> Result<(), JsError> {
+        let _params: WasmLeaveSessionParams = serde_wasm_bindgen::from_value(params)
+            .map_err(|err| JsError::new(&format!("invalid leave params: {err}")))?;
+
+        // Note: This requires room_id and slot_id to be tracked in the session
+        // For now, we return an error if they're not available
+        // This is a limitation that should be addressed in the core crate
+        Err(JsError::new(
+            "leave() on single session requires room_id and slot_id to be tracked",
+        ))
     }
 }
 

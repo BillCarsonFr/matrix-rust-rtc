@@ -32,11 +32,14 @@ mod transport;
 
 pub use commands::{CommandCallback, RtcCommandSender, SendEventCallback};
 pub use error::{CommandError, JoinError, LeaveError};
-pub use join::{JoinSessionParams, LeaveSessionParams, DEFAULT_KEEP_ALIVE_TIMEOUT_MS};
-pub use keepalive::{KeepAliveInfo, KeepAliveMachine, KeepAliveMachineBuilder, KeepAliveState, DEFAULT_KEEP_ALIVE_TIMEOUT_MS as KEEP_ALIVE_DEFAULT_TIMEOUT_MS};
 pub use event::{
     EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     StickyEventsUpdate,
+};
+pub use join::{DEFAULT_KEEP_ALIVE_TIMEOUT_MS, JoinSessionParams, LeaveSessionParams};
+pub use keepalive::{
+    DEFAULT_KEEP_ALIVE_TIMEOUT_MS as KEEP_ALIVE_DEFAULT_TIMEOUT_MS, KeepAliveInfo,
+    KeepAliveMachine, KeepAliveMachineBuilder, KeepAliveState,
 };
 pub use manager::RtcSessionManager;
 pub use session::{CallMembershipEvent, JoinedMembership, LeftMembership, RtcSession};

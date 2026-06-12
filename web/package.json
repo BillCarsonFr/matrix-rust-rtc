@@ -13,11 +13,15 @@
       "default": "./pkg/browser/matrix_rtc_wasm.js"
     }
   },
+  "devDependencies": {
+    "vitest": "^2.1.3"
+  },
   "scripts": {
     "build": "./scripts/build-bindings.sh",
     "build:browser": "wasm-pack build ../crates/matrix-rtc-wasm --release --target web --out-dir pkg/browser --out-name matrix_rtc_wasm",
     "build:node": "wasm-pack build ../crates/matrix-rtc-wasm --release --target nodejs --out-dir pkg/node --out-name matrix_rtc_wasm",
-    "test": "node --test test/*.test.mjs"
+    "test:vitest": "vitest run",
+    "test:watch": "vitest"
   }
 }
 

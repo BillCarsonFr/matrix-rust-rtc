@@ -95,9 +95,9 @@ impl JoinSessionParams {
     /// If a membership_id was explicitly set, returns that.
     /// Otherwise, generates one from user_id and device_id.
     pub fn membership_id(&self) -> String {
-        self.membership_id.clone().unwrap_or_else(|| {
-            format!("{}-{}", self.user_id, self.device_id)
-        })
+        self.membership_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", self.user_id, self.device_id))
     }
 
     /// Gets the keep-alive timeout to use.
@@ -204,7 +204,10 @@ mod tests {
             }),
         );
 
-        assert_eq!(params.keep_alive_timeout_ms(), DEFAULT_KEEP_ALIVE_TIMEOUT_MS);
+        assert_eq!(
+            params.keep_alive_timeout_ms(),
+            DEFAULT_KEEP_ALIVE_TIMEOUT_MS
+        );
     }
 
     #[test]

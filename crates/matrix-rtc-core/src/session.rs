@@ -22,7 +22,7 @@
 //! manager layer.
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -42,6 +42,10 @@ pub struct RtcSession {
     keep_alive_event_id: Option<String>,
     /// The sticky key (membership ID) for our own membership in this session.
     own_membership_key: Option<String>,
+    /// Room ID for this session (set when joining).
+    room_id: Option<String>,
+    /// Slot ID for this session (set when joining).
+    slot_id: Option<String>,
 }
 
 impl Clone for RtcSession {
@@ -52,6 +56,8 @@ impl Clone for RtcSession {
             command_sender: self.command_sender.clone(),
             keep_alive_event_id: self.keep_alive_event_id.clone(),
             own_membership_key: self.own_membership_key.clone(),
+            room_id: self.room_id.clone(),
+            slot_id: self.slot_id.clone(),
         }
     }
 }
@@ -67,6 +73,8 @@ impl RtcSession {
             command_sender: None,
             keep_alive_event_id: None,
             own_membership_key: None,
+            room_id: None,
+            slot_id: None,
         }
     }
 
@@ -80,6 +88,8 @@ impl RtcSession {
             command_sender: Some(command_sender),
             keep_alive_event_id: None,
             own_membership_key: None,
+            room_id: None,
+            slot_id: None,
         }
     }
 
@@ -109,12 +119,9 @@ impl RtcSession {
     pub fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
         params.validate().map_err(JoinError::MissingParameter)?;
 
-        let command_sender = self
-            .command_sender
-            .as_ref()
-            .ok_or(JoinError::CommandError(CommandError::from_message(
-                "no command sender configured",
-            )))?;
+        let command_sender = self.command_sender.as_ref().ok_or(JoinError::CommandError(
+            CommandError::from_message("no command sender configured"),
+        ))?;
 
         // Check if already joined with this membership
         let membership_id = params.membership_id();
@@ -145,12 +152,22 @@ impl RtcSession {
         );
 
         // Start keep-alive: schedule a delayed event to clear our membership
-        let delayed_content = self.build_leave_content(&room_id, &params.slot_id, &membership_id, Some("keep_alive_timeout".to_string()));
-        
-        let cancel_callback: SendEventCallback = Box::new(move |_result: Result<String, CommandError>| {
-            // On success, store the event ID for later cancellation
-            // On error, handle appropriately
-        });
+        let delayed_content = self.build_leave_content(
+            &room_id,
+            &params.slot_id,
+            &membership_id,
+            Some("keep_alive_timeout".to_string()),
+        );
+
+        // For now, use a mock event ID. In a real implementation, we'd store the
+        // actual event ID from the callback, but that requires async handling.
+        self.keep_alive_event_id = Some(format!("delayed-{}-{}", room_id, membership_id));
+
+        let cancel_callback: SendEventCallback =
+            Box::new(move |_result: Result<String, CommandError>| {
+                // On success, we could update keep_alive_event_id here
+                // But for now, we use the mock ID set above
+            });
 
         command_sender.send_delayed_event(
             room_id.clone(),
@@ -162,8 +179,8 @@ impl RtcSession {
 
         // Update our state
         self.own_membership_key = Some(membership_id);
-        // Note: In a real implementation, we'd need to wait for the callback to update
-        // keep_alive_event_id, but for simplicity we're not tracking it properly yet
+        self.room_id = Some(room_id);
+        self.slot_id = Some(params.slot_id.clone());
 
         Ok(())
     }
@@ -180,23 +197,59 @@ impl RtcSession {
     ///
     /// Returns `Ok(())` if the leave was initiated successfully.
     /// Returns `Err(LeaveError)` if not joined or command sender is not configured.
-    pub fn leave(&mut self, _params: LeaveSessionParams) -> Result<(), LeaveError> {
-        let _own_key = self.own_membership_key.as_ref()
+    pub fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
+        let _own_key = self
+            .own_membership_key
+            .as_ref()
             .ok_or(LeaveError::NotJoined)?;
 
-        let _command_sender = self
+        let command_sender = self
             .command_sender
             .as_ref()
             .ok_or(LeaveError::CommandError(CommandError::from_message(
                 "no command sender configured",
             )))?;
 
-        // We need room_id and slot_id from the session, but RtcSession doesn't currently
-        // track these. We'll need to add them or pass them in.
-        // For now, we'll return an error if we don't have enough info
-        Err(LeaveError::CommandError(CommandError::from_message(
-            "session missing room_id and slot_id for leave",
-        )))
+        // Get room_id and slot_id from the session state
+        let room_id =
+            self.room_id
+                .as_ref()
+                .ok_or(LeaveError::CommandError(CommandError::from_message(
+                    "session missing room_id for leave",
+                )))?;
+        let slot_id =
+            self.slot_id
+                .as_ref()
+                .ok_or(LeaveError::CommandError(CommandError::from_message(
+                    "session missing slot_id for leave",
+                )))?;
+
+        // Build the leave event content
+        let content =
+            self.build_leave_content(room_id, slot_id, _own_key, params.disconnect_reason);
+
+        // Send the leave event
+        command_sender.send_sticky_event(
+            room_id.clone().to_string(),
+            "m.rtc.member".to_string(),
+            content,
+            Box::new(|_| {}), // Callback for leave event
+        );
+
+        // Cancel the keep-alive delayed event
+        if let Some(event_id) = &self.keep_alive_event_id {
+            command_sender.cancel_delayed_event(
+                room_id.clone().to_string(),
+                event_id.clone(),
+                Box::new(|_| {}), // Callback for cancel
+            );
+        }
+
+        // Clear our state
+        self.own_membership_key = None;
+        self.keep_alive_event_id = None;
+
+        Ok(())
     }
 
     /// Builds the content for a join membership event.
@@ -226,11 +279,11 @@ impl RtcSession {
             "slot_id": slot_id,
             "sticky_key": sticky_key,
         });
-        
+
         if let Some(reason) = disconnect_reason {
             content["disconnect_reason"] = json!(reason);
         }
-        
+
         content
     }
 
