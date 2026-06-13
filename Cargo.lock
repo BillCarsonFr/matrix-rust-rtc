@@ -390,6 +390,8 @@ name = "matrix-rtc-ffi"
 version = "0.1.0"
 dependencies = [
  "matrix-rtc-core",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "uniffi",

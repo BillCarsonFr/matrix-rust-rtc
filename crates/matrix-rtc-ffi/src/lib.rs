@@ -30,6 +30,12 @@ use matrix_rtc_core::{
 };
 use tokio::sync::watch;
 
+mod commands;
+pub use commands::{
+    CommandSenderCallback, CommandSenderError, FfiCommandSender, FfiJoinSessionParams,
+    FfiLeaveSessionParams, FfiTransportConfig,
+};
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MatrixRtcFfiError {
     #[error("invalid input: {0}")]
@@ -94,6 +100,24 @@ impl RtcSessionHandle {
         })
     }
 
+    /// Sets the command sender for this session.
+    ///
+    /// This must be called before join/leave operations to enable sending events
+    /// back to the Matrix room. The callback will be invoked by the core to send
+    /// membership events (join, leave, keep-alive).
+    ///
+    /// # Arguments
+    /// * `callback` - Native implementation of CommandSenderCallback
+    pub fn set_command_sender(
+        &self,
+        callback: Box<dyn CommandSenderCallback>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let command_sender = FfiCommandSender::new(Arc::from(callback));
+        let mut session = lock_mutex(&self.inner)?;
+        session.set_command_sender(command_sender);
+        Ok(())
+    }
+
     pub fn on_sticky_events_snapshot_received(
         &self,
         events: Vec<StickyEvent>,
@@ -141,6 +165,32 @@ impl RtcSessionHandle {
             }),
         }))
     }
+
+    pub fn join(&self, params: FfiJoinSessionParams) -> Result<(), MatrixRtcFfiError> {
+        let core_params = params
+            .into_core()
+            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))?;
+
+        let mut session = lock_mutex(&self.inner)?;
+
+        // Note: set_command_sender() must be called before join() to enable sending events
+        session
+            .join(core_params)
+            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+    }
+
+    pub fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
+        let _core_params = params.into_core();
+
+        let _session = lock_mutex(&self.inner)?;
+
+        // Note: This requires room_id and slot_id to be tracked in the session
+        // For now, we need to handle this properly
+        // This is a limitation that the session needs to track its room/slot
+        Err(MatrixRtcFfiError::InvalidInput(
+            "leave() on single session requires room_id and slot_id to be tracked by the session itself. Use RtcSessionManagerHandle::leave() instead.".to_string(),
+        ))
+    }
 }
 
 #[uniffi::export]
@@ -150,6 +200,24 @@ impl RtcSessionManagerHandle {
         Arc::new(Self {
             inner: Mutex::new(RtcSessionManager::new()),
         })
+    }
+
+    /// Sets the command sender for this manager.
+    ///
+    /// This must be called before join/leave operations to enable sending events
+    /// back to the Matrix room. The callback will be invoked by the core to send
+    /// membership events (join, leave, keep-alive) for all sessions.
+    ///
+    /// # Arguments
+    /// * `callback` - Native implementation of CommandSenderCallback
+    pub fn set_command_sender(
+        &self,
+        callback: Box<dyn CommandSenderCallback>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let command_sender = FfiCommandSender::new(Arc::from(callback));
+        let mut manager = lock_mutex(&self.inner)?;
+        manager.set_command_sender(command_sender);
+        Ok(())
     }
 
     pub fn initial_sticky_for_room(
@@ -222,6 +290,35 @@ impl RtcSessionManagerHandle {
         Ok(manager
             .member_count(&room_id, &slot_id)
             .map(|count| count as u64))
+    }
+
+    pub fn join(&self, params: FfiJoinSessionParams) -> Result<(), MatrixRtcFfiError> {
+        let core_params = params
+            .into_core()
+            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))?;
+
+        let mut manager = lock_mutex(&self.inner)?;
+
+        // Note: set_command_sender() must be called before join() to enable sending events
+        manager
+            .join(core_params)
+            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+    }
+
+    pub fn leave(
+        &self,
+        room_id: String,
+        slot_id: String,
+        params: FfiLeaveSessionParams,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let core_params = params.into_core();
+
+        let mut manager = lock_mutex(&self.inner)?;
+
+        // Note: set_command_sender() must be called before leave() to enable sending events
+        manager
+            .leave(room_id, slot_id, core_params)
+            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
     }
 }
 
