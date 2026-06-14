@@ -35,9 +35,8 @@ use crate::error::CommandError;
 /// Implementations of this trait are provided by the binding layers (WASM, FFI)
 /// and delegate to the respective platform's Matrix client SDK.
 ///
-/// The client layer is expected to guarantee:
-/// - **Delivery**: Events will be delivered or an error will be reported
-/// - **Ordering**: Events will be sent in the order they are received
+/// The client layer is expected to provide:
+/// - **Retry strategy**: For handling shaky connections or 429 rate limiting
 ///
 /// Methods are async to allow awaiting completion and proper error handling.
 /// Note: The `?Send` bound is used to support platforms like WASM where futures
