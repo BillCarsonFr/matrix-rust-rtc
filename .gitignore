@@ -30,3 +30,7 @@ mobile/android/local.properties
 mobile/android/build/
 
 mobile/android/matrixrtc/build/
+
+mobile/ios/generated/
+
+mobile/android/matrixrtc/src/main/java/uniffi/

@@ -1,20 +1,20 @@
-import assert from 'node:assert/strict';
+import { describe, it, expect } from 'vitest';
 import { existsSync } from 'node:fs';
-import { test } from 'node:test';
 
 const browserBindingUrl = new URL('../pkg/browser/matrix_rtc_wasm.js', import.meta.url);
 
-test('generated browser binding surface is available after build', async (t) => {
-  if (!existsSync(browserBindingUrl)) {
-    t.skip('bindings have not been generated yet');
-    return;
-  }
+describe('generated bindings', () => {
+  it('browser binding surface is available after build', async () => {
+    if (!existsSync(browserBindingUrl)) {
+      // Skip if bindings haven't been built
+      return;
+    }
 
-  const mod = await import(browserBindingUrl.href);
+    const mod = await import(browserBindingUrl.href);
 
-  assert.ok(mod);
-  assert.equal(typeof mod.WasmRtcSession, 'function');
-  assert.equal(typeof mod.WasmRtcSessionManager, 'function');
-  assert.equal(typeof mod.WasmMembershipSnapshotSubscription, 'function');
+    expect(mod).toBeDefined();
+    expect(typeof mod.WasmRtcSession).toBe('function');
+    expect(typeof mod.WasmRtcSessionManager).toBe('function');
+    expect(typeof mod.WasmMembershipSnapshotSubscription).toBe('function');
+  });
 });
-

@@ -21,27 +21,183 @@
 //! applies joined/left transitions from domain membership events produced by the
 //! manager layer.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::sync::watch;
 
+use crate::commands::RtcCommandSender;
+use crate::error::{CommandError, JoinError, LeaveError};
+use crate::join::{JoinSessionParams, LeaveSessionParams};
+use crate::own_membership::{OwnMembershipMachine, transport_to_json};
 use crate::transport::RtcTransport;
 
-#[derive(Clone, Debug)]
+#[allow(unused_imports)]
+use log::*;
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession {
     members: Vec<JoinedMembership>,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
+    /// Command sender for sending events to the Matrix room.
+    command_sender: Option<Arc<dyn RtcCommandSender>>,
+    /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
+    own_membership_machine: Option<OwnMembershipMachine>,
+}
+
+impl Clone for RtcSession {
+    fn clone(&self) -> Self {
+        Self {
+            members: self.members.clone(),
+            membership_snapshots_tx: self.membership_snapshots_tx.clone(),
+            command_sender: self.command_sender.clone(),
+            own_membership_machine: None, // Don't clone the machine - it's not cloneable
+        }
+    }
 }
 
 impl RtcSession {
-    /// Creates an empty session.
+    /// Creates an empty session without a command sender.
     pub fn new() -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
         Self {
             members: Vec::new(),
             membership_snapshots_tx,
+            command_sender: None,
+            own_membership_machine: None,
         }
+    }
+
+    /// Creates an empty session with a command sender.
+    pub fn with_command_sender(command_sender: Arc<dyn RtcCommandSender>) -> Self {
+        let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
+
+        Self {
+            members: Vec::new(),
+            membership_snapshots_tx,
+            command_sender: Some(command_sender),
+            own_membership_machine: None,
+        }
+    }
+
+    /// Sets the command sender for this session.
+    pub fn set_command_sender(&mut self, command_sender: Arc<dyn RtcCommandSender>) {
+        self.command_sender = Some(command_sender);
+    }
+
+    /// Returns true if this session has a command sender configured.
+    pub fn has_command_sender(&self) -> bool {
+        self.command_sender.is_some()
+    }
+
+    /// Joins this RTC session with the given parameters.
+    ///
+    /// This sends a membership event to the Matrix room via the command sender,
+    /// and starts the keep-alive mechanism to ensure proper cleanup.
+    ///
+    /// The dead man's switch strategy is used:
+    /// 1. Schedule delayed leave event FIRST (safety net) - **awaited**
+    /// 2. Send join membership event - **awaited**
+    /// 3. Heartbeat will restart the delayed leave periodically
+    ///
+    /// The async design ensures the delayed leave is scheduled before the join event is sent.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - The join parameters including user info, transport, etc.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the join completed successfully.
+    /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
+    pub async fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
+        params.validate().map_err(JoinError::MissingParameter)?;
+
+        let command_sender = self.command_sender.as_ref().ok_or(JoinError::CommandError(
+            CommandError::from_message("no command sender configured"),
+        ))?;
+
+        let membership_id = params.membership_id();
+
+        // Check if already joined with this membership
+        if self
+            .own_membership_machine
+            .as_ref()
+            .is_some_and(|machine| machine.sticky_key() == membership_id)
+        {
+            return Err(JoinError::AlreadyJoined(membership_id));
+        }
+
+        // Create the own membership machine
+        let transport_json = transport_to_json(&params.transport);
+        let machine = OwnMembershipMachine::new(
+            command_sender.clone(),
+            params.room_id.clone(),
+            params.slot_id.clone(),
+            membership_id.clone(),
+            params.user_id.clone(),
+            params.device_id.clone(),
+            params.application.clone(),
+            params.keep_alive_timeout_ms(),
+        );
+
+        // Use the machine to join (async, awaits both delayed leave scheduling and join event)
+        machine.join(Some(transport_json)).await?;
+
+        // Store the machine
+        self.own_membership_machine = Some(machine);
+
+        Ok(())
+    }
+
+    /// Leaves this RTC session.
+    ///
+    /// This sends a left membership event and cancels any active keep-alive delayed event.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - The leave parameters including optional disconnect reason.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the leave completed successfully.
+    /// Returns `Err(LeaveError)` if not joined, command sender is not configured, or commands fail.
+    pub async fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
+        // Check if we have a membership machine (i.e., we've joined)
+        let machine = self
+            .own_membership_machine
+            .take()
+            .ok_or(LeaveError::NotJoined)?;
+
+        // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
+        machine.leave(params.disconnect_reason.clone()).await?;
+
+        Ok(())
+    }
+
+    /// Performs a heartbeat to restart the keep-alive delayed leave event.
+    ///
+    /// This should be called periodically (e.g., every 15-20 seconds) to keep the
+    /// membership active. The dead man's switch strategy ensures that if the
+    /// client stops sending heartbeats, the delayed leave will fire and clean up.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the heartbeat was processed successfully.
+    /// Returns `false` if not joined (no membership machine active).
+    pub async fn heartbeat(&mut self) -> bool {
+        if let Some(machine) = self.own_membership_machine.as_ref() {
+            machine.heartbeat().await;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the number of currently tracked joined members.
+    pub fn member_count(&self) -> usize {
+        self.members.len()
     }
 
     /// Subscribes to full membership snapshots for this session as a watch receiver.
@@ -107,11 +263,46 @@ impl RtcSession {
         self.membership_snapshots_tx
             .send_replace(self.members.clone());
     }
+}
 
-    /// Returns the number of currently tracked joined members.
-    pub fn member_count(&self) -> usize {
-        self.members.len()
-    }
+/// MSC4143: Relates-to reference for event continuity
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelatesTo {
+    #[serde(rename = "rel_type")]
+    pub relation_type: String,
+    pub event_id: String,
+}
+
+/// MSC4143: Member object
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberInfo {
+    /// UUID to distinguish multiple participations
+    pub id: Option<String>,
+    /// Matrix device identifier
+    pub claimed_device_id: Option<String>,
+    /// Matrix user ID
+    pub claimed_user_id: Option<String>,
+}
+
+/// MSC4143: Application info
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationInfo {
+    #[serde(rename = "type")]
+    pub application_type: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// MSC4143: Disconnect reason
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisconnectReason {
+    /// High-level category (e.g., "user_action", "server_error", "client_error")
+    pub class: Option<String>,
+    /// Machine-readable identifier (e.g., "hangup", "ice_failed")
+    pub reason: Option<String>,
+    /// Optional human-readable explanation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,8 +314,8 @@ pub enum CallMembershipEvent {
     Left(LeftMembership),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-/// Connected membership payload.
+/// MSC4143: Connected membership payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinedMembership {
     /// Room where the membership is active.
     pub room_id: String,
@@ -134,14 +325,20 @@ pub struct JoinedMembership {
     pub sender: String,
     /// Sticky key identifying this membership stream.
     pub sticky_key: String,
-    /// Application type, usually `m.call`.
+    /// Application info (MSC4143).
     pub application: Option<String>,
+    /// Member info (MSC4143).
+    pub member: MemberInfo,
+    /// Protocol versions (MSC4143).
+    pub versions: Vec<String>,
+    /// Optional relates-to reference (MSC4143).
+    pub m_relates_to: Option<RelatesTo>,
     /// RTC transports for this member (MSC4143 / MSC4195).
     pub transports: Vec<RtcTransport>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-/// Disconnected membership payload.
+/// MSC4143: Disconnected membership payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeftMembership {
     /// Room where the membership was active.
     pub room_id: String,
@@ -151,8 +348,10 @@ pub struct LeftMembership {
     pub sender: String,
     /// Sticky key identifying this membership stream.
     pub sticky_key: String,
-    /// Optional machine-readable reason provided by the sender.
-    pub disconnect_reason: Option<String>,
+    /// Optional disconnect reason (MSC4143 compliant object).
+    pub disconnect_reason: Option<DisconnectReason>,
+    /// Optional relates-to reference (MSC4143).
+    pub m_relates_to: Option<RelatesTo>,
 }
 
 impl Default for RtcSession {

@@ -1,22 +1,22 @@
-import assert from 'node:assert/strict';
+import { describe, it, expect } from 'vitest';
 import { readFile } from 'node:fs/promises';
-import { test } from 'node:test';
 
 const packageJsonPath = new URL('../package.json', import.meta.url);
 const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8'));
 
-test('package exports are browser-first', () => {
-  assert.equal(packageJson.name, 'matrix-rtc-wasm');
-  assert.equal(packageJson.private, true);
-  assert.equal(packageJson.exports['.'].browser, './pkg/browser/matrix_rtc_wasm.js');
-  assert.equal(packageJson.exports['.'].node, './pkg/node/matrix_rtc_wasm.js');
-  assert.equal(packageJson.main, './pkg/node/matrix_rtc_wasm.js');
-  assert.equal(packageJson.module, './pkg/browser/matrix_rtc_wasm.js');
-});
+describe('package exports', () => {
+  it('are browser-first', () => {
+    expect(packageJson.name).toBe('matrix-rtc-wasm');
+    expect(packageJson.private).toBe(true);
+    expect(packageJson.exports['.'].browser).toBe('./pkg/browser/matrix_rtc_wasm.js');
+    expect(packageJson.exports['.'].node).toBe('./pkg/node/matrix_rtc_wasm.js');
+    expect(packageJson.main).toBe('./pkg/node/matrix_rtc_wasm.js');
+    expect(packageJson.module).toBe('./pkg/browser/matrix_rtc_wasm.js');
+  });
 
-test('build script is wired to wasm-pack', () => {
-  assert.match(packageJson.scripts.build, /build-bindings\.sh$/);
-  assert.match(packageJson.scripts['build:browser'], /wasm-pack build/);
-  assert.match(packageJson.scripts['build:node'], /wasm-pack build/);
+  it('build script is wired to wasm-pack', () => {
+    expect(packageJson.scripts.build).toMatch(/build-bindings\.sh$/);
+    expect(packageJson.scripts['build:browser']).toMatch(/wasm-pack build/);
+    expect(packageJson.scripts['build:node']).toMatch(/wasm-pack build/);
+  });
 });
-

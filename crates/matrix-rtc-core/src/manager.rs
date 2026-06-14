@@ -21,24 +21,117 @@
 //! sticky snapshots/updates to the right session by `(room_id, slot_id)`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::commands::RtcCommandSender;
+use crate::error::{JoinError, LeaveError};
 use crate::event::{
     EventConversionError, RawStickyEvent, RawStickyEventUpdate, StickyEventsUpdate,
 };
+use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::session::{CallMembershipEvent, RtcSession};
 
 /// Holds and routes all active RTC sessions.
 #[derive(Default)]
 pub struct RtcSessionManager {
     sessions: HashMap<SessionKey, RtcSession>,
+    /// Command sender for sending events to Matrix rooms.
+    /// This is passed to sessions when they are created or when they need to send commands.
+    command_sender: Option<Arc<dyn RtcCommandSender>>,
 }
 
 impl RtcSessionManager {
     // TODO(msc4143): add a manager-level lifecycle subscription API that emits
     // when sessions are created/removed (separate from per-session membership snapshots).
-    /// Creates an empty session manager.
+    /// Creates an empty session manager without a command sender.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty session manager with a command sender.
+    pub fn with_command_sender(command_sender: Arc<dyn RtcCommandSender>) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            command_sender: Some(command_sender),
+        }
+    }
+
+    /// Sets the command sender for this manager.
+    pub fn set_command_sender(&mut self, command_sender: Arc<dyn RtcCommandSender>) {
+        self.command_sender = Some(command_sender);
+    }
+
+    /// Returns true if this manager has a command sender configured.
+    pub fn has_command_sender(&self) -> bool {
+        self.command_sender.is_some()
+    }
+
+    /// Joins an RTC session with the given parameters.
+    ///
+    /// This will find or create the appropriate session for the given room_id and slot_id,
+    /// and then call join on that session.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - The join parameters including user info, transport, etc.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the join completed successfully.
+    /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
+    pub async fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
+        let command_sender = self
+            .command_sender
+            .as_ref()
+            .ok_or(JoinError::CommandError(
+                crate::error::CommandError::from_message("no command sender configured"),
+            ))?
+            .clone();
+
+        let key = SessionKey::new(params.room_id.clone(), params.slot_id.clone());
+
+        // Get or create the session
+        let session = self.sessions.entry(key).or_insert_with(|| {
+            let mut session = RtcSession::new();
+            session.set_command_sender(command_sender.clone());
+            session
+        });
+
+        // If the session doesn't have a command sender yet, set it
+        if !session.has_command_sender() {
+            session.set_command_sender(command_sender);
+        }
+
+        session.join(params).await
+    }
+
+    /// Leaves an RTC session.
+    ///
+    /// This will find the appropriate session for the given room_id and slot_id,
+    /// and then call leave on that session.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID of the session to leave
+    /// * `slot_id` - The slot ID of the session to leave
+    /// * `params` - The leave parameters including optional disconnect reason
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the leave completed successfully.
+    /// Returns `Err(LeaveError)` if the session doesn't exist or other errors occur.
+    pub async fn leave(
+        &mut self,
+        room_id: String,
+        slot_id: String,
+        params: LeaveSessionParams,
+    ) -> Result<(), LeaveError> {
+        let key = SessionKey::new(room_id, slot_id);
+        let session = self.sessions.get_mut(&key).ok_or(LeaveError::CommandError(
+            crate::error::CommandError::from_message("session not found"),
+        ))?;
+
+        session.leave(params).await
     }
 
     /// Applies an initial sticky snapshot for one room, typically from SDK `getStickyEvents`.
