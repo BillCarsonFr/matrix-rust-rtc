@@ -21,6 +21,8 @@
 //! SDK layers into the core without exposing host SDK types here.
 //! Conversion then interprets DTO content as MatrixRTC membership events.
 
+use serde::Serialize;
+
 use crate::session::{CallMembershipEvent, JoinedMembership, LeftMembership};
 use crate::transport::RawRtcTransport;
 use thiserror::Error;
@@ -38,19 +40,23 @@ pub struct RawStickyEvent {
     pub content: RawStickyEventContent,
 }
 
-#[derive(Clone, Debug)]
-/// Content DTO extracted from a sticky Matrix event.
+#[derive(Clone, Debug, Serialize)]
+/// Content DTO extracted from a sticky Matrix event (MSC4143 compliant).
 pub struct RawStickyEventContent {
     /// MatrixRTC slot identifier.
     pub slot_id: String,
     /// Sticky-map key associated with the sender/device membership.
     pub sticky_key: String,
-    /// Application type from `content.application.type`.
-    pub application_type: Option<String>,
-    /// Member identifier from `content.member.id`.
-    pub member_id: Option<String>,
-    /// Optional disconnect reason for disconnected membership updates.
-    pub disconnect_reason: Option<String>,
+    /// Application info from `content.application` (MSC4143).
+    pub application: crate::session::ApplicationInfo,
+    /// Member info from `content.member` (MSC4143).
+    pub member: crate::session::MemberInfo,
+    /// Protocol versions from `content.versions` (MSC4143).
+    pub versions: Vec<String>,
+    /// Optional disconnect reason for disconnected membership updates (MSC4143).
+    pub disconnect_reason: Option<crate::session::DisconnectReason>,
+    /// Optional relates-to reference (MSC4143).
+    pub m_relates_to: Option<crate::session::RelatesTo>,
     /// RTC transports from `content.rtc_transports` (MSC4143 / MSC4195).
     pub rtc_transports: Option<Vec<RawRtcTransport>>,
 }
@@ -87,8 +93,8 @@ pub enum EventConversionError {
 impl RawStickyEvent {
     /// Converts a raw sticky DTO into a domain membership event.
     ///
-    /// The event is interpreted as connected when connect content is present;
-    /// otherwise it is treated as disconnected, per the current skeleton behavior.
+    /// The event is interpreted as connected when connect content is present (has member.id);
+    /// otherwise it is treated as disconnected, per MSC4143.
     pub fn try_into_call_membership_event(
         self,
     ) -> Result<CallMembershipEvent, EventConversionError> {
@@ -117,22 +123,35 @@ impl RawStickyEvent {
             .map(|t| t.into_typed())
             .collect();
 
-        let event = if self.content.is_valid_connect_content() {
+        let event = if self.content.is_connected() {
+            // Build connected membership from MSC4143 fields
+            let application_type = self
+                .content
+                .application
+                .application_type
+                .clone()
+                .unwrap_or_default();
+
             CallMembershipEvent::Joined(JoinedMembership {
                 room_id: self.room_id,
                 slot_id: self.content.slot_id,
                 sender: self.sender,
                 sticky_key: self.content.sticky_key,
-                application: self.content.application_type,
+                application: Some(application_type),
+                member: self.content.member.clone(),
+                versions: self.content.versions.clone(),
+                m_relates_to: self.content.m_relates_to.clone(),
                 transports,
             })
         } else {
+            // Build disconnected membership from MSC4143 fields
             CallMembershipEvent::Left(LeftMembership {
                 room_id: self.room_id,
                 slot_id: self.content.slot_id,
                 sender: self.sender,
                 sticky_key: self.content.sticky_key,
-                disconnect_reason: self.content.disconnect_reason,
+                disconnect_reason: self.content.disconnect_reason.clone(),
+                m_relates_to: self.content.m_relates_to.clone(),
             })
         };
 
@@ -167,17 +186,20 @@ impl RawStickyEvent {
             slot_id: self.content.slot_id,
             sender: self.sender,
             sticky_key: self.content.sticky_key,
-            disconnect_reason: self.content.disconnect_reason,
+            disconnect_reason: self.content.disconnect_reason.clone(),
+            m_relates_to: self.content.m_relates_to.clone(),
         }))
     }
 }
 
 impl RawStickyEventContent {
-    fn is_valid_connect_content(&self) -> bool {
-        has_non_empty(&self.application_type) && has_non_empty(&self.member_id)
+    /// MSC4143: An event is "connected" if it has member.id and application.type
+    fn is_connected(&self) -> bool {
+        self.member.id.as_deref().is_some_and(|v| !v.is_empty())
+            && self
+                .application
+                .application_type
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
     }
-}
-
-fn has_non_empty(value: &Option<String>) -> bool {
-    value.as_deref().is_some_and(|v| !v.is_empty())
 }

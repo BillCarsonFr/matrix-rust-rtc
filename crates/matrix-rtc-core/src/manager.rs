@@ -77,9 +77,9 @@ impl RtcSessionManager {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if the join was initiated successfully.
-    /// Returns `Err(JoinError)` if validation fails or a command sender is not configured.
-    pub fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
+    /// Returns `Ok(())` if the join completed successfully.
+    /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
+    pub async fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
         let command_sender = self
             .command_sender
             .as_ref()
@@ -102,7 +102,7 @@ impl RtcSessionManager {
             session.set_command_sender(command_sender);
         }
 
-        session.join(params)
+        session.join(params).await
     }
 
     /// Leaves an RTC session.
@@ -118,9 +118,9 @@ impl RtcSessionManager {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if the leave was initiated successfully.
+    /// Returns `Ok(())` if the leave completed successfully.
     /// Returns `Err(LeaveError)` if the session doesn't exist or other errors occur.
-    pub fn leave(
+    pub async fn leave(
         &mut self,
         room_id: String,
         slot_id: String,
@@ -131,7 +131,7 @@ impl RtcSessionManager {
             crate::error::CommandError::from_message("session not found"),
         ))?;
 
-        session.leave(params)
+        session.leave(params).await
     }
 
     /// Applies an initial sticky snapshot for one room, typically from SDK `getStickyEvents`.

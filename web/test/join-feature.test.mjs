@@ -27,18 +27,19 @@ function createMockMatrixClient() {
   const cancelledEvents = [];
 
   const client = {
-    sendStickyEvent: vi.fn((roomId, eventType, content, callback) => {
+    // WASM now expects these methods to return Promises
+    sendStickyEvent: vi.fn((roomId, eventType, content) => {
       stickyEventsSent.push({ roomId, eventType, content });
-      setTimeout(() => callback(), 0);
+      return Promise.resolve();
     }),
-    sendDelayedEvent: vi.fn((roomId, eventType, content, delayMs, callback) => {
+    sendDelayedEvent: vi.fn((roomId, eventType, content, delayMs) => {
       const eventId = `delayed-event-${delayedEventsSent.length}`;
       delayedEventsSent.push({ roomId, eventType, content, delayMs, eventId });
-      setTimeout(() => callback(null, eventId), 0);
+      return Promise.resolve(eventId);
     }),
-    cancelDelayedEvent: vi.fn((roomId, eventId, callback) => {
+    cancelDelayedEvent: vi.fn((roomId, eventId) => {
       cancelledEvents.push({ roomId, eventId });
-      setTimeout(() => callback(), 0);
+      return Promise.resolve();
     }),
     // Expose internal state for assertions
     _getStickyEvents: () => stickyEventsSent,
@@ -107,7 +108,7 @@ describe('WASM bindings with mock client', () => {
       };
 
       // Join the session
-      manager.join(joinParams);
+      await manager.join(joinParams);
 
       // Wait for the mock callbacks to fire
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -131,7 +132,10 @@ describe('WASM bindings with mock client', () => {
 
       // Check delayed event content
       const delayedContent = delayedEvents[0].content;
-      expect(getContentValue(delayedContent, 'disconnect_reason')).toBe('keep_alive_timeout');
+      const disconnectReason = getContentValue(delayedContent, 'disconnect_reason');
+      expect(disconnectReason).toBeDefined();
+      expect(getContentValue(disconnectReason, 'reason')).toBe('keep_alive_timeout');
+      expect(getContentValue(disconnectReason, 'class')).toBe('server_error');
     });
 
     it('leave() with disconnect reason works', async () => {
@@ -154,7 +158,10 @@ describe('WASM bindings with mock client', () => {
         },
       };
 
-      manager.join(joinParams);
+      await manager.join(joinParams);
+
+      // Wait for the join callbacks to fire
+      await new Promise(resolve => setTimeout(resolve, 50));
 
       // Clear the events from join
       mockClient._clear();
@@ -164,7 +171,7 @@ describe('WASM bindings with mock client', () => {
         disconnect_reason: 'user_left',
       };
 
-      manager.leave(ROOM_ID, SLOT_ID, leaveParams);
+      await manager.leave(ROOM_ID, SLOT_ID, leaveParams);
 
       // Wait for the mock callbacks to fire
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -176,13 +183,17 @@ describe('WASM bindings with mock client', () => {
 
       // Check the content
       const content = stickyEvents[0].content;
-      expect(getContentValue(content, 'disconnect_reason')).toBe('user_left');
+      const disconnectReason = getContentValue(content, 'disconnect_reason');
+      expect(disconnectReason).toBeDefined();
+      expect(getContentValue(disconnectReason, 'reason')).toBe('hangup');
+      expect(getContentValue(disconnectReason, 'class')).toBe('user_action');
+      expect(getContentValue(disconnectReason, 'description')).toBe('user_left');
 
       // Should also cancel the delayed event
       const cancelledEvents = mockClient._getCancelledEvents();
       expect(cancelledEvents.length).toBe(1);
       expect(cancelledEvents[0].roomId).toBe(ROOM_ID);
-      expect(cancelledEvents[0].eventId).toBe(`delayed-${ROOM_ID}-${USER_ID}-${DEVICE_ID}`);
+      expect(cancelledEvents[0].eventId).toBe('delayed-event-0');
     });
   });
 
@@ -214,7 +225,7 @@ describe('WASM bindings with mock client', () => {
         },
       };
 
-      session.join(joinParams);
+      await session.join(joinParams);
 
       // Wait for the mock callbacks to fire
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -229,7 +240,7 @@ describe('WASM bindings with mock client', () => {
   });
 
   describe('Error handling', () => {
-    it('join with missing required params throws', () => {
+    it('join with missing required params throws', async () => {
       const manager = new bindings.WasmRtcSessionManager();
       manager.setup_command_sender(mockClient);
 
@@ -245,7 +256,7 @@ describe('WASM bindings with mock client', () => {
         },
       };
 
-      expect(() => manager.join(invalidParams)).toThrow(/invalid join params/);
+      await expect(manager.join(invalidParams)).rejects.toThrow(/invalid join params/);
     });
   });
 });

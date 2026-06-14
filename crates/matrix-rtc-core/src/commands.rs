@@ -21,22 +21,14 @@
 //! to send commands (events) to the Matrix room through the client SDK.
 //! The client layer is responsible for actual delivery and guarantees ordering.
 //!
-//! Commands use callbacks to notify the core of success or failure, enabling
-//! state management (e.g., tracking delayed event IDs for keep-alive).
+//! Commands are async to allow the core to await completion, particularly
+//! for the dead man's switch pattern where we need to verify delayed event
+//! scheduling before sending join events.
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::CommandError;
-
-/// Callback type for command completion notifications.
-///
-/// The callback receives a `Result` indicating success or failure of the command.
-pub type CommandCallback = Box<dyn FnOnce(Result<(), CommandError>) + Send + Sync>;
-
-/// Callback type for commands that return a value (like event IDs).
-///
-/// Used by `send_delayed_event` to return the scheduled event's ID.
-pub type SendEventCallback = Box<dyn FnOnce(Result<String, CommandError>) + Send + Sync>;
 
 /// Trait for sending Matrix events from the core crate to the client SDK.
 ///
@@ -47,32 +39,32 @@ pub type SendEventCallback = Box<dyn FnOnce(Result<String, CommandError>) + Send
 /// - **Delivery**: Events will be delivered or an error will be reported
 /// - **Ordering**: Events will be sent in the order they are received
 ///
-/// This allows the core to use simple fire-and-forget semantics with callbacks.
+/// Methods are async to allow awaiting completion and proper error handling.
+/// Note: The `?Send` bound is used to support platforms like WASM where futures
+/// may not be `Send` (e.g., when wrapping JavaScript Promises).
+#[async_trait(?Send)]
 pub trait RtcCommandSender: Send + Sync {
     /// Send a sticky event to a Matrix room.
     ///
     /// The event will be sent as a sticky event (using the appropriate MSC or
-    /// stable event type). The callback is invoked when the client SDK confirms
-    /// delivery or reports an error.
+    /// stable event type). Returns Ok(()) on success or an error on failure.
     ///
     /// # Arguments
     ///
     /// * `room_id` - The room ID where the event should be sent
     /// * `event_type` - The event type (e.g., "m.rtc.member")
     /// * `content` - The event content as a JSON value
-    /// * `callback` - Called when the operation completes
-    fn send_sticky_event(
+    async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
-        callback: CommandCallback,
-    );
+    ) -> Result<(), CommandError>;
 
     /// Send a delayed event to a Matrix room.
     ///
     /// The event will be scheduled to be sent after the specified delay.
-    /// The callback receives the event ID that can be used to cancel the event later.
+    /// Returns Ok(event_id) with the scheduled event's ID on success, or an error on failure.
     ///
     /// This is used for implementing the keep-alive mechanism where a delayed
     /// cleanup event is scheduled and periodically restarted.
@@ -83,61 +75,65 @@ pub trait RtcCommandSender: Send + Sync {
     /// * `event_type` - The event type
     /// * `content` - The event content as a JSON value
     /// * `delay_ms` - Delay in milliseconds before the event is sent
-    /// * `callback` - Called with the event ID on success, or error on failure
-    fn send_delayed_event(
+    async fn send_delayed_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
         delay_ms: u64,
-        callback: SendEventCallback,
-    );
+    ) -> Result<String, CommandError>;
 
     /// Cancel a previously scheduled delayed event.
     ///
     /// This prevents the delayed event from being sent if it hasn't already been
-    /// sent. The callback is invoked when the cancellation is confirmed or fails.
+    /// sent. Returns Ok(()) on success or an error on failure.
     ///
     /// # Arguments
     ///
     /// * `room_id` - The room ID where the delayed event was scheduled
     /// * `event_id` - The event ID returned by `send_delayed_event`
-    /// * `callback` - Called when the operation completes
-    fn cancel_delayed_event(&self, room_id: String, event_id: String, callback: CommandCallback);
+    async fn cancel_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError>;
 }
 
 /// A no-op implementation of `RtcCommandSender` for testing purposes.
 ///
-/// This implementation immediately invokes callbacks with success, useful for
+/// This implementation immediately returns success, useful for
 /// unit tests that don't need to verify command execution behavior.
 #[cfg(test)]
 pub struct NoopCommandSender;
 
 #[cfg(test)]
+#[async_trait(?Send)]
 impl RtcCommandSender for NoopCommandSender {
-    fn send_sticky_event(
+    async fn send_sticky_event(
         &self,
         _room_id: String,
         _event_type: String,
         _content: Value,
-        callback: CommandCallback,
-    ) {
-        callback(Ok(()));
+    ) -> Result<(), CommandError> {
+        Ok(())
     }
 
-    fn send_delayed_event(
+    async fn send_delayed_event(
         &self,
         _room_id: String,
         _event_type: String,
         _content: Value,
         _delay_ms: u64,
-        callback: SendEventCallback,
-    ) {
-        callback(Ok("mock-event-id".to_string()));
+    ) -> Result<String, CommandError> {
+        Ok("mock-event-id".to_string())
     }
 
-    fn cancel_delayed_event(&self, _room_id: String, _event_id: String, callback: CommandCallback) {
-        callback(Ok(()));
+    async fn cancel_delayed_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+    ) -> Result<(), CommandError> {
+        Ok(())
     }
 }
 
@@ -170,43 +166,46 @@ impl MockCommandSender {
 }
 
 #[cfg(test)]
+#[async_trait(?Send)]
 impl RtcCommandSender for MockCommandSender {
-    fn send_sticky_event(
+    async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
-        callback: CommandCallback,
-    ) {
+    ) -> Result<(), CommandError> {
         self.sticky_events
             .lock()
             .unwrap()
             .push((room_id, event_type, content));
-        callback(Ok(()));
+        Ok(())
     }
 
-    fn send_delayed_event(
+    async fn send_delayed_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
         delay_ms: u64,
-        callback: SendEventCallback,
-    ) {
+    ) -> Result<String, CommandError> {
         self.delayed_events.lock().unwrap().push((
             room_id.clone(),
             event_type.clone(),
             content,
             delay_ms,
         ));
-        callback(Ok(format!("delayed-{}-{}", room_id, event_type)));
+        Ok(format!("delayed-{}-{}", room_id, event_type))
     }
 
-    fn cancel_delayed_event(&self, room_id: String, event_id: String, callback: CommandCallback) {
+    async fn cancel_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
         self.cancelled_events
             .lock()
             .unwrap()
             .push((room_id, event_id));
-        callback(Ok(()));
+        Ok(())
     }
 }

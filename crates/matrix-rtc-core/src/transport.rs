@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A single RTC transport specification from an m.rtc.member event.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RtcTransport {
     /// LiveKit SFU transport as defined in MSC4195.
     LiveKit(LiveKitTransport),
@@ -34,14 +34,14 @@ pub enum RtcTransport {
 }
 
 /// LiveKit-specific transport configuration (MSC4195).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveKitTransport {
     /// URL of the service that issues JWT tokens for connecting to the LiveKit SFU.
     pub livekit_service_url: String,
 }
 
 /// An unsupported transport type, storing raw data for forward compatibility.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedTransport {
     /// The transport type string, e.g., "webrtc", "p2p", etc.
     pub transport_type: String,
@@ -51,7 +51,7 @@ pub struct UnsupportedTransport {
 
 /// Raw transport data as it appears in the JSON, before parsing into typed variants.
 /// Used for deserialization from SDK events.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawRtcTransport {
     /// The transport type, e.g., "livekit".
     #[serde(rename = "type")]

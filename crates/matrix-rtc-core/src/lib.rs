@@ -25,24 +25,26 @@ mod commands;
 mod error;
 mod event;
 mod join;
-mod keepalive;
 mod manager;
+mod own_membership;
 mod session;
 mod transport;
 
-pub use commands::{CommandCallback, RtcCommandSender, SendEventCallback};
+pub use commands::RtcCommandSender;
 pub use error::{CommandError, JoinError, LeaveError};
 pub use event::{
     EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     StickyEventsUpdate,
 };
-pub use join::{DEFAULT_KEEP_ALIVE_TIMEOUT_MS, JoinSessionParams, LeaveSessionParams};
-pub use keepalive::{
-    DEFAULT_KEEP_ALIVE_TIMEOUT_MS as KEEP_ALIVE_DEFAULT_TIMEOUT_MS, KeepAliveInfo,
-    KeepAliveMachine, KeepAliveMachineBuilder, KeepAliveState,
-};
+pub use join::{JoinSessionParams, LeaveSessionParams};
 pub use manager::RtcSessionManager;
-pub use session::{CallMembershipEvent, JoinedMembership, LeftMembership, RtcSession};
+pub use own_membership::{
+    KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
+};
+pub use session::{
+    ApplicationInfo, CallMembershipEvent, DisconnectReason, JoinedMembership, LeftMembership,
+    MemberInfo, RelatesTo, RtcSession,
+};
 pub use transport::{LiveKitTransport, RawRtcTransport, RtcTransport, UnsupportedTransport};
 
 #[cfg(test)]
@@ -67,9 +69,22 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: slot_id.to_owned(),
                 sticky_key: sticky_key.to_owned(),
-                application_type: application_type.map(str::to_owned),
-                member_id: member_id.map(str::to_owned),
-                disconnect_reason: disconnect_reason.map(str::to_owned),
+                application: ApplicationInfo {
+                    application_type: application_type.map(str::to_owned),
+                    extra: std::collections::BTreeMap::new(),
+                },
+                member: MemberInfo {
+                    id: member_id.map(str::to_owned),
+                    claimed_device_id: None,
+                    claimed_user_id: None,
+                },
+                versions: Vec::new(),
+                disconnect_reason: disconnect_reason.map(|r| DisconnectReason {
+                    class: None,
+                    reason: Some(r.to_owned()),
+                    description: None,
+                }),
+                m_relates_to: None,
                 rtc_transports: None,
             },
         }
@@ -96,7 +111,12 @@ mod tests {
             slot_id: slot_id.to_owned(),
             sender: sender.to_owned(),
             sticky_key: sticky_key.to_owned(),
-            disconnect_reason: Some("ice_failed".to_owned()),
+            disconnect_reason: Some(DisconnectReason {
+                class: Some("server_error".to_owned()),
+                reason: Some("ice_failed".to_owned()),
+                description: None,
+            }),
+            m_relates_to: None,
         })
     }
 
@@ -116,9 +136,18 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),
-                application_type: Some("m.call".to_owned()),
-                member_id: Some("alice-device-a".to_owned()),
+                application: ApplicationInfo {
+                    application_type: Some("m.call".to_owned()),
+                    extra: std::collections::BTreeMap::new(),
+                },
+                member: MemberInfo {
+                    id: Some("alice-device-a".to_owned()),
+                    claimed_device_id: None,
+                    claimed_user_id: None,
+                },
+                versions: Vec::new(),
                 disconnect_reason: None,
+                m_relates_to: None,
                 rtc_transports: None,
             },
             ..joined.clone()
@@ -252,9 +281,18 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),
-                application_type: None,
-                member_id: None,
+                application: ApplicationInfo {
+                    application_type: None,
+                    extra: std::collections::BTreeMap::new(),
+                },
+                member: MemberInfo {
+                    id: None,
+                    claimed_device_id: None,
+                    claimed_user_id: None,
+                },
+                versions: Vec::new(),
                 disconnect_reason: None,
+                m_relates_to: None,
                 rtc_transports: None,
             },
         };
@@ -284,9 +322,18 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),
-                application_type: Some("m.call".to_owned()),
-                member_id: Some("alice-device-a".to_owned()),
+                application: ApplicationInfo {
+                    application_type: Some("m.call".to_owned()),
+                    extra: std::collections::BTreeMap::new(),
+                },
+                member: MemberInfo {
+                    id: Some("alice-device-a".to_owned()),
+                    claimed_device_id: None,
+                    claimed_user_id: None,
+                },
+                versions: Vec::new(),
                 disconnect_reason: None,
+                m_relates_to: None,
                 rtc_transports: Some(vec![RawRtcTransport {
                     transport_type: "livekit".to_owned(),
                     extra_fields,
@@ -331,9 +378,18 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),
-                application_type: Some("m.call".to_owned()),
-                member_id: Some("alice-device-a".to_owned()),
+                application: ApplicationInfo {
+                    application_type: Some("m.call".to_owned()),
+                    extra: std::collections::BTreeMap::new(),
+                },
+                member: MemberInfo {
+                    id: Some("alice-device-a".to_owned()),
+                    claimed_device_id: None,
+                    claimed_user_id: None,
+                },
+                versions: Vec::new(),
                 disconnect_reason: None,
+                m_relates_to: None,
                 rtc_transports: Some(vec![RawRtcTransport {
                     transport_type: "unknown_transport".to_owned(),
                     extra_fields,

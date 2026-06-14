@@ -25,8 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use matrix_rtc_core::{
     CallMembershipEvent, EventConversionError, JoinedMembership as CoreJoinedMembership,
-    RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate, RtcSession, RtcSessionManager,
-    StickyEventsUpdate,
+    RawStickyEvent, RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
 };
 use tokio::sync::watch;
 
@@ -171,12 +170,28 @@ impl RtcSessionHandle {
             .into_core()
             .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))?;
 
-        let mut session = lock_mutex(&self.inner)?;
+        // Take the session out of the mutex to avoid holding the guard across await
+        let mut inner = lock_mutex(&self.inner)?;
+        let mut session = std::mem::replace(&mut *inner, RtcSession::new());
 
-        // Note: set_command_sender() must be called before join() to enable sending events
-        session
-            .join(core_params)
-            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+        // Drop the lock before doing async work
+        drop(inner);
+
+        // Do the async join
+        // For FFI, the command sender callbacks are synchronous, so the async
+        // operations will complete immediately. We use a simple block_on.
+        let result = futures::executor::block_on(async {
+            session
+                .join(core_params)
+                .await
+                .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+        });
+
+        // Store the session back
+        let mut inner = lock_mutex(&self.inner)?;
+        *inner = session;
+
+        result
     }
 
     pub fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
@@ -297,12 +312,26 @@ impl RtcSessionManagerHandle {
             .into_core()
             .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))?;
 
-        let mut manager = lock_mutex(&self.inner)?;
+        // Take the manager out of the mutex to avoid holding the guard across await
+        let mut inner = lock_mutex(&self.inner)?;
+        let mut manager = std::mem::replace(&mut *inner, RtcSessionManager::new());
 
-        // Note: set_command_sender() must be called before join() to enable sending events
-        manager
-            .join(core_params)
-            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+        // Drop the lock before doing async work
+        drop(inner);
+
+        // Do the async join
+        let result = futures::executor::block_on(async {
+            manager
+                .join(core_params)
+                .await
+                .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+        });
+
+        // Store the manager back
+        let mut inner = lock_mutex(&self.inner)?;
+        *inner = manager;
+
+        result
     }
 
     pub fn leave(
@@ -313,12 +342,26 @@ impl RtcSessionManagerHandle {
     ) -> Result<(), MatrixRtcFfiError> {
         let core_params = params.into_core();
 
-        let mut manager = lock_mutex(&self.inner)?;
+        // Take the manager out of the mutex to avoid holding the guard across await
+        let mut inner = lock_mutex(&self.inner)?;
+        let mut manager = std::mem::replace(&mut *inner, RtcSessionManager::new());
 
-        // Note: set_command_sender() must be called before leave() to enable sending events
-        manager
-            .leave(room_id, slot_id, core_params)
-            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+        // Drop the lock before doing async work
+        drop(inner);
+
+        // Do the async leave
+        let result = futures::executor::block_on(async {
+            manager
+                .leave(room_id, slot_id, core_params)
+                .await
+                .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+        });
+
+        // Store the manager back
+        let mut inner = lock_mutex(&self.inner)?;
+        *inner = manager;
+
+        result
     }
 }
 
@@ -346,7 +389,34 @@ impl MembershipSnapshotSubscription {
     }
 }
 
-fn to_core_event(event: StickyEvent) -> RawStickyEvent {
+fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
+    use matrix_rtc_core::{
+        ApplicationInfo, DisconnectReason, MemberInfo, RawStickyEvent, RawStickyEventContent,
+    };
+    use std::collections::BTreeMap;
+
+    // Map FFI types to MSC4143-compliant core types
+    let application = ApplicationInfo {
+        application_type: event.application_type,
+        extra: BTreeMap::new(),
+    };
+
+    let member = MemberInfo {
+        id: event.member_id,
+        claimed_device_id: None,
+        claimed_user_id: None,
+    };
+
+    let disconnect_reason = event.disconnect_reason.map(|reason| {
+        // For now, map simple string to a basic disconnect reason
+        // In a full implementation, this would parse the MSC4143 object
+        DisconnectReason {
+            class: None,
+            reason: Some(reason),
+            description: None,
+        }
+    });
+
     RawStickyEvent {
         room_id: event.room_id,
         sender: event.sender,
@@ -354,9 +424,11 @@ fn to_core_event(event: StickyEvent) -> RawStickyEvent {
         content: RawStickyEventContent {
             slot_id: event.slot_id,
             sticky_key: event.sticky_key,
-            application_type: event.application_type,
-            member_id: event.member_id,
-            disconnect_reason: event.disconnect_reason,
+            application,
+            member,
+            versions: Vec::new(),
+            disconnect_reason,
+            m_relates_to: None,
             rtc_transports: None,
         },
     }

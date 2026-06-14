@@ -22,7 +22,7 @@
 //!
 //! DTOs are used to decouple core logic from FFI-specific types.
 
-use matrix_rtc_core::{CommandCallback, CommandError, RtcCommandSender, SendEventCallback};
+use matrix_rtc_core::{CommandError, RtcCommandSender};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -36,6 +36,17 @@ pub enum CommandSenderError {
     SerializationError(String),
     /// Error from the native SDK when sending the event
     SendError(String),
+}
+
+impl From<CommandSenderError> for matrix_rtc_core::CommandError {
+    fn from(err: CommandSenderError) -> Self {
+        match err {
+            CommandSenderError::SerializationError(e) => {
+                matrix_rtc_core::CommandError::SerializationError(e)
+            }
+            CommandSenderError::SendError(e) => matrix_rtc_core::CommandError::SendError(e),
+        }
+    }
 }
 
 /// FFI-friendly transport configuration for join operations.
@@ -216,71 +227,49 @@ impl FfiCommandSender {
     }
 }
 
+use async_trait::async_trait;
+
+#[async_trait(?Send)]
 impl RtcCommandSender for FfiCommandSender {
-    fn send_sticky_event(
+    async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
-        callback: CommandCallback,
-    ) {
-        let content_json = match serde_json::to_string(&content) {
-            Ok(json) => json,
-            Err(e) => {
-                callback(Err(CommandError::SerializationError(e.to_string())));
-                return;
-            }
-        };
+    ) -> Result<(), CommandError> {
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        let result = self
-            .callback
-            .send_sticky_event(room_id, event_type, content_json);
-        callback(match result {
-            Ok(()) => Ok(()),
-            Err(CommandSenderError::SerializationError(e)) => {
-                Err(CommandError::SerializationError(e))
-            }
-            Err(CommandSenderError::SendError(e)) => Err(CommandError::SendError(e)),
-        });
+        self.callback
+            .send_sticky_event(room_id, event_type, content_json)
+            .map_err(CommandError::from)?;
+        Ok(())
     }
 
-    fn send_delayed_event(
+    async fn send_delayed_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
         delay_ms: u64,
-        callback: SendEventCallback,
-    ) {
-        let content_json = match serde_json::to_string(&content) {
-            Ok(json) => json,
-            Err(e) => {
-                callback(Err(CommandError::SerializationError(e.to_string())));
-                return;
-            }
-        };
+    ) -> Result<String, CommandError> {
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        let result = self
-            .callback
-            .send_delayed_event(room_id, event_type, content_json, delay_ms);
-        callback(match result {
-            Ok(event_id) => Ok(event_id),
-            Err(CommandSenderError::SerializationError(e)) => {
-                Err(CommandError::SerializationError(e))
-            }
-            Err(CommandSenderError::SendError(e)) => Err(CommandError::SendError(e)),
-        });
+        self.callback
+            .send_delayed_event(room_id, event_type, content_json, delay_ms)
+            .map_err(CommandError::from)
     }
 
-    fn cancel_delayed_event(&self, room_id: String, event_id: String, callback: CommandCallback) {
-        let result = self.callback.cancel_delayed_event(room_id, event_id);
-        callback(match result {
-            Ok(()) => Ok(()),
-            Err(CommandSenderError::SerializationError(e)) => {
-                Err(CommandError::SerializationError(e))
-            }
-            Err(CommandSenderError::SendError(e)) => Err(CommandError::SendError(e)),
-        });
+    async fn cancel_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        self.callback
+            .cancel_delayed_event(room_id, event_id)
+            .map_err(CommandError::from)?;
+        Ok(())
     }
 }
 
@@ -333,55 +322,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_ffi_command_sender_sends_sticky_event() {
+    #[tokio::test]
+    async fn test_ffi_command_sender_sends_sticky_event() {
         let mock_callback = MockCommandSenderCallback;
         let callback: Arc<dyn CommandSenderCallback> = Arc::new(mock_callback);
         let command_sender = FfiCommandSender::new(callback);
 
-        let called = Arc::new(std::sync::Mutex::new(false));
-        let called_clone = called.clone();
+        let result = command_sender
+            .send_sticky_event(
+                "!room:example.org".to_string(),
+                "m.rtc.member".to_string(),
+                serde_json::json!({
+                    "slot_id": "m.call#ROOM",
+                    "sticky_key": "alice-device-a"
+                }),
+            )
+            .await;
 
-        command_sender.send_sticky_event(
-            "!room:example.org".to_string(),
-            "m.rtc.member".to_string(),
-            serde_json::json!({
-                "slot_id": "m.call#ROOM",
-                "sticky_key": "alice-device-a"
-            }),
-            Box::new(move |result| {
-                *called_clone.lock().unwrap() = true;
-                assert!(result.is_ok());
-            }),
-        );
-
-        assert!(*called.lock().unwrap());
+        assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_ffi_command_sender_sends_delayed_event() {
+    #[tokio::test]
+    async fn test_ffi_command_sender_sends_delayed_event() {
         let mock_callback = MockCommandSenderCallback;
         let callback: Arc<dyn CommandSenderCallback> = Arc::new(mock_callback);
         let command_sender = FfiCommandSender::new(callback);
 
-        let called = Arc::new(std::sync::Mutex::new(false));
-        let event_id_clone = called.clone();
+        let result = command_sender
+            .send_delayed_event(
+                "!room:example.org".to_string(),
+                "m.rtc.member".to_string(),
+                serde_json::json!({
+                    "slot_id": "m.call#ROOM",
+                    "sticky_key": "alice-device-a"
+                }),
+                30000,
+            )
+            .await;
 
-        command_sender.send_delayed_event(
-            "!room:example.org".to_string(),
-            "m.rtc.member".to_string(),
-            serde_json::json!({
-                "slot_id": "m.call#ROOM",
-                "sticky_key": "alice-device-a"
-            }),
-            30000,
-            Box::new(move |result| {
-                *event_id_clone.lock().unwrap() = true;
-                assert!(result.is_ok());
-                assert_eq!(result.unwrap(), "event-!room:example.org-m.rtc.member");
-            }),
-        );
-
-        assert!(*called.lock().unwrap());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "event-!room:example.org-m.rtc.member");
     }
 }

@@ -20,9 +20,11 @@
 //! This module provides the `JsCommandSender` that implements `RtcCommandSender`
 //! by delegating to a JavaScript object that provides the actual Matrix SDK integration.
 
+use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
-use matrix_rtc_core::{CommandCallback, CommandError, RtcCommandSender, SendEventCallback};
+use matrix_rtc_core::{CommandError, RtcCommandSender};
 use serde_json::Value;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 /// WASM implementation of the RtcCommandSender trait.
@@ -80,11 +82,15 @@ impl JsCommandSender {
         }
     }
 
-    /// Call a method on the client object by name.
+    /// Call a method on the client object by name that returns a Promise.
     ///
-    /// Returns Ok(()) if the method exists and was called successfully,
-    /// or Err if the method doesn't exist.
-    fn call_client_method(&self, method_name: &str, args: &[JsValue]) -> Result<(), JsValue> {
+    /// This is used for async operations where the JS method returns a Promise
+    /// that will be converted to a Rust Future.
+    fn call_js_promise_method(
+        &self,
+        method_name: &str,
+        args: Vec<JsValue>,
+    ) -> Result<js_sys::Promise, JsValue> {
         let method = Reflect::get(&self.client, &JsValue::from_str(method_name))?;
         if method.is_undefined() {
             return Err(JsValue::from_str(&format!(
@@ -92,14 +98,23 @@ impl JsCommandSender {
                 method_name
             )));
         }
+
         // Convert args to js_sys::Array
         let js_args = Array::new();
         for (i, arg) in args.iter().enumerate() {
             js_args.set(i as u32, arg.clone());
         }
-        // We don't use the return value since methods with catch don't return meaningful values
-        let _ = Reflect::apply(&method.dyn_into::<Function>()?, &self.client, &js_args)?;
-        Ok(())
+
+        // Call the method and expect a Promise to be returned
+        let result = Reflect::apply(&method.dyn_into::<Function>()?, &self.client, &js_args)?;
+
+        // Verify it's a Promise
+        if result.is_instance_of::<js_sys::Promise>() {
+            Ok(result.dyn_into::<js_sys::Promise>().unwrap())
+        } else {
+            // If it's not a Promise, wrap it in a resolved Promise
+            Ok(js_sys::Promise::resolve(&result))
+        }
     }
 }
 
@@ -108,115 +123,110 @@ impl JsCommandSender {
 unsafe impl Send for JsCommandSender {}
 unsafe impl Sync for JsCommandSender {}
 
+#[async_trait(?Send)]
 impl RtcCommandSender for JsCommandSender {
-    fn send_sticky_event(
+    async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
-        callback: CommandCallback,
-    ) {
+    ) -> Result<(), CommandError> {
         self.log_command(&format!(
             "send_sticky_event: room={}, type={}",
             room_id, event_type
         ));
 
         // Convert Rust Value to JsValue
-        let js_content = match serde_wasm_bindgen::to_value(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                callback(Err(CommandError::SerializationError(e.to_string())));
-                return;
-            }
-        };
+        let js_content = serde_wasm_bindgen::to_value(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        // Create a JS callback that will invoke the Rust callback
-        let rust_callback = callback;
-        let js_callback = Closure::once(move |error: JsValue| {
-            if error.is_undefined() || error.is_null() {
-                rust_callback(Ok(()));
-            } else {
-                rust_callback(Err(JsCommandSender::convert_js_error(error)));
-            }
-        });
+        // Create a Promise that will be resolved by the JS callback
+        let promise = self
+            .call_js_promise_method(
+                "sendStickyEvent",
+                vec![
+                    JsValue::from_str(&room_id),
+                    JsValue::from_str(&event_type),
+                    js_content,
+                ],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
 
-        let args = vec![
-            JsValue::from_str(&room_id),
-            JsValue::from_str(&event_type),
-            js_content,
-            js_callback.into_js_value(),
-        ];
+        // Convert the Promise to a Rust Future and await it
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
 
-        let _ = self.call_client_method("sendStickyEvent", &args);
+        Ok(())
     }
 
-    fn send_delayed_event(
+    async fn send_delayed_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
         delay_ms: u64,
-        callback: SendEventCallback,
-    ) {
+    ) -> Result<String, CommandError> {
         self.log_command(&format!(
             "send_delayed_event: room={}, type={}, delay={}ms",
             room_id, event_type, delay_ms
         ));
 
         // Convert Rust Value to JsValue
-        let js_content = match serde_wasm_bindgen::to_value(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                callback(Err(CommandError::SerializationError(e.to_string())));
-                return;
-            }
-        };
+        let js_content = serde_wasm_bindgen::to_value(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        // Create a JS callback that will invoke the Rust callback with event_id
-        let rust_callback = callback;
-        let js_callback = Closure::once(move |error: JsValue, event_id: JsValue| {
-            if error.is_undefined() || error.is_null() {
-                let event_id_str = event_id.as_string().unwrap_or_default();
-                rust_callback(Ok(event_id_str));
-            } else {
-                rust_callback(Err(JsCommandSender::convert_js_error(error)));
-            }
-        });
+        // Create a Promise that will be resolved by the JS callback
+        let promise = self
+            .call_js_promise_method(
+                "sendDelayedEvent",
+                vec![
+                    JsValue::from_str(&room_id),
+                    JsValue::from_str(&event_type),
+                    js_content,
+                    JsValue::from_f64(delay_ms as f64),
+                ],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
 
-        let args = vec![
-            JsValue::from_str(&room_id),
-            JsValue::from_str(&event_type),
-            js_content,
-            JsValue::from_f64(delay_ms as f64),
-            js_callback.into_js_value(),
-        ];
+        // Convert the Promise to a Rust Future and await it
+        // The Promise should resolve to the event_id string
+        let js_result = wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
 
-        let _ = self.call_client_method("sendDelayedEvent", &args);
+        // Extract the event_id from the result
+        let event_id = js_result.as_string().ok_or_else(|| {
+            CommandError::SendError("sendDelayedEvent did not return a string event_id".to_string())
+        })?;
+
+        Ok(event_id)
     }
 
-    fn cancel_delayed_event(&self, room_id: String, event_id: String, callback: CommandCallback) {
+    async fn cancel_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
         self.log_command(&format!(
             "cancel_delayed_event: room={}, event_id={}",
             room_id, event_id
         ));
 
-        // Create a JS callback that will invoke the Rust callback
-        let rust_callback = callback;
-        let js_callback = Closure::once(move |error: JsValue| {
-            if error.is_undefined() || error.is_null() {
-                rust_callback(Ok(()));
-            } else {
-                rust_callback(Err(JsCommandSender::convert_js_error(error)));
-            }
-        });
+        // Create a Promise that will be resolved by the JS callback
+        let promise = self
+            .call_js_promise_method(
+                "cancelDelayedEvent",
+                vec![JsValue::from_str(&room_id), JsValue::from_str(&event_id)],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
 
-        let args = vec![
-            JsValue::from_str(&room_id),
-            JsValue::from_str(&event_id),
-            js_callback.into_js_value(),
-        ];
+        // Convert the Promise to a Rust Future and await it
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
 
-        let _ = self.call_client_method("cancelDelayedEvent", &args);
+        Ok(())
     }
 }
 

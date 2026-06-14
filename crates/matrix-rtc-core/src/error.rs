@@ -76,10 +76,6 @@ pub enum JoinError {
     /// Invalid transport configuration.
     #[error("invalid transport configuration")]
     InvalidTransport,
-
-    /// The keep-alive mechanism failed to start.
-    #[error("failed to start keep-alive: {0}")]
-    KeepAliveError(String),
 }
 
 /// Errors that can occur when attempting to leave an RTC session.
@@ -92,10 +88,6 @@ pub enum LeaveError {
     /// The session is not currently joined.
     #[error("not joined")]
     NotJoined,
-
-    /// Failed to cancel the keep-alive delayed event.
-    #[error("failed to cancel keep-alive: {0}")]
-    KeepAliveCancelError(String),
 }
 
 impl CommandError {

@@ -22,8 +22,8 @@
 
 use matrix_rtc_core::{
     EventConversionError, JoinSessionParams, JoinedMembership, LeaveSessionParams, RawRtcTransport,
-    RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate, RtcCommandSender, RtcSession,
-    RtcSessionManager, RtcTransport, StickyEventsUpdate,
+    RawStickyEvent, RawStickyEventUpdate, RtcCommandSender, RtcSession, RtcSessionManager,
+    RtcTransport, StickyEventsUpdate,
 };
 
 mod commands;
@@ -138,7 +138,7 @@ impl WasmRtcSessionManager {
     ///   - `application`: Application type (e.g., "m.call")
     ///   - `transport`: Transport configuration object
     ///   - `keep_alive_timeout_ms`: Optional keep-alive timeout in milliseconds (default: 30000)
-    pub fn join(&mut self, params: JsValue) -> Result<(), JsError> {
+    pub async fn join(&mut self, params: JsValue) -> Result<(), JsError> {
         let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
 
@@ -146,6 +146,7 @@ impl WasmRtcSessionManager {
 
         self.inner
             .join(core_params)
+            .await
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
@@ -159,7 +160,7 @@ impl WasmRtcSessionManager {
     /// * `slot_id` - The slot ID of the session to leave
     /// * `params` - Optional JSON object containing leave parameters:
     ///   - `disconnect_reason`: Optional reason for leaving (e.g., "user_left", "ice_failed")
-    pub fn leave(
+    pub async fn leave(
         &mut self,
         room_id: String,
         slot_id: String,
@@ -172,6 +173,7 @@ impl WasmRtcSessionManager {
 
         self.inner
             .leave(room_id, slot_id, core_params)
+            .await
             .map_err(|err| JsError::new(&err.to_string()))
     }
 }
@@ -378,7 +380,7 @@ impl WasmRtcSession {
     /// # Arguments
     ///
     /// * `params` - JSON object containing join parameters (same as WasmRtcSessionManager::join)
-    pub fn join(&mut self, params: JsValue) -> Result<(), JsError> {
+    pub async fn join(&mut self, params: JsValue) -> Result<(), JsError> {
         let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
 
@@ -386,6 +388,7 @@ impl WasmRtcSession {
 
         self.inner
             .join(core_params)
+            .await
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
@@ -507,12 +510,27 @@ impl From<WasmStickyEvent> for RawStickyEvent {
             room_id: value.room_id,
             sender: value.sender,
             event_type: value.event_type,
-            content: RawStickyEventContent {
+            content: matrix_rtc_core::RawStickyEventContent {
                 slot_id: value.content.slot_id,
                 sticky_key: value.content.sticky_key,
-                application_type: value.content.application.map(|app| app.kind),
-                member_id: value.content.member.map(|member| member.id),
-                disconnect_reason: value.content.disconnect_reason,
+                application: matrix_rtc_core::ApplicationInfo {
+                    application_type: value.content.application.map(|app| app.kind),
+                    extra: std::collections::BTreeMap::new(),
+                },
+                member: matrix_rtc_core::MemberInfo {
+                    id: value.content.member.map(|member| member.id),
+                    claimed_device_id: None,
+                    claimed_user_id: None,
+                },
+                versions: Vec::new(),
+                disconnect_reason: value.content.disconnect_reason.map(|reason| {
+                    matrix_rtc_core::DisconnectReason {
+                        class: None,
+                        reason: Some(reason),
+                        description: None,
+                    }
+                }),
+                m_relates_to: None,
                 rtc_transports: value
                     .content
                     .rtc_transports
