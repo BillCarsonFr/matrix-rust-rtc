@@ -29,45 +29,6 @@ can be used to record calls via a headless bot
 ## Audience & Scope
 This document is a lightweight guide for contributors and automated agents. It focuses on stable concepts and boundaries, not implementation details.
 
-## AI Working Folder (`agent-workspace/`)
-
-A git-ignored sandbox for all transient AI-generated files. **Use only paths under the workspace and keep transient files in `agent-workspace/`.**
-
-### Rules
-
-- **Write files** using file tools; use shell commands for execution tasks only.
-- **Overwriting**: replace entire files for generated docs like `pr-body.md`.
-- **Store only transient workflow artifacts** here; keep source code and reviewable files in tracked project paths.
-- **Commit messages**: write to `agent-workspace/<feature-slug>/commit-msg.txt` and use `git commit -F agent-workspace/<feature-slug>/commit-msg.txt`
-- **PR descriptions**: write to `agent-workspace/<feature-slug>/pr-body.md` and use `gh pr create --body-file agent-workspace/<feature-slug>/pr-body.md`
-
-### Per-Feature Subfolder Convention
-
-Every agent task that spans more than a single trivial edit **must** create a dedicated subfolder:
-
-```
-agent-workspace/<feature-slug>/
-```
-
-`feature-slug` is a short kebab-case label matching the branch name (e.g., `membership-routing`, `e2ee-key-dist`).
-
-**Required files** (create as the work progresses, omit only if genuinely not applicable):
-
-| File | Purpose |
-|---|---|
-| `plan.md` | Agreed approach before coding starts. Written after the user confirms direction. |
-| `implementation-summary.md` | What was built, key decisions made, trade-offs. Written before handoff. |
-| `commit-msg.txt` | Conventional commit message(s), one file per logical commit if batched. |
-| `pr-body.md` | Full PR description. |
-
-**Optional files:**
-
-| File | Purpose |
-|---|---|
-| `NN-prompt.md` | Raw prompt text (numbered, e.g. `01-initial.md`, `02-debug.md`). Keep as many as useful for knowledge sharing with teammates. |
-| `review-pr-findings.md` | Output of the PR self-review step. |
-| `decisions.md` | Architectural/design decisions and the reasoning behind them. |
-
 ## First-Pass Handoff (for Agents)
 
 After implementing a requested change, stop and hand the result to the user before doing the full code-quality pass.
