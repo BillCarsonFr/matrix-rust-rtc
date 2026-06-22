@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::commands::RtcCommandSender;
+use crate::encryption::EncryptionManager;
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::own_membership::{OwnMembershipMachine, transport_to_json};
@@ -36,27 +37,30 @@ use crate::transport::RtcTransport;
 use log::*;
 
 /// Per-session MatrixRTC state machine and membership store.
-pub struct RtcSession {
+pub struct RtcSession<T: RtcCommandSender> {
     members: Vec<JoinedMembership>,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
     /// Command sender for sending events to the Matrix room.
-    command_sender: Option<Arc<dyn RtcCommandSender>>,
+    command_sender: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
-    own_membership_machine: Option<OwnMembershipMachine>,
+    own_membership_machine: Option<OwnMembershipMachine<T>>,
+    /// Encryption manager for key distribution and management.
+    encryption_manager: Option<EncryptionManager<T>>,
 }
 
-impl Clone for RtcSession {
+impl<T: RtcCommandSender> Clone for RtcSession<T> {
     fn clone(&self) -> Self {
         Self {
             members: self.members.clone(),
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             command_sender: self.command_sender.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
+            encryption_manager: None,     // Don't clone the encryption manager
         }
     }
 }
 
-impl RtcSession {
+impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Creates an empty session without a command sender.
     pub fn new() -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
@@ -66,11 +70,12 @@ impl RtcSession {
             membership_snapshots_tx,
             command_sender: None,
             own_membership_machine: None,
+            encryption_manager: None,
         }
     }
 
     /// Creates an empty session with a command sender.
-    pub fn with_command_sender(command_sender: Arc<dyn RtcCommandSender>) -> Self {
+    pub fn with_command_sender(command_sender: Arc<T>) -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
         Self {
@@ -78,11 +83,12 @@ impl RtcSession {
             membership_snapshots_tx,
             command_sender: Some(command_sender),
             own_membership_machine: None,
+            encryption_manager: None,
         }
     }
 
     /// Sets the command sender for this session.
-    pub fn set_command_sender(&mut self, command_sender: Arc<dyn RtcCommandSender>) {
+    pub fn set_command_sender(&mut self, command_sender: Arc<T>) {
         self.command_sender = Some(command_sender);
     }
 
@@ -148,6 +154,38 @@ impl RtcSession {
         // Store the machine
         self.own_membership_machine = Some(machine);
 
+        // Create the encryption manager
+        // We need a closure that can access self.members
+        // Since we can't capture self by reference in an Arc closure, we'll use a different approach
+        // For now, we'll create a simple closure that clones the members vector
+        let get_memberships_for_encryption = {
+            let members_tx = self.membership_snapshots_tx.clone();
+            move || members_tx.borrow().clone()
+        };
+
+        let encryption_config = params.encryption_config();
+        let mut encryption_manager = EncryptionManager::new(
+            command_sender.clone(),
+            params.user_id.clone(),
+            params.device_id.clone(),
+            membership_id.clone(),
+            params.room_id.clone(),
+            params.slot_id.clone(),
+            get_memberships_for_encryption,
+        );
+        encryption_manager.set_config(encryption_config);
+
+        // Start the encryption manager (creates first key)
+        encryption_manager.join().await.map_err(|e| {
+            JoinError::CommandError(CommandError::from_message(format!(
+                "failed to start encryption manager: {:?}",
+                e
+            )))
+        })?;
+
+        // Store the encryption manager
+        self.encryption_manager = Some(encryption_manager);
+
         Ok(())
     }
 
@@ -172,6 +210,11 @@ impl RtcSession {
 
         // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
         machine.leave(params.disconnect_reason.clone()).await?;
+
+        // Clean up the encryption manager
+        if let Some(encryption_manager) = self.encryption_manager.take() {
+            encryption_manager.leave();
+        }
 
         Ok(())
     }
@@ -208,26 +251,26 @@ impl RtcSession {
     }
 
     /// Applies the initial membership events for this single session.
-    pub fn initial_events(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
+    pub async fn initial_events(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
         for event in events {
-            self.apply_membership_event(event);
+            self.apply_membership_event(event).await;
         }
     }
 
     /// Applies a membership update batch for this single session.
-    pub fn handle_update(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
+    pub async fn handle_update(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
         for event in events {
-            self.apply_membership_event(event);
+            self.apply_membership_event(event).await;
         }
     }
 
     /// Applies one membership event to this session.
-    pub fn update(&mut self, event: CallMembershipEvent) {
-        self.apply_membership_event(event);
+    pub async fn update(&mut self, event: CallMembershipEvent) {
+        self.apply_membership_event(event).await;
     }
 
-    fn apply_membership_event(&mut self, event: CallMembershipEvent) {
-        match event {
+    async fn apply_membership_event(&mut self, event: CallMembershipEvent) {
+        let membership_changed = match event {
             CallMembershipEvent::Joined(joined) => {
                 let key_sender = joined.sender.clone();
                 let key_sticky = joined.sticky_key.clone();
@@ -245,6 +288,7 @@ impl RtcSession {
                 }
 
                 self.publish_membership_snapshot();
+                true
             }
             CallMembershipEvent::Left(left) => {
                 let before = self.members.len();
@@ -254,8 +298,17 @@ impl RtcSession {
 
                 if self.members.len() != before {
                     self.publish_membership_snapshot();
+                    true
+                } else {
+                    false
                 }
             }
+        };
+
+        // Notify encryption manager of membership changes
+        if membership_changed && let Some(ref encryption_manager) = self.encryption_manager {
+            // Notify the encryption manager directly (async)
+            let _ = encryption_manager.on_memberships_update().await;
         }
     }
 
@@ -335,6 +388,8 @@ pub struct JoinedMembership {
     pub m_relates_to: Option<RelatesTo>,
     /// RTC transports for this member (MSC4143 / MSC4195).
     pub transports: Vec<RtcTransport>,
+    /// Timestamp (ms) when this membership was created (MSC4143).
+    pub created_ts: Option<u64>,
 }
 
 /// MSC4143: Disconnected membership payload.
@@ -354,7 +409,7 @@ pub struct LeftMembership {
     pub m_relates_to: Option<RelatesTo>,
 }
 
-impl Default for RtcSession {
+impl<T: RtcCommandSender + 'static> Default for RtcSession<T> {
     fn default() -> Self {
         Self::new()
     }

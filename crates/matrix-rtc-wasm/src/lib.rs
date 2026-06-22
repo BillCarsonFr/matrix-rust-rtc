@@ -21,9 +21,9 @@
 //! Keeping this conversion here lets the core remain independent from wasm/JS types.
 
 use matrix_rtc_core::{
-    EventConversionError, JoinSessionParams, JoinedMembership, LeaveSessionParams, RawRtcTransport,
-    RawStickyEvent, RawStickyEventUpdate, RtcCommandSender, RtcSession, RtcSessionManager,
-    RtcTransport, StickyEventsUpdate,
+    EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,
+    LeaveSessionParams, RawRtcTransport, RawStickyEvent, RawStickyEventUpdate, RtcSession,
+    RtcSessionManager, RtcTransport, StickyEventsUpdate,
 };
 
 mod commands;
@@ -36,9 +36,9 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 /// WebAssembly-facing wrapper around `RtcSessionManager`.
 pub struct WasmRtcSessionManager {
-    inner: RtcSessionManager,
+    inner: RtcSessionManager<JsCommandSender>,
     /// Command sender for sending events to Matrix rooms
-    command_sender: Option<Arc<dyn RtcCommandSender>>,
+    command_sender: Option<Arc<JsCommandSender>>,
 }
 
 #[wasm_bindgen]
@@ -57,8 +57,7 @@ impl WasmRtcSessionManager {
     /// This must be called before join/leave operations.
     /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
-        let command_sender: Arc<dyn matrix_rtc_core::RtcCommandSender> =
-            Arc::new(JsCommandSender::new(client));
+        let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());
         self.command_sender = Some(command_sender);
     }
@@ -69,7 +68,7 @@ impl WasmRtcSessionManager {
     }
 
     /// Applies the initial sticky snapshot for one room from a JS iterable/array payload.
-    pub fn on_sticky_events_snapshot_received(
+    pub async fn on_sticky_events_snapshot_received(
         &mut self,
         room_id: String,
         events: JsValue,
@@ -81,11 +80,12 @@ impl WasmRtcSessionManager {
 
         self.inner
             .initial_sticky_for_room(&room_id, mapped)
+            .await
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
     /// Applies one sticky diff payload for one room from JS (`added`, `updated`, `removed`).
-    pub fn on_sticky_events_update_received(
+    pub async fn on_sticky_events_update_received(
         &mut self,
         room_id: String,
         update: JsValue,
@@ -108,6 +108,7 @@ impl WasmRtcSessionManager {
 
         self.inner
             .sticky_update_for_room(&room_id, mapped)
+            .await
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
@@ -197,11 +198,45 @@ pub struct WasmJoinSessionParams {
     pub transport: WasmTransportConfig,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub encryption_config: Option<WasmEncryptionConfig>,
+}
+
+/// WASM-friendly encryption configuration.
+#[derive(Debug, Default, Deserialize)]
+pub struct WasmEncryptionConfig {
+    #[serde(default = "default_delay_before_use_ms")]
+    pub delay_before_use_ms: u64,
+    #[serde(default = "default_key_rotation_grace_period_ms")]
+    pub key_rotation_grace_period_ms: u64,
+    #[serde(default = "default_manage_media_keys")]
+    pub manage_media_keys: bool,
+}
+
+fn default_delay_before_use_ms() -> u64 {
+    5000
+}
+fn default_key_rotation_grace_period_ms() -> u64 {
+    10000
+}
+fn default_manage_media_keys() -> bool {
+    true
+}
+
+impl From<WasmEncryptionConfig> for EncryptionConfig {
+    fn from(value: WasmEncryptionConfig) -> Self {
+        EncryptionConfig {
+            delay_before_use_ms: value.delay_before_use_ms,
+            key_rotation_grace_period_ms: value.key_rotation_grace_period_ms,
+            manage_media_keys: value.manage_media_keys,
+        }
+    }
 }
 
 impl WasmJoinSessionParams {
     pub fn into_core(self) -> Result<JoinSessionParams, JsError> {
         let transport = self.transport.into_core()?;
+        let encryption_config = self.encryption_config.map(Into::into);
         Ok(JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
@@ -211,6 +246,7 @@ impl WasmJoinSessionParams {
             application: self.application,
             transport,
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
+            encryption_config,
         })
     }
 }
@@ -275,9 +311,9 @@ impl WasmLeaveSessionParams {
 #[wasm_bindgen]
 /// WebAssembly-facing single-session API.
 pub struct WasmRtcSession {
-    inner: RtcSession,
+    inner: RtcSession<JsCommandSender>,
     /// Command sender for sending events to Matrix rooms
-    command_sender: Option<Arc<dyn RtcCommandSender>>,
+    command_sender: Option<Arc<JsCommandSender>>,
 }
 
 #[wasm_bindgen]
@@ -298,8 +334,7 @@ impl WasmRtcSession {
     /// This must be called before join/leave operations.
     /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
-        let command_sender: Arc<dyn matrix_rtc_core::RtcCommandSender> =
-            Arc::new(JsCommandSender::new(client));
+        let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());
         self.command_sender = Some(command_sender);
     }
@@ -310,7 +345,10 @@ impl WasmRtcSession {
     }
 
     /// Applies initial sticky events for this single session.
-    pub fn on_sticky_events_snapshot_received(&mut self, events: JsValue) -> Result<(), JsError> {
+    pub async fn on_sticky_events_snapshot_received(
+        &mut self,
+        events: JsValue,
+    ) -> Result<(), JsError> {
         let input: Vec<WasmStickyEvent> = serde_wasm_bindgen::from_value(events)
             .map_err(|err| JsError::new(&format!("invalid sticky snapshot payload: {err}")))?;
 
@@ -324,13 +362,16 @@ impl WasmRtcSession {
             }
         }
 
-        self.inner.initial_events(membership_events);
+        self.inner.initial_events(membership_events).await;
 
         Ok(())
     }
 
     /// Applies one sticky diff payload for this single session.
-    pub fn on_sticky_events_update_received(&mut self, update: JsValue) -> Result<(), JsError> {
+    pub async fn on_sticky_events_update_received(
+        &mut self,
+        update: JsValue,
+    ) -> Result<(), JsError> {
         let input: WasmStickyEventsUpdate = serde_wasm_bindgen::from_value(update)
             .map_err(|err| JsError::new(&format!("invalid sticky event payload: {err}")))?;
 
@@ -360,7 +401,7 @@ impl WasmRtcSession {
             }
         }
 
-        self.inner.handle_update(membership_events);
+        self.inner.handle_update(membership_events).await;
 
         Ok(())
     }
@@ -535,6 +576,7 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                     .content
                     .rtc_transports
                     .map(|v| v.into_iter().map(Into::into).collect()),
+                created_ts: None,
             },
         }
     }

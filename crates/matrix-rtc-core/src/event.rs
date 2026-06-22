@@ -59,6 +59,8 @@ pub struct RawStickyEventContent {
     pub m_relates_to: Option<crate::session::RelatesTo>,
     /// RTC transports from `content.rtc_transports` (MSC4143 / MSC4195).
     pub rtc_transports: Option<Vec<RawRtcTransport>>,
+    /// Timestamp (ms) when this membership was created (MSC4143: `created_ts`).
+    pub created_ts: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +144,7 @@ impl RawStickyEvent {
                 versions: self.content.versions.clone(),
                 m_relates_to: self.content.m_relates_to.clone(),
                 transports,
+                created_ts: self.content.created_ts,
             })
         } else {
             // Build disconnected membership from MSC4143 fields

@@ -96,6 +96,31 @@ pub trait RtcCommandSender: Send + Sync {
         room_id: String,
         event_id: String,
     ) -> Result<(), CommandError>;
+
+    /// Send a to-device message to a specific device.
+    ///
+    /// This is used for encryption key distribution as specified in MSC4143.
+    /// To-device messages are encrypted using Olm and delivered directly to the
+    /// target device(s).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The target user ID
+    /// * `device_id` - The target device ID (use "*" for all devices of the user)
+    /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
+    /// * `content` - The message content as a JSON value
+    ///
+    /// # MSC4143 Compliance
+    ///
+    /// MSC4143 specifies that encryption keys MUST be sent via encrypted to-device
+    /// messages. Keys sent in cleartext SHOULD be discarded by recipients.
+    async fn send_to_device_message(
+        &self,
+        user_id: String,
+        device_id: String,
+        message_type: String,
+        content: Value,
+    ) -> Result<(), CommandError>;
 }
 
 /// A no-op implementation of `RtcCommandSender` for testing purposes.
@@ -134,6 +159,16 @@ impl RtcCommandSender for NoopCommandSender {
     ) -> Result<(), CommandError> {
         Ok(())
     }
+
+    async fn send_to_device_message(
+        &self,
+        _user_id: String,
+        _device_id: String,
+        _message_type: String,
+        _content: Value,
+    ) -> Result<(), CommandError> {
+        Ok(())
+    }
 }
 
 /// A mock implementation of `RtcCommandSender` that captures sent events for testing.
@@ -145,6 +180,7 @@ pub struct MockCommandSender {
     pub sticky_events: std::sync::Mutex<Vec<(String, String, Value)>>,
     pub delayed_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
     pub cancelled_events: std::sync::Mutex<Vec<(String, String)>>,
+    pub to_device_messages: std::sync::Mutex<Vec<(String, String, String, Value)>>,
 }
 
 #[cfg(test)]
@@ -161,6 +197,22 @@ impl MockCommandSender {
     #[allow(dead_code)]
     pub fn last_delayed_event(&self) -> Option<(String, String, Value, u64)> {
         self.delayed_events.lock().unwrap().last().cloned()
+    }
+
+    #[allow(dead_code)]
+    pub fn last_to_device_message(&self) -> Option<(String, String, String, Value)> {
+        self.to_device_messages.lock().unwrap().last().cloned()
+    }
+
+    #[allow(dead_code)]
+    pub fn to_device_messages_for(&self, user_id: &str, device_id: &str) -> Vec<(String, Value)> {
+        self.to_device_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(u, d, _, _)| u == user_id && d == device_id)
+            .map(|(_, _, t, c)| (t.clone(), c.clone()))
+            .collect()
     }
 }
 
@@ -205,6 +257,20 @@ impl RtcCommandSender for MockCommandSender {
             .lock()
             .unwrap()
             .push((room_id, event_id));
+        Ok(())
+    }
+
+    async fn send_to_device_message(
+        &self,
+        user_id: String,
+        device_id: String,
+        message_type: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        self.to_device_messages
+            .lock()
+            .unwrap()
+            .push((user_id, device_id, message_type, content));
         Ok(())
     }
 }

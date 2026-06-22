@@ -22,13 +22,12 @@
 //! types and binding-tooling concerns.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::watch;
 
 use matrix_rtc_core::{
     CallMembershipEvent, EventConversionError, JoinedMembership as CoreJoinedMembership,
     RawStickyEvent, RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
 };
-use tokio::sync::watch;
-
 mod commands;
 pub use commands::{
     CommandSenderCallback, CommandSenderError, FfiCommandSender, FfiJoinSessionParams,
@@ -72,12 +71,12 @@ pub struct JoinedMembership {
 
 #[derive(uniffi::Object)]
 pub struct RtcSessionHandle {
-    inner: Mutex<RtcSession>,
+    inner: Mutex<RtcSession<FfiCommandSender>>,
 }
 
 #[derive(uniffi::Object)]
 pub struct RtcSessionManagerHandle {
-    inner: Mutex<RtcSessionManager>,
+    inner: Mutex<RtcSessionManager<FfiCommandSender>>,
 }
 
 struct SubscriptionState {
@@ -123,8 +122,10 @@ impl RtcSessionHandle {
     ) -> Result<(), MatrixRtcFfiError> {
         let parsed = to_core_membership_events(to_core_events(events))?;
         let mut session = lock_mutex(&self.inner)?;
-        session.initial_events(parsed);
-        Ok(())
+        futures::executor::block_on(async {
+            session.initial_events(parsed).await;
+            Ok(())
+        })
     }
 
     pub fn on_sticky_events_update_received(
@@ -147,8 +148,10 @@ impl RtcSessionHandle {
         membership_events.extend(removed_events);
 
         let mut session = lock_mutex(&self.inner)?;
-        session.handle_update(membership_events);
-        Ok(())
+        futures::executor::block_on(async {
+            session.handle_update(membership_events).await;
+            Ok(())
+        })
     }
 
     pub fn subscribe_membership_snapshots(
@@ -241,9 +244,12 @@ impl RtcSessionManagerHandle {
         events: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
         let mut manager = lock_mutex(&self.inner)?;
-        manager
-            .initial_sticky_for_room(&room_id, to_core_events(events))
-            .map_err(map_conversion_error)
+        futures::executor::block_on(async {
+            manager
+                .initial_sticky_for_room(&room_id, to_core_events(events))
+                .await
+                .map_err(map_conversion_error)
+        })
     }
 
     pub fn sticky_update_for_room(
@@ -260,9 +266,12 @@ impl RtcSessionManagerHandle {
         };
 
         let mut manager = lock_mutex(&self.inner)?;
-        manager
-            .sticky_update_for_room(&room_id, update)
-            .map_err(map_conversion_error)
+        futures::executor::block_on(async {
+            manager
+                .sticky_update_for_room(&room_id, update)
+                .await
+                .map_err(map_conversion_error)
+        })
     }
 
     pub fn on_sticky_events_snapshot_received(
@@ -270,9 +279,12 @@ impl RtcSessionManagerHandle {
         events: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
         let mut manager = lock_mutex(&self.inner)?;
-        manager
-            .on_sticky_events_snapshot_received(to_core_events(events))
-            .map_err(map_conversion_error)
+        futures::executor::block_on(async {
+            manager
+                .on_sticky_events_snapshot_received(to_core_events(events))
+                .await
+                .map_err(map_conversion_error)
+        })
     }
 
     pub fn on_sticky_events_update_received(
@@ -282,13 +294,16 @@ impl RtcSessionManagerHandle {
         removed: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
         let mut manager = lock_mutex(&self.inner)?;
-        manager
-            .on_sticky_events_update_received(StickyEventsUpdate {
-                added: to_core_events(added),
-                updated: to_core_updates(updated),
-                removed: to_core_events(removed),
-            })
-            .map_err(map_conversion_error)
+        futures::executor::block_on(async {
+            manager
+                .on_sticky_events_update_received(StickyEventsUpdate {
+                    added: to_core_events(added),
+                    updated: to_core_updates(updated),
+                    removed: to_core_events(removed),
+                })
+                .await
+                .map_err(map_conversion_error)
+        })
     }
 
     pub fn session_count(&self) -> Result<u64, MatrixRtcFfiError> {
@@ -430,6 +445,7 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
             disconnect_reason,
             m_relates_to: None,
             rtc_transports: None,
+            created_ts: None,
         },
     }
 }

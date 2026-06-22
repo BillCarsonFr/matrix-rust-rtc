@@ -25,10 +25,14 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
 log.workspace = true
 async-trait.workspace = true
+rand = "0.8"
+rand_core = "0.6"
+base64 = "0.21"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
+futures = "0.3"
 

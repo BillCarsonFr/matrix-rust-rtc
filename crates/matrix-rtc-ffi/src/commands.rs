@@ -58,6 +58,17 @@ pub struct FfiTransportConfig {
     pub livekit_service_url: Option<String>,
 }
 
+/// FFI-friendly encryption configuration.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiEncryptionConfig {
+    /// Time to wait (ms) before using a newly distributed key (default: 5000ms).
+    pub delay_before_use_ms: Option<u64>,
+    /// Grace period (ms) for key rotation (default: 10000ms).
+    pub key_rotation_grace_period_ms: Option<u64>,
+    /// Whether to manage media keys (default: true).
+    pub manage_media_keys: Option<bool>,
+}
+
 /// FFI-friendly join session parameters.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiJoinSessionParams {
@@ -77,6 +88,8 @@ pub struct FfiJoinSessionParams {
     pub transport: FfiTransportConfig,
     /// Optional keep-alive timeout in milliseconds (default: 30000)
     pub keep_alive_timeout_ms: Option<u64>,
+    /// Optional encryption configuration
+    pub encryption_config: Option<FfiEncryptionConfig>,
 }
 
 /// FFI-friendly leave session parameters.
@@ -118,12 +131,23 @@ impl FfiTransportConfig {
     }
 }
 
+impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
+    fn from(value: FfiEncryptionConfig) -> Self {
+        matrix_rtc_core::EncryptionConfig {
+            delay_before_use_ms: value.delay_before_use_ms.unwrap_or(5000),
+            key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
+            manage_media_keys: value.manage_media_keys.unwrap_or(true),
+        }
+    }
+}
+
 /// Conversion from FFI join params to core join params.
 impl FfiJoinSessionParams {
     pub fn into_core(
         self,
     ) -> Result<matrix_rtc_core::JoinSessionParams, matrix_rtc_core::CommandError> {
         let transport = self.transport.into_core()?;
+        let encryption_config = self.encryption_config.map(Into::into);
         Ok(matrix_rtc_core::JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
@@ -133,6 +157,7 @@ impl FfiJoinSessionParams {
             application: self.application,
             transport,
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
+            encryption_config,
         })
     }
 }
@@ -203,6 +228,24 @@ pub trait CommandSenderCallback: Send + Sync {
         room_id: String,
         event_id: String,
     ) -> Result<(), CommandSenderError>;
+
+    /// Called when a to-device message needs to be sent (MSC4143).
+    ///
+    /// # Arguments
+    /// * `user_id` - The target user ID
+    /// * `device_id` - The target device ID (use "*" for all devices of the user)
+    /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
+    /// * `content_json` - The message content as a JSON string
+    ///
+    /// # Returns
+    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    fn send_to_device_message(
+        &self,
+        user_id: String,
+        device_id: String,
+        message_type: String,
+        content_json: String,
+    ) -> Result<(), CommandSenderError>;
 }
 
 /// FFI-friendly command sender that wraps a native callback implementation.
@@ -220,9 +263,9 @@ pub struct FfiCommandSender {
 impl FfiCommandSender {
     /// Creates a new FfiCommandSender with the given native callback implementation.
     ///
-    /// Returns an `Arc<dyn RtcCommandSender>` for thread-safe sharing with the core.
+    /// Returns an `Arc<FfiCommandSender>` for thread-safe sharing with the core.
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(callback: Arc<dyn CommandSenderCallback>) -> Arc<dyn RtcCommandSender> {
+    pub fn new(callback: Arc<dyn CommandSenderCallback>) -> Arc<FfiCommandSender> {
         Arc::new(Self { callback })
     }
 }
@@ -268,6 +311,22 @@ impl RtcCommandSender for FfiCommandSender {
     ) -> Result<(), CommandError> {
         self.callback
             .cancel_delayed_event(room_id, event_id)
+            .map_err(CommandError::from)?;
+        Ok(())
+    }
+
+    async fn send_to_device_message(
+        &self,
+        user_id: String,
+        device_id: String,
+        message_type: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+        self.callback
+            .send_to_device_message(user_id, device_id, message_type, content_json)
             .map_err(CommandError::from)?;
         Ok(())
     }
@@ -317,6 +376,20 @@ mod tests {
             println!(
                 "Mock cancel_delayed_event: room={}, event_id={}",
                 room_id, event_id
+            );
+            Ok(())
+        }
+
+        fn send_to_device_message(
+            &self,
+            user_id: String,
+            device_id: String,
+            message_type: String,
+            content_json: String,
+        ) -> Result<(), CommandSenderError> {
+            println!(
+                "Mock send_to_device_message: user={}, device={}, type={}, content={}",
+                user_id, device_id, message_type, content_json
             );
             Ok(())
         }
