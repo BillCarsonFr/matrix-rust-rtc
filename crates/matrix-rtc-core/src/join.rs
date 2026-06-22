@@ -21,6 +21,7 @@
 //! an RTC session, including user information, transport configuration, and
 //! call intent.
 
+use crate::encryption::types::EncryptionConfig;
 use crate::transport::RtcTransport;
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
@@ -64,6 +65,11 @@ pub struct JoinSessionParams {
     ///
     /// Defaults to `DEFAULT_KEEP_ALIVE_TIMEOUT_MS` if not specified.
     pub keep_alive_timeout_ms: Option<u64>,
+
+    /// Configuration for encryption key management.
+    ///
+    /// If not provided, defaults to `EncryptionConfig::default()`.
+    pub encryption_config: Option<EncryptionConfig>,
 }
 
 impl JoinSessionParams {
@@ -87,6 +93,7 @@ impl JoinSessionParams {
             application,
             transport,
             keep_alive_timeout_ms: None,
+            encryption_config: None,
         }
     }
 
@@ -106,6 +113,13 @@ impl JoinSessionParams {
     pub fn keep_alive_timeout_ms(&self) -> u64 {
         self.keep_alive_timeout_ms
             .unwrap_or(DEFAULT_KEEP_ALIVE_TIMEOUT_MS)
+    }
+
+    /// Gets the encryption configuration to use.
+    ///
+    /// Returns the configured config or the default.
+    pub fn encryption_config(&self) -> EncryptionConfig {
+        self.encryption_config.clone().unwrap_or_default()
     }
 
     /// Validates the parameters.

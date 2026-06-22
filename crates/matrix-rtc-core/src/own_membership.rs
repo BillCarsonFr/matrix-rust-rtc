@@ -102,9 +102,9 @@ pub struct KeepAliveInfo {
 /// - Sending join/leave events via the command sender
 /// - Managing the keep-alive delayed event lifecycle
 /// - Storing and retrieving the delayed event ID from callbacks
-pub struct OwnMembershipMachine {
+pub struct OwnMembershipMachine<T: RtcCommandSender> {
     /// Reference to the command sender for sending events.
-    command_sender: Arc<dyn RtcCommandSender>,
+    command_sender: Arc<T>,
     /// Room ID for the session.
     room_id: String,
     /// Slot ID for the session.
@@ -125,7 +125,7 @@ pub struct OwnMembershipMachine {
     keep_alive_timeout_ms: u64,
 }
 
-impl OwnMembershipMachine {
+impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// Creates a new own membership machine.
     ///
     /// # Arguments
@@ -140,7 +140,7 @@ impl OwnMembershipMachine {
     /// * `keep_alive_timeout_ms` - The keep-alive timeout in milliseconds (default: 30000)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        command_sender: Arc<dyn RtcCommandSender>,
+        command_sender: Arc<T>,
         room_id: String,
         slot_id: String,
         sticky_key: String,
@@ -165,7 +165,7 @@ impl OwnMembershipMachine {
 
     /// Creates a new own membership machine with the default keep-alive timeout.
     pub fn with_default_timeout(
-        command_sender: Arc<dyn RtcCommandSender>,
+        command_sender: Arc<T>,
         room_id: String,
         slot_id: String,
         sticky_key: String,

@@ -32,24 +32,29 @@ use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::session::{CallMembershipEvent, RtcSession};
 
 /// Holds and routes all active RTC sessions.
-#[derive(Default)]
-pub struct RtcSessionManager {
-    sessions: HashMap<SessionKey, RtcSession>,
+pub struct RtcSessionManager<T: RtcCommandSender> {
+    sessions: HashMap<SessionKey, RtcSession<T>>,
     /// Command sender for sending events to Matrix rooms.
     /// This is passed to sessions when they are created or when they need to send commands.
-    command_sender: Option<Arc<dyn RtcCommandSender>>,
+    command_sender: Option<Arc<T>>,
 }
 
-impl RtcSessionManager {
+impl<T: RtcCommandSender + 'static> Default for RtcSessionManager<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     // TODO(msc4143): add a manager-level lifecycle subscription API that emits
     // when sessions are created/removed (separate from per-session membership snapshots).
     /// Creates an empty session manager without a command sender.
     pub fn new() -> Self {
-        Self::default()
+        Default::default()
     }
 
     /// Creates an empty session manager with a command sender.
-    pub fn with_command_sender(command_sender: Arc<dyn RtcCommandSender>) -> Self {
+    pub fn with_command_sender(command_sender: Arc<T>) -> Self {
         Self {
             sessions: HashMap::new(),
             command_sender: Some(command_sender),
@@ -57,7 +62,7 @@ impl RtcSessionManager {
     }
 
     /// Sets the command sender for this manager.
-    pub fn set_command_sender(&mut self, command_sender: Arc<dyn RtcCommandSender>) {
+    pub fn set_command_sender(&mut self, command_sender: Arc<T>) {
         self.command_sender = Some(command_sender);
     }
 
@@ -91,11 +96,10 @@ impl RtcSessionManager {
         let key = SessionKey::new(params.room_id.clone(), params.slot_id.clone());
 
         // Get or create the session
-        let session = self.sessions.entry(key).or_insert_with(|| {
-            let mut session = RtcSession::new();
-            session.set_command_sender(command_sender.clone());
-            session
-        });
+        let session = self
+            .sessions
+            .entry(key)
+            .or_insert_with(|| RtcSession::with_command_sender(command_sender.clone()));
 
         // If the session doesn't have a command sender yet, set it
         if !session.has_command_sender() {
@@ -135,7 +139,7 @@ impl RtcSessionManager {
     }
 
     /// Applies an initial sticky snapshot for one room, typically from SDK `getStickyEvents`.
-    pub fn initial_sticky_for_room(
+    pub async fn initial_sticky_for_room(
         &mut self,
         room_id: &str,
         events: impl IntoIterator<Item = RawStickyEvent>,
@@ -161,14 +165,14 @@ impl RtcSessionManager {
         }
 
         for (key, batch) in batches {
-            self.session_for_key(key).initial_events(batch);
+            self.session_for_key(key).initial_events(batch).await;
         }
 
         Ok(())
     }
 
     /// Applies a sticky diff batch for one room.
-    pub fn sticky_update_for_room(
+    pub async fn sticky_update_for_room(
         &mut self,
         room_id: &str,
         update: StickyEventsUpdate,
@@ -234,14 +238,14 @@ impl RtcSessionManager {
         }
 
         for (key, batch) in batches {
-            self.session_for_key(key).handle_update(batch);
+            self.session_for_key(key).handle_update(batch).await;
         }
 
         Ok(())
     }
 
     /// Applies an initial sticky snapshot, grouped by room and slot.
-    pub fn on_sticky_events_snapshot_received(
+    pub async fn on_sticky_events_snapshot_received(
         &mut self,
         events: impl IntoIterator<Item = RawStickyEvent>,
     ) -> Result<(), EventConversionError> {
@@ -255,14 +259,14 @@ impl RtcSessionManager {
         }
 
         for (room_id, batch) in by_room {
-            self.initial_sticky_for_room(&room_id, batch)?;
+            self.initial_sticky_for_room(&room_id, batch).await?;
         }
 
         Ok(())
     }
 
     /// Applies one incremental sticky diff batch, grouped by room and slot.
-    pub fn on_sticky_events_update_received(
+    pub async fn on_sticky_events_update_received(
         &mut self,
         update: StickyEventsUpdate,
     ) -> Result<(), EventConversionError> {
@@ -293,7 +297,7 @@ impl RtcSessionManager {
         }
 
         for (room_id, batch) in by_room {
-            self.sticky_update_for_room(&room_id, batch)?;
+            self.sticky_update_for_room(&room_id, batch).await?;
         }
 
         Ok(())
@@ -310,7 +314,7 @@ impl RtcSessionManager {
         self.sessions.get(&key).map(RtcSession::member_count)
     }
 
-    fn session_for_key(&mut self, key: SessionKey) -> &mut RtcSession {
+    fn session_for_key(&mut self, key: SessionKey) -> &mut RtcSession<T> {
         self.sessions.entry(key).or_default()
     }
 

@@ -49,6 +49,7 @@ impl JsCommandSender {
     /// - sendStickyEvent(roomId, eventType, content, callback)
     /// - sendDelayedEvent(roomId, eventType, content, delayMs, callback)
     /// - cancelDelayedEvent(roomId, eventId, callback)
+    /// - sendToDeviceMessage(userId, deviceId, messageType, content, callback)
     #[wasm_bindgen(constructor)]
     pub fn new(client: JsValue) -> Self {
         Self {
@@ -218,6 +219,43 @@ impl RtcCommandSender for JsCommandSender {
             .call_js_promise_method(
                 "cancelDelayedEvent",
                 vec![JsValue::from_str(&room_id), JsValue::from_str(&event_id)],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        // Convert the Promise to a Rust Future and await it
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        Ok(())
+    }
+
+    async fn send_to_device_message(
+        &self,
+        user_id: String,
+        device_id: String,
+        message_type: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        self.log_command(&format!(
+            "send_to_device_message: user={}, device={}, type={}",
+            user_id, device_id, message_type
+        ));
+
+        // Convert Rust Value to JsValue
+        let js_content = serde_wasm_bindgen::to_value(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+        // Create a Promise that will be resolved by the JS callback
+        let promise = self
+            .call_js_promise_method(
+                "sendToDeviceMessage",
+                vec![
+                    JsValue::from_str(&user_id),
+                    JsValue::from_str(&device_id),
+                    JsValue::from_str(&message_type),
+                    js_content,
+                ],
             )
             .map_err(JsCommandSender::convert_js_error)?;
 
