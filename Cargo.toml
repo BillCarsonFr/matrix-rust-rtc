@@ -20,6 +20,7 @@ members = [
     "crates/matrix-rtc-core",
     "crates/matrix-rtc-wasm",
     "crates/matrix-rtc-ffi",
+    "crates/matrix-rtc-livekit",
     "uniffi-bindgen",
 ]
 resolver = "2"
