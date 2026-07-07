@@ -96,5 +96,8 @@ jobs:
         run: cargo test -p matrix-rtc-ffi
 
       - name: Run all tests
-        run: cargo test --all
+        # Exclude matrix-rtc-livekit: it depends on livekit/libwebrtc (native
+        # C++) and cannot build on this runner without a C++ toolchain. It is
+        # not part of the mobile/FFI surface this job covers.
+        run: cargo test --workspace --exclude matrix-rtc-livekit
 

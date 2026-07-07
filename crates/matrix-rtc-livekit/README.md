@@ -24,6 +24,9 @@ targets wasm.
 - `matrix-sdk` *(off by default)* — provides a default `OpenIdTokenSource`
   implementation for `matrix_sdk::Client`, and enables the `connect` example.
 
+> This crate depends on `livekit`, which pulls in `libwebrtc` (native C++), so
+> building it requires a C++ toolchain. CI jobs without one must not build it.
+
 ## End-to-end encryption status
 
 E2EE frame encryption is **not yet wired**. `matrix-rtc-core` produces

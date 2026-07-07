@@ -36,13 +36,15 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 base64 = "0.22"
 # Keep default features (notably `tokio`, which enables the signal client) and
-# select the rustls TLS backend for the SFU WebSocket/HTTP connections.
+# select the rustls TLS backend for the SFU WebSocket/HTTP connections. This
+# pulls in libwebrtc (native C++) via webrtc-sys, so building this crate needs a
+# C++ toolchain — CI jobs that lack one must not build this crate.
 livekit = { version = "0.7", features = ["rustls-tls-native-roots"] }
 matrix-sdk = { version = "0.18", optional = true }
 
 [features]
 # Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`.
-# Enables the `connect` example. Off by default to keep the core crate light.
+# Enables the `connect` example. Off by default to keep the base crate light.
 matrix-sdk = ["dep:matrix-sdk"]
 
 [dev-dependencies]
