@@ -1,0 +1,56 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+[package]
+name = "matrix-rtc-livekit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MSC4195 LiveKit transport for MatrixRTC: SFU token exchange, media session, and E2EE key bridging."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+base64 = "0.22"
+# Keep default features (notably `tokio`, which enables the signal client) and
+# select the rustls TLS backend for the SFU WebSocket/HTTP connections. This
+# pulls in libwebrtc (native C++) via webrtc-sys, so building this crate needs a
+# C++ toolchain — CI jobs that lack one must not build this crate.
+livekit = { version = "0.7", features = ["rustls-tls-native-roots"] }
+matrix-sdk = { version = "0.18", optional = true }
+
+[features]
+# Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`.
+# Enables the `connect` example. Off by default to keep the base crate light.
+matrix-sdk = ["dep:matrix-sdk"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "connect"
+required-features = ["matrix-sdk"]

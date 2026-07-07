@@ -14,8 +14,10 @@ This project provides a core RTC SDK in Rust that can be used across multiple pl
 - `crates/matrix-rtc-wasm`: wasm bindings that accept room-scoped JS sticky event payloads.
 - `web`: browser-first JavaScript package and wasm-pack build/test scaffold for the wasm bindings.
 - `crates/matrix-rtc-ffi`: UniFFI-based native bindings around the same room-scoped manager API.
+- `crates/matrix-rtc-livekit`: MSC4195 LiveKit transport — SFU token exchange, media session (subscribe), and the E2EE key bridge. Native-only (pulls in `libwebrtc`).
 - `mobile/android`: Android Gradle library module and build scripts for AAR packaging.
 - `mobile/ios`: iOS Swift Package and build scripts for XCFramework packaging.
+- `demo/backend`: local MatrixRTC stack (Synapse + LiveKit + lk-jwt-service + nginx/TLS + Element Web) for running the demo against a real SFU.
 
 ## Quick Mobile Builds
 
