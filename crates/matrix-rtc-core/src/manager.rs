@@ -303,6 +303,19 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         Ok(())
     }
 
+    /// Restarts the keep-alive delayed-leave for one `(room_id, slot_id)` session.
+    ///
+    /// Call periodically (e.g. every 15 s) while joined so the dead man's switch
+    /// timer keeps getting pushed back. Returns `false` if no such session is
+    /// joined.
+    pub async fn heartbeat(&mut self, room_id: &str, slot_id: &str) -> bool {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        match self.sessions.get_mut(&key) {
+            Some(session) => session.heartbeat().await,
+            None => false,
+        }
+    }
+
     /// Returns the number of tracked sessions.
     pub fn session_count(&self) -> usize {
         self.sessions.len()

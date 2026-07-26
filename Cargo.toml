@@ -42,3 +42,18 @@ tokio = { version = "1", features = ["rt", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 log = "0.4"
 async-trait = "0.1"
+
+# The experimental matrix-sdk fork (used by matrix-rtc-livekit behind the
+# `matrix-sdk` feature) carries these git pins in its own `[patch.crates-io]`.
+# Cargo does NOT propagate a dependency's `[patch]` to the consuming workspace,
+# so we must replicate them here verbatim, or the SDK fails to build. ruma is a
+# plain git dependency in the fork and resolves transitively, so it needs no patch.
+# Source: BillCarsonFr/matrix-rust-sdk@valere/experimental_sticky Cargo.toml.
+[patch.crates-io]
+async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
+const_panic = { git = "https://github.com/jplatte/const_panic", rev = "e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f" }
+# Needed to fix rotation log issue on Android (https://github.com/tokio-rs/tracing/issues/2937)
+tracing = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
+tracing-core = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
+tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
+tracing-appender = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }

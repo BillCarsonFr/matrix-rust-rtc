@@ -38,9 +38,21 @@ pub mod keys;
 pub mod session;
 pub mod token;
 
+// Synthetic-audio test utilities (tone gen / record / WAV / frequency detect),
+// used by the `e2e_call` example and integration tests. Gated so they never
+// enter a normal build — enabled by `cfg(test)` and the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
+pub mod media;
+
+#[cfg(feature = "matrix-sdk")]
+pub mod matrix_bridge;
+
 pub use keys::{MediaKeyBridge, ParticipantKey};
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};
+
+#[cfg(feature = "matrix-sdk")]
+pub use matrix_bridge::{SdkCommandSender, run_sticky_bridge};
 
 /// Configuration identifying the MatrixRTC slot to connect to.
 #[derive(Clone, Debug)]
