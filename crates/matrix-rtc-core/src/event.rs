@@ -21,7 +21,7 @@
 //! SDK layers into the core without exposing host SDK types here.
 //! Conversion then interprets DTO content as MatrixRTC membership events.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::session::{CallMembershipEvent, JoinedMembership, LeftMembership};
 use crate::transport::RawRtcTransport;
@@ -40,26 +40,38 @@ pub struct RawStickyEvent {
     pub content: RawStickyEventContent,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 /// Content DTO extracted from a sticky Matrix event (MSC4143 compliant).
+///
+/// `Deserialize` lets host SDK layers parse an `m.rtc.member` event's `content`
+/// object straight into this DTO (see `matrix-rtc-livekit`'s `matrix_bridge`).
+/// Only `slot_id` and `sticky_key` are required; a disconnect event carries just
+/// those plus `disconnect_reason`, so the rest default.
 pub struct RawStickyEventContent {
     /// MatrixRTC slot identifier.
     pub slot_id: String,
     /// Sticky-map key associated with the sender/device membership.
     pub sticky_key: String,
     /// Application info from `content.application` (MSC4143).
+    #[serde(default)]
     pub application: crate::session::ApplicationInfo,
     /// Member info from `content.member` (MSC4143).
+    #[serde(default)]
     pub member: crate::session::MemberInfo,
     /// Protocol versions from `content.versions` (MSC4143).
+    #[serde(default)]
     pub versions: Vec<String>,
     /// Optional disconnect reason for disconnected membership updates (MSC4143).
+    #[serde(default)]
     pub disconnect_reason: Option<crate::session::DisconnectReason>,
     /// Optional relates-to reference (MSC4143).
+    #[serde(default)]
     pub m_relates_to: Option<crate::session::RelatesTo>,
     /// RTC transports from `content.rtc_transports` (MSC4143 / MSC4195).
+    #[serde(default)]
     pub rtc_transports: Option<Vec<RawRtcTransport>>,
     /// Timestamp (ms) when this membership was created (MSC4143: `created_ts`).
+    #[serde(default)]
     pub created_ts: Option<u64>,
 }
 
