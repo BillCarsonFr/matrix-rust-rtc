@@ -47,7 +47,10 @@ pub mod media;
 #[cfg(feature = "matrix-sdk")]
 pub mod matrix_bridge;
 
-pub use keys::{MediaKeyBridge, ParticipantKey};
+pub use keys::{
+    MediaKeyBridge, NATIVE_KEY_RING_MAX, ParticipantKey, msc4195_key_provider,
+    msc4195_key_provider_options,
+};
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};
 

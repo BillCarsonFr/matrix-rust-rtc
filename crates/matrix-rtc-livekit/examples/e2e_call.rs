@@ -50,13 +50,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
-use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
 use matrix_sdk::ruma::events::InitialStateEvent;
 use matrix_sdk::ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
+use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 use tokio::sync::Mutex;
 
@@ -116,8 +116,14 @@ async fn login_and_sync(
         .initial_device_display_name("matrix-rtc-livekit e2e_call")
         .send()
         .await?;
-    let user_id = client.user_id().ok_or("no user id after login")?.to_string();
-    let device_id = client.device_id().ok_or("no device id after login")?.to_string();
+    let user_id = client
+        .user_id()
+        .ok_or("no user id after login")?
+        .to_string();
+    let device_id = client
+        .device_id()
+        .ok_or("no device id after login")?
+        .to_string();
     println!("[{user}] logged in as {user_id} (device {device_id})");
 
     let sync = SyncService::builder(client.clone()).build().await?;
@@ -162,9 +168,9 @@ async fn join_rtc(
     let device_id = client.device_id().ok_or("no device id")?.to_string();
 
     // Wire the manager + sticky bridge.
-    let manager: Manager = Arc::new(Mutex::new(RtcSessionManager::with_command_sender(Arc::new(
-        SdkCommandSender::new(client.clone()),
-    ))));
+    let manager: Manager = Arc::new(Mutex::new(RtcSessionManager::with_command_sender(
+        Arc::new(SdkCommandSender::new(client.clone())),
+    )));
     // The core's `RtcCommandSender` is `?Send`, so futures that drive the manager
     // are `!Send` and must run on the current thread via `spawn_local` (the caller
     // wraps the flow in a `LocalSet`).
@@ -248,7 +254,11 @@ async fn wait_for_joined_members(
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
     for _ in 0..60 {
-        let count = room.members(RoomMemberships::JOIN).await.map(|m| m.len()).unwrap_or(0);
+        let count = room
+            .members(RoomMemberships::JOIN)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         if count >= target {
             println!("[{label}] room has {count} joined members");
             return Ok(());
@@ -419,12 +429,16 @@ async fn record_and_verify_tone(bob: &mut Participant) -> Result<bool, Box<dyn E
         };
 
         match event {
-            RoomEvent::TrackSubscribed { track, participant, .. } => {
+            RoomEvent::TrackSubscribed {
+                track, participant, ..
+            } => {
                 println!("[bob] track subscribed from {:?}", participant.identity());
                 if let RemoteTrack::Audio(audio) = track {
                     println!("[bob] recording ~2s of audio...");
                     let pcm = media::record_track(&audio, Duration::from_secs(2)).await;
-                    if let Err(error) = media::write_wav("/tmp/e2e_received.wav", &pcm, media::SAMPLE_RATE) {
+                    if let Err(error) =
+                        media::write_wav("/tmp/e2e_received.wav", &pcm, media::SAMPLE_RATE)
+                    {
                         eprintln!("[bob] failed to write WAV: {error}");
                     } else {
                         println!("[bob] wrote /tmp/e2e_received.wav ({} samples)", pcm.len());

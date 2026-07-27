@@ -35,7 +35,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use livekit::options::TrackPublishOptions;
-use livekit::prelude::{LocalAudioTrack, LocalTrack, RemoteAudioTrack, RtcAudioSource, TrackSource};
+use livekit::prelude::{
+    LocalAudioTrack, LocalTrack, RemoteAudioTrack, RtcAudioSource, TrackSource,
+};
 use livekit::webrtc::audio_source::AudioSourceOptions;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
@@ -68,8 +70,7 @@ impl Drop for ToneHandle {
 /// returned [`ToneHandle`] is dropped.
 pub async fn publish_tone(session: &LiveKitSession, freq_hz: f64) -> Result<ToneHandle, Error> {
     let source = NativeAudioSource::new(AudioSourceOptions::default(), SAMPLE_RATE, CHANNELS, 1000);
-    let track =
-        LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
+    let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
     session
         .room()
         .local_participant()
