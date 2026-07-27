@@ -35,8 +35,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
-use crate::session::{ApplicationInfo, DisconnectReason, MemberInfo};
-use crate::transport::RtcTransport;
+use crate::event::RawStickyEventContent;
+use crate::session::DisconnectReason;
+use crate::transport::{RawRtcTransport, RtcTransport};
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
@@ -319,33 +320,24 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
     /// Builds MSC4143-compliant content for a delayed leave event (dead man's switch).
     fn build_delayed_leave_content(&self, slot_id: &str, sticky_key: &str) -> Value {
-        // Build typed disconnect reason
         let disconnect_reason = DisconnectReason {
             class: Some("server_error".to_string()),
             reason: Some("keep_alive_timeout".to_string()),
             description: Some("Dead man's switch: client failed to heartbeat".to_string()),
         };
-        let disconnect_reason_value =
-            serde_json::to_value(disconnect_reason).unwrap_or_else(|_| {
-                json!({
-                    "class": "server_error",
-                    "reason": "keep_alive_timeout",
-                    "description": "Dead man's switch: client failed to heartbeat"
-                })
-            });
-
-        // Build the final content JSON with typed disconnect_reason
-        json!({
-            "slot_id": slot_id,
-            "sticky_key": sticky_key,
-            "disconnect_reason": disconnect_reason_value
-        })
+        let content = RawStickyEventContent::for_leave(
+            slot_id.to_string(),
+            sticky_key.to_string(),
+            Some(disconnect_reason),
+        );
+        serde_json::to_value(content).expect("m.rtc.member content is always serializable")
     }
 
     /// Builds MSC4143-compliant content for a join membership event.
     ///
-    /// Uses typed structs for MSC4143 fields (application, member) but keeps transport
-    /// as pre-serialized Value since it comes from transport_to_json().
+    /// The `transport_json` comes pre-serialized from `transport_to_json()`; it is parsed
+    /// back into the typed `RawRtcTransport` (a lossless round-trip) so the whole content
+    /// is built from the single shared `RawStickyEventContent` type.
     fn build_join_content(
         &self,
         slot_id: &str,
@@ -355,43 +347,19 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         application_type: &str,
         transport_json: Option<Value>,
     ) -> Value {
-        // Build typed application info and serialize it to ensure proper structure
-        let application = ApplicationInfo {
-            application_type: Some(application_type.to_string()),
-            extra: std::collections::BTreeMap::new(),
-        };
-        let application_value =
-            serde_json::to_value(application).unwrap_or_else(|_| json!({"type": application_type}));
+        let rtc_transports = transport_json
+            .and_then(|v| serde_json::from_value::<RawRtcTransport>(v).ok())
+            .map(|t| vec![t]);
 
-        // Build typed member info and serialize it
-        let member = MemberInfo {
-            id: Some(sticky_key.to_string()),
-            claimed_user_id: Some(user_id.to_string()),
-            claimed_device_id: Some(device_id.to_string()),
-        };
-        let member_value = serde_json::to_value(member).unwrap_or_else(|_| {
-            json!({
-                "id": sticky_key,
-                "claimed_user_id": user_id,
-                "claimed_device_id": device_id
-            })
-        });
-
-        // Build the final content JSON with typed fields
-        let mut content = json!({
-            "slot_id": slot_id,
-            "sticky_key": sticky_key,
-            "application": application_value,
-            "member": member_value,
-            "versions": ["v0"]
-        });
-
-        // Add transport if provided (already pre-serialized)
-        if let Some(transport) = transport_json {
-            content["rtc_transports"] = serde_json::Value::Array(vec![transport]);
-        }
-
-        content
+        let content = RawStickyEventContent::for_join(
+            slot_id.to_string(),
+            sticky_key.to_string(),
+            user_id.to_string(),
+            device_id.to_string(),
+            application_type.to_string(),
+            rtc_transports,
+        );
+        serde_json::to_value(content).expect("m.rtc.member content is always serializable")
     }
 
     /// Leaves the session by sending a leave event and canceling the keep-alive.
@@ -406,43 +374,22 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
 
-        // Build MSC4143-compliant leave content
-        // disconnect_reason must be an object with class and reason fields
-        let leave_content = if let Some(reason) = disconnect_reason {
-            // Map simple string reason to MSC4143 disconnect_reason object
+        // Build MSC4143-compliant leave content.
+        // Map any simple string reason to a typed disconnect_reason object.
+        let disconnect_reason = disconnect_reason.map(|reason| {
             let (class, reason_str) = self.map_reason_to_msc4143(&reason);
-
-            // Clone the strings for use in fallback
-            let class_clone = class.clone();
-            let reason_str_clone = reason_str.clone();
-            let reason_clone = reason.clone();
-
-            // Build typed disconnect reason and serialize it
-            let disconnect_reason = DisconnectReason {
+            DisconnectReason {
                 class: Some(class),
                 reason: Some(reason_str),
                 description: Some(reason),
-            };
-            let disconnect_reason_value =
-                serde_json::to_value(disconnect_reason).unwrap_or_else(|_| {
-                    json!({
-                        "class": class_clone,
-                        "reason": reason_str_clone,
-                        "description": reason_clone
-                    })
-                });
-
-            json!({
-                "slot_id": slot_id,
-                "sticky_key": sticky_key,
-                "disconnect_reason": disconnect_reason_value
-            })
-        } else {
-            json!({
-                "slot_id": slot_id,
-                "sticky_key": sticky_key,
-            })
-        };
+            }
+        });
+        let leave_content = serde_json::to_value(RawStickyEventContent::for_leave(
+            slot_id.clone(),
+            sticky_key.clone(),
+            disconnect_reason,
+        ))
+        .expect("m.rtc.member content is always serializable");
 
         // Update state to Leaving
         {
@@ -828,5 +775,82 @@ mod tests {
 
         // Should have scheduled at least one more (the cancel may or may not have been processed)
         assert!(new_count > initial_count);
+    }
+
+    fn test_machine(
+        mock_sender: Arc<MockCommandSender>,
+    ) -> OwnMembershipMachine<MockCommandSender> {
+        OwnMembershipMachine::with_default_timeout(
+            mock_sender,
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            APPLICATION_TYPE.to_string(),
+        )
+    }
+
+    // Regression: every write path must emit the MSC4354 unstable id `msc4354_sticky_key`,
+    // never the bare `sticky_key`. The join, delayed-leave and leave content are all built
+    // from the single shared `RawStickyEventContent`, so the rename is applied everywhere.
+
+    #[tokio::test]
+    async fn test_join_and_delayed_leave_use_unstable_sticky_key() {
+        let mock_sender = Arc::new(MockCommandSender::new());
+        test_machine(mock_sender.clone())
+            .join(None)
+            .await
+            .expect("join should succeed");
+
+        let (_, _, join_content) = &mock_sender.sticky_events.lock().unwrap()[0];
+        assert_eq!(
+            join_content
+                .get("msc4354_sticky_key")
+                .and_then(|v| v.as_str()),
+            Some("alice-device-a")
+        );
+        assert!(join_content.get("sticky_key").is_none());
+        // Join events carry no disconnect_reason.
+        assert!(join_content.get("disconnect_reason").is_none());
+
+        let (_, _, delayed_content, _) = &mock_sender.delayed_events.lock().unwrap()[0];
+        assert_eq!(
+            delayed_content
+                .get("msc4354_sticky_key")
+                .and_then(|v| v.as_str()),
+            Some("alice-device-a")
+        );
+        assert!(delayed_content.get("sticky_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_leave_uses_unstable_sticky_key_and_round_trips() {
+        use crate::event::RawStickyEventContent;
+
+        let mock_sender = Arc::new(MockCommandSender::new());
+        test_machine(mock_sender.clone())
+            .leave(Some("user_left".to_string()))
+            .await
+            .expect("leave should succeed");
+
+        let (_, _, leave_content) = &mock_sender.sticky_events.lock().unwrap()[0];
+        assert_eq!(
+            leave_content
+                .get("msc4354_sticky_key")
+                .and_then(|v| v.as_str()),
+            Some("alice-device-a")
+        );
+        assert!(leave_content.get("sticky_key").is_none());
+        // Leave events carry only slot_id / sticky_key / disconnect_reason.
+        assert!(leave_content.get("application").is_none());
+        assert!(leave_content.get("member").is_none());
+        assert!(leave_content.get("versions").is_none());
+
+        // The emitted content must deserialize back through the shared struct with the
+        // sticky_key intact — this is the exact regression the refactor guards against.
+        let parsed: RawStickyEventContent =
+            serde_json::from_value(leave_content.clone()).expect("leave content must round-trip");
+        assert_eq!(parsed.sticky_key, "alice-device-a");
     }
 }

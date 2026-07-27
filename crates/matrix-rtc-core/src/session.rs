@@ -337,6 +337,13 @@ pub struct MemberInfo {
     pub claimed_user_id: Option<String>,
 }
 
+impl MemberInfo {
+    /// True when no member fields are set (used to skip serialization for leave events).
+    pub fn is_empty(&self) -> bool {
+        self.id.is_none() && self.claimed_device_id.is_none() && self.claimed_user_id.is_none()
+    }
+}
+
 /// MSC4143: Application info
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationInfo {
@@ -344,6 +351,13 @@ pub struct ApplicationInfo {
     pub application_type: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl ApplicationInfo {
+    /// True when no application fields are set (used to skip serialization for leave events).
+    pub fn is_empty(&self) -> bool {
+        self.application_type.is_none() && self.extra.is_empty()
+    }
 }
 
 /// MSC4143: Disconnect reason
