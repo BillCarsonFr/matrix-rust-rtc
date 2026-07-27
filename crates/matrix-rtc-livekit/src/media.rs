@@ -125,12 +125,10 @@ pub async fn record_track(track: &RemoteAudioTrack, dur: Duration) -> Vec<i16> {
     let mut stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, CHANNELS as i32);
     let mut pcm = Vec::new();
     let deadline = tokio::time::Instant::now() + dur;
-    loop {
-        match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(frame)) => pcm.extend_from_slice(&frame.data),
-            // Deadline reached, or the stream ended.
-            Err(_) | Ok(None) => break,
-        }
+    // Stops when the deadline is reached (timeout `Err`) or the stream ends
+    // (`Ok(None)`).
+    while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        pcm.extend_from_slice(&frame.data);
     }
     pcm
 }

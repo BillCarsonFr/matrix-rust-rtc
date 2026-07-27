@@ -55,9 +55,10 @@ jobs:
         with:
           components: clippy
 
-      # Exclude matrix-rtc-livekit for the same reason as the test job in
-      # build-mobile.yml: it depends on livekit/libwebrtc (native C++) and
-      # cannot build on this runner without a C++ toolchain. Its clippy coverage
-      # stays a known gap until a C++-capable runner is available.
+      # Covers the whole workspace, including matrix-rtc-livekit. That crate
+      # pulls in livekit/libwebrtc: webrtc-sys downloads a prebuilt libwebrtc
+      # and needs a C++ toolchain to compile its glue and link, which
+      # ubuntu-latest provides (build-essential). If the prebuilt fetch or link
+      # proves flaky/slow here, re-add `--exclude matrix-rtc-livekit`.
       - name: Run clippy
-        run: cargo clippy --workspace --exclude matrix-rtc-livekit --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
