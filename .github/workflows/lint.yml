@@ -1,0 +1,70 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+name: Lint
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # rustfmt only parses source, so it needs no C++ toolchain and can cover
+      # the whole workspace, including matrix-rtc-livekit.
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # matrix-rtc-livekit pulls in livekit/webrtc-sys. Its build script runs
+      # even under `cargo clippy` (to generate cxx bindings and link flags) and
+      # shells out to pkg-config for glib-2.0, which the prebuilt linux
+      # libwebrtc dynamically links. ubuntu-latest ships a C++ toolchain but not
+      # libglib2.0-dev, so install it here.
+      - name: Install webrtc-sys system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      # Covers the whole workspace, including matrix-rtc-livekit.
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

@@ -35,7 +35,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use livekit::options::TrackPublishOptions;
-use livekit::prelude::{LocalAudioTrack, LocalTrack, RemoteAudioTrack, RtcAudioSource, TrackSource};
+use livekit::prelude::{
+    LocalAudioTrack, LocalTrack, RemoteAudioTrack, RtcAudioSource, TrackSource,
+};
 use livekit::webrtc::audio_source::AudioSourceOptions;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
@@ -68,8 +70,7 @@ impl Drop for ToneHandle {
 /// returned [`ToneHandle`] is dropped.
 pub async fn publish_tone(session: &LiveKitSession, freq_hz: f64) -> Result<ToneHandle, Error> {
     let source = NativeAudioSource::new(AudioSourceOptions::default(), SAMPLE_RATE, CHANNELS, 1000);
-    let track =
-        LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
+    let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
     session
         .room()
         .local_participant()
@@ -124,12 +125,10 @@ pub async fn record_track(track: &RemoteAudioTrack, dur: Duration) -> Vec<i16> {
     let mut stream = NativeAudioStream::new(track.rtc_track(), SAMPLE_RATE as i32, CHANNELS as i32);
     let mut pcm = Vec::new();
     let deadline = tokio::time::Instant::now() + dur;
-    loop {
-        match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(frame)) => pcm.extend_from_slice(&frame.data),
-            // Deadline reached, or the stream ended.
-            Err(_) | Ok(None) => break,
-        }
+    // Stops when the deadline is reached (timeout `Err`) or the stream ends
+    // (`Ok(None)`).
+    while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        pcm.extend_from_slice(&frame.data);
     }
     pcm
 }

@@ -149,17 +149,31 @@ impl EncryptionKeySignalHandler for MediaKeyBridge {
     async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
         let key = ParticipantKey::from(signal);
         let index = i32::from(key.key_index);
-        // Indices at or past the ring size abort the process in the native
-        // frame cryptor rather than returning false, and peers control this
-        // value (see NATIVE_KEY_RING_MAX).
-        if index < NATIVE_KEY_RING_MAX
-            && let Some(provider) = &self.provider
-        {
-            // `rtc_backend_identity` equals `identity::pseudonymous_identity(...)`
-            // and maps directly onto the LiveKit participant identity.
-            // TODO: surface set_key failures to the host.
-            let identity = ParticipantIdentity::from(key.rtc_backend_identity.clone());
-            let _ = provider.set_key(&identity, index, key.key.clone());
+        if let Some(provider) = &self.provider {
+            // Indices at or past the ring size abort the process in the native
+            // frame cryptor rather than returning false, and peers control this
+            // value (see NATIVE_KEY_RING_MAX). Drop (but still record) such a
+            // key: media from that peer stays undecryptable, but the process
+            // survives.
+            if index < NATIVE_KEY_RING_MAX {
+                // `rtc_backend_identity` equals `identity::pseudonymous_identity(...)`
+                // and maps directly onto the LiveKit participant identity.
+                let identity = ParticipantIdentity::from(key.rtc_backend_identity.clone());
+                if !provider.set_key(&identity, index, key.key.clone()) {
+                    // TODO: surface set_key failures to the host.
+                    log::warn!(
+                        "LiveKit KeyProvider rejected key index {index} for participant {}; \
+                         its media will not decrypt",
+                        key.rtc_backend_identity,
+                    );
+                }
+            } else {
+                log::warn!(
+                    "dropping key index {index} for participant {}: exceeds native ring size \
+                     (NATIVE_KEY_RING_MAX = {NATIVE_KEY_RING_MAX}); its media will not decrypt",
+                    key.rtc_backend_identity,
+                );
+            }
         }
         self.keys
             .lock()
