@@ -21,9 +21,14 @@
 //! SDK layers into the core without exposing host SDK types here.
 //! Conversion then interprets DTO content as MatrixRTC membership events.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::session::{CallMembershipEvent, JoinedMembership, LeftMembership};
+use crate::session::{
+    ApplicationInfo, CallMembershipEvent, DisconnectReason, JoinedMembership, LeftMembership,
+    MemberInfo,
+};
 use crate::transport::RawRtcTransport;
 use thiserror::Error;
 
@@ -51,27 +56,28 @@ pub struct RawStickyEventContent {
     /// MatrixRTC slot identifier.
     pub slot_id: String,
     /// Sticky-map key associated with the sender/device membership.
+    #[serde(rename = "msc4354_sticky_key")]
     pub sticky_key: String,
     /// Application info from `content.application` (MSC4143).
-    #[serde(default)]
-    pub application: crate::session::ApplicationInfo,
+    #[serde(default, skip_serializing_if = "ApplicationInfo::is_empty")]
+    pub application: ApplicationInfo,
     /// Member info from `content.member` (MSC4143).
-    #[serde(default)]
-    pub member: crate::session::MemberInfo,
+    #[serde(default, skip_serializing_if = "MemberInfo::is_empty")]
+    pub member: MemberInfo,
     /// Protocol versions from `content.versions` (MSC4143).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<String>,
     /// Optional disconnect reason for disconnected membership updates (MSC4143).
-    #[serde(default)]
-    pub disconnect_reason: Option<crate::session::DisconnectReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnect_reason: Option<DisconnectReason>,
     /// Optional relates-to reference (MSC4143).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m_relates_to: Option<crate::session::RelatesTo>,
     /// RTC transports from `content.rtc_transports` (MSC4143 / MSC4195).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtc_transports: Option<Vec<RawRtcTransport>>,
     /// Timestamp (ms) when this membership was created (MSC4143: `created_ts`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_ts: Option<u64>,
 }
 
@@ -208,6 +214,62 @@ impl RawStickyEvent {
 }
 
 impl RawStickyEventContent {
+    /// Builds MSC4143-compliant content for a join (connected) membership event.
+    ///
+    /// This is the single source of truth for the outgoing `m.rtc.member` join wire
+    /// format: the same struct governs both serialization here and deserialization of
+    /// incoming events, so field names (e.g. the `msc4354_sticky_key` rename) live in
+    /// exactly one place.
+    pub(crate) fn for_join(
+        slot_id: String,
+        sticky_key: String,
+        user_id: String,
+        device_id: String,
+        application_type: String,
+        rtc_transports: Option<Vec<RawRtcTransport>>,
+    ) -> Self {
+        Self {
+            slot_id,
+            application: ApplicationInfo {
+                application_type: Some(application_type),
+                extra: BTreeMap::new(),
+            },
+            member: MemberInfo {
+                id: Some(sticky_key.clone()),
+                claimed_device_id: Some(device_id),
+                claimed_user_id: Some(user_id),
+            },
+            sticky_key,
+            versions: vec!["v0".to_string()],
+            disconnect_reason: None,
+            m_relates_to: None,
+            rtc_transports,
+            created_ts: None,
+        }
+    }
+
+    /// Builds MSC4143-compliant content for a leave (disconnected) membership event.
+    ///
+    /// Only `slot_id`, `sticky_key` and the optional `disconnect_reason` are emitted;
+    /// the connect-only fields are left empty and skipped during serialization.
+    pub(crate) fn for_leave(
+        slot_id: String,
+        sticky_key: String,
+        disconnect_reason: Option<DisconnectReason>,
+    ) -> Self {
+        Self {
+            slot_id,
+            sticky_key,
+            application: ApplicationInfo::default(),
+            member: MemberInfo::default(),
+            versions: Vec::new(),
+            disconnect_reason,
+            m_relates_to: None,
+            rtc_transports: None,
+            created_ts: None,
+        }
+    }
+
     /// MSC4143: An event is "connected" if it has member.id and application.type
     fn is_connected(&self) -> bool {
         self.member.id.as_deref().is_some_and(|v| !v.is_empty())
