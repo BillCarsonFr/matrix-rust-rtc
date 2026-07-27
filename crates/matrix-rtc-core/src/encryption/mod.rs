@@ -850,9 +850,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     async fn signal_key_to_app(&self, key: &OutboundEncryptionKey) {
         if let Some(handler) = &self.signal_handler {
             let rtc_backend_id = match &self.identity_mapper {
-                Some(mapper) => {
-                    mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id)
-                }
+                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
                 None => self.get_own_rtc_backend_identity(),
             };
             let signal = KeyMaterialSignal {

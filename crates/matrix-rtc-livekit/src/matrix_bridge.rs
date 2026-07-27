@@ -34,11 +34,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, update_delayed_event,
 };
-use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::ruma::events::{
     AnyMessageLikeEventContent, AnyToDeviceEventContent, MessageLikeEventType,
 };
@@ -177,7 +177,11 @@ impl RtcCommandSender for SdkCommandSender {
                 .collect()
         } else {
             let dev_id = <&DeviceId>::from(device_id.as_str());
-            match encryption.get_device(&user, dev_id).await.map_err(command_error)? {
+            match encryption
+                .get_device(&user, dev_id)
+                .await
+                .map_err(command_error)?
+            {
                 Some(device) => vec![device],
                 None => {
                     log::warn!(
@@ -194,16 +198,20 @@ impl RtcCommandSender for SdkCommandSender {
         }
         let recipients: Vec<&Device> = devices.iter().collect();
 
-        let raw: Raw<AnyToDeviceEventContent> = Raw::new(&content)
-            .map_err(command_error)?
-            .cast_unchecked();
+        let raw: Raw<AnyToDeviceEventContent> =
+            Raw::new(&content).map_err(command_error)?.cast_unchecked();
 
         // `AllDevices` sends to every device regardless of verification/cross-
         // signing state, which the throwaway logins in the e2e test lack. A
         // production integration should prefer `IdentityBasedStrategy` (MSC4153)
         // to refuse sending keys to unverified identities.
         let failures = encryption
-            .encrypt_and_send_raw_to_device(recipients, &message_type, raw, CollectStrategy::AllDevices)
+            .encrypt_and_send_raw_to_device(
+                recipients,
+                &message_type,
+                raw,
+                CollectStrategy::AllDevices,
+            )
             .await
             .map_err(command_error)?;
         if !failures.is_empty() {
