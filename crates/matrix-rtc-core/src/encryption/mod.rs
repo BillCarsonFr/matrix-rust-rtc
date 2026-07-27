@@ -178,6 +178,16 @@ pub trait EncryptionKeySignalHandler: Send + Sync {
     async fn on_new_key_material(&self, signal: KeyMaterialSignal);
 }
 
+/// Maps a `(user_id, device_id, member_id)` triple to the RTC-backend
+/// participant identity that the media layer addresses keys by.
+///
+/// `matrix-rtc-core` stays agnostic about how that identity is derived: a
+/// consumer (e.g. the LiveKit transport, which uses the MSC4195 pseudonymous
+/// identity) injects the derivation via [`EncryptionManager::set_identity_mapper`].
+/// When no mapper is set, the manager falls back to its default identity
+/// (`user_id:device_id` for the own key, `member_id` for inbound keys).
+pub type RtcIdentityMapper = Arc<dyn Fn(&str, &str, &str) -> String + Send + Sync>;
+
 /// The EncryptionManager manages encryption keys for an RTC session.
 ///
 /// This implementation follows the architecture of the JS SDK's RTCEncryptionManager
@@ -225,6 +235,10 @@ pub struct EncryptionManager<T: RtcCommandSender> {
 
     /// Handler for key material signals
     signal_handler: Option<Arc<dyn EncryptionKeySignalHandler>>,
+
+    /// Optional consumer-supplied mapper from `(user_id, device_id, member_id)`
+    /// to the RTC-backend participant identity (see [`RtcIdentityMapper`]).
+    identity_mapper: Option<RtcIdentityMapper>,
 
     /// Track if key distribution is in progress
     key_distribution_in_progress: Arc<Mutex<bool>>,
@@ -275,6 +289,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             inbound_keys: Arc::new(RwLock::new(HashMap::new())),
             config: EncryptionConfig::default(),
             signal_handler: None,
+            identity_mapper: None,
             key_distribution_in_progress: Arc::new(Mutex::new(false)),
             need_new_distribution: Arc::new(Mutex::new(false)),
             next_key_index: Arc::new(Mutex::new(0)),
@@ -291,6 +306,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// Sets the handler for key material signals.
     pub fn set_signal_handler(&mut self, handler: Arc<dyn EncryptionKeySignalHandler>) {
         self.signal_handler = Some(handler);
+    }
+
+    /// Sets the identity mapper used to derive the RTC-backend participant
+    /// identity carried in [`KeyMaterialSignal`]s (see [`RtcIdentityMapper`]).
+    pub fn set_identity_mapper(&mut self, mapper: RtcIdentityMapper) {
+        self.identity_mapper = Some(mapper);
     }
 
     /// Gets the current timestamp in milliseconds.
@@ -828,7 +849,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// Signals a key to the application layer.
     async fn signal_key_to_app(&self, key: &OutboundEncryptionKey) {
         if let Some(handler) = &self.signal_handler {
-            let rtc_backend_id = self.get_own_rtc_backend_identity();
+            let rtc_backend_id = match &self.identity_mapper {
+                Some(mapper) => {
+                    mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id)
+                }
+                None => self.get_own_rtc_backend_identity(),
+            };
             let signal = KeyMaterialSignal {
                 key: key.key.clone(),
                 key_index: key.key_index,
@@ -941,16 +967,24 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         key: InboundEncryptionKey,
         membership: &JoinedMembership,
     ) {
-        // Compute RTC backend identity for this participant
-        // For now, use member_id as the identity
-        // In the future, this could be hashed as per MSC4143
-        let rtc_backend_id = membership.member.id.clone().unwrap_or_else(|| {
-            format!(
-                "{}:{}",
-                membership.sender,
-                membership.member.claimed_device_id.as_deref().unwrap_or("")
-            )
-        });
+        // Compute the RTC backend identity for this participant. When a mapper is
+        // installed (e.g. the LiveKit transport's MSC4195 pseudonymous identity),
+        // derive it from the membership's user/device/member triple; otherwise
+        // fall back to the raw member_id (or `sender:device`).
+        let rtc_backend_id = match &self.identity_mapper {
+            Some(mapper) => mapper(
+                &membership.sender,
+                membership.member.claimed_device_id.as_deref().unwrap_or(""),
+                membership.member.id.as_deref().unwrap_or(""),
+            ),
+            None => membership.member.id.clone().unwrap_or_else(|| {
+                format!(
+                    "{}:{}",
+                    membership.sender,
+                    membership.member.claimed_device_id.as_deref().unwrap_or("")
+                )
+            }),
+        };
 
         // Store the key
         let map_key = key.member_id.clone();
@@ -1055,6 +1089,7 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
             inbound_keys: self.inbound_keys.clone(),
             config: self.config.clone(),
             signal_handler: self.signal_handler.clone(),
+            identity_mapper: self.identity_mapper.clone(),
             key_distribution_in_progress: self.key_distribution_in_progress.clone(),
             need_new_distribution: self.need_new_distribution.clone(),
             next_key_index: self.next_key_index.clone(),

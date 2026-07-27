@@ -38,10 +38,14 @@ use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateA
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, update_delayed_event,
 };
-use matrix_sdk::ruma::events::{AnyMessageLikeEventContent, MessageLikeEventType};
+use matrix_sdk::encryption::identities::Device;
+use matrix_sdk::ruma::events::{
+    AnyMessageLikeEventContent, AnyToDeviceEventContent, MessageLikeEventType,
+};
 use matrix_sdk::ruma::serde::Raw;
-use matrix_sdk::ruma::{RoomId, TransactionId};
+use matrix_sdk::ruma::{DeviceId, RoomId, TransactionId, UserId};
 use matrix_sdk::{Client, Room};
+use matrix_sdk_base::crypto::CollectStrategy;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
@@ -155,15 +159,59 @@ impl RtcCommandSender for SdkCommandSender {
         user_id: String,
         device_id: String,
         message_type: String,
-        _content: Value,
+        content: Value,
     ) -> Result<(), CommandError> {
-        // MSC4143 encryption-key distribution. Media frame E2EE is out of scope
-        // for the current end-to-end test (the LiveKit Rust SDK lacks the
-        // per-participant key import — see `keys.rs`), so this is a logged no-op
-        // rather than a real encrypted to-device send.
-        log::debug!(
-            "skipping to-device {message_type} to {user_id}/{device_id} (E2EE out of scope)"
-        );
+        // MSC4143 encryption-key distribution: send the media key as an
+        // Olm-encrypted to-device message to the target device(s).
+        let user = UserId::parse(&user_id).map_err(command_error)?;
+        let encryption = self.client.encryption();
+
+        // Resolve the recipient devices. `"*"` (used by the core to target every
+        // device of a user) fans out to all of the user's known devices.
+        let devices: Vec<Device> = if device_id == "*" {
+            encryption
+                .get_user_devices(&user)
+                .await
+                .map_err(command_error)?
+                .devices()
+                .collect()
+        } else {
+            let dev_id = <&DeviceId>::from(device_id.as_str());
+            match encryption.get_device(&user, dev_id).await.map_err(command_error)? {
+                Some(device) => vec![device],
+                None => {
+                    log::warn!(
+                        "no known device {device_id} for {user_id}; dropping to-device \
+                         {message_type}"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        if devices.is_empty() {
+            log::warn!("no devices to send to-device {message_type} to {user_id}");
+            return Ok(());
+        }
+        let recipients: Vec<&Device> = devices.iter().collect();
+
+        let raw: Raw<AnyToDeviceEventContent> = Raw::new(&content)
+            .map_err(command_error)?
+            .cast_unchecked();
+
+        // `AllDevices` sends to every device regardless of verification/cross-
+        // signing state, which the throwaway logins in the e2e test lack. A
+        // production integration should prefer `IdentityBasedStrategy` (MSC4153)
+        // to refuse sending keys to unverified identities.
+        let failures = encryption
+            .encrypt_and_send_raw_to_device(recipients, &message_type, raw, CollectStrategy::AllDevices)
+            .await
+            .map_err(command_error)?;
+        if !failures.is_empty() {
+            log::warn!(
+                "to-device {message_type}: {} device(s) did not receive the key",
+                failures.len()
+            );
+        }
         Ok(())
     }
 }

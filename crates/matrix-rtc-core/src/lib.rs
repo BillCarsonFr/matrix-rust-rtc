@@ -36,7 +36,9 @@ pub use encryption::types::{
     EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, OutboundEncryptionKey,
     OutdatedKeyFilter, ParticipantDeviceInfo,
 };
-pub use encryption::{EncryptionKeySignalHandler, EncryptionManager, KEY_MESSAGE_TYPE};
+pub use encryption::{
+    EncryptionKeySignalHandler, EncryptionManager, KEY_MESSAGE_TYPE, RtcIdentityMapper,
+};
 pub use error::{CommandError, JoinError, LeaveError};
 pub use event::{
     EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,

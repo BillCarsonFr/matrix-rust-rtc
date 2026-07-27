@@ -24,7 +24,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::commands::RtcCommandSender;
-use crate::error::{JoinError, LeaveError};
+use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
+use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::{
     EventConversionError, RawStickyEvent, RawStickyEventUpdate, StickyEventsUpdate,
 };
@@ -325,6 +326,67 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     pub fn member_count(&self, room_id: &str, slot_id: &str) -> Option<usize> {
         let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
         self.sessions.get(&key).map(RtcSession::member_count)
+    }
+
+    /// Registers a media key signal handler for one `(room_id, slot_id)`
+    /// session. Returns `false` if the session does not exist or has not joined.
+    pub fn set_encryption_signal_handler(
+        &mut self,
+        room_id: &str,
+        slot_id: &str,
+        handler: Arc<dyn EncryptionKeySignalHandler>,
+    ) -> bool {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get_mut(&key)
+            .is_some_and(|session| session.set_encryption_signal_handler(handler))
+    }
+
+    /// Installs the RTC-backend identity mapper for one `(room_id, slot_id)`
+    /// session. Returns `false` if the session does not exist or has not joined.
+    pub fn set_encryption_identity_mapper(
+        &mut self,
+        room_id: &str,
+        slot_id: &str,
+        mapper: RtcIdentityMapper,
+    ) -> bool {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get_mut(&key)
+            .is_some_and(|session| session.set_encryption_identity_mapper(mapper))
+    }
+
+    /// Routes a media encryption key received from a peer into every session in
+    /// `room_id`.
+    ///
+    /// The MSC4143 key to-device content carries no `slot_id`, so the key is
+    /// fanned out to all sessions of the room. This is exact for the common
+    /// single-slot-per-room case; multi-slot rooms would receive the key in
+    /// every slot (harmless — unmatched keys are buffered/ignored).
+    pub async fn receive_encryption_key(
+        &self,
+        room_id: &str,
+        sender_user_id: String,
+        sender_device_id: String,
+        key_b64: String,
+        key_index: u8,
+        member_id: String,
+    ) -> Result<(), CommandError> {
+        for (key, session) in self.sessions.iter() {
+            if key.room_id == room_id {
+                session
+                    .receive_encryption_key(
+                        sender_user_id.clone(),
+                        sender_device_id.clone(),
+                        key_b64.clone(),
+                        key_index,
+                        member_id.clone(),
+                        room_id.to_owned(),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     fn session_for_key(&mut self, key: SessionKey) -> &mut RtcSession<T> {
