@@ -229,40 +229,35 @@ pub async fn run_sticky_bridge(
         log::warn!("failed to apply initial sticky snapshot: {error}");
     }
 
-    loop {
-        match receiver.recv().await {
-            Ok(_) | Err(RecvError::Lagged(_)) => {
-                let current = snapshot(&room);
-                let current_ids: HashMap<StickyId, RawStickyEvent> =
-                    current.iter().map(|e| (sticky_id(e), e.clone())).collect();
+    while let Ok(_) | Err(RecvError::Lagged(_)) = receiver.recv().await {
+        let current = snapshot(&room);
+        let current_ids: HashMap<StickyId, RawStickyEvent> =
+            current.iter().map(|e| (sticky_id(e), e.clone())).collect();
 
-                // Entries that disappeared from the live set (TTL expiry) become
-                // leaves; entries still present (joins and explicit disconnects)
-                // are re-applied via `added`.
-                let removed = known
-                    .iter()
-                    .filter(|(id, _)| !current_ids.contains_key(*id))
-                    .map(|(_, event)| event.clone())
-                    .collect();
+        // Entries that disappeared from the live set (TTL expiry) become
+        // leaves; entries still present (joins and explicit disconnects)
+        // are re-applied via `added`.
+        let removed = known
+            .iter()
+            .filter(|(id, _)| !current_ids.contains_key(*id))
+            .map(|(_, event)| event.clone())
+            .collect();
 
-                let update = StickyEventsUpdate {
-                    added: current,
-                    updated: Vec::new(),
-                    removed,
-                };
+        let update = StickyEventsUpdate {
+            added: current,
+            updated: Vec::new(),
+            removed,
+        };
 
-                if let Err(error) = manager
-                    .lock()
-                    .await
-                    .on_sticky_events_update_received(update)
-                    .await
-                {
-                    log::warn!("failed to apply sticky update: {error}");
-                }
-
-                known = current_ids;
-            }
-            Err(RecvError::Closed) => break,
+        if let Err(error) = manager
+            .lock()
+            .await
+            .on_sticky_events_update_received(update)
+            .await
+        {
+            log::warn!("failed to apply sticky update: {error}");
         }
+
+        known = current_ids;
     }
 }
