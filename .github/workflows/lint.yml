@@ -55,10 +55,16 @@ jobs:
         with:
           components: clippy
 
-      # Covers the whole workspace, including matrix-rtc-livekit. That crate
-      # pulls in livekit/libwebrtc: webrtc-sys downloads a prebuilt libwebrtc
-      # and needs a C++ toolchain to compile its glue and link, which
-      # ubuntu-latest provides (build-essential). If the prebuilt fetch or link
-      # proves flaky/slow here, re-add `--exclude matrix-rtc-livekit`.
+      # matrix-rtc-livekit pulls in livekit/webrtc-sys. Its build script runs
+      # even under `cargo clippy` (to generate cxx bindings and link flags) and
+      # shells out to pkg-config for glib-2.0, which the prebuilt linux
+      # libwebrtc dynamically links. ubuntu-latest ships a C++ toolchain but not
+      # libglib2.0-dev, so install it here.
+      - name: Install webrtc-sys system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      # Covers the whole workspace, including matrix-rtc-livekit.
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
