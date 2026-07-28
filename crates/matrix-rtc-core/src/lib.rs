@@ -44,16 +44,18 @@ pub use event::{
     EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     StickyEventsUpdate,
 };
-pub use join::{JoinSessionParams, LeaveSessionParams};
+pub use join::{JoinSessionParams, LeaveSessionParams, generate_member_id};
 pub use manager::RtcSessionManager;
 pub use own_membership::{
     KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
 };
 pub use session::{
-    ApplicationInfo, CallMembershipEvent, DisconnectReason, JoinedMembership, LeftMembership,
-    MemberInfo, RelatesTo, RtcSession,
+    ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,
+    MemberInfo, Membership, RtcSession,
 };
-pub use transport::{LiveKitTransport, RawRtcTransport, RtcTransport, UnsupportedTransport};
+pub use transport::{
+    LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
+};
 
 #[cfg(test)]
 mod tests {
@@ -68,12 +70,13 @@ mod tests {
         slot_id: &str,
         sticky_key: &str,
         application_type: Option<&str>,
-        member_id: Option<&str>,
-        disconnect_reason: Option<&str>,
+        member: MemberInfo,
+        leave_reason: Option<LeaveReason>,
     ) -> RawStickyEvent {
         RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
             sender: sender.to_owned(),
+            sender_device_id: None,
             event_type: EVENT_TYPE_RTC_MEMBER.to_owned(),
             content: RawStickyEventContent {
                 slot_id: slot_id.to_owned(),
@@ -82,20 +85,9 @@ mod tests {
                     application_type: application_type.map(str::to_owned),
                     extra: std::collections::BTreeMap::new(),
                 },
-                member: MemberInfo {
-                    id: member_id.map(str::to_owned),
-                    claimed_device_id: None,
-                    claimed_user_id: None,
-                },
-                versions: Vec::new(),
-                disconnect_reason: disconnect_reason.map(|r| DisconnectReason {
-                    class: None,
-                    reason: Some(r.to_owned()),
-                    description: None,
-                }),
-                m_relates_to: None,
-                rtc_transports: None,
-                created_ts: None,
+                member,
+                transports: None,
+                leave_reason,
             },
         }
     }
@@ -106,14 +98,27 @@ mod tests {
             slot_id,
             sticky_key,
             Some("m.call"),
-            Some(sticky_key),
+            MemberInfo {
+                id: Some(sticky_key.to_owned()),
+                membership: Some(Membership::Join),
+            },
             None,
         )
     }
 
     #[allow(dead_code)]
     fn left_event(sender: &str, slot_id: &str, sticky_key: &str) -> RawStickyEvent {
-        sticky_event(sender, slot_id, sticky_key, None, None, Some("ice_failed"))
+        sticky_event(
+            sender,
+            slot_id,
+            sticky_key,
+            None,
+            MemberInfo {
+                id: Some(sticky_key.to_owned()),
+                membership: Some(Membership::Leave),
+            },
+            Some(LeaveReason::new(LeaveCode::Leave)),
+        )
     }
 
     fn left_membership(sender: &str, slot_id: &str, sticky_key: &str) -> CallMembershipEvent {
@@ -122,12 +127,8 @@ mod tests {
             slot_id: slot_id.to_owned(),
             sender: sender.to_owned(),
             sticky_key: sticky_key.to_owned(),
-            disconnect_reason: Some(DisconnectReason {
-                class: Some("server_error".to_owned()),
-                reason: Some("ice_failed".to_owned()),
-                description: None,
-            }),
-            m_relates_to: None,
+            member_id: Some(sticky_key.to_owned()),
+            leave_reason: Some(LeaveReason::new(LeaveCode::Leave)),
         })
     }
 
@@ -365,6 +366,7 @@ mod tests {
         let event = RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
             sender: "@alice:example.org".to_owned(),
+            sender_device_id: None,
             event_type: "m.rtc.member".to_owned(),
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
@@ -375,17 +377,13 @@ mod tests {
                 },
                 member: MemberInfo {
                     id: Some("alice-device-a".to_owned()),
-                    claimed_device_id: None,
-                    claimed_user_id: None,
+                    membership: Some(Membership::Join),
                 },
-                versions: Vec::new(),
-                disconnect_reason: None,
-                m_relates_to: None,
-                rtc_transports: Some(vec![RawRtcTransport {
+                transports: Some(MemberTransports::publishing(RawRtcTransport {
                     transport_type: "livekit".to_owned(),
                     extra_fields,
-                }]),
-                created_ts: None,
+                })),
+                leave_reason: None,
             },
         };
 
@@ -422,6 +420,7 @@ mod tests {
         let event = RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
             sender: "@alice:example.org".to_owned(),
+            sender_device_id: None,
             event_type: "m.rtc.member".to_owned(),
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
@@ -432,17 +431,13 @@ mod tests {
                 },
                 member: MemberInfo {
                     id: Some("alice-device-a".to_owned()),
-                    claimed_device_id: None,
-                    claimed_user_id: None,
+                    membership: Some(Membership::Join),
                 },
-                versions: Vec::new(),
-                disconnect_reason: None,
-                m_relates_to: None,
-                rtc_transports: Some(vec![RawRtcTransport {
+                transports: Some(MemberTransports::publishing(RawRtcTransport {
                     transport_type: "unknown_transport".to_owned(),
                     extra_fields,
-                }]),
-                created_ts: None,
+                })),
+                leave_reason: None,
             },
         };
 

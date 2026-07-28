@@ -236,6 +236,13 @@ fn sticky_id(event: &RawStickyEvent) -> StickyId {
 }
 
 /// Snapshot the room's live `m.rtc.member` sticky events as core DTOs.
+///
+/// The sending device comes from the event's decryption metadata, which is the
+/// only place MSC4143 leaves it: the proposal removed the self-asserted
+/// `member.claimed_device_id`, and key distribution targets "the devices that
+/// were used to encrypt these member events". Cleartext events have no such
+/// metadata, so `sender_device_id` stays `None` and key delivery falls back to
+/// all of the sender's devices.
 fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
     let room_id = room.room_id().to_string();
     room.live_sticky_events()
@@ -245,10 +252,15 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
             if event_type != "m.rtc.member" && event_type != "org.matrix.msc4143.rtc.member" {
                 return None;
             }
-            let content: RawStickyEventContent = entry.event.get_field("content").ok().flatten()?;
+            let content: RawStickyEventContent = entry.raw().get_field("content").ok().flatten()?;
+            let sender_device_id = entry
+                .encryption_info()
+                .and_then(|info| info.sender_device.as_ref())
+                .map(|device| device.to_string());
             Some(RawStickyEvent {
                 room_id: room_id.clone(),
                 sender: entry.key.sender.to_string(),
+                sender_device_id,
                 event_type,
                 content,
             })

@@ -49,27 +49,37 @@ futures-util = "0.3"
 # peer discovery) rides on it. See `matrix_bridge`. Keeps matrix-sdk's default
 # features (e2e-encryption, sqlite, rustls-aws-lc-rs) and adds sticky events.
 #
-# Pinned to rev 625c1a3 (the "feat(sticky): WIP experimental sticky events"
-# commit), NOT branch HEAD: the later "update ruma" commit (8c98e71) repoints ruma
-# to upstream `ruma/ruma`, which lacks the MSC4143 `events::rtc::member` types that
-# matrix-sdk-base's `unstable-msc4354` code needs, so HEAD does not compile. 625c1a3
-# pins ruma to `BillCarsonFr/ruma@161531d`, which has them. (Bump once the fork's
-# ruma pin is fixed.)
+# Pinned to rev 1815b08 ("chore(deps): Update ruma"), which builds on 7603577
+# ("keep encryption info for sticky events"). That commit makes `StickyLiveEvent`
+# carry a `TimelineEventKind` and so exposes `encryption_info().sender_device` —
+# the only source for a member event's sending device now that MSC4143 has
+# dropped `member.claimed_device_id`. See `matrix_bridge::snapshot`.
+#
+# 1815b08 is also what makes the fork compile again: it repoints ruma from
+# upstream `ruma/ruma@7f925c1` (which has no `events::rtc::member`) to
+# `BillCarsonFr/ruma@3da084e`, which carries the MSC4143 event types that
+# matrix-sdk-base's `unstable-msc4354` code needs.
+#
+# NOTE: that ruma still models the PRE-rewrite MSC4143 (`claimed_device_id`,
+# `versions`, `disconnect_reason`, flat `rtc_transports`). It only affects
+# matrix-sdk-base's own `active_rtc_member_stickies` /
+# `has_active_rtc_member_sticky` helpers, which we do not call — this crate
+# parses member content with `matrix_rtc_core::RawStickyEventContent`.
 # `experimental-send-custom-to-device` exposes
 # `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
 # keys as Olm-encrypted to-device messages (see `matrix_bridge`). It pulls in
 # `e2e-encryption`, already on via defaults.
-matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "625c1a31e174d69c291434a806834a548c840391", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
+matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "1815b08c22e455cc7926f01a9335684e2c425e64", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
 # Drives sliding sync (which auto-enables the sticky extension under
 # `unstable-msc4354`) plus the encryption sync, so sticky events actually flow.
 # Encryption support rides along via matrix-sdk's default features; ui only needs
 # the sticky feature for unification with matrix-sdk-base.
-matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "625c1a31e174d69c291434a806834a548c840391", optional = true, features = ["unstable-msc4354"] }
+matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "1815b08c22e455cc7926f01a9335684e2c425e64", optional = true, features = ["unstable-msc4354"] }
 # Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
 # to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it. Same
 # rev as matrix-sdk so cargo unifies the source; `e2e-encryption` gates the
 # `crypto` re-export.
-matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "625c1a31e174d69c291434a806834a548c840391", optional = true, features = ["e2e-encryption"] }
+matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "1815b08c22e455cc7926f01a9335684e2c425e64", optional = true, features = ["e2e-encryption"] }
 
 [features]
 # Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`,

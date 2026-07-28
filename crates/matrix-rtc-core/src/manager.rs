@@ -119,7 +119,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// * `room_id` - The room ID of the session to leave
     /// * `slot_id` - The slot ID of the session to leave
-    /// * `params` - The leave parameters including optional disconnect reason
+    /// * `params` - The leave parameters including the optional MSC4143 leave reason
     ///
     /// # Returns
     ///

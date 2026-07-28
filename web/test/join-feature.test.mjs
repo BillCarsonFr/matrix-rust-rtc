@@ -122,7 +122,12 @@ describe('WASM bindings with mock client', () => {
       // Check the content
       const content = stickyEvents[0].content;
       expect(getContentValue(content, 'slot_id')).toBe(SLOT_ID);
-      expect(getContentValue(content, 'sticky_key')).toBe(`${USER_ID}-${DEVICE_ID}`);
+      // member.id must be unique per join, so it must not be derived from the
+      // (stable) user and device IDs.
+      const stickyKey = getContentValue(content, 'msc4354_sticky_key');
+      expect(stickyKey).toBeTruthy();
+      expect(stickyKey).not.toBe(`${USER_ID}-${DEVICE_ID}`);
+      expect(getContentValue(getContentValue(content, 'member'), 'membership')).toBe('join');
 
       // Verify delayed event was scheduled for keep-alive
       const delayedEvents = mockClient._getDelayedEvents();
@@ -132,13 +137,14 @@ describe('WASM bindings with mock client', () => {
 
       // Check delayed event content
       const delayedContent = delayedEvents[0].content;
-      const disconnectReason = getContentValue(delayedContent, 'disconnect_reason');
-      expect(disconnectReason).toBeDefined();
-      expect(getContentValue(disconnectReason, 'reason')).toBe('keep_alive_timeout');
-      expect(getContentValue(disconnectReason, 'class')).toBe('server_error');
+      // The homeserver fires this on our behalf when heartbeats stop, so it must
+      // be distinguishable from a user-initiated leave.
+      const leaveReason = getContentValue(delayedContent, 'leave_reason');
+      expect(leaveReason).toBeDefined();
+      expect(getContentValue(leaveReason, 'code')).toBe('delayed_leave');
     });
 
-    it('leave() with disconnect reason works', async () => {
+    it('leave() with a leave reason works', async () => {
       const manager = new bindings.WasmRtcSessionManager();
       manager.setup_command_sender(mockClient);
 
@@ -168,7 +174,7 @@ describe('WASM bindings with mock client', () => {
 
       // Now leave
       const leaveParams = {
-        disconnect_reason: 'user_left',
+        leave_reason: { code: 'leave', reason: 'user hung up' },
       };
 
       await manager.leave(ROOM_ID, SLOT_ID, leaveParams);
@@ -176,18 +182,18 @@ describe('WASM bindings with mock client', () => {
       // Wait for the mock callbacks to fire
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // Leave should send a sticky event with disconnect_reason
+      // Leave should send a sticky event with the leave reason
       const stickyEvents = mockClient._getStickyEvents();
       expect(stickyEvents.length).toBe(1);
       expect(stickyEvents[0].eventType).toBe('m.rtc.member');
 
       // Check the content
       const content = stickyEvents[0].content;
-      const disconnectReason = getContentValue(content, 'disconnect_reason');
-      expect(disconnectReason).toBeDefined();
-      expect(getContentValue(disconnectReason, 'reason')).toBe('hangup');
-      expect(getContentValue(disconnectReason, 'class')).toBe('user_action');
-      expect(getContentValue(disconnectReason, 'description')).toBe('user_left');
+      const leaveReason = getContentValue(content, 'leave_reason');
+      expect(leaveReason).toBeDefined();
+      expect(getContentValue(leaveReason, 'code')).toBe('leave');
+      expect(getContentValue(leaveReason, 'reason')).toBe('user hung up');
+      expect(getContentValue(getContentValue(content, 'member'), 'membership')).toBe('leave');
 
       // Should also cancel the delayed event
       const cancelledEvents = mockClient._getCancelledEvents();

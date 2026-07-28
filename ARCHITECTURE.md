@@ -83,6 +83,43 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 Current implementation only establishes event intake and membership state wiring; protocol completeness is intentionally deferred.
 
+### MSC4143 catch-up status
+
+The vendored reference in `skills/msc/references/msc4143.md` tracks the rewritten
+proposal. The `m.rtc.member` wire format now matches it:
+
+- `member.membership` (`join` / `leave`) is the explicit join signal; the old
+  inference from content shape is gone.
+- `leave_reason {code, reason}` replaces `disconnect_reason {class, reason,
+  description}`. Note the inversion: `code` is the machine-readable half and
+  `reason` the human-readable one.
+- `transports {published, can_subscribe}` replaces the flat `rtc_transports`
+  array.
+- `member.claimed_user_id`, `member.claimed_device_id`, `versions`,
+  `m.relates_to` and `created_ts` are gone. The sending device now comes from the
+  event's decryption metadata and rides on `RawStickyEvent::sender_device_id`,
+  which the LiveKit bridge fills from `EncryptionInfo::sender_device` — available
+  since the SDK's "keep encryption info for sticky events" commit, which is why
+  the pin moved.
+- `member.id` is generated fresh per join (`generate_member_id`), as the spec
+  requires; it is no longer derived from the user and device IDs.
+
+Still outstanding, in the order they are planned:
+
+1. **Key targeting hardening** — `receive_key` still ignores the sender/device it
+   is handed, so the MUSTs around matching them to the member event, and around
+   discarding cleartext keys, are unimplemented.
+2. **Slots** — `m.rtc.slot` is not modelled at all. That blocks the MSC4143 join
+   conditions (an open slot must exist, the sender must be joined to the room),
+   eviction on slot close, and the `status` / `encryption` fields the slot event
+   gained.
+3. **Encryption negotiation** — the mechanism should come from the slot's
+   `encryption.type` plus room encryption rather than a local config flag. The
+   to-device key message also still sends `version: "0"` where the spec now says
+   `format: 0`, and the MSC4153 cross-signing check is missing.
+4. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
+   implemented; LiveKit URLs come from configuration.
+
 ## Non-goals in this first skeleton
 
 - No dependency on `ruma` in core.
@@ -97,4 +134,4 @@ Current implementation only establishes event intake and membership state wiring
 2. Introduce explicit machine outputs (commands/events) to communicate with host clients.
 3. Add persistence abstraction for sessions and sticky membership maps.
 4. Add transport discovery and focus modeling (`MSC4195`).
-5. Model `rtc_transports` in sticky membership DTOs and membership projections (`MSC4143` / `MSC4195`).
+5. Model `transports.published` / `can_subscribe` in sticky membership DTOs and membership projections (`MSC4143` / `MSC4195`).

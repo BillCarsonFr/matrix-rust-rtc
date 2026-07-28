@@ -63,6 +63,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use matrix_rtc_core::{
     JoinSessionParams, LiveKitTransport, RtcIdentityMapper, RtcSessionManager, RtcTransport,
+    generate_member_id,
 };
 use matrix_rtc_livekit::{
     LiveKitConnection, LiveKitTransportConfig, MediaKeyBridge, MemberClaims, SdkCommandSender,
@@ -217,7 +218,9 @@ async fn join_rtc(
     // man's switch delayed leave, then — still holding the manager lock so no
     // sticky update can interleave — wire the encryption manager to our bridge
     // and to the MSC4195 pseudonymous-identity derivation.
-    let membership_id = format!("{user_id}-{device_id}");
+    // MSC4143 requires a fresh `member.id` on every join, so this must not be
+    // derived from the (stable) user and device IDs.
+    let membership_id = generate_member_id();
     let own_identity = pseudonymous_identity(&user_id, &device_id, &membership_id);
     let mut params = JoinSessionParams::new(
         user_id.clone(),
@@ -254,9 +257,10 @@ async fn join_rtc(
                     .receive_encryption_key(
                         &received.room_id,
                         received.sender_user_id,
-                        // The core ignores the sender device id; the identity
-                        // mapper derives the peer's LiveKit identity from its RTC
-                        // membership (claimed_device_id), so "*" is fine here.
+                        // The core ignores the sender device id here; the
+                        // identity mapper derives the peer's LiveKit identity from
+                        // the device that encrypted their member event, so "*" is
+                        // fine at this call site.
                         "*".to_owned(),
                         received.key_b64,
                         received.key_index,

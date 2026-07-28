@@ -95,8 +95,8 @@ pub struct FfiJoinSessionParams {
 /// FFI-friendly leave session parameters.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiLeaveSessionParams {
-    /// Optional reason for leaving (e.g., "user_left", "ice_failed")
-    pub disconnect_reason: Option<String>,
+    /// Optional MSC4143 leave reason. Defaults to `code = "leave"` when unset.
+    pub leave_reason: Option<crate::FfiLeaveReason>,
 }
 
 /// Conversion from FFI transport config to core transport type.
@@ -166,7 +166,7 @@ impl FfiJoinSessionParams {
 impl FfiLeaveSessionParams {
     pub fn into_core(self) -> matrix_rtc_core::LeaveSessionParams {
         matrix_rtc_core::LeaveSessionParams {
-            disconnect_reason: self.disconnect_reason,
+            leave_reason: self.leave_reason.map(Into::into),
         }
     }
 }

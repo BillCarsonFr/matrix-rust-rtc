@@ -46,12 +46,35 @@ pub enum MatrixRtcFfiError {
 pub struct StickyEvent {
     pub room_id: String,
     pub sender: String,
+    /// Device that sent the event, from its decryption metadata. MSC4143 has no
+    /// self-asserted device field, so the host must supply this for key
+    /// distribution to target a single device.
+    pub sender_device_id: Option<String>,
     pub event_type: String,
     pub slot_id: String,
     pub sticky_key: String,
     pub application_type: Option<String>,
     pub member_id: Option<String>,
-    pub disconnect_reason: Option<String>,
+    /// MSC4143 `member.membership`: "join" or "leave".
+    pub membership: Option<String>,
+    pub leave_reason: Option<FfiLeaveReason>,
+}
+
+/// MSC4143 `leave_reason`: a machine-readable `code` plus an optional
+/// human-readable `reason`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiLeaveReason {
+    pub code: String,
+    pub reason: Option<String>,
+}
+
+impl From<FfiLeaveReason> for matrix_rtc_core::LeaveReason {
+    fn from(value: FfiLeaveReason) -> Self {
+        matrix_rtc_core::LeaveReason {
+            code: matrix_rtc_core::LeaveCode::from_code(&value.code),
+            reason: value.reason,
+        }
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -65,8 +88,12 @@ pub struct JoinedMembership {
     pub room_id: String,
     pub slot_id: String,
     pub sender: String,
+    pub sender_device_id: Option<String>,
     pub sticky_key: String,
+    pub member_id: String,
     pub application: Option<String>,
+    /// Transport types this member can subscribe to (MSC4143).
+    pub can_subscribe: Vec<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -406,7 +433,7 @@ impl MembershipSnapshotSubscription {
 
 fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
     use matrix_rtc_core::{
-        ApplicationInfo, DisconnectReason, MemberInfo, RawStickyEvent, RawStickyEventContent,
+        ApplicationInfo, MemberInfo, Membership, RawStickyEvent, RawStickyEventContent,
     };
     use std::collections::BTreeMap;
 
@@ -418,34 +445,26 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
 
     let member = MemberInfo {
         id: event.member_id,
-        claimed_device_id: None,
-        claimed_user_id: None,
+        membership: event.membership.map(|m| match m.as_str() {
+            "join" => Membership::Join,
+            "leave" => Membership::Leave,
+            _ => Membership::Unknown(m),
+        }),
     };
-
-    let disconnect_reason = event.disconnect_reason.map(|reason| {
-        // For now, map simple string to a basic disconnect reason
-        // In a full implementation, this would parse the MSC4143 object
-        DisconnectReason {
-            class: None,
-            reason: Some(reason),
-            description: None,
-        }
-    });
 
     RawStickyEvent {
         room_id: event.room_id,
         sender: event.sender,
+        sender_device_id: event.sender_device_id,
         event_type: event.event_type,
         content: RawStickyEventContent {
             slot_id: event.slot_id,
             sticky_key: event.sticky_key,
             application,
             member,
-            versions: Vec::new(),
-            disconnect_reason,
-            m_relates_to: None,
-            rtc_transports: None,
-            created_ts: None,
+            // Transports are not yet exposed over the FFI boundary.
+            transports: None,
+            leave_reason: event.leave_reason.map(Into::into),
         },
     }
 }
@@ -499,8 +518,11 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         room_id: member.room_id,
         slot_id: member.slot_id,
         sender: member.sender,
+        sender_device_id: member.sender_device_id,
         sticky_key: member.sticky_key,
+        member_id: member.member_id,
         application: member.application,
+        can_subscribe: member.can_subscribe,
     }
 }
 
@@ -524,12 +546,14 @@ mod tests {
         StickyEvent {
             room_id: "!room:example.org".to_owned(),
             sender: "@alice:example.org".to_owned(),
+            sender_device_id: Some("DEVICEID".to_owned()),
             event_type: "m.rtc.member".to_owned(),
             slot_id: "m.call#ROOM".to_owned(),
             sticky_key: "alice-device-a".to_owned(),
             application_type: Some("m.call".to_owned()),
             member_id: Some("alice-device-a".to_owned()),
-            disconnect_reason: None,
+            membership: Some("join".to_owned()),
+            leave_reason: None,
         }
     }
 

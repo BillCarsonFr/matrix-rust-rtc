@@ -205,8 +205,6 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             params.room_id.clone(),
             params.slot_id.clone(),
             membership_id.clone(),
-            params.user_id.clone(),
-            params.device_id.clone(),
             params.application.clone(),
             params.keep_alive_timeout_ms(),
         );
@@ -272,7 +270,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             .ok_or(LeaveError::NotJoined)?;
 
         // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
-        machine.leave(params.disconnect_reason.clone()).await?;
+        machine.leave(params.leave_reason.clone()).await?;
 
         // Clean up the encryption manager
         if let Some(encryption_manager) = self.encryption_manager.take() {
@@ -381,29 +379,49 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     }
 }
 
-/// MSC4143: Relates-to reference for event continuity
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelatesTo {
-    #[serde(rename = "rel_type")]
-    pub relation_type: String,
-    pub event_id: String,
+/// MSC4143: the intended membership status carried in `content.member.membership`.
+///
+/// Unknown values round-trip through [`Membership::Unknown`] rather than failing
+/// the whole event: a member event using a status from a future spec revision
+/// still has to parse, and simply doesn't count as joined.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Membership {
+    /// The member intends to be joined to the slot.
+    Join,
+    /// The member has left the slot.
+    Leave,
+    /// A status this client does not understand; treated as left.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
-/// MSC4143: Member object
+/// MSC4143: Member object (`content.member`).
+///
+/// Note that the pre-2026 `claimed_user_id` / `claimed_device_id` fields are gone:
+/// the sending user is authenticated by the event's `sender`, and the sending
+/// device by the event's decryption metadata (see
+/// [`JoinedMembership::sender_device_id`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberInfo {
-    /// UUID to distinguish multiple participations
+    /// Identifier distinguishing this participation, unique per join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Matrix device identifier
-    pub claimed_device_id: Option<String>,
-    /// Matrix user ID
-    pub claimed_user_id: Option<String>,
+    /// The intended membership status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<Membership>,
 }
 
 impl MemberInfo {
-    /// True when no member fields are set (used to skip serialization for leave events).
+    /// True when no member fields are set (used to skip serialization).
     pub fn is_empty(&self) -> bool {
-        self.id.is_none() && self.claimed_device_id.is_none() && self.claimed_user_id.is_none()
+        self.id.is_none() && self.membership.is_none()
+    }
+
+    /// True when this member object declares `membership = join` with a usable id.
+    pub fn is_join(&self) -> bool {
+        matches!(self.membership, Some(Membership::Join))
+            && self.id.as_deref().is_some_and(|id| !id.is_empty())
     }
 }
 
@@ -423,16 +441,66 @@ impl ApplicationInfo {
     }
 }
 
-/// MSC4143: Disconnect reason
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisconnectReason {
-    /// High-level category (e.g., "user_action", "server_error", "client_error")
-    pub class: Option<String>,
-    /// Machine-readable identifier (e.g., "hangup", "ice_failed")
+/// MSC4143: the generic `leave_reason.code` values defined by the core proposal.
+///
+/// Applications and transports may define further codes, which land in
+/// [`LeaveCode::Other`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaveCode {
+    /// The member left intentionally (e.g. by hanging up a call).
+    Leave,
+    /// The member left through a scheduled delayed leave event.
+    DelayedLeave,
+    /// The member left because the slot was closed mid-session.
+    SlotClosed,
+    /// A code defined outside this proposal.
+    #[serde(untagged)]
+    Other(String),
+}
+
+impl LeaveCode {
+    /// Parses a wire `leave_reason.code`, keeping application- and
+    /// transport-defined codes intact as [`LeaveCode::Other`].
+    ///
+    /// The bindings use this so every entry point agrees on the mapping.
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "leave" => Self::Leave,
+            "delayed_leave" => Self::DelayedLeave,
+            "slot_closed" => Self::SlotClosed,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+/// MSC4143: Leave reason (`content.leave_reason`).
+///
+/// Replaces the earlier `disconnect_reason` object. `code` is the machine-readable
+/// identifier and `reason` the optional human-readable explanation — note that in
+/// the old shape `reason` was the machine-readable half.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveReason {
+    /// Identifier for the specific leave cause.
+    pub code: LeaveCode,
+    /// Optional human-readable explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Optional human-readable explanation
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+}
+
+impl LeaveReason {
+    /// A leave reason carrying just a code.
+    pub fn new(code: LeaveCode) -> Self {
+        Self { code, reason: None }
+    }
+
+    /// A leave reason with a human-readable explanation.
+    pub fn with_reason(code: LeaveCode, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -444,7 +512,7 @@ pub enum CallMembershipEvent {
     Left(LeftMembership),
 }
 
-/// MSC4143: Connected membership payload.
+/// MSC4143: Joined membership payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinedMembership {
     /// Room where the membership is active.
@@ -453,23 +521,28 @@ pub struct JoinedMembership {
     pub slot_id: String,
     /// Sender user ID of the membership event.
     pub sender: String,
-    /// Sticky key identifying this membership stream.
+    /// Device that sent the membership event, from the event's decryption
+    /// metadata rather than from its content.
+    ///
+    /// MSC4143 removed the self-asserted `member.claimed_device_id`; key
+    /// distribution instead targets "the devices that were used to encrypt these
+    /// member events". `None` for events received in the clear, or when the host
+    /// SDK could not supply it.
+    pub sender_device_id: Option<String>,
+    /// Sticky key identifying this membership stream (equal to `member_id`).
     pub sticky_key: String,
-    /// Application info (MSC4143).
+    /// `member.id` — identifies this participation, unique per join.
+    pub member_id: String,
+    /// Application type from `content.application.type`.
     pub application: Option<String>,
-    /// Member info (MSC4143).
-    pub member: MemberInfo,
-    /// Protocol versions (MSC4143).
-    pub versions: Vec<String>,
-    /// Optional relates-to reference (MSC4143).
-    pub m_relates_to: Option<RelatesTo>,
-    /// RTC transports for this member (MSC4143 / MSC4195).
+    /// Transports this member publishes on (`content.transports.published`).
     pub transports: Vec<RtcTransport>,
-    /// Timestamp (ms) when this membership was created (MSC4143).
-    pub created_ts: Option<u64>,
+    /// Transport types this member can subscribe to
+    /// (`content.transports.can_subscribe`).
+    pub can_subscribe: Vec<String>,
 }
 
-/// MSC4143: Disconnected membership payload.
+/// MSC4143: Left membership payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeftMembership {
     /// Room where the membership was active.
@@ -480,10 +553,11 @@ pub struct LeftMembership {
     pub sender: String,
     /// Sticky key identifying this membership stream.
     pub sticky_key: String,
-    /// Optional disconnect reason (MSC4143 compliant object).
-    pub disconnect_reason: Option<DisconnectReason>,
-    /// Optional relates-to reference (MSC4143).
-    pub m_relates_to: Option<RelatesTo>,
+    /// `member.id`, when the event carried one. Absent on malformed events and
+    /// on sticky removals, which are treated as leaves regardless of content.
+    pub member_id: Option<String>,
+    /// Optional leave reason (MSC4143).
+    pub leave_reason: Option<LeaveReason>,
 }
 
 impl<T: RtcCommandSender + 'static> Default for RtcSession<T> {

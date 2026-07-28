@@ -487,7 +487,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             // In practice, JoinedMembership should have a member_id field
             let full_membership = known_memberships
                 .iter()
-                .find(|m| m.member.id.as_deref() == Some(&key.member_id));
+                .find(|m| m.member_id == key.member_id);
 
             if let Some(membership) = full_membership {
                 // We now have the membership, add the key properly
@@ -583,12 +583,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             .iter()
             .filter(|m| {
                 // Exclude ourselves - we don't send keys to ourselves
-                m.member.id.as_deref() != Some(&self.own_member_id)
+                m.member_id != self.own_member_id
             })
             .map(|m| ParticipantDeviceInfo {
                 user_id: m.sender.clone(),
-                device_id: m.member.claimed_device_id.clone().unwrap_or_default(),
-                member_id: m.member.id.clone().unwrap_or_default(),
+                device_id: m.sender_device_id.clone().unwrap_or_default(),
+                member_id: m.member_id.clone(),
             })
             .collect();
 
@@ -801,19 +801,17 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         // Find the target participant in our membership list
         let memberships = (self.get_memberships.lock().unwrap())();
-        let target = memberships
-            .iter()
-            .find(|m| m.member.id.as_deref() == Some(target_member_id));
+        let target = memberships.iter().find(|m| m.member_id == target_member_id);
 
         match target {
             Some(membership) => {
                 // Send to the specific user and device
                 let target_user_id = &membership.sender;
-                let target_device_id = membership
-                    .member
-                    .claimed_device_id
-                    .as_deref()
-                    .unwrap_or("*");
+                // MSC4143: key material goes to the device that encrypted the
+                // member event. Falling back to "*" (every device of that user)
+                // keeps cleartext-room sessions working; Olm still encrypts
+                // per-device, so this widens delivery, not readership.
+                let target_device_id = membership.sender_device_id.as_deref().unwrap_or("*");
 
                 log::debug!(
                     "[{}:{}] Sending key to user={}, device={}",
@@ -935,9 +933,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             let guard = self.get_memberships.lock().unwrap();
             (guard)()
         };
-        let full_membership = known_memberships
-            .iter()
-            .find(|m| m.member.id.as_deref() == Some(&member_id));
+        let full_membership = known_memberships.iter().find(|m| m.member_id == member_id);
 
         if let Some(membership) = full_membership {
             // We have the membership, add the key
@@ -972,16 +968,10 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let rtc_backend_id = match &self.identity_mapper {
             Some(mapper) => mapper(
                 &membership.sender,
-                membership.member.claimed_device_id.as_deref().unwrap_or(""),
-                membership.member.id.as_deref().unwrap_or(""),
+                membership.sender_device_id.as_deref().unwrap_or(""),
+                &membership.member_id,
             ),
-            None => membership.member.id.clone().unwrap_or_else(|| {
-                format!(
-                    "{}:{}",
-                    membership.sender,
-                    membership.member.claimed_device_id.as_deref().unwrap_or("")
-                )
-            }),
+            None => membership.member_id.clone(),
         };
 
         // Store the key
@@ -1108,7 +1098,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 mod tests {
     use super::*;
     use crate::commands::{MockCommandSender, NoopCommandSender};
-    use crate::session::{JoinedMembership, MemberInfo};
+    use crate::session::JoinedMembership;
     use std::sync::Arc;
 
     const ROOM_ID: &str = "!room:example.org";
@@ -1122,17 +1112,12 @@ mod tests {
             room_id: ROOM_ID.to_string(),
             slot_id: SLOT_ID.to_string(),
             sender: "@bob:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
             sticky_key: "bob-device456-uuid".to_string(),
+            member_id: "bob-device456-uuid".to_string(),
             application: Some("m.call".to_string()),
-            member: MemberInfo {
-                id: Some("bob-device456-uuid".to_string()),
-                claimed_device_id: Some("device456".to_string()),
-                claimed_user_id: Some("@bob:example.org".to_string()),
-            },
-            versions: vec!["v0".to_string()],
-            m_relates_to: None,
             transports: Vec::new(),
-            created_ts: Some(2000),
+            can_subscribe: Vec::new(),
         }
     }
 

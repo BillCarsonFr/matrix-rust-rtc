@@ -160,7 +160,10 @@ impl WasmRtcSessionManager {
     /// * `room_id` - The room ID of the session to leave
     /// * `slot_id` - The slot ID of the session to leave
     /// * `params` - Optional JSON object containing leave parameters:
-    ///   - `disconnect_reason`: Optional reason for leaving (e.g., "user_left", "ice_failed")
+    ///   - `leave_reason`: Optional MSC4143 leave reason, an object of
+    ///     `{ code, reason }` — e.g. `{ code: "leave" }` for an intentional
+    ///     hang-up, or `{ code: "ice_failed", reason: "no candidates" }` for a
+    ///     transport-defined cause. Defaults to `{ code: "leave" }`.
     pub async fn leave(
         &mut self,
         room_id: String,
@@ -297,13 +300,31 @@ impl WasmTransportConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct WasmLeaveSessionParams {
     #[serde(default)]
-    pub disconnect_reason: Option<String>,
+    pub leave_reason: Option<WasmLeaveReason>,
+}
+
+/// MSC4143 `leave_reason`: a machine-readable `code` plus an optional
+/// human-readable `reason`.
+#[derive(Debug, Deserialize)]
+pub struct WasmLeaveReason {
+    pub code: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl From<WasmLeaveReason> for matrix_rtc_core::LeaveReason {
+    fn from(value: WasmLeaveReason) -> Self {
+        matrix_rtc_core::LeaveReason {
+            code: matrix_rtc_core::LeaveCode::from_code(&value.code),
+            reason: value.reason,
+        }
+    }
 }
 
 impl WasmLeaveSessionParams {
     pub fn into_core(self) -> LeaveSessionParams {
         LeaveSessionParams {
-            disconnect_reason: self.disconnect_reason,
+            leave_reason: self.leave_reason.map(Into::into),
         }
     }
 }
@@ -488,6 +509,10 @@ impl WasmMembershipSnapshotSubscription {
 struct WasmStickyEvent {
     room_id: String,
     sender: String,
+    /// Device that sent the event, from its decryption metadata. MSC4143 has no
+    /// self-asserted device field, so the host must supply this.
+    #[serde(default)]
+    sender_device_id: Option<String>,
     #[serde(rename = "type")]
     event_type: String,
     content: WasmStickyEventContent,
@@ -499,9 +524,18 @@ struct WasmStickyEventContent {
     sticky_key: String,
     application: Option<WasmApplication>,
     member: Option<WasmMember>,
-    disconnect_reason: Option<String>,
     #[serde(default)]
-    rtc_transports: Option<Vec<WasmRawRtcTransport>>,
+    transports: Option<WasmTransports>,
+    #[serde(default)]
+    leave_reason: Option<WasmLeaveReason>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WasmTransports {
+    #[serde(default)]
+    published: Vec<WasmRawRtcTransport>,
+    #[serde(default)]
+    can_subscribe: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,6 +555,9 @@ struct WasmApplication {
 #[derive(Debug, Deserialize)]
 struct WasmMember {
     id: String,
+    /// MSC4143 `member.membership`: "join" or "leave".
+    #[serde(default)]
+    membership: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,9 +584,23 @@ impl From<WasmRawRtcTransport> for RawRtcTransport {
 
 impl From<WasmStickyEvent> for RawStickyEvent {
     fn from(value: WasmStickyEvent) -> Self {
+        let member = value
+            .content
+            .member
+            .map(|member| matrix_rtc_core::MemberInfo {
+                id: Some(member.id),
+                membership: member.membership.map(|m| match m.as_str() {
+                    "join" => matrix_rtc_core::Membership::Join,
+                    "leave" => matrix_rtc_core::Membership::Leave,
+                    _ => matrix_rtc_core::Membership::Unknown(m),
+                }),
+            })
+            .unwrap_or_default();
+
         RawStickyEvent {
             room_id: value.room_id,
             sender: value.sender,
+            sender_device_id: value.sender_device_id,
             event_type: value.event_type,
             content: matrix_rtc_core::RawStickyEventContent {
                 slot_id: value.content.slot_id,
@@ -558,25 +609,15 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                     application_type: value.content.application.map(|app| app.kind),
                     extra: std::collections::BTreeMap::new(),
                 },
-                member: matrix_rtc_core::MemberInfo {
-                    id: value.content.member.map(|member| member.id),
-                    claimed_device_id: None,
-                    claimed_user_id: None,
-                },
-                versions: Vec::new(),
-                disconnect_reason: value.content.disconnect_reason.map(|reason| {
-                    matrix_rtc_core::DisconnectReason {
-                        class: None,
-                        reason: Some(reason),
-                        description: None,
-                    }
-                }),
-                m_relates_to: None,
-                rtc_transports: value
+                member,
+                transports: value
                     .content
-                    .rtc_transports
-                    .map(|v| v.into_iter().map(Into::into).collect()),
-                created_ts: None,
+                    .transports
+                    .map(|t| matrix_rtc_core::MemberTransports {
+                        published: t.published.into_iter().map(Into::into).collect(),
+                        can_subscribe: t.can_subscribe,
+                    }),
+                leave_reason: value.content.leave_reason.map(Into::into),
             },
         }
     }
@@ -604,7 +645,6 @@ mod tests {
         sticky_key: String,
         application: Option<TestApplication>,
         member: Option<TestMember>,
-        disconnect_reason: Option<String>,
     }
 
     #[derive(Serialize)]
@@ -616,6 +656,7 @@ mod tests {
     #[derive(Serialize)]
     struct TestMember {
         id: String,
+        membership: String,
     }
 
     fn joined_event() -> TestStickyEvent {
@@ -631,8 +672,8 @@ mod tests {
                 }),
                 member: Some(TestMember {
                     id: "alice-device-a".to_owned(),
+                    membership: "join".to_owned(),
                 }),
-                disconnect_reason: None,
             },
         }
     }
