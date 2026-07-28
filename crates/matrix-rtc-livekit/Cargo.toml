@@ -55,19 +55,28 @@ futures-util = "0.3"
 # matrix-sdk-base's `unstable-msc4354` code needs, so HEAD does not compile. 625c1a3
 # pins ruma to `BillCarsonFr/ruma@161531d`, which has them. (Bump once the fork's
 # ruma pin is fixed.)
-matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "625c1a31e174d69c291434a806834a548c840391", optional = true, features = ["unstable-msc4354"] }
+# `experimental-send-custom-to-device` exposes
+# `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
+# keys as Olm-encrypted to-device messages (see `matrix_bridge`). It pulls in
+# `e2e-encryption`, already on via defaults.
+matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "625c1a31e174d69c291434a806834a548c840391", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
 # Drives sliding sync (which auto-enables the sticky extension under
 # `unstable-msc4354`) plus the encryption sync, so sticky events actually flow.
 # Encryption support rides along via matrix-sdk's default features; ui only needs
 # the sticky feature for unification with matrix-sdk-base.
 matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "625c1a31e174d69c291434a806834a548c840391", optional = true, features = ["unstable-msc4354"] }
+# Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
+# to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it. Same
+# rev as matrix-sdk so cargo unifies the source; `e2e-encryption` gates the
+# `crypto` re-export.
+matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "625c1a31e174d69c291434a806834a548c840391", optional = true, features = ["e2e-encryption"] }
 
 [features]
 # Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`,
 # the `matrix_bridge` (SDK-backed command sender + sticky-event bridge into
 # matrix-rtc-core), and the `connect` / `e2e_call` examples. Off by default to
 # keep the base crate light and buildable without the git SDK.
-matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-ui"]
+matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-ui", "dep:matrix-sdk-base"]
 # Exposes the `media` module of synthetic-audio test utilities (tone gen /
 # record / WAV / frequency detect) for examples and integration tests. Not for
 # production use; the module is otherwise only compiled under `cfg(test)`.

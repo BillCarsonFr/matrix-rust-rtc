@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::commands::RtcCommandSender;
-use crate::encryption::EncryptionManager;
+use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::own_membership::{OwnMembershipMachine, transport_to_json};
@@ -95,6 +95,69 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Returns true if this session has a command sender configured.
     pub fn has_command_sender(&self) -> bool {
         self.command_sender.is_some()
+    }
+
+    /// Registers a handler that receives media key material signalled by this
+    /// session's encryption manager.
+    ///
+    /// Returns `false` if the session has not joined yet (no encryption manager
+    /// exists). Call after [`RtcSession::join`].
+    pub fn set_encryption_signal_handler(
+        &mut self,
+        handler: Arc<dyn EncryptionKeySignalHandler>,
+    ) -> bool {
+        match &mut self.encryption_manager {
+            Some(manager) => {
+                manager.set_signal_handler(handler);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Installs the identity mapper used to derive the RTC-backend participant
+    /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
+    ///
+    /// Returns `false` if the session has not joined yet. Call after
+    /// [`RtcSession::join`].
+    pub fn set_encryption_identity_mapper(&mut self, mapper: RtcIdentityMapper) -> bool {
+        match &mut self.encryption_manager {
+            Some(manager) => {
+                manager.set_identity_mapper(mapper);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Feeds a media encryption key received from a peer (MSC4143 to-device
+    /// message) into this session's encryption manager.
+    ///
+    /// A no-op if the session has not joined yet (no encryption manager).
+    pub async fn receive_encryption_key(
+        &self,
+        sender_user_id: String,
+        sender_device_id: String,
+        key_b64: String,
+        key_index: u8,
+        member_id: String,
+        room_id: String,
+    ) -> Result<(), CommandError> {
+        match &self.encryption_manager {
+            Some(manager) => {
+                manager
+                    .receive_key(
+                        sender_user_id,
+                        sender_device_id,
+                        key_b64,
+                        key_index,
+                        member_id,
+                        room_id,
+                    )
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     /// Joins this RTC session with the given parameters.

@@ -2472,6 +2472,7 @@ dependencies = [
  "log",
  "matrix-rtc-core",
  "matrix-sdk",
+ "matrix-sdk-base",
  "matrix-sdk-ui",
  "reqwest 0.12.28",
  "rustls",

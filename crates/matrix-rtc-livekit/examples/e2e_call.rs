@@ -51,22 +51,36 @@ use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
 use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
-use matrix_sdk::ruma::events::InitialStateEvent;
 use matrix_sdk::ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
+use matrix_sdk::ruma::events::{AnyToDeviceEvent, InitialStateEvent};
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use matrix_rtc_core::{JoinSessionParams, LiveKitTransport, RtcSessionManager, RtcTransport};
+use matrix_rtc_core::{
+    JoinSessionParams, LiveKitTransport, RtcIdentityMapper, RtcSessionManager, RtcTransport,
+};
 use matrix_rtc_livekit::{
-    LiveKitConnection, LiveKitTransportConfig, MemberClaims, SdkCommandSender, connect, media,
-    run_sticky_bridge,
+    LiveKitConnection, LiveKitTransportConfig, MediaKeyBridge, MemberClaims, SdkCommandSender,
+    connect_e2ee, identity::pseudonymous_identity, media, msc4195_key_provider, run_sticky_bridge,
 };
 
 type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
+
+/// A media encryption key extracted from a peer's decrypted
+/// `org.matrix.msc4143.rtc.encryption_key` to-device message, carried from the
+/// (`Send`) event handler to the (`!Send`) key pump over an mpsc channel.
+struct ReceivedKey {
+    sender_user_id: String,
+    room_id: String,
+    member_id: String,
+    key_index: u8,
+    key_b64: String,
+}
 
 fn required(name: &str) -> Result<String, Box<dyn Error>> {
     env::var(name).map_err(|_| format!("missing required env var {name}").into())
@@ -82,9 +96,18 @@ struct SyncedClient {
 struct Participant {
     manager: Manager,
     connection: LiveKitConnection,
+    // Frame-encryption key bridge: receives every media key signalled by the
+    // core (own + peers) and imports it into the room's LiveKit KeyProvider.
+    // Kept so the test can assert which peer keys were received and mapped.
+    bridge: Arc<MediaKeyBridge>,
+    // Our own MSC4195 pseudonymous LiveKit identity (the JWT `sub`); the peer
+    // imports our key under this identity to decrypt our frames.
+    own_identity: String,
     // Kept alive for the duration of the call (dropping stops sync / the bridge).
     _sync: SyncService,
     _bridge: tokio::task::JoinHandle<()>,
+    // Drains received peer keys into the (!Send) manager on the LocalSet.
+    key_pump: tokio::task::JoinHandle<()>,
     // Aborted at teardown so a heartbeat tick can't re-arm a delayed leave after
     // `leave` has cancelled it.
     heartbeat: tokio::task::JoinHandle<()>,
@@ -174,11 +197,28 @@ async fn join_rtc(
     // The core's `RtcCommandSender` is `?Send`, so futures that drive the manager
     // are `!Send` and must run on the current thread via `spawn_local` (the caller
     // wraps the flow in a `LocalSet`).
-    let bridge = tokio::task::spawn_local(run_sticky_bridge(room.clone(), manager.clone()));
+    let sticky_bridge = tokio::task::spawn_local(run_sticky_bridge(room.clone(), manager.clone()));
+
+    // Frame encryption: a single shared KeyProvider handle feeds both the
+    // LiveKit room (which encrypts our frames and decrypts peers') and the
+    // MediaKeyBridge (which imports every key the core signals). MSC4195
+    // per-participant HKDF mode.
+    let provider = msc4195_key_provider();
+    let bridge = Arc::new(MediaKeyBridge::with_provider(provider.clone()));
+
+    // Receive path: peers distribute their media keys as Olm-encrypted
+    // `m.rtc.encryption_key` to-device messages. The SDK decrypts and dispatches
+    // them to a handler that must stay `Send`; forward the (Send) key bytes over
+    // a channel to a `spawn_local` pump that drives the `!Send` manager.
+    let (key_tx, mut key_rx) = unbounded_channel::<ReceivedKey>();
+    register_key_receiver(&client, key_tx);
 
     // Join the RTC session: publishes our own membership sticky + arms the dead
-    // man's switch delayed leave.
+    // man's switch delayed leave, then — still holding the manager lock so no
+    // sticky update can interleave — wire the encryption manager to our bridge
+    // and to the MSC4195 pseudonymous-identity derivation.
     let membership_id = format!("{user_id}-{device_id}");
+    let own_identity = pseudonymous_identity(&user_id, &device_id, &membership_id);
     let mut params = JoinSessionParams::new(
         user_id.clone(),
         device_id.clone(),
@@ -190,7 +230,45 @@ async fn join_rtc(
         }),
     );
     params.membership_id = Some(membership_id.clone());
-    manager.lock().await.join(params).await?;
+    {
+        let mut mgr = manager.lock().await;
+        mgr.join(params).await?;
+        let identity_mapper: RtcIdentityMapper =
+            Arc::new(|user_id: &str, device_id: &str, member_id: &str| {
+                pseudonymous_identity(user_id, device_id, member_id)
+            });
+        if !mgr.set_encryption_signal_handler(room_id, &cfg.slot_id, bridge.clone()) {
+            return Err("failed to register encryption signal handler".into());
+        }
+        mgr.set_encryption_identity_mapper(room_id, &cfg.slot_id, identity_mapper);
+    }
+
+    // Spawn the pump that drains received peer keys into the manager.
+    let key_pump = {
+        let manager = manager.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(received) = key_rx.recv().await {
+                if let Err(error) = manager
+                    .lock()
+                    .await
+                    .receive_encryption_key(
+                        &received.room_id,
+                        received.sender_user_id,
+                        // The core ignores the sender device id; the identity
+                        // mapper derives the peer's LiveKit identity from its RTC
+                        // membership (claimed_device_id), so "*" is fine here.
+                        "*".to_owned(),
+                        received.key_b64,
+                        received.key_index,
+                        received.member_id,
+                    )
+                    .await
+                {
+                    eprintln!("failed to ingest received media key: {error}");
+                }
+            }
+        })
+    };
     println!("[{user}] joined RTC session (membership {membership_id})");
 
     // Heartbeat loop so the delayed leave keeps getting pushed back.
@@ -221,16 +299,41 @@ async fn join_rtc(
             claimed_device_id: device_id,
         },
     };
-    let connection = connect(&http, &lk_config, &client).await?;
-    println!("[{user}] connected to the SFU");
+    let connection = connect_e2ee(&http, &lk_config, &client, provider).await?;
+    println!("[{user}] connected to the SFU (per-participant frame E2EE enabled)");
 
     Ok(Participant {
         manager,
         connection,
+        bridge,
+        own_identity,
         _sync: sync,
-        _bridge: bridge,
+        _bridge: sticky_bridge,
+        key_pump,
         heartbeat,
     })
+}
+
+/// Register a to-device handler that forwards decrypted
+/// `m.rtc.encryption_key` events to the key pump.
+///
+/// The handler is `Send` (it only moves owned key data into a channel), which
+/// `add_event_handler` requires; the `!Send` work happens in the pump.
+fn register_key_receiver(client: &Client, key_tx: UnboundedSender<ReceivedKey>) {
+    client.add_event_handler(move |event: AnyToDeviceEvent| {
+        let key_tx = key_tx.clone();
+        async move {
+            if let AnyToDeviceEvent::RtcEncryptionKey(event) = event {
+                let _ = key_tx.send(ReceivedKey {
+                    sender_user_id: event.sender.to_string(),
+                    room_id: event.content.room_id.to_string(),
+                    member_id: event.content.member_id,
+                    key_index: event.content.media_key.index,
+                    key_b64: event.content.media_key.key,
+                });
+            }
+        }
+    });
 }
 
 /// Poll until the room is known to the client, or time out.
@@ -368,6 +471,13 @@ async fn run(
 
     let tone_ok = record_and_verify_tone(&mut bob).await?;
 
+    // Encryption proof: bob must have imported alice's media key under alice's
+    // MSC4195 pseudonymous identity (the JWT `sub`) — direct evidence the key
+    // crossed the wire and the identity mapping is correct. With GCM frame E2EE
+    // enabled, bob could not have decoded the tone above without it.
+    let alice_key_seen_by_bob = bob.bridge.key_for(&alice.own_identity).is_some();
+    println!("[bob] imported alice's per-participant media key: {alice_key_seen_by_bob}");
+
     // Tear down both peers cleanly and symmetrically: each stops its heartbeat,
     // sends its leave sticky (cancelling its delayed leave), and closes its SFU
     // connection.
@@ -377,10 +487,11 @@ async fn run(
     println!("\n=== RESULT ===");
     println!("sticky membership discovered by alice: {alice_sees}");
     println!("sticky membership discovered by bob:   {bob_sees}");
+    println!("alice's media key received by bob:      {alice_key_seen_by_bob}");
     println!("440 Hz tone received + verified by bob: {tone_ok}");
 
-    if alice_sees && bob_sees && tone_ok {
-        println!("END-TO-END TEST PASSED");
+    if alice_sees && bob_sees && alice_key_seen_by_bob && tone_ok {
+        println!("END-TO-END TEST PASSED (with per-participant frame E2EE)");
         Ok(())
     } else {
         Err("end-to-end test failed (see WARNING lines above)".into())
@@ -395,6 +506,7 @@ async fn run(
 /// failures are logged rather than aborting teardown of the other peer.
 async fn leave_and_close(participant: Participant, room_id: &str, slot_id: &str, label: &str) {
     participant.heartbeat.abort();
+    participant.key_pump.abort();
     if let Err(error) = participant
         .manager
         .lock()

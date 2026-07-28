@@ -94,6 +94,42 @@ pub async fn connect(
     LiveKitSession::connect(&sfu_token).await
 }
 
+/// Like [`connect`], but enables MSC4195 per-participant GCM frame E2EE on the
+/// LiveKit room using the supplied `key_provider`.
+///
+/// `key_provider` MUST be the same handle also given to
+/// [`MediaKeyBridge::with_provider`] (a [`livekit::e2ee::key_provider::KeyProvider`]
+/// is a cheap shared handle — clone it), so keys signalled by `matrix-rtc-core`
+/// and imported through the bridge reach the frame cryptor of this room.
+pub async fn connect_e2ee(
+    http: &reqwest::Client,
+    config: &LiveKitTransportConfig,
+    token_source: &dyn OpenIdTokenSource,
+    key_provider: livekit::e2ee::key_provider::KeyProvider,
+) -> Result<LiveKitConnection, Error> {
+    use livekit::RoomOptions;
+    use livekit::e2ee::{E2eeOptions, EncryptionType};
+
+    let openid_token = token_source.open_id_token().await?;
+    let sfu_token = token::get_token(
+        http,
+        &config.livekit_service_url,
+        &config.room_id,
+        &config.slot_id,
+        &config.member,
+        &openid_token,
+    )
+    .await?;
+
+    // RoomOptions is #[non_exhaustive]; mutate a default instance.
+    let mut options = RoomOptions::default();
+    options.encryption = Some(E2eeOptions {
+        encryption_type: EncryptionType::Gcm,
+        key_provider,
+    });
+    LiveKitSession::connect_with_options(&sfu_token, options).await
+}
+
 /// Errors produced by the LiveKit transport.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
