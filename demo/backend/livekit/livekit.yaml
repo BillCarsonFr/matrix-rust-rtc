@@ -1,0 +1,28 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# LiveKit SFU config for the dev/test stack, adapted from Element Call's
+# backend/dev_livekit.yaml (webhook section dropped: it only feeds
+# lk-jwt-service's optional sanity-check feature, which is off by default).
+
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+rtc:
+  tcp_port: 7881
+  port_range_start: 50100
+  port_range_end: 50200
+  use_external_ip: false
+  # Advertise loopback in ICE candidates: the test clients run on the host and
+  # reach the container through the ports docker publishes on localhost.
+  node_ip: 127.0.0.1
+keys:
+  devkey: secret
+room:
+  auto_create: false

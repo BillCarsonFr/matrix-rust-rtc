@@ -20,7 +20,8 @@
 //!
 //! The flow mirrors a real call being set up from scratch:
 //!
-//! 1. Both `alice` and `bob` log in and start a sync service.
+//! 1. Two throwaway users are provisioned on the homeserver (unless
+//!    `ALICE`/`BOB` credentials are supplied), log in and start a sync service.
 //! 2. `alice` **creates an encrypted room**, sets history visibility to
 //!    `shared`, and **invites** `bob`.
 //! 3. `bob` **joins** the room; both sides wait until the two-member room
@@ -34,17 +35,17 @@
 //! 6. Both connect to the LiveKit SFU; `alice` publishes a 440 Hz tone and
 //!    `bob` records what the SFU forwards and verifies the frequency.
 //!
-//! Run against the `demo/backend` stack (see its README). Element Web is NOT
-//! needed — the two Rust clients are each other's peer, and the room is created
-//! on the fly, so no pre-existing `ROOM_ID` is required:
+//! Runs against the `demo/backend` stack (see its README) with no further
+//! configuration — every endpoint defaults to the stack's localhost ports and
+//! users are created on the fly:
 //!
 //! ```sh
-//! HOMESERVER_URL=https://synapse.m.localhost \
-//! ALICE=alice ALICE_PW=secret BOB=bob BOB_PW=secret \
-//! SLOT_ID='m.call#ROOM' \
-//! LIVEKIT_SERVICE_URL=https://matrix-rtc.m.localhost/livekit/jwt INSECURE_TLS=1 \
-//! cargo run -p matrix-rtc-livekit --features matrix-sdk,testing --example e2e_call
+//! make backend-up
+//! cargo test -p matrix-rtc-livekit --features matrix-sdk,testing \
+//!     --test e2e_call -- --ignored --nocapture
 //! ```
+
+mod provision;
 
 use std::env;
 use std::error::Error;
@@ -75,6 +76,12 @@ use matrix_rtc_livekit::{
     connect_e2ee, identity::pseudonymous_identity, media, msc4195_key_provider, run_sticky_bridge,
 };
 
+use provision::Credentials;
+
+/// Hard cap on the whole flow so a wedged stack fails the test instead of
+/// eating the CI job timeout.
+const OVERALL_DEADLINE: Duration = Duration::from_secs(300);
+
 type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
 
 /// A media encryption key extracted from a peer's decrypted
@@ -86,10 +93,6 @@ struct ReceivedKey {
     member_id: String,
     key_index: u8,
     key_b64: String,
-}
-
-fn required(name: &str) -> Result<String, Box<dyn Error>> {
-    env::var(name).map_err(|_| format!("missing required env var {name}").into())
 }
 
 /// A logged-in, synced client (before it has joined any RTC session).
@@ -126,14 +129,50 @@ struct Config {
     insecure_tls: bool,
 }
 
+impl Config {
+    /// Defaults target the `demo/backend` compose stack; every value can be
+    /// overridden to point the same test at a remote (TLS) deployment.
+    fn from_env() -> Self {
+        Config {
+            homeserver: env::var("HOMESERVER_URL")
+                .unwrap_or_else(|_| "http://localhost:8008".to_owned()),
+            slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned()),
+            livekit_service_url: env::var("LIVEKIT_SERVICE_URL")
+                .unwrap_or_else(|_| "http://localhost:6080".to_owned()),
+            insecure_tls: env::var("INSECURE_TLS").is_ok(),
+        }
+    }
+}
+
+/// Use `ALICE`/`BOB` (+`_PW`) when supplied (long-lived stacks with closed
+/// registration); otherwise register fresh throwaway users for this run.
+async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn Error>> {
+    if let (Ok(alice), Ok(bob)) = (env::var("ALICE"), env::var("BOB")) {
+        return Ok((
+            Credentials {
+                user: alice,
+                password: env::var("ALICE_PW").map_err(|_| "ALICE is set but ALICE_PW is not")?,
+            },
+            Credentials {
+                user: bob,
+                password: env::var("BOB_PW").map_err(|_| "BOB is set but BOB_PW is not")?,
+            },
+        ));
+    }
+
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(cfg.insecure_tls)
+        .build()?;
+    let suffix = provision::run_suffix();
+    let alice = provision::register_user(&http, &cfg.homeserver, "alice", &suffix).await?;
+    let bob = provision::register_user(&http, &cfg.homeserver, "bob", &suffix).await?;
+    Ok((alice, bob))
+}
+
 /// Log in and start the sync service. Under `unstable-msc4354`, sliding sync
 /// auto-enables the sticky-events extension, so `m.rtc.member` stickies flow
 /// into the base room's sticky store (see `matrix_bridge`).
-async fn login_and_sync(
-    cfg: &Config,
-    user: &str,
-    password: &str,
-) -> Result<SyncedClient, Box<dyn Error>> {
+async fn login_and_sync(cfg: &Config, who: &Credentials) -> Result<SyncedClient, Box<dyn Error>> {
     let mut builder = Client::builder().homeserver_url(&cfg.homeserver);
     if cfg.insecure_tls {
         builder = builder.disable_ssl_verification();
@@ -141,7 +180,7 @@ async fn login_and_sync(
     let client = builder.build().await?;
     client
         .matrix_auth()
-        .login_username(user, password)
+        .login_username(&who.user, &who.password)
         .initial_device_display_name("matrix-rtc-livekit e2e_call")
         .send()
         .await?;
@@ -153,7 +192,7 @@ async fn login_and_sync(
         .device_id()
         .ok_or("no device id after login")?
         .to_string();
-    println!("[{user}] logged in as {user_id} (device {device_id})");
+    println!("[{}] logged in as {user_id} (device {device_id})", who.user);
 
     let sync = SyncService::builder(client.clone()).build().await?;
     sync.start().await;
@@ -368,7 +407,9 @@ async fn join_rtc(
 /// Register a to-device handler that forwards decrypted
 /// `m.rtc.encryption_key` events to the key pump.
 ///
-/// The handler is `Send` (it only moves owned key data into a channel), which
+/// Uses ruma's typed event — the pinned ruma models the rewritten MSC4143, so
+/// its content shape matches what `matrix-rtc-core` sends. The handler is
+/// `Send` (it only moves owned key data into a channel), which
 /// `add_event_handler` requires; the `!Send` work happens in the pump.
 fn register_key_receiver(client: &Client, key_tx: UnboundedSender<ReceivedKey>) {
     client.add_event_handler(
@@ -460,24 +501,29 @@ async fn wait_for_members(
     target: usize,
     label: &str,
 ) -> bool {
+    let mut last_count = 0;
     for _ in 0..60 {
-        let count = manager
+        last_count = manager
             .lock()
             .await
             .member_count(room_id, slot_id)
             .unwrap_or(0);
-        if count >= target {
-            println!("[{label}] sees {count} members (sticky round-trip OK)");
+        if last_count >= target {
+            println!("[{label}] sees {last_count} members (sticky round-trip OK)");
             return true;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    println!("[{label}] WARNING: did not observe {target} members within 30s");
+    // The count separates failure modes: 0 = the slot/room-state projection
+    // dropped everyone (even ourselves); 1 = own membership round-tripped but
+    // the peer's sticky never arrived.
+    println!("[{label}] WARNING: observed {last_count} of {target} members within 30s");
     false
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+#[test]
+#[ignore = "requires the demo/backend docker stack (make backend-up)"]
+fn e2e_call_two_clients_audio() {
     // The dependency tree enables both rustls crypto backends (`ring` via
     // livekit/reqwest, `aws-lc-rs` via matrix-sdk), so rustls can't auto-select a
     // process-level `CryptoProvider` and panics on first TLS handshake. Install
@@ -492,34 +538,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    let cfg = Config {
-        homeserver: required("HOMESERVER_URL")?,
-        slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned()),
-        livekit_service_url: required("LIVEKIT_SERVICE_URL")?,
-        insecure_tls: env::var("INSECURE_TLS").is_ok(),
-    };
-    let alice_user = required("ALICE")?;
-    let alice_pw = required("ALICE_PW")?;
-    let bob_user = required("BOB")?;
-    let bob_pw = required("BOB_PW")?;
+    let cfg = Config::from_env();
 
     // The manager/bridge/heartbeat futures are `!Send` (the core command sender
     // is `?Send`), so the whole flow runs on a single-thread `LocalSet`.
-    tokio::task::LocalSet::new()
-        .run_until(run(cfg, alice_user, alice_pw, bob_user, bob_pw))
-        .await
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    let outcome = runtime.block_on(
+        tokio::task::LocalSet::new()
+            .run_until(async { tokio::time::timeout(OVERALL_DEADLINE, run(cfg)).await }),
+    );
+
+    match outcome {
+        Err(_) => panic!("e2e call did not finish within {OVERALL_DEADLINE:?}"),
+        Ok(Err(error)) => panic!("e2e call failed: {error}"),
+        Ok(Ok(())) => {}
+    }
 }
 
-async fn run(
-    cfg: Config,
-    alice_user: String,
-    alice_pw: String,
-    bob_user: String,
-    bob_pw: String,
-) -> Result<(), Box<dyn Error>> {
+async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
+    let (alice_creds, bob_creds) = credentials(&cfg).await?;
+
     // 1. Both clients log in and sync.
-    let alice = login_and_sync(&cfg, &alice_user, &alice_pw).await?;
-    let bob = login_and_sync(&cfg, &bob_user, &bob_pw).await?;
+    let alice = login_and_sync(&cfg, &alice_creds).await?;
+    let bob = login_and_sync(&cfg, &bob_creds).await?;
     let bob_id = bob.client.user_id().ok_or("bob has no user id")?.to_owned();
 
     // 2. Alice creates the encrypted room and invites bob.
@@ -553,8 +597,8 @@ async fn run(
 
     // 5. Now both join the RTC session (membership stickies + SFU connect).
     let room_id_str = room_id.to_string();
-    let alice = join_rtc(&cfg, &room_id_str, alice, alice_room, &alice_user).await?;
-    let mut bob = join_rtc(&cfg, &room_id_str, bob, bob_room, &bob_user).await?;
+    let alice = join_rtc(&cfg, &room_id_str, alice, alice_room, &alice_creds.user).await?;
+    let mut bob = join_rtc(&cfg, &room_id_str, bob, bob_room, &bob_creds.user).await?;
 
     // Signalling proof: each side discovers the other's membership
     // via stickies (own + peer == 2).
@@ -645,12 +689,14 @@ async fn record_and_verify_tone(bob: &mut Participant) -> Result<bool, Box<dyn E
                 if let RemoteTrack::Audio(audio) = track {
                     println!("[bob] recording ~2s of audio...");
                     let pcm = media::record_track(&audio, Duration::from_secs(2)).await;
-                    if let Err(error) =
-                        media::write_wav("/tmp/e2e_received.wav", &pcm, media::SAMPLE_RATE)
-                    {
+                    // CI uploads this on failure, so keep the path predictable
+                    // (temp_dir is /tmp on the linux runners).
+                    let wav_path = std::env::temp_dir().join("e2e_received.wav");
+                    let wav_path = wav_path.to_string_lossy();
+                    if let Err(error) = media::write_wav(&wav_path, &pcm, media::SAMPLE_RATE) {
                         eprintln!("[bob] failed to write WAV: {error}");
                     } else {
-                        println!("[bob] wrote /tmp/e2e_received.wav ({} samples)", pcm.len());
+                        println!("[bob] wrote {wav_path} ({} samples)", pcm.len());
                     }
                     let energy = media::detect_tone(&pcm, media::SAMPLE_RATE, 440.0);
                     println!("[bob] 440 Hz energy ratio: {energy:.3}");

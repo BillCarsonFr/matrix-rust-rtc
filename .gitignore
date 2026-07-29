@@ -21,6 +21,9 @@ node_modules/
 
 agent-workspace/
 
+# Runtime state of the local MatrixRTC backend stack
+demo/backend/data/
+
 .idea/
 
 mobile/android/.gradle/

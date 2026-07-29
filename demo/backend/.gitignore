@@ -1,2 +1,4 @@
-# Cloned Element Call dev backend (not vendored)
+# All runtime state (synapse db/media/signing key, generated TLS certs)
+data/
+# Leftover clone from the old setup.sh-based backend
 element-call/

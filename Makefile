@@ -18,7 +18,7 @@
 
 # Makefile for common development tasks
 
-.PHONY: help setup build-check fmt fmt-check clippy test build-ffi build-mobile build-android build-ios clean
+.PHONY: help setup build-check fmt fmt-check clippy test build-ffi build-mobile build-android build-ios clean backend-up backend-down backend-logs test-e2e
 
 help:
 	@echo "Matrix RTC Development Commands"
@@ -32,6 +32,12 @@ help:
 	@echo "  make clippy             Run clippy linter"
 	@echo "  make test               Run all tests"
 	@echo "  make build-check        Check builds for all crates"
+	@echo ""
+	@echo "E2E / local backend (demo/backend):"
+	@echo "  make backend-up         Start the MatrixRTC backend stack (docker compose)"
+	@echo "  make backend-down       Tear the backend stack down"
+	@echo "  make backend-logs       Follow the backend stack logs"
+	@echo "  make test-e2e           Run the e2e call test against the backend stack"
 	@echo ""
 	@echo "Build Mobile:"
 	@echo "  make build-mobile       Build both Android AAR and iOS XCFramework (interactive)"
@@ -82,6 +88,19 @@ clean:
 	rm -rf mobile/ios/generated
 	rm -rf mobile/android/matrixrtc/src/main/jniLibs
 	rm -rf mobile/android/matrixrtc/build
+
+backend-up:
+	docker compose -f demo/backend/docker-compose.yml up -d --wait
+	./demo/backend/wait-ready.sh
+
+backend-down:
+	docker compose -f demo/backend/docker-compose.yml down -v
+
+backend-logs:
+	docker compose -f demo/backend/docker-compose.yml logs -f
+
+test-e2e: backend-up
+	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
 
 .PHONY: quality-check
 quality-check: fmt-check clippy test build-check

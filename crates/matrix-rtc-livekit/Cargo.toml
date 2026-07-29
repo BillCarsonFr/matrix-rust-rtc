@@ -49,37 +49,34 @@ futures-util = "0.3"
 # peer discovery) rides on it. See `matrix_bridge`. Keeps matrix-sdk's default
 # features (e2e-encryption, sqlite, rustls-aws-lc-rs) and adds sticky events.
 #
-# Pinned to rev 1815b08 ("chore(deps): Update ruma"), which builds on 7603577
-# ("keep encryption info for sticky events"). That commit makes `StickyLiveEvent`
-# carry a `TimelineEventKind` and so exposes `encryption_info().sender_device` —
-# the only source for a member event's sending device now that MSC4143 has
-# dropped `member.claimed_device_id`. See `matrix_bridge::snapshot`.
+# Pinned to rev 3773300 ("Update ruma to the rewritten MSC4143"), which
+# repoints ruma to `BillCarsonFr/ruma@3fc675d`. That ruma models the 2026
+# MSC4143 rewrite — `member.membership`, `leave_reason`, `transports
+# {published, can_subscribe}`, and an `m.rtc.encryption_key` content of
+# `{room_id, member_id, media_key, format}` — matching what `matrix-rtc-core`
+# puts on the wire, so ruma's typed events (e.g. `AnyToDeviceEvent`) can be
+# used on RTC wire content again. Member events are still parsed with
+# `matrix_rtc_core::RawStickyEventContent` (the core must not depend on ruma).
 #
-# 1815b08 is also what makes the fork compile again: it repoints ruma from
-# upstream `ruma/ruma@7f925c1` (which has no `events::rtc::member`) to
-# `BillCarsonFr/ruma@3da084e`, which carries the MSC4143 event types that
-# matrix-sdk-base's `unstable-msc4354` code needs.
-#
-# NOTE: that ruma still models the PRE-rewrite MSC4143 (`claimed_device_id`,
-# `versions`, `disconnect_reason`, flat `rtc_transports`). It only affects
-# matrix-sdk-base's own `active_rtc_member_stickies` /
-# `has_active_rtc_member_sticky` helpers, which we do not call — this crate
-# parses member content with `matrix_rtc_core::RawStickyEventContent`.
+# The pin also carries 7603577 ("keep encryption info for sticky events"),
+# which makes `StickyLiveEvent` expose `encryption_info().sender_device` — the
+# only source for a member event's sending device now that MSC4143 has dropped
+# `member.claimed_device_id`. See `matrix_bridge::snapshot`.
 # `experimental-send-custom-to-device` exposes
 # `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
 # keys as Olm-encrypted to-device messages (see `matrix_bridge`). It pulls in
 # `e2e-encryption`, already on via defaults.
-matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "1815b08c22e455cc7926f01a9335684e2c425e64", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
+matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
 # Drives sliding sync (which auto-enables the sticky extension under
 # `unstable-msc4354`) plus the encryption sync, so sticky events actually flow.
 # Encryption support rides along via matrix-sdk's default features; ui only needs
 # the sticky feature for unification with matrix-sdk-base.
-matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "1815b08c22e455cc7926f01a9335684e2c425e64", optional = true, features = ["unstable-msc4354"] }
+matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354"] }
 # Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
 # to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it. Same
 # rev as matrix-sdk so cargo unifies the source; `e2e-encryption` gates the
 # `crypto` re-export.
-matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "1815b08c22e455cc7926f01a9335684e2c425e64", optional = true, features = ["e2e-encryption"] }
+matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["e2e-encryption"] }
 
 [features]
 # Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`,
@@ -91,6 +88,15 @@ matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-ui", "dep:matrix-sdk-base"]
 # record / WAV / frequency detect) for examples and integration tests. Not for
 # production use; the module is otherwise only compiled under `cfg(test)`.
 testing = []
+
+# The end-to-end call test (see tests/E2E_CALL.md). `required-features` keeps
+# plain `cargo test --workspace` from compiling it (and the git SDK + libwebrtc
+# behind it); the `#[ignore]` inside keeps `--all-features` runs from executing
+# it without the demo/backend stack.
+[[test]]
+name = "e2e_call"
+path = "tests/e2e_call/main.rs"
+required-features = ["matrix-sdk", "testing"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
@@ -105,7 +111,3 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 [[example]]
 name = "connect"
 required-features = ["matrix-sdk"]
-
-[[example]]
-name = "e2e_call"
-required-features = ["matrix-sdk", "testing"]

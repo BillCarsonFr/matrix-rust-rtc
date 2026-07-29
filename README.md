@@ -17,7 +17,7 @@ This project provides a core RTC SDK in Rust that can be used across multiple pl
 - `crates/matrix-rtc-livekit`: MSC4195 LiveKit transport — SFU token exchange, media session (subscribe), and the E2EE key bridge. Native-only (pulls in `libwebrtc`).
 - `mobile/android`: Android Gradle library module and build scripts for AAR packaging.
 - `mobile/ios`: iOS Swift Package and build scripts for XCFramework packaging.
-- `demo/backend`: local MatrixRTC stack (Synapse + LiveKit + lk-jwt-service + nginx/TLS + Element Web) for running the demo against a real SFU.
+- `demo/backend`: self-contained MatrixRTC backend (Synapse + lk-jwt-service + LiveKit SFU, docker compose) used by the e2e call test on CI and for local development.
 
 ## Quick Mobile Builds
 
@@ -78,6 +78,14 @@ cargo check
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+```
+
+End-to-end call test against the local backend stack (see
+[demo/backend/README.md](demo/backend/README.md); also run by CI on every PR):
+
+```bash
+make backend-up
+cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
 ```
 
 ## Pre-commit checklist

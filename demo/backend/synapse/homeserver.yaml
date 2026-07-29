@@ -1,0 +1,124 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# Dev/test Synapse for the MatrixRTC backend stack. NOT for production:
+# open registration, disabled rate limits, well-known dev secrets.
+
+# The compose service name, so federation discovery resolves in-network.
+server_name: "synapse"
+public_baseurl: "http://localhost:8008/"
+pid_file: /data/homeserver.pid
+log_config: /cfg/log.config
+
+listeners:
+  # Client-server API, plain HTTP, published to the host.
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: false
+    bind_addresses: ["0.0.0.0"]
+    resources:
+      - names: [client, openid]
+        compress: false
+  # Federation over TLS (self-signed, minted by the init-certs service).
+  # Required because lk-jwt-service validates OpenID tokens against
+  # /_matrix/federation/v1/openid/userinfo and only speaks HTTPS. Not
+  # published to the host.
+  - port: 8448
+    tls: true
+    type: http
+    bind_addresses: ["0.0.0.0"]
+    resources:
+      - names: [federation, openid]
+        compress: false
+
+tls_certificate_path: /data/tls/synapse.crt
+tls_private_key_path: /data/tls/synapse.key
+
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+
+media_store_path: /data/media_store
+# Auto-generated on first start into the (git-ignored) data volume.
+signing_key_path: /data/synapse.signing.key
+report_stats: false
+suppress_key_server_warning: true
+trusted_key_servers: []
+
+# Tests provision throwaway users on the fly. The shared secret additionally
+# enables the admin registration API (/_synapse/admin/v1/register and the
+# register_new_matrix_user CLI) should open registration ever be turned off.
+enable_registration: true
+enable_registration_without_verification: true
+registration_shared_secret: "matrix-rtc-dev-only"
+
+# MSC4140 delayed events (the dead man's switch behind delayed RTC leaves).
+# There is no experimental_features flag for it; setting a maximum delay is
+# what enables the API.
+max_event_delay_duration: 24h
+
+experimental_features:
+  # MSC3266: room summary API (Element Call parity for the future overlay).
+  msc3266_enabled: true
+  # MSC4222: state_after in sync, used by current SDKs.
+  msc4222_enabled: true
+  # MSC4354: sticky events — the MatrixRTC signalling backbone.
+  msc4354_enabled: true
+
+# Rate limits effectively disabled so automated tests can log in, join, and
+# re-arm delayed events as fast as they like.
+rc_message:
+  per_second: 1000
+  burst_count: 1000
+rc_registration:
+  per_second: 1000
+  burst_count: 1000
+rc_login:
+  address:
+    per_second: 1000
+    burst_count: 1000
+  account:
+    per_second: 1000
+    burst_count: 1000
+  failed_attempts:
+    per_second: 1000
+    burst_count: 1000
+rc_joins:
+  local:
+    per_second: 1000
+    burst_count: 1000
+  remote:
+    per_second: 1000
+    burst_count: 1000
+rc_joins_per_room:
+  per_second: 1000
+  burst_count: 1000
+rc_invites:
+  per_room:
+    per_second: 1000
+    burst_count: 1000
+  per_user:
+    per_second: 1000
+    burst_count: 1000
+  per_issuer:
+    per_second: 1000
+    burst_count: 1000
+# MSC4140 bucket: the 15s RTC heartbeat re-arms a delayed leave, which the
+# default limit (per_second: 1) would throttle across concurrent tests.
+rc_delayed_event_mgmt:
+  per_second: 1000
+  burst_count: 1000
+rc_key_requests:
+  per_second: 1000
+  burst_count: 1000
+rc_admin_redaction:
+  per_second: 1000
+  burst_count: 1000

@@ -39,6 +39,7 @@ use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateA
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, update_delayed_event,
 };
+use matrix_sdk::ruma::api::client::state::get_state_events;
 use matrix_sdk::ruma::events::{
     AnyMessageLikeEventContent, AnyToDeviceEventContent, MessageLikeEventType, StateEventType,
 };
@@ -46,7 +47,6 @@ use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{DeviceId, RoomId, TransactionId, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships};
 use matrix_sdk_base::crypto::CollectStrategy;
-use matrix_sdk_base::deserialized_responses::RawAnySyncOrStrippedState;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
@@ -306,58 +306,61 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
         .collect()
 }
 
-/// Snapshot the room's `m.rtc.slot` state as core DTOs.
+/// Snapshot the room's `m.rtc.slot` state as core DTOs, or `None` when the
+/// state could not be determined this tick.
 ///
 /// The state key is the slot id. Events whose content will not parse are still
 /// reported, with empty content, so the slot resolves closed rather than
 /// vanishing — an unreadable slot event is not an open slot.
 ///
-/// NOTE: unlike the member path — which filters raw type strings out of the
-/// sticky map and so accepts the stable and unstable ids alike — this queries
-/// the state store *by type*, and ruma can only name one id at a time (the
-/// other is an alias it normalises away). So this reads whichever id ruma
-/// currently designates, and a homeserver serving the other one looks like a
-/// room with no slots, i.e. every member left. Bumping ruma is what carries
-/// this across the stable transition.
-async fn slot_snapshot(room: &Room) -> Vec<RawSlotEvent> {
+/// This asks the homeserver (`GET /rooms/{id}/state`) instead of the SDK's
+/// state store: the store only holds event types listed in sliding sync's
+/// `required_state`, which does not (yet) include the MSC4143 slot type, so
+/// the store reports every room as slotless — and feeding that into the core
+/// closes the slot and drops every member. For the same reason a failed fetch
+/// returns `None` (skip this tick's update) rather than "no slots". Once the
+/// SDK's sliding sync config carries the slot type, this can go back to
+/// reading the store.
+///
+/// Filtering happens on the raw `type` string, so the stable and unstable ids
+/// are accepted alike — same as the member path, and immune to which of the
+/// two ruma currently treats as primary.
+async fn slot_snapshot(room: &Room) -> Option<Vec<RawSlotEvent>> {
     let room_id = room.room_id().to_string();
-    let event_type = StateEventType::from(SLOT_EVENT_TYPE.to_owned());
-
-    let states = match room.get_state_events(event_type).await {
-        Ok(states) => states,
+    let request = get_state_events::v3::Request::new(room.room_id().to_owned());
+    let response = match room.client().send(request).await {
+        Ok(response) => response,
         Err(error) => {
-            log::warn!("failed to read m.rtc.slot state: {error}");
-            return Vec::new();
+            log::warn!("failed to fetch room state for m.rtc.slot: {error}");
+            return None;
         }
     };
 
-    states
+    let slots = response
+        .room_state
         .into_iter()
-        .filter_map(|state| {
-            // Read the fields off the raw JSON either way: an invited room's
-            // stripped state still carries the slot id and content.
-            let (state_key, content) = match &state {
-                RawAnySyncOrStrippedState::Sync(raw) => (
-                    raw.get_field::<String>("state_key").ok().flatten(),
-                    raw.get_field::<RawSlotEventContent>("content")
-                        .ok()
-                        .flatten(),
-                ),
-                RawAnySyncOrStrippedState::Stripped(raw) => (
-                    raw.get_field::<String>("state_key").ok().flatten(),
-                    raw.get_field::<RawSlotEventContent>("content")
-                        .ok()
-                        .flatten(),
-                ),
-            };
+        .filter_map(|raw| {
+            let event_type = raw.get_field::<String>("type").ok().flatten()?;
+            if event_type != SLOT_EVENT_TYPE && event_type != "org.matrix.msc4143.rtc.slot" {
+                return None;
+            }
+
+            let state_key = raw.get_field::<String>("state_key").ok().flatten();
+            let content = raw
+                .get_field::<RawSlotEventContent>("content")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
 
             Some(RawSlotEvent {
                 room_id: room_id.clone(),
                 slot_id: state_key?,
-                content: content.unwrap_or_default(),
+                content,
             })
         })
-        .collect()
+        .collect();
+
+    Some(slots)
 }
 
 /// Snapshot the users currently joined to the room.
@@ -394,7 +397,11 @@ async fn feed_room_state(room: &Room, manager: &Arc<Mutex<RtcSessionManager<SdkC
         }
         Err(error) => log::warn!("failed to read room encryption state: {error}"),
     }
-    manager.on_room_slots_received(room_id, slots).await;
+    // A `None` snapshot means the fetch failed; leave the slot knowledge as it
+    // was rather than reporting an empty (all-closed) room.
+    if let Some(slots) = slots {
+        manager.on_room_slots_received(room_id, slots).await;
+    }
     manager.on_room_members_received(room_id, members).await;
 }
 

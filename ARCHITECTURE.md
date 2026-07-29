@@ -195,9 +195,9 @@ publish on is an application decision: the app calls
 `GET /_matrix/client/v1/rtc/transports` itself and passes the result into
 `join`. The core has no HTTP of its own, and adding a fetch would have meant
 every host implementing one whose result it then handed back to itself.
-`examples/e2e_call.rs` shows the pattern, using ruma's
-`api::client::rtc::transports` endpoint and falling back to a configured URL
-where the homeserver has not implemented it.
+The `e2e_call` integration test (`crates/matrix-rtc-livekit/tests/e2e_call/`)
+shows the pattern, using ruma's `api::client::rtc::transports` endpoint and
+falling back to a configured URL where the homeserver has not implemented it.
 
 What the core does model is the *intent*, via `TransportIntent`:
 
@@ -216,6 +216,14 @@ Still outstanding:
    late. A room-state subscription would fix it.
 2. **Mid-session renegotiation** — a slot that changes its encryption mechanism
    while a session is live keeps the mechanism negotiated at join.
+3. **Slot state comes from a server fetch, not the store** — sliding sync only
+   delivers state types listed in `required_state`, and the SDK's room-list
+   defaults do not include the MSC4143 slot type, so the local store reports
+   every room as slotless (which the core reads as "slot closed, everyone
+   left"). The bridge therefore fetches `GET /rooms/{id}/state` on each tick
+   and skips the update when the fetch fails. The real fix is adding the slot
+   type to the fork SDK's sliding sync `required_state`, then reverting
+   `slot_snapshot` to the state store.
 
 ## Non-goals in this first skeleton
 

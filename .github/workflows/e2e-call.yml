@@ -1,0 +1,92 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+name: E2E Call
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-call:
+    name: Two-client audio call
+    runs-on: ubuntu-latest
+    # Generous: an uncached build of the matrix-sdk fork alone takes ~25-45
+    # minutes. With a warm rust-cache the whole job is ~10 minutes.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start the backend first so image pulls and Synapse's first boot overlap
+      # the (much longer) rust build.
+      - name: Start MatrixRTC backend
+        run: docker compose -f demo/backend/docker-compose.yml up -d --wait
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # matrix-rtc-livekit pulls in livekit/webrtc-sys, whose build script
+      # shells out to pkg-config for glib-2.0 (the prebuilt linux libwebrtc
+      # dynamically links it). Same dependency the Lint workflow installs.
+      - name: Install webrtc-sys system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-call
+
+      # Build without running so a compile failure is distinguishable from a
+      # call failure, and the stack gets extra minutes to settle.
+      - name: Build e2e test
+        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call --no-run
+
+      - name: Wait for backend readiness
+        run: ./demo/backend/wait-ready.sh
+
+      - name: Run e2e call test
+        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
+        env:
+          RUST_LOG: info
+
+      # Always, not just on failure: the auth-service (lk-jwt) logs are the
+      # only visibility into the OpenID/token hop, and green runs that log
+      # oddities are how drift gets spotted early.
+      - name: Backend logs
+        if: always()
+        run: docker compose -f demo/backend/docker-compose.yml logs --no-color
+
+      # The recorded audio is the best evidence when tone detection fails.
+      - name: Upload recorded audio
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-received-wav
+          path: /tmp/e2e_received.wav
+          if-no-files-found: ignore
+
+      - name: Teardown backend
+        if: always()
+        run: docker compose -f demo/backend/docker-compose.yml down -v
