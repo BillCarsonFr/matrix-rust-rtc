@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::commands::RtcCommandSender;
+use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
@@ -133,29 +134,15 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Feeds a media encryption key received from a peer (MSC4143 to-device
     /// message) into this session's encryption manager.
     ///
-    /// A no-op if the session has not joined yet (no encryption manager).
+    /// The key is only used if it passes the MSC4143 checks; see
+    /// [`EncryptionManager::receive_key`]. A no-op if the session has not
+    /// joined yet (no encryption manager).
     pub async fn receive_encryption_key(
         &self,
-        sender_user_id: String,
-        sender_device_id: String,
-        key_b64: String,
-        key_index: u8,
-        member_id: String,
-        room_id: String,
+        received: ReceivedEncryptionKey,
     ) -> Result<(), CommandError> {
         match &self.encryption_manager {
-            Some(manager) => {
-                manager
-                    .receive_key(
-                        sender_user_id,
-                        sender_device_id,
-                        key_b64,
-                        key_index,
-                        member_id,
-                        room_id,
-                    )
-                    .await
-            }
+            Some(manager) => manager.receive_key(received).await,
             None => Ok(()),
         }
     }

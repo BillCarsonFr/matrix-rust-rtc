@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::commands::RtcCommandSender;
+use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::{
@@ -357,7 +358,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     }
 
     /// Routes a media encryption key received from a peer into every session in
-    /// `room_id`.
+    /// the room it names.
     ///
     /// The MSC4143 key to-device content carries no `slot_id`, so the key is
     /// fanned out to all sessions of the room. This is exact for the common
@@ -365,25 +366,11 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// every slot (harmless — unmatched keys are buffered/ignored).
     pub async fn receive_encryption_key(
         &self,
-        room_id: &str,
-        sender_user_id: String,
-        sender_device_id: String,
-        key_b64: String,
-        key_index: u8,
-        member_id: String,
+        received: ReceivedEncryptionKey,
     ) -> Result<(), CommandError> {
         for (key, session) in self.sessions.iter() {
-            if key.room_id == room_id {
-                session
-                    .receive_encryption_key(
-                        sender_user_id.clone(),
-                        sender_device_id.clone(),
-                        key_b64.clone(),
-                        key_index,
-                        member_id.clone(),
-                        room_id.to_owned(),
-                    )
-                    .await?;
+            if key.room_id == received.room_id {
+                session.receive_encryption_key(received.clone()).await?;
             }
         }
         Ok(())

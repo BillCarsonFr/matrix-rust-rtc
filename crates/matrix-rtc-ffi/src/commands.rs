@@ -67,6 +67,9 @@ pub struct FfiEncryptionConfig {
     pub key_rotation_grace_period_ms: Option<u64>,
     /// Whether to manage media keys (default: true).
     pub manage_media_keys: Option<bool>,
+    /// Whether to discard keys from devices that are not cross-signed
+    /// (default: true, per MSC4153).
+    pub require_cross_signed_sender: Option<bool>,
 }
 
 /// FFI-friendly join session parameters.
@@ -137,6 +140,7 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms.unwrap_or(5000),
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
+            require_cross_signed_sender: value.require_cross_signed_sender.unwrap_or(true),
         }
     }
 }

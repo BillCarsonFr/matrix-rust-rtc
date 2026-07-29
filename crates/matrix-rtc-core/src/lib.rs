@@ -33,8 +33,8 @@ mod transport;
 
 pub use commands::RtcCommandSender;
 pub use encryption::types::{
-    EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, OutboundEncryptionKey,
-    OutdatedKeyFilter, ParticipantDeviceInfo,
+    EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, KeyOrigin, KeyRejection,
+    OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,
 };
 pub use encryption::{
     EncryptionKeySignalHandler, EncryptionManager, KEY_MESSAGE_TYPE, RtcIdentityMapper,

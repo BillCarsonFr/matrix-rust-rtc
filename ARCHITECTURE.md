@@ -104,20 +104,34 @@ proposal. The `m.rtc.member` wire format now matches it:
 - `member.id` is generated fresh per join (`generate_member_id`), as the spec
   requires; it is no longer derived from the user and device IDs.
 
+Inbound `m.rtc.encryption_key` messages are checked before use. A key is only
+stored and signalled once it has been matched against the sender's member event:
+
+- The host reports how the message arrived via `KeyOrigin`, built from Olm
+  decryption metadata. Cleartext messages are discarded, since nothing in the
+  payload can be trusted to identify a sender.
+- The to-device sender and its device must equal the sender and
+  `sender_device_id` of the `m.rtc.member` event the message names, or the key is
+  discarded. A key naming another room is discarded too.
+- Keys from devices that are not cross-signed are discarded unless
+  `EncryptionConfig::require_cross_signed_sender` is turned off (MSC4153).
+- A key that arrives before its member event is buffered *with its origin* and
+  checked when the membership shows up — verification is deferred, never
+  skipped. Rejected keys never reach the outdated-key filter, so a bogus key
+  cannot take the `(member, index)` slot and suppress the genuine one.
+
+The outgoing key message declares `format: 0` as the spec requires.
+
 Still outstanding, in the order they are planned:
 
-1. **Key targeting hardening** — `receive_key` still ignores the sender/device it
-   is handed, so the MUSTs around matching them to the member event, and around
-   discarding cleartext keys, are unimplemented.
-2. **Slots** — `m.rtc.slot` is not modelled at all. That blocks the MSC4143 join
+1. **Slots** — `m.rtc.slot` is not modelled at all. That blocks the MSC4143 join
    conditions (an open slot must exist, the sender must be joined to the room),
    eviction on slot close, and the `status` / `encryption` fields the slot event
    gained.
-3. **Encryption negotiation** — the mechanism should come from the slot's
-   `encryption.type` plus room encryption rather than a local config flag. The
-   to-device key message also still sends `version: "0"` where the spec now says
-   `format: 0`, and the MSC4153 cross-signing check is missing.
-4. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
+2. **Encryption negotiation** — whether to encrypt, and with which mechanism,
+   should come from the slot's `encryption.type` plus room encryption rather than
+   a local config flag.
+3. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
    implemented; LiveKit URLs come from configuration.
 
 ## Non-goals in this first skeleton

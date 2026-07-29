@@ -214,6 +214,10 @@ pub struct WasmEncryptionConfig {
     pub key_rotation_grace_period_ms: u64,
     #[serde(default = "default_manage_media_keys")]
     pub manage_media_keys: bool,
+    /// Whether to discard keys from devices that are not cross-signed
+    /// (default: true, per MSC4153).
+    #[serde(default = "default_require_cross_signed_sender")]
+    pub require_cross_signed_sender: bool,
 }
 
 fn default_delay_before_use_ms() -> u64 {
@@ -225,6 +229,9 @@ fn default_key_rotation_grace_period_ms() -> u64 {
 fn default_manage_media_keys() -> bool {
     true
 }
+fn default_require_cross_signed_sender() -> bool {
+    true
+}
 
 impl From<WasmEncryptionConfig> for EncryptionConfig {
     fn from(value: WasmEncryptionConfig) -> Self {
@@ -232,6 +239,7 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms,
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms,
             manage_media_keys: value.manage_media_keys,
+            require_cross_signed_sender: value.require_cross_signed_sender,
         }
     }
 }

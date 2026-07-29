@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
+use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
 use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
 use matrix_sdk::ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
@@ -62,8 +63,8 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use matrix_rtc_core::{
-    JoinSessionParams, LiveKitTransport, RtcIdentityMapper, RtcSessionManager, RtcTransport,
-    generate_member_id,
+    EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, ReceivedEncryptionKey,
+    RtcIdentityMapper, RtcSessionManager, RtcTransport, generate_member_id,
 };
 use matrix_rtc_livekit::{
     LiveKitConnection, LiveKitTransportConfig, MediaKeyBridge, MemberClaims, SdkCommandSender,
@@ -76,7 +77,7 @@ type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
 /// `org.matrix.msc4143.rtc.encryption_key` to-device message, carried from the
 /// (`Send`) event handler to the (`!Send`) key pump over an mpsc channel.
 struct ReceivedKey {
-    sender_user_id: String,
+    origin: KeyOrigin,
     room_id: String,
     member_id: String,
     key_index: u8,
@@ -233,6 +234,13 @@ async fn join_rtc(
         }),
     );
     params.membership_id = Some(membership_id.clone());
+    // The two clients here are throwaway logins with no cross-signing set up, so
+    // the MSC4153 requirement would discard every key they send each other. A
+    // real client should leave this at its default (`true`).
+    params.encryption_config = Some(EncryptionConfig {
+        require_cross_signed_sender: false,
+        ..EncryptionConfig::default()
+    });
     {
         let mut mgr = manager.lock().await;
         mgr.join(params).await?;
@@ -254,18 +262,13 @@ async fn join_rtc(
                 if let Err(error) = manager
                     .lock()
                     .await
-                    .receive_encryption_key(
-                        &received.room_id,
-                        received.sender_user_id,
-                        // The core ignores the sender device id here; the
-                        // identity mapper derives the peer's LiveKit identity from
-                        // the device that encrypted their member event, so "*" is
-                        // fine at this call site.
-                        "*".to_owned(),
-                        received.key_b64,
-                        received.key_index,
-                        received.member_id,
-                    )
+                    .receive_encryption_key(ReceivedEncryptionKey {
+                        origin: received.origin,
+                        room_id: received.room_id,
+                        member_id: received.member_id,
+                        key_b64: received.key_b64,
+                        key_index: received.key_index,
+                    })
                     .await
                 {
                     eprintln!("failed to ingest received media key: {error}");
@@ -324,20 +327,50 @@ async fn join_rtc(
 /// The handler is `Send` (it only moves owned key data into a channel), which
 /// `add_event_handler` requires; the `!Send` work happens in the pump.
 fn register_key_receiver(client: &Client, key_tx: UnboundedSender<ReceivedKey>) {
-    client.add_event_handler(move |event: AnyToDeviceEvent| {
-        let key_tx = key_tx.clone();
-        async move {
-            if let AnyToDeviceEvent::RtcEncryptionKey(event) = event {
-                let _ = key_tx.send(ReceivedKey {
-                    sender_user_id: event.sender.to_string(),
-                    room_id: event.content.room_id.to_string(),
-                    member_id: event.content.member_id,
-                    key_index: event.content.media_key.index,
-                    key_b64: event.content.media_key.key,
-                });
+    client.add_event_handler(
+        move |event: AnyToDeviceEvent, encryption_info: Option<EncryptionInfo>| {
+            let key_tx = key_tx.clone();
+            async move {
+                if let AnyToDeviceEvent::RtcEncryptionKey(event) = event {
+                    let _ = key_tx.send(ReceivedKey {
+                        origin: key_origin(encryption_info.as_ref()),
+                        room_id: event.content.room_id.to_string(),
+                        member_id: event.content.member_id,
+                        key_index: event.content.media_key.index,
+                        key_b64: event.content.media_key.key,
+                    });
+                }
             }
-        }
-    });
+        },
+    );
+}
+
+/// Translate the SDK's decryption metadata into the core's [`KeyOrigin`].
+///
+/// `None` means the to-device message arrived unencrypted, which MSC4143 says
+/// to discard — the core makes that call, this just reports it faithfully.
+fn key_origin(info: Option<&EncryptionInfo>) -> KeyOrigin {
+    let Some(info) = info else {
+        return KeyOrigin::Cleartext;
+    };
+
+    // MSC4153 asks whether the sending device is cross-signed, not whether we
+    // trust its owner: an unverified *identity* still signs its own devices.
+    // States that leave the device unattributable count as not cross-signed.
+    let sender_is_cross_signed = !matches!(
+        info.verification_state,
+        VerificationState::Unverified(
+            VerificationLevel::UnsignedDevice
+                | VerificationLevel::None(_)
+                | VerificationLevel::MismatchedSender
+        )
+    );
+
+    KeyOrigin::Encrypted {
+        sender_user_id: info.sender.to_string(),
+        sender_device_id: info.sender_device.as_ref().map(|d| d.to_string()),
+        sender_is_cross_signed,
+    }
 }
 
 /// Poll until the room is known to the client, or time out.
