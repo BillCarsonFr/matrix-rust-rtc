@@ -121,6 +121,27 @@ pub trait RtcCommandSender: Send + Sync {
         message_type: String,
         content: Value,
     ) -> Result<(), CommandError>;
+
+    /// Send a state event to a Matrix room.
+    ///
+    /// Used for `m.rtc.slot`, the only MatrixRTC event that lives in room state.
+    /// Sending it usually requires a power level the average member does not
+    /// have, so implementations should surface an authorization failure as an
+    /// error rather than swallowing it.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID where the event should be sent
+    /// * `event_type` - The event type (e.g., "m.rtc.slot")
+    /// * `state_key` - The state key (for a slot, the slot id)
+    /// * `content` - The event content as a JSON value
+    async fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content: Value,
+    ) -> Result<(), CommandError>;
 }
 
 /// A no-op implementation of `RtcCommandSender` for testing purposes.
@@ -169,6 +190,16 @@ impl RtcCommandSender for NoopCommandSender {
     ) -> Result<(), CommandError> {
         Ok(())
     }
+
+    async fn send_state_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _state_key: String,
+        _content: Value,
+    ) -> Result<(), CommandError> {
+        Ok(())
+    }
 }
 
 /// A mock implementation of `RtcCommandSender` that captures sent events for testing.
@@ -181,6 +212,7 @@ pub struct MockCommandSender {
     pub delayed_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
     pub cancelled_events: std::sync::Mutex<Vec<(String, String)>>,
     pub to_device_messages: std::sync::Mutex<Vec<(String, String, String, Value)>>,
+    pub state_events: std::sync::Mutex<Vec<(String, String, String, Value)>>,
 }
 
 #[cfg(test)]
@@ -271,6 +303,20 @@ impl RtcCommandSender for MockCommandSender {
             .lock()
             .unwrap()
             .push((user_id, device_id, message_type, content));
+        Ok(())
+    }
+
+    async fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        self.state_events
+            .lock()
+            .unwrap()
+            .push((room_id, event_type, state_key, content));
         Ok(())
     }
 }

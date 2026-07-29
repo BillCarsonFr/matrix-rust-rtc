@@ -25,11 +25,13 @@
 //!    `shared`, and **invites** `bob`.
 //! 3. `bob` **joins** the room; both sides wait until the two-member room
 //!    membership has settled.
-//! 4. Only then do both peers join the same MatrixRTC slot: each publishes its
+//! 4. `alice` **opens the slot** with an `m.rtc.slot` state event; MSC4143
+//!    only counts members as joined against an open slot.
+//! 5. Only then do both peers join the same MatrixRTC slot: each publishes its
 //!    own `m.rtc.member` membership as an MSC4354 sticky event (plus a dead
 //!    man's switch delayed leave) and discovers the other via the sticky-event
 //!    subscription.
-//! 5. Both connect to the LiveKit SFU; `alice` publishes a 440 Hz tone and
+//! 6. Both connect to the LiveKit SFU; `alice` publishes a 440 Hz tone and
 //!    `bob` records what the SFU forwards and verifies the frequency.
 //!
 //! Run against the `demo/backend` stack (see its README). Element Web is NOT
@@ -64,7 +66,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use matrix_rtc_core::{
     EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, ReceivedEncryptionKey,
-    RtcIdentityMapper, RtcSessionManager, RtcTransport, generate_member_id,
+    RtcIdentityMapper, RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
 use matrix_rtc_livekit::{
     LiveKitConnection, LiveKitTransportConfig, MediaKeyBridge, MemberClaims, SdkCommandSender,
@@ -491,7 +493,23 @@ async fn run(
     wait_for_joined_members(&alice_room, 2, "alice").await?;
     wait_for_joined_members(&bob_room, 2, "bob").await?;
 
-    // 4. Now both join the RTC session (membership stickies + SFU connect).
+    // 4. Alice (the room creator, so the only one with the power level for it)
+    //    opens the slot. Without an open `m.rtc.slot` in room state, MSC4143
+    //    says no member of it counts as joined.
+    RtcSessionManager::with_command_sender(Arc::new(SdkCommandSender::new(alice.client.clone())))
+        .open_slot(
+            room_id.to_string(),
+            cfg.slot_id.clone(),
+            "m.call".to_owned(),
+            Some(SlotEncryption {
+                encryption_type: "m.per_member".to_owned(),
+                extra: Default::default(),
+            }),
+        )
+        .await?;
+    println!("[alice] opened slot {}", cfg.slot_id);
+
+    // 5. Now both join the RTC session (membership stickies + SFU connect).
     let room_id_str = room_id.to_string();
     let alice = join_rtc(&cfg, &room_id_str, alice, alice_room, &alice_user).await?;
     let mut bob = join_rtc(&cfg, &room_id_str, bob, bob_room, &bob_user).await?;
@@ -501,7 +519,7 @@ async fn run(
     let alice_sees = wait_for_members(&alice.manager, &room_id_str, &cfg.slot_id, 2, "alice").await;
     let bob_sees = wait_for_members(&bob.manager, &room_id_str, &cfg.slot_id, 2, "bob").await;
 
-    // 5. Media proof: alice publishes a 440 Hz tone; bob records what the SFU
+    // 6. Media proof: alice publishes a 440 Hz tone; bob records what the SFU
     //    forwards and checks the frequency.
     println!("[alice] publishing 440 Hz tone");
     let _tone = media::publish_tone(&alice.connection.session, 440.0).await?;

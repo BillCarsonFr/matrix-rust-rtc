@@ -25,6 +25,7 @@ function createMockMatrixClient() {
   const stickyEventsSent = [];
   const delayedEventsSent = [];
   const cancelledEvents = [];
+  const stateEventsSent = [];
 
   const client = {
     // WASM now expects these methods to return Promises
@@ -41,14 +42,21 @@ function createMockMatrixClient() {
       cancelledEvents.push({ roomId, eventId });
       return Promise.resolve();
     }),
+    // Used for m.rtc.slot, the only MatrixRTC event that lives in room state.
+    sendStateEvent: vi.fn((roomId, eventType, stateKey, content) => {
+      stateEventsSent.push({ roomId, eventType, stateKey, content });
+      return Promise.resolve();
+    }),
     // Expose internal state for assertions
     _getStickyEvents: () => stickyEventsSent,
     _getDelayedEvents: () => delayedEventsSent,
     _getCancelledEvents: () => cancelledEvents,
+    _getStateEvents: () => stateEventsSent,
     _clear: () => {
       stickyEventsSent.length = 0;
       delayedEventsSent.length = 0;
       cancelledEvents.length = 0;
+      stateEventsSent.length = 0;
     }
   };
 

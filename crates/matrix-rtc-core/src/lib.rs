@@ -29,6 +29,7 @@ mod join;
 mod manager;
 mod own_membership;
 mod session;
+mod slot;
 mod transport;
 
 pub use commands::RtcCommandSender;
@@ -52,6 +53,10 @@ pub use own_membership::{
 pub use session::{
     ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,
     MemberInfo, Membership, RtcSession,
+};
+pub use slot::{
+    OpenSlot, RawSlotEvent, RawSlotEventContent, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
+    SlotStatus,
 };
 pub use transport::{
     LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
@@ -121,236 +126,235 @@ mod tests {
         )
     }
 
-    fn left_membership(sender: &str, slot_id: &str, sticky_key: &str) -> CallMembershipEvent {
-        CallMembershipEvent::Left(LeftMembership {
+    fn slot_event(slot_id: &str, json: &str) -> RawSlotEvent {
+        RawSlotEvent {
             room_id: ROOM_ID.to_owned(),
             slot_id: slot_id.to_owned(),
-            sender: sender.to_owned(),
-            sticky_key: sticky_key.to_owned(),
-            member_id: Some(sticky_key.to_owned()),
-            leave_reason: Some(LeaveReason::new(LeaveCode::Leave)),
-        })
+            content: serde_json::from_str(json).expect("slot content must parse"),
+        }
     }
 
-    // TODO: Investigate stack overflow with watch channels in RtcSession
-    // #[test]
-    // fn manager_routes_snapshot_and_diff_update_membership() {
-    //     let rt = tokio::runtime::Builder::new_multi_thread()
-    //         .enable_all()
-    //         .build()
-    //         .expect("Failed to create runtime");
-    //     let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
-    //
-    //     let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
-    //
-    //     rt.block_on(async {
-    //         manager
-    //             .initial_sticky_for_room(ROOM_ID, vec![joined.clone()])
-    //             .await
-    //             .unwrap();
-    //     });
-    //     assert_eq!(manager.session_count(), 1);
-    //     assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
-    //
-    //     let joined_updated = RawStickyEvent {
-    //         content: RawStickyEventContent {
-    //             slot_id: "m.call#ROOM".to_owned(),
-    //             sticky_key: "alice-device-a".to_owned(),
-    //             application: ApplicationInfo {
-    //                 application_type: Some("m.call".to_owned()),
-    //                 extra: std::collections::BTreeMap::new(),
-    //             },
-    //             member: MemberInfo {
-    //                 id: Some("alice-device-a".to_owned()),
-    //                 claimed_device_id: None,
-    //                 claimed_user_id: None,
-    //             },
-    //             versions: Vec::new(),
-    //             disconnect_reason: None,
-    //             m_relates_to: None,
-    //             rtc_transports: None,
-    //             created_ts: None,
-    //         },
-    //         ..joined.clone()
-    //     };
-    //
-    //     let left = left_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
-    //
-    //     rt.block_on(async {
-    //         manager
-    //             .sticky_update_for_room(
-    //                 ROOM_ID,
-    //                 StickyEventsUpdate {
-    //                     added: Vec::new(),
-    //                     updated: vec![RawStickyEventUpdate {
-    //                         current: joined_updated,
-    //                         previous: joined,
-    //                     }],
-    //                     removed: vec![left],
-    //                 },
-    //             )
-    //             .await
-    //             .unwrap();
-    //     });
-    //
-    //     assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
-    // }
+    fn open_call_slot() -> RawSlotEvent {
+        slot_event(
+            "m.call#ROOM",
+            r#"{ "status": "open", "application": { "type": "m.call" } }"#,
+        )
+    }
 
-    #[test]
-    fn session_is_single_session_only() {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-        let mut session: RtcSession<NoopCommandSender> = RtcSession::new();
+    /// Restored after fixing the `RtcSessionManager::new()` recursion that used
+    /// to overflow the stack (it was misattributed to watch channels).
+    #[tokio::test]
+    async fn manager_routes_snapshot_and_diff_update_membership() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
 
-        let event = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a")
-            .try_into_call_membership_event()
+        manager
+            .initial_sticky_for_room(ROOM_ID, vec![joined.clone()])
+            .await
             .unwrap();
 
-        rt.block_on(async {
-            session.initial_events(vec![event]).await;
-        });
+        assert_eq!(manager.session_count(), 1);
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
 
-        assert_eq!(session.member_count(), 1);
-    }
-
-    #[test]
-    fn removed_events_clear_membership_even_if_content_looks_connected() {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-        let mut session: RtcSession<NoopCommandSender> = RtcSession::new();
-
-        let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a")
-            .try_into_call_membership_event()
+        let left = left_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
+        manager
+            .sticky_update_for_room(
+                ROOM_ID,
+                StickyEventsUpdate {
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                    removed: vec![left],
+                },
+            )
+            .await
             .unwrap();
 
-        rt.block_on(async {
-            session.initial_events(vec![joined]).await;
-        });
-
-        rt.block_on(async {
-            session
-                .handle_update(vec![left_membership(
-                    "@alice:example.org",
-                    "m.call#ROOM",
-                    "alice-device-a",
-                )])
-                .await;
-        });
-
-        assert_eq!(session.member_count(), 0);
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
     }
 
-    // TODO: This test causes a stack overflow, likely due to watch channel in RtcSession
-    // #[tokio::test(flavor = "multi_thread")]
-    // async fn manager_groups_sessions_by_slot_within_room() {
-    //     let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
-    //
-    //     let call_one = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
-    //     let call_two = joined_event("@bob:example.org", "m.call#SIDE", "bob-device-a");
-    //
-    //     manager
-    //         .initial_sticky_for_room(ROOM_ID, vec![call_one, call_two])
-    //         .await
-    //         .unwrap();
-    //
-    //     assert_eq!(manager.session_count(), 2);
-    //     assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
-    //     assert_eq!(manager.member_count(ROOM_ID, "m.call#SIDE"), Some(1));
-    // }
+    #[tokio::test]
+    async fn manager_accepts_stable_and_unstable_rtc_member_event_types() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
 
-    #[test]
-    fn session_membership_receiver_emits_initial_and_full_snapshots() {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-        let mut session: RtcSession<NoopCommandSender> = RtcSession::new();
-        let mut subscription = session.subscribe_membership_snapshots();
+        let stable = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
+        let unstable = RawStickyEvent {
+            event_type: "org.matrix.msc4143.rtc.member".to_owned(),
+            ..joined_event("@bob:example.org", "m.call#ROOM", "bob-device-a")
+        };
 
-        let initial = subscription.borrow().clone();
-        assert!(initial.is_empty());
-
-        let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a")
-            .try_into_call_membership_event()
+        manager
+            .initial_sticky_for_room(ROOM_ID, vec![stable, unstable])
+            .await
             .unwrap();
 
-        rt.block_on(async {
-            session.initial_events(vec![joined]).await;
-        });
-
-        assert!(subscription.has_changed().unwrap());
-        let after_join = subscription.borrow_and_update().clone();
-        assert_eq!(after_join.len(), 1);
-        assert_eq!(after_join[0].sender, "@alice:example.org");
-
-        rt.block_on(async {
-            session
-                .handle_update(vec![left_membership(
-                    "@alice:example.org",
-                    "m.call#ROOM",
-                    "alice-device-a",
-                )])
-                .await;
-        });
-
-        assert!(subscription.has_changed().unwrap());
-        let after_leave = subscription.borrow_and_update().clone();
-        assert!(after_leave.is_empty());
-
-        assert!(!subscription.has_changed().unwrap());
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(2));
     }
 
-    // TODO: Investigate stack overflow with multiple events in manager
-    // #[tokio::test]
-    // async fn manager_accepts_stable_and_unstable_rtc_member_event_types() {
-    //     let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
-    //
-    //     let stable = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
-    //
-    //     let unstable = RawStickyEvent {
-    //         event_type: "org.matrix.msc4143.rtc.member".to_owned(),
-    //         ..joined_event("@bob:example.org", "m.call#ROOM", "bob-device-a")
-    //     };
-    //
-    //     manager
-    //         .initial_sticky_for_room(ROOM_ID, vec![stable, unstable])
-    //         .await
-    //         .unwrap();
-    //
-    //     assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(2));
-    // }
+    #[tokio::test]
+    async fn manager_ignores_non_membership_event_types() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
 
-    // TODO: Investigate stack overflow in tokio::test with watch channels
-    // #[tokio::test]
-    // async fn manager_ignores_non_membership_event_types() {
-    //     let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
-    //
-    //     let event = RawStickyEvent {
-    //         room_id: ROOM_ID.to_owned(),
-    //         sender: "@alice:example.org".to_owned(),
-    //         event_type: "m.not.rtc.member".to_owned(),
-    //         content: RawStickyEventContent {
-    //             slot_id: "m.call#ROOM".to_owned(),
-    //             sticky_key: "alice-device-a".to_owned(),
-    //             application: ApplicationInfo {
-    //                 application_type: None,
-    //                 extra: std::collections::BTreeMap::new(),
-    //             },
-    //             member: MemberInfo {
-    //                 id: None,
-    //                 claimed_device_id: None,
-    //                 claimed_user_id: None,
-    //             },
-    //             versions: Vec::new(),
-    //             disconnect_reason: None,
-    //             m_relates_to: None,
-    //             rtc_transports: None,
-    //             created_ts: None,
-    //         },
-    //     };
-    //
-    //     manager
-    //         .initial_sticky_for_room(ROOM_ID, vec![event])
-    //         .await
-    //         .unwrap();
-    //
-    //     assert_eq!(manager.session_count(), 0);
-    // }
+        let event = RawStickyEvent {
+            event_type: "m.not.rtc.member".to_owned(),
+            ..joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a")
+        };
+
+        manager
+            .initial_sticky_for_room(ROOM_ID, vec![event])
+            .await
+            .unwrap();
+
+        assert_eq!(manager.session_count(), 0);
+    }
+
+    /// Until a host supplies room state the open-slot condition cannot be
+    /// evaluated, so it is not enforced; otherwise every existing consumer would
+    /// silently see an empty session.
+    #[tokio::test]
+    async fn members_are_joined_while_slot_state_is_unsupplied() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .initial_sticky_for_room(
+                ROOM_ID,
+                vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+        assert_eq!(manager.slot_state(ROOM_ID, "m.call#ROOM"), None);
+    }
+
+    /// MSC4143: a member event only counts as joined against an *open* slot.
+    /// Supplying room state with no slot in it means the slot is closed.
+    #[tokio::test]
+    async fn members_are_left_when_no_slot_is_open() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .initial_sticky_for_room(
+                ROOM_ID,
+                vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
+            )
+            .await
+            .unwrap();
+        manager.on_room_slots_received(ROOM_ID, Vec::new()).await;
+
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
+        assert_eq!(
+            manager.slot_state(ROOM_ID, "m.call#ROOM"),
+            Some(SlotState::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn members_are_joined_against_an_open_slot() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+        manager
+            .initial_sticky_for_room(
+                ROOM_ID,
+                vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+    }
+
+    /// "Clients MUST constantly react to and respect the latest state of the
+    /// room": closing a slot mid-session leaves everyone in it, and reopening it
+    /// brings back the members whose events are still sticky.
+    #[tokio::test]
+    async fn closing_and_reopening_a_slot_re_evaluates_members() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+        manager
+            .initial_sticky_for_room(
+                ROOM_ID,
+                vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+
+        manager
+            .on_room_slots_received(
+                ROOM_ID,
+                vec![slot_event("m.call#ROOM", r#"{ "status": "closed" }"#)],
+            )
+            .await;
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
+
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+    }
+
+    /// Slot state that arrives before the session exists still governs it.
+    #[tokio::test]
+    async fn slot_state_applies_to_sessions_created_later() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager.on_room_slots_received(ROOM_ID, Vec::new()).await;
+        manager
+            .initial_sticky_for_room(
+                ROOM_ID,
+                vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
+    }
+
+    /// A slot in one room says nothing about the same slot id in another.
+    #[tokio::test]
+    async fn slot_state_is_scoped_to_its_room() {
+        const OTHER_ROOM: &str = "!other:example.org";
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+
+        assert!(manager.slot_state(ROOM_ID, "m.call#ROOM").is_some());
+        assert_eq!(manager.slot_state(OTHER_ROOM, "m.call#ROOM"), None);
+    }
+
+    /// MSC4143: a member event only counts while its sender is still joined to
+    /// the room.
+    #[tokio::test]
+    async fn members_who_left_the_room_are_not_joined() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .initial_sticky_for_room(
+                ROOM_ID,
+                vec![
+                    joined_event("@alice:example.org", "m.call#ROOM", "alice-a"),
+                    joined_event("@bob:example.org", "m.call#ROOM", "bob-a"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(2));
+
+        // Bob is no longer in the room, though his member event is still sticky.
+        manager
+            .on_room_members_received(ROOM_ID, vec!["@alice:example.org".to_owned()])
+            .await;
+
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+    }
 
     #[test]
     fn joined_event_with_livekit_transport_is_parsed_correctly() {

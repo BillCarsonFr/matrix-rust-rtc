@@ -1,0 +1,325 @@
+// Copyright 2026 Valere Fedronic
+//
+// This file is part of matrix-rust-rtc.
+//
+// matrix-rust-rtc is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// matrix-rust-rtc is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+//! MatrixRTC slots (`m.rtc.slot`).
+//!
+//! A slot is the room-state half of MatrixRTC: it says which application may run
+//! at a given slot id and whether that slot is currently open. Membership is
+//! only meaningful against an open slot, so this module's output feeds the
+//! MSC4143 join conditions applied in [`crate::session`].
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::session::ApplicationInfo;
+
+/// Event type for MatrixRTC slots (MSC4143).
+///
+/// This is the stable id. The core never rewrites it: translating to whatever
+/// id the homeserver actually speaks (today
+/// `org.matrix.msc4143.rtc.slot`) is a host-layer concern, and only the
+/// `matrix-sdk`-backed bridge does it — the wasm and FFI bindings pass event
+/// type strings through untouched, so those hosts choose their own id.
+pub const SLOT_EVENT_TYPE: &str = "m.rtc.slot";
+
+/// MSC4143 `content.status` of an `m.rtc.slot` event.
+///
+/// Unknown values parse into [`SlotStatus::Unknown`] instead of failing, and
+/// resolve to a closed slot: a status this client does not understand is not
+/// one it may treat as open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlotStatus {
+    /// The slot is open for members to join.
+    Open,
+    /// The slot is closed.
+    Closed,
+    /// A status this client does not understand; treated as closed.
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+/// MSC4143 `content.encryption` of an `m.rtc.slot` event.
+///
+/// Its presence is what enables RTC encryption for the slot; its absence
+/// disables it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotEncryption {
+    /// The encryption mechanism identifier, e.g. `m.per_member`.
+    #[serde(rename = "type")]
+    pub encryption_type: String,
+    /// Mechanism-specific settings.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Content of an `m.rtc.slot` state event, as it appears on the wire.
+///
+/// Every field is optional here so that a malformed or partial event still
+/// parses; [`RawSlotEvent::resolve`] is what decides whether it describes an
+/// open slot.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RawSlotEventContent {
+    /// The slot's status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<SlotStatus>,
+    /// The application that may run in this slot.
+    #[serde(default, skip_serializing_if = "ApplicationInfo::is_empty")]
+    pub application: ApplicationInfo,
+    /// The encryption mechanism for this slot, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<SlotEncryption>,
+}
+
+/// An `m.rtc.slot` state event received from a host SDK layer.
+#[derive(Clone, Debug)]
+pub struct RawSlotEvent {
+    /// Room the slot belongs to.
+    pub room_id: String,
+    /// The event's `state_key`, which is the slot id.
+    pub slot_id: String,
+    /// The event content.
+    pub content: RawSlotEventContent,
+}
+
+/// An open slot's configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenSlot {
+    /// The application type that may run here.
+    pub application_type: String,
+    /// Application-specific settings from the slot event.
+    pub application_extra: BTreeMap<String, serde_json::Value>,
+    /// The slot's encryption mechanism; `None` means encryption is disabled.
+    pub encryption: Option<SlotEncryption>,
+}
+
+/// The resolved state of a slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// The slot is open with this configuration.
+    Open(OpenSlot),
+    /// The slot is closed, or its event does not describe a valid open slot.
+    Closed,
+}
+
+impl SlotState {
+    /// The open configuration, if this slot is open.
+    pub fn open(&self) -> Option<&OpenSlot> {
+        match self {
+            Self::Open(slot) => Some(slot),
+            Self::Closed => None,
+        }
+    }
+
+    /// Whether members may be considered joined to this slot.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open(_))
+    }
+}
+
+impl RawSlotEvent {
+    /// Resolves the event into a slot state.
+    ///
+    /// MSC4143: a slot is open only when `status = "open"` with a valid
+    /// application object; "any slot that doesn't fulfill these requirements is
+    /// closed". The application `type` must also align with the `state_key`,
+    /// which is checked by *forming* the documented `{type}#` prefix and
+    /// comparing — the grammar must not be used to parse a slot id apart.
+    pub fn resolve(&self) -> SlotState {
+        if self.content.status != Some(SlotStatus::Open) {
+            return SlotState::Closed;
+        }
+
+        let Some(application_type) = self
+            .content
+            .application
+            .application_type
+            .as_deref()
+            .filter(|t| !t.is_empty())
+        else {
+            return SlotState::Closed;
+        };
+
+        if !self.slot_id.starts_with(&format!("{application_type}#")) {
+            log::warn!(
+                "m.rtc.slot '{}' declares application type '{}', which does not match its \
+                 state key; treating the slot as closed",
+                self.slot_id,
+                application_type,
+            );
+            return SlotState::Closed;
+        }
+
+        SlotState::Open(OpenSlot {
+            application_type: application_type.to_owned(),
+            application_extra: self.content.application.extra.clone(),
+            encryption: self.content.encryption.clone(),
+        })
+    }
+}
+
+impl RawSlotEventContent {
+    /// Builds content that opens a slot for `application_type`.
+    pub fn for_open(application_type: String, encryption: Option<SlotEncryption>) -> Self {
+        Self {
+            status: Some(SlotStatus::Open),
+            application: ApplicationInfo {
+                application_type: Some(application_type),
+                ..ApplicationInfo::default()
+            },
+            encryption,
+        }
+    }
+
+    /// Builds content that closes a slot.
+    ///
+    /// MSC4143 allows the `application` / `encryption` objects to be kept on a
+    /// closed slot to make reopening easier, so callers may retain them; this
+    /// helper emits the minimal form.
+    pub fn for_close() -> Self {
+        Self {
+            status: Some(SlotStatus::Closed),
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(json: &str) -> SlotState {
+        RawSlotEvent {
+            room_id: "!room:example.org".to_owned(),
+            slot_id: "m.call#ROOM".to_owned(),
+            content: serde_json::from_str(json).expect("content must parse"),
+        }
+        .resolve()
+    }
+
+    #[test]
+    fn open_slot_resolves_with_its_application_and_encryption() {
+        let state = slot(
+            r#"{ "status": "open",
+                 "application": { "type": "m.call", "m.call.voice_only": true },
+                 "encryption": { "type": "m.per_member" } }"#,
+        );
+
+        let open = state.open().expect("slot should be open");
+        assert_eq!(open.application_type, "m.call");
+        assert_eq!(
+            open.application_extra.get("m.call.voice_only"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            open.encryption.as_ref().map(|e| e.encryption_type.as_str()),
+            Some("m.per_member")
+        );
+    }
+
+    #[test]
+    fn absent_encryption_means_encryption_disabled() {
+        let state = slot(r#"{ "status": "open", "application": { "type": "m.call" } }"#);
+        assert!(state.open().expect("open").encryption.is_none());
+    }
+
+    #[test]
+    fn closed_status_resolves_closed() {
+        assert_eq!(
+            slot(r#"{ "status": "closed", "application": { "type": "m.call" } }"#),
+            SlotState::Closed
+        );
+    }
+
+    /// "Any slot that doesn't fulfill these requirements is closed" — an open
+    /// status with no application is not a valid open slot.
+    #[test]
+    fn open_without_application_resolves_closed() {
+        assert_eq!(slot(r#"{ "status": "open" }"#), SlotState::Closed);
+    }
+
+    /// A status from a future revision must parse, and must not be treated as
+    /// open.
+    #[test]
+    fn unknown_status_parses_and_resolves_closed() {
+        assert_eq!(
+            slot(r#"{ "status": "draining", "application": { "type": "m.call" } }"#),
+            SlotState::Closed
+        );
+    }
+
+    /// An empty content object is how a slot event looked before `status`
+    /// existed; it is not an open slot.
+    #[test]
+    fn empty_content_resolves_closed() {
+        assert_eq!(slot("{}"), SlotState::Closed);
+    }
+
+    /// The application type has to agree with the slot id, or a slot could
+    /// admit members of an application it does not name.
+    #[test]
+    fn application_type_must_align_with_the_slot_id() {
+        assert_eq!(
+            slot(r#"{ "status": "open", "application": { "type": "m.whiteboard" } }"#),
+            SlotState::Closed
+        );
+    }
+
+    /// The check is a prefix comparison, so an application type that merely
+    /// starts the same does not count.
+    #[test]
+    fn application_type_prefix_must_end_at_the_separator() {
+        let state = RawSlotEvent {
+            room_id: "!room:example.org".to_owned(),
+            slot_id: "m.callisto#ROOM".to_owned(),
+            content: serde_json::from_str(
+                r#"{ "status": "open", "application": { "type": "m.call" } }"#,
+            )
+            .unwrap(),
+        }
+        .resolve();
+
+        assert_eq!(state, SlotState::Closed);
+    }
+
+    #[test]
+    fn built_open_content_round_trips() {
+        let content = RawSlotEventContent::for_open(
+            "m.call".to_owned(),
+            Some(SlotEncryption {
+                encryption_type: "m.per_member".to_owned(),
+                extra: BTreeMap::new(),
+            }),
+        );
+
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json.pointer("/status").unwrap(), "open");
+        assert_eq!(json.pointer("/application/type").unwrap(), "m.call");
+        assert_eq!(json.pointer("/encryption/type").unwrap(), "m.per_member");
+
+        let parsed: RawSlotEventContent = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.status, Some(SlotStatus::Open));
+    }
+
+    #[test]
+    fn built_close_content_has_no_application() {
+        let json = serde_json::to_value(RawSlotEventContent::for_close()).unwrap();
+        assert_eq!(json.pointer("/status").unwrap(), "closed");
+        assert!(json.get("application").is_none());
+    }
+}

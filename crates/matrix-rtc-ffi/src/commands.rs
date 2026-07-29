@@ -219,6 +219,27 @@ pub trait CommandSenderCallback: Send + Sync {
         delay_ms: u64,
     ) -> Result<String, CommandSenderError>;
 
+    /// Called when a state event needs to be sent.
+    ///
+    /// Used for `m.rtc.slot`. Sending room state usually needs a raised power
+    /// level, so return an error if the homeserver rejects it.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID where the event should be sent
+    /// * `event_type` - The event type (e.g., "m.rtc.slot")
+    /// * `state_key` - The state key (for a slot, the slot id)
+    /// * `content_json` - The event content as a JSON string
+    ///
+    /// # Returns
+    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content_json: String,
+    ) -> Result<(), CommandSenderError>;
+
     /// Called when a previously scheduled delayed event needs to be canceled.
     ///
     /// # Arguments
@@ -334,6 +355,22 @@ impl RtcCommandSender for FfiCommandSender {
             .map_err(CommandError::from)?;
         Ok(())
     }
+
+    async fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+        self.callback
+            .send_state_event(room_id, event_type, state_key, content_json)
+            .map_err(CommandError::from)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +407,20 @@ mod tests {
                 room_id, event_type, delay_ms, content_json
             );
             Ok(format!("event-{}-{}", room_id, event_type))
+        }
+
+        fn send_state_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            state_key: String,
+            content_json: String,
+        ) -> Result<(), CommandSenderError> {
+            println!(
+                "Mock send_state_event: room={}, type={}, state_key={}, content={}",
+                room_id, event_type, state_key, content_json
+            );
+            Ok(())
         }
 
         fn cancel_delayed_event(

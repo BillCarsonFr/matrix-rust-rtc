@@ -122,17 +122,43 @@ stored and signalled once it has been matched against the sender's member event:
 
 The outgoing key message declares `format: 0` as the spec requires.
 
+### Slots and the join conditions
+
+`m.rtc.slot` is modelled in `slot.rs` and resolved to `SlotState::Open`/`Closed`
+per MSC4143: open requires `status = "open"` plus an application whose `type`
+agrees with the state key, and anything else — a closed status, a missing
+application, empty content, a status from a future revision — is closed.
+
+A session keeps its member events as *candidates* and projects the joined set
+from them, so the conditions are re-evaluated whenever their inputs move rather
+than only at ingestion. Closing a slot therefore leaves everyone in it, and
+reopening restores whoever is still sticky. The projection also drives key
+distribution, so a member who drops out of the joined set stops receiving keys.
+
+The two room-state conditions are only enforced once a host supplies the state:
+
+- `RtcSessionManager::on_room_slots_received` takes a room's complete slot state.
+  Calling it is what switches the room from "unknown" (condition unevaluable, so
+  unenforced) to enforcing; a slot absent from that call is closed, not unknown.
+- `RtcSessionManager::on_room_members_received` supplies the room's joined users.
+
+This is deliberate: enforcing an unevaluable condition would silently empty every
+session for hosts that do not yet feed room state. The LiveKit bridge feeds both.
+
+`open_slot` / `close_slot` send the state event through the command sender's new
+`send_state_event`.
+
 Still outstanding, in the order they are planned:
 
-1. **Slots** — `m.rtc.slot` is not modelled at all. That blocks the MSC4143 join
-   conditions (an open slot must exist, the sender must be joined to the room),
-   eviction on slot close, and the `status` / `encryption` fields the slot event
-   gained.
-2. **Encryption negotiation** — whether to encrypt, and with which mechanism,
+1. **Encryption negotiation** — whether to encrypt, and with which mechanism,
    should come from the slot's `encryption.type` plus room encryption rather than
-   a local config flag.
-3. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
+   a local config flag. `SlotState::Open` already carries the parsed
+   `encryption` object for this.
+2. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
    implemented; LiveKit URLs come from configuration.
+3. **Prompt reaction to slot changes** — the LiveKit bridge re-reads room state
+   on sticky-event ticks, so a slot closing in an otherwise idle room is noticed
+   late. A room-state subscription would fix it.
 
 ## Non-goals in this first skeleton
 

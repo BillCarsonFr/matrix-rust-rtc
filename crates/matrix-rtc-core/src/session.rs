@@ -22,7 +22,7 @@
 //! manager layer.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -32,14 +32,46 @@ use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdenti
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::own_membership::{OwnMembershipMachine, transport_to_json};
+use crate::slot::SlotState;
 use crate::transport::RtcTransport;
 
 #[allow(unused_imports)]
 use log::*;
 
+/// What a session knows about the room state governing its slot.
+///
+/// MSC4143 makes an open `m.rtc.slot` a precondition for anyone being joined,
+/// so "no open slot" and "nobody has told us about the slot" have to be
+/// distinguished: the first means every member is left, the second means the
+/// condition cannot be evaluated yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SlotKnowledge {
+    /// No room state has been supplied for this room, so the slot condition is
+    /// not enforced. Hosts opt in by calling
+    /// [`RtcSessionManager::on_room_slots_received`].
+    ///
+    /// [`RtcSessionManager::on_room_slots_received`]: crate::RtcSessionManager::on_room_slots_received
+    #[default]
+    Unsupplied,
+    /// Room state has been supplied; this is the slot's resolved state. A slot
+    /// with no state event in the room resolves to [`SlotState::Closed`].
+    Known(SlotState),
+}
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession<T: RtcCommandSender> {
+    /// Member events that are join-shaped and still sticky. These are
+    /// candidates only: the remaining MSC4143 join conditions depend on room
+    /// state, which can change under them at any time.
+    candidates: Vec<JoinedMembership>,
+    /// The candidates that currently satisfy every join condition. This is what
+    /// gets published and what the encryption manager distributes keys to.
     members: Vec<JoinedMembership>,
+    /// The slot this session's members are joined to.
+    slot: SlotKnowledge,
+    /// Users currently joined to the room, when the host supplies them; `None`
+    /// leaves the room-membership condition unenforced.
+    room_members: Option<HashSet<String>>,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
     /// Command sender for sending events to the Matrix room.
     command_sender: Option<Arc<T>>,
@@ -52,7 +84,10 @@ pub struct RtcSession<T: RtcCommandSender> {
 impl<T: RtcCommandSender> Clone for RtcSession<T> {
     fn clone(&self) -> Self {
         Self {
+            candidates: self.candidates.clone(),
             members: self.members.clone(),
+            slot: self.slot.clone(),
+            room_members: self.room_members.clone(),
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             command_sender: self.command_sender.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
@@ -67,7 +102,10 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
         Self {
+            candidates: Vec::new(),
             members: Vec::new(),
+            slot: SlotKnowledge::default(),
+            room_members: None,
             membership_snapshots_tx,
             command_sender: None,
             own_membership_machine: None,
@@ -80,7 +118,10 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
         Self {
+            candidates: Vec::new(),
             members: Vec::new(),
+            slot: SlotKnowledge::default(),
+            room_members: None,
             membership_snapshots_tx,
             command_sender: Some(command_sender),
             own_membership_machine: None,
@@ -318,51 +359,128 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     }
 
     async fn apply_membership_event(&mut self, event: CallMembershipEvent) {
-        let membership_changed = match event {
+        match event {
             CallMembershipEvent::Joined(joined) => {
-                let key_sender = joined.sender.clone();
-                let key_sticky = joined.sticky_key.clone();
-
-                if let Some(index) = self.members.iter().position(|member| {
-                    member.sender == key_sender && member.sticky_key == key_sticky
-                }) {
-                    if self.members[index] == joined {
-                        return;
-                    }
-
-                    self.members[index] = joined;
-                } else {
-                    self.members.push(joined);
-                }
-
-                self.publish_membership_snapshot();
-                true
-            }
-            CallMembershipEvent::Left(left) => {
-                let before = self.members.len();
-                self.members.retain(|member| {
-                    !(member.sender == left.sender && member.sticky_key == left.sticky_key)
+                let existing = self.candidates.iter().position(|candidate| {
+                    candidate.sender == joined.sender && candidate.sticky_key == joined.sticky_key
                 });
 
-                if self.members.len() != before {
-                    self.publish_membership_snapshot();
-                    true
-                } else {
-                    false
+                match existing {
+                    Some(index) if self.candidates[index] == joined => return,
+                    Some(index) => self.candidates[index] = joined,
+                    None => self.candidates.push(joined),
                 }
             }
-        };
+            CallMembershipEvent::Left(left) => {
+                let before = self.candidates.len();
+                self.candidates.retain(|candidate| {
+                    !(candidate.sender == left.sender && candidate.sticky_key == left.sticky_key)
+                });
 
-        // Notify encryption manager of membership changes
-        if membership_changed && let Some(ref encryption_manager) = self.encryption_manager {
-            // Notify the encryption manager directly (async)
+                if self.candidates.len() == before {
+                    return;
+                }
+            }
+        }
+
+        self.refresh().await;
+    }
+
+    /// Whether `candidate` satisfies the MSC4143 join conditions that depend on
+    /// room state.
+    ///
+    /// The other two conditions are handled before this point: `membership =
+    /// join` when the event is converted, and stickiness by the host's sticky
+    /// map, whose removals arrive as leaves.
+    fn is_joined(&self, candidate: &JoinedMembership) -> bool {
+        match &self.slot {
+            // Nothing has told us about the slot, so this condition cannot be
+            // evaluated; enforcing it would drop every member.
+            SlotKnowledge::Unsupplied => {}
+            SlotKnowledge::Known(state) if state.is_open() => {}
+            SlotKnowledge::Known(_) => return false,
+        }
+
+        match &self.room_members {
+            Some(joined) => joined.contains(&candidate.sender),
+            None => true,
+        }
+    }
+
+    /// Recomputes the joined set and publishes it if it changed.
+    ///
+    /// Every input to the join conditions routes through here, so a slot
+    /// closing or a member leaving the room takes effect the same way a leave
+    /// event does — including telling the encryption manager to stop sharing
+    /// keys with whoever dropped out.
+    async fn refresh(&mut self) {
+        let members: Vec<JoinedMembership> = self
+            .candidates
+            .iter()
+            .filter(|candidate| self.is_joined(candidate))
+            .cloned()
+            .collect();
+
+        if members == self.members {
+            return;
+        }
+
+        self.members = members;
+        self.membership_snapshots_tx
+            .send_replace(self.members.clone());
+
+        if let Some(ref encryption_manager) = self.encryption_manager {
             let _ = encryption_manager.on_memberships_update().await;
         }
     }
 
-    fn publish_membership_snapshot(&self) {
-        self.membership_snapshots_tx
-            .send_replace(self.members.clone());
+    /// Applies the room state governing this session's slot.
+    ///
+    /// Closing a slot leaves every member of it, and reopening it restores the
+    /// ones whose member events are still sticky — MSC4143 requires clients to
+    /// track the latest room state at all times, not just at join.
+    pub async fn set_slot_state(&mut self, state: SlotState) {
+        if self.slot == SlotKnowledge::Known(state.clone()) {
+            return;
+        }
+        self.slot = SlotKnowledge::Known(state);
+        self.refresh().await;
+    }
+
+    /// Sets the slot state on a session that has no members yet.
+    ///
+    /// Used when a session is created after its room state was already known;
+    /// [`RtcSession::set_slot_state`] is the one to use once it is live.
+    pub(crate) fn seed_slot_state(&mut self, state: SlotState) {
+        debug_assert!(self.candidates.is_empty(), "seeding a populated session");
+        self.slot = SlotKnowledge::Known(state);
+    }
+
+    /// Sets the room members on a session that has no members yet.
+    pub(crate) fn seed_room_members(&mut self, room_members: HashSet<String>) {
+        debug_assert!(self.candidates.is_empty(), "seeding a populated session");
+        self.room_members = Some(room_members);
+    }
+
+    /// The slot state this session is applying, if any has been supplied.
+    pub fn slot_state(&self) -> Option<&SlotState> {
+        match &self.slot {
+            SlotKnowledge::Known(state) => Some(state),
+            SlotKnowledge::Unsupplied => None,
+        }
+    }
+
+    /// Sets the users currently joined to the room.
+    ///
+    /// Until this is called the room-membership condition is not enforced. A
+    /// member who leaves the room stops being joined to the slot even if their
+    /// member event is still sticky.
+    pub async fn set_room_members(&mut self, room_members: HashSet<String>) {
+        if self.room_members.as_ref() == Some(&room_members) {
+            return;
+        }
+        self.room_members = Some(room_members);
+        self.refresh().await;
     }
 }
 

@@ -94,6 +94,9 @@
 //!     async fn send_to_device_message(&self, _user_id: String, _device_id: String, _message_type: String, _content: serde_json::Value) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }
+//!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<(), CommandError> {
+//!         Ok(())
+//!     }
 //! }
 //!
 //! // Create an encryption manager
