@@ -29,11 +29,13 @@
 //! binary/example/test targets can. Hence this lives here.
 
 fn main() {
-    // Only `-examples` here: this crate ships no bin target (emitting
-    // `rustc-link-arg-bins` without one is a hard error), and the runnable
-    // artifacts that create libwebrtc's PeerConnectionFactory are the examples.
+    // Examples and tests only: this crate ships no bin target (emitting
+    // `rustc-link-arg-bins` without one is a hard error). Both kinds of
+    // runnable artifact create libwebrtc's PeerConnectionFactory — the
+    // `connect` example and the `e2e_call` integration test.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" || target_os == "ios" {
         println!("cargo:rustc-link-arg-examples=-ObjC");
+        println!("cargo:rustc-link-arg-tests=-ObjC");
     }
 }

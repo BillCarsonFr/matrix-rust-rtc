@@ -1,100 +1,109 @@
-# Local MatrixRTC backend for the `matrix-rtc-livekit` demo
+# Local MatrixRTC backend (Synapse + lk-jwt-service + LiveKit)
 
-This brings up a complete, ElementWeb-interoperable MatrixRTC stack so the
-`connect` example (and future demos) can join a real call:
+A self-contained docker-compose stack providing everything the Rust MatrixRTC
+clients need — used by the `e2e_call` integration test on CI and for local
+development:
 
-- **Synapse** homeserver
-- **LiveKit** SFU
-- **lk-jwt-service** (the MatrixRTC authorisation service, MSC4195 `/get_token`)
-- **nginx** reverse proxy terminating TLS with the dev `*.m.localhost` CA
-- **Element Web** (embeds Element Call) — the other participant that publishes media
+- **Synapse** (`ghcr.io/element-hq/synapse:latest`) — homeserver with MSC4354
+  (sticky events) and MSC4140 (delayed events) enabled, rate limits disabled,
+  open registration for throwaway test users.
+- **lk-jwt-service** (`ghcr.io/element-hq/lk-jwt-service:0.4.4`) — the
+  MatrixRTC authorisation service (MSC4195 `/get_token`).
+- **LiveKit SFU** (`livekit/livekit-server:v1.10.1`).
 
-Rather than re-derive Synapse / LiveKit / nginx / TLS config by hand, this reuses
-[Element Call's dev backend](https://github.com/element-hq/element-call) verbatim
-— it is the reference deployment and guarantees interop. `setup.sh` clones it and
-starts the minimal (non-federated) subset of services.
+No nginx, no TLS on the client side, no federation pair — this is the minimal
+subset of [Element Call's dev backend](https://github.com/element-hq/element-call)
+that the Rust e2e flow needs. All state lives in `./data/` (git-ignored); wipe
+it for a factory reset.
 
-## Prerequisites
-
-- Docker + Docker Compose
-- `git`
-
-## 1. Start the stack
+## Usage
 
 ```sh
-./setup.sh up
+make backend-up      # docker compose up -d --wait + readiness probe
+make backend-logs    # follow logs
+make backend-down    # tear down (incl. volumes)
 ```
 
-This clones `element-hq/element-call` (the `livekit` branch) into
-`./element-call/` if absent, then runs:
+or directly:
 
 ```sh
-docker compose -f dev-backend-docker-compose.yml up synapse auth-service livekit nginx element-web
+docker compose -f demo/backend/docker-compose.yml up -d --wait
+./demo/backend/wait-ready.sh
 ```
 
-Services / hostnames once up:
+Endpoints once up (all on `localhost` — do **not** expose these beyond it;
+registration is open and the secrets are well-known dev values):
 
-| Purpose            | URL                                                  |
-| ------------------ | ---------------------------------------------------- |
-| Synapse (CS API)   | `https://synapse.m.localhost`                        |
-| RTC auth service   | `https://matrix-rtc.m.localhost/livekit/jwt`         |
-| LiveKit SFU        | `wss://matrix-rtc.m.localhost/livekit/sfu`           |
-| Element Web        | `http://localhost:8081`                              |
+| Purpose                     | URL                     |
+| --------------------------- | ----------------------- |
+| Synapse (client-server API) | `http://localhost:8008` |
+| RTC auth service (lk-jwt)   | `http://localhost:6080` |
+| LiveKit SFU (WebSocket)     | `ws://localhost:7880`   |
 
-The homeserver advertises the SFU via `.well-known/matrix/client`
-(`org.matrix.msc4143.rtc_foci`), served by nginx.
+## Running the e2e call test against it
 
-## 2. Trust the dev TLS CA
-
-The stack uses a self-signed CA for `*.m.localhost`. Either trust the CA, or
-accept the browser exception for each host. The CA ships in the cloned repo:
-
-```
-./element-call/backend/dev_tls_m.localhost.crt
-```
-
-- **Browser (Element Web):** visit `https://synapse.m.localhost/.well-known/matrix/client`
-  and `https://matrix-rtc.m.localhost/livekit/jwt/healthz` and accept the exceptions,
-  or import the CA into your browser's trust store.
-- **The Rust example:** pass `INSECURE_TLS=1` (it sets
-  `danger_accept_invalid_certs` on the HTTP client and disables SDK TLS
-  verification) — dev only.
-
-## 3. Create a user
+The integration test provisions its own throwaway users and defaults to the
+endpoints above, so this is all it takes:
 
 ```sh
-./setup.sh register alice secret
+cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
 ```
 
-(Wraps `register_new_matrix_user` inside the Synapse container.)
+See [`crates/matrix-rtc-livekit/tests/E2E_CALL.md`](../../crates/matrix-rtc-livekit/tests/E2E_CALL.md).
 
-## 4. Join a call from Element Web
+## Why Synapse has a TLS listener (and why you never see it)
 
-Open `http://localhost:8081`, log in as your user, create/open a room, and start
-a call. Element Web publishes audio/video into the LiveKit room.
+lk-jwt-service validates client OpenID tokens against Synapse's federation API
+(`/_matrix/federation/v1/openid/userinfo`), and its federation client speaks
+HTTPS only — `LIVEKIT_INSECURE_SKIP_VERIFY_TLS` skips certificate
+*verification*, not TLS. So the one-shot `init-certs` service mints a
+self-signed cert (into `./data/tls/`, generated not committed) and Synapse
+serves federation over TLS on 8448. `server_name` is `synapse` — the compose
+service name — so gomatrixserverlib's discovery fallback (`synapse:8448`)
+resolves inside the compose network. The port is not published to the host;
+everything client-facing stays plain HTTP.
 
-## 5. Run the connect example against it
+## Registering a user by hand
+
+For the interactive `connect` example (or curl poking), either use open
+registration:
 
 ```sh
-HOMESERVER_URL=https://synapse.m.localhost \
-MX_USER=alice MX_PASSWORD=secret \
-ROOM_ID='!yourroom:synapse.m.localhost' \
-SLOT_ID='m.call#ROOM' \
-LIVEKIT_SERVICE_URL=https://matrix-rtc.m.localhost/livekit/jwt \
-INSECURE_TLS=1 \
-cargo run -p matrix-rtc-livekit --example connect --features matrix-sdk
+curl -s -X POST http://localhost:8008/_matrix/client/v3/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "alice", "password": "secret", "auth": {"type": "m.login.dummy"}}'
 ```
 
-The example logs in, fetches an SFU token, connects, and prints a line for each
-remote track it subscribes to from the Element Web participant.
-
-## Tear down
+or the Synapse admin CLI (backed by `registration_shared_secret`, which also
+keeps `/_synapse/admin/v1/register` available if open registration is ever
+turned off):
 
 ```sh
-./setup.sh down
+docker compose -f demo/backend/docker-compose.yml exec synapse \
+  register_new_matrix_user -u alice -p secret -a -c /cfg/homeserver.yaml http://localhost:8008
 ```
 
-> [!NOTE]
-> The Element Call `livekit` branch is a moving target. If a service fails to
-> start after an update, `rm -rf element-call` and re-run `./setup.sh up` to
-> re-clone, or pin the clone to a known-good commit in `setup.sh`.
+## Future: Element Web / Element Call + TLS
+
+Browser clients need TLS end to end. The plan is a compose **overlay**
+(`docker-compose.tls.yml`, applied with `-f docker-compose.yml -f
+docker-compose.tls.yml`) adding nginx + element-web + element-call, with
+`init-certs` grown into a local CA minting per-host certs. The base file stays
+HTTP-only; client-facing URLs are already env-indirected (`LIVEKIT_WS_URL` in a
+`.env` file overrides what lk-jwt hands to clients), and the e2e test reads
+`HOMESERVER_URL` / `LIVEKIT_SERVICE_URL` / `INSECURE_TLS`, so the same test
+binary will run against the TLS overlay unchanged.
+
+## Troubleshooting
+
+- **`up --wait` hangs on synapse** — `docker compose logs synapse`; a config
+  parse error (e.g. an experimental flag renamed by a new `synapse:latest`)
+  shows up there. Pin the image by digest until fixed (see the comment in
+  `docker-compose.yml`).
+- **lk-jwt returns 500 on `/get_token`** — usually the federation hop:
+  `docker compose logs auth-service` should show the OpenID lookup failing.
+  Check that `./data/tls/` contains `synapse.crt`/`synapse.key` and that
+  Synapse came up after `init-certs` completed.
+- **Media never flows but signalling works** — ICE. The SFU advertises
+  `127.0.0.1` (see `livekit/livekit.yaml`), which host-run clients reach via
+  the published UDP range `50100-50200` with TCP `7881` as fallback.

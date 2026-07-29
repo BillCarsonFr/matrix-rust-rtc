@@ -1,0 +1,108 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# Self-contained MatrixRTC backend: Synapse + lk-jwt-service + LiveKit SFU.
+# Used by the e2e_call integration test (CI) and for local development.
+# See README.md. All state lives under ./data/ (git-ignored).
+
+name: matrix-rtc-backend
+
+services:
+  # One-shot, idempotent: mints the self-signed cert Synapse's federation
+  # listener needs. lk-jwt-service validates OpenID tokens over the federation
+  # API, which gomatrixserverlib only speaks over HTTPS —
+  # LIVEKIT_INSECURE_SKIP_VERIFY_TLS skips certificate *verification*, not TLS
+  # itself. The cert never leaves the compose network and is generated, not
+  # committed, so no private key lives in git.
+  init-certs:
+    image: alpine/openssl:3.3.2
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        [ -f /certs/synapse.key ] || openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout /certs/synapse.key -out /certs/synapse.crt -days 3650 \
+          -subj "/CN=synapse" -addext "subjectAltName=DNS:synapse"
+    volumes:
+      - ./data/tls:/certs
+
+  # `latest` keeps us on current experimental-MSC behaviour (msc4354 sticky
+  # events), at the cost of drift risk. If a Synapse release breaks the stack,
+  # pin by digest until fixed: ghcr.io/element-hq/synapse:latest@sha256:<...>
+  # (grab the last good digest from a green CI run's pull log).
+  synapse:
+    image: ghcr.io/element-hq/synapse:latest
+    # The service name doubles as server_name: gomatrixserverlib's federation
+    # discovery (well-known -> SRV -> <server_name>:8448) resolves it inside
+    # the compose network, so lk-jwt-service reaches the TLS listener directly.
+    environment:
+      SYNAPSE_CONFIG_PATH: /cfg/homeserver.yaml
+      UID: "0"
+      GID: "0"
+    volumes:
+      - ./synapse/homeserver.yaml:/cfg/homeserver.yaml:ro
+      - ./synapse/log.config:/cfg/log.config:ro
+      - ./data/synapse:/data
+      - ./data/tls:/data/tls:ro
+    ports:
+      # Client-server API, plain HTTP. 8448 (federation, TLS) is deliberately
+      # NOT published: only lk-jwt-service needs it, in-network.
+      - "8008:8008"
+    depends_on:
+      init-certs:
+        condition: service_completed_successfully
+    # The image ships a curl-based healthcheck with a 15s interval; override it
+    # to converge faster on CI.
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "http://localhost:8008/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # MatrixRTC authorisation service (MSC4195 /get_token).
+  auth-service:
+    image: ghcr.io/element-hq/lk-jwt-service:0.4.4
+    environment:
+      LIVEKIT_JWT_PORT: "6080"
+      # Returned verbatim to clients in the /get_token response, so it must be
+      # reachable from wherever the clients run (the host, for the e2e test).
+      # Override via .env for non-localhost setups.
+      LIVEKIT_URL: "${LIVEKIT_WS_URL:-ws://localhost:7880}"
+      LIVEKIT_KEY: devkey
+      LIVEKIT_SECRET: secret
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse
+      # Synapse's federation listener uses the self-signed cert from init-certs.
+      LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
+    ports:
+      - "6080:6080"
+    depends_on:
+      synapse:
+        condition: service_healthy
+    # No healthcheck: 0.4.4 is a FROM-scratch image (no shell, no healthcheck
+    # binary — that only exists on unreleased main). wait-ready.sh probes
+    # http://localhost:6080/healthz from the host instead. Once a release ships
+    # /lk-jwt-service-healthcheck, add it here and drop the host-side probe.
+
+  livekit:
+    image: livekit/livekit-server:v1.10.1
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7880:7880/tcp" # signalling WebSocket + HTTP
+      - "7881:7881/tcp" # ICE over TCP (fallback when UDP is blocked)
+      - "50100-50200:50100-50200/udp" # WebRTC media (keep the range small: one iptables entry per port)
+    # Same probe the official livekit-helm chart uses; the alpine base ships
+    # busybox wget.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7880/"]
+      interval: 3s
+      timeout: 5s
+      retries: 20

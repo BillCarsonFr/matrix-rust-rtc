@@ -92,6 +92,15 @@ matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-ui", "dep:matrix-sdk-base"]
 # production use; the module is otherwise only compiled under `cfg(test)`.
 testing = []
 
+# The end-to-end call test (see tests/E2E_CALL.md). `required-features` keeps
+# plain `cargo test --workspace` from compiling it (and the git SDK + libwebrtc
+# behind it); the `#[ignore]` inside keeps `--all-features` runs from executing
+# it without the demo/backend stack.
+[[test]]
+name = "e2e_call"
+path = "tests/e2e_call/main.rs"
+required-features = ["matrix-sdk", "testing"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -105,7 +114,3 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 [[example]]
 name = "connect"
 required-features = ["matrix-sdk"]
-
-[[example]]
-name = "e2e_call"
-required-features = ["matrix-sdk", "testing"]

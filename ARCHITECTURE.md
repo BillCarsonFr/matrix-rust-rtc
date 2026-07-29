@@ -195,9 +195,9 @@ publish on is an application decision: the app calls
 `GET /_matrix/client/v1/rtc/transports` itself and passes the result into
 `join`. The core has no HTTP of its own, and adding a fetch would have meant
 every host implementing one whose result it then handed back to itself.
-`examples/e2e_call.rs` shows the pattern, using ruma's
-`api::client::rtc::transports` endpoint and falling back to a configured URL
-where the homeserver has not implemented it.
+The `e2e_call` integration test (`crates/matrix-rtc-livekit/tests/e2e_call/`)
+shows the pattern, using ruma's `api::client::rtc::transports` endpoint and
+falling back to a configured URL where the homeserver has not implemented it.
 
 What the core does model is the *intent*, via `TransportIntent`:
 
