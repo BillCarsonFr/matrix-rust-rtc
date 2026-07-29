@@ -216,6 +216,14 @@ Still outstanding:
    late. A room-state subscription would fix it.
 2. **Mid-session renegotiation** — a slot that changes its encryption mechanism
    while a session is live keeps the mechanism negotiated at join.
+3. **Slot state comes from a server fetch, not the store** — sliding sync only
+   delivers state types listed in `required_state`, and the SDK's room-list
+   defaults do not include the MSC4143 slot type, so the local store reports
+   every room as slotless (which the core reads as "slot closed, everyone
+   left"). The bridge therefore fetches `GET /rooms/{id}/state` on each tick
+   and skips the update when the fetch fails. The real fix is adding the slot
+   type to the fork SDK's sliding sync `required_state`, then reverting
+   `slot_snapshot` to the state store.
 
 ## Non-goals in this first skeleton
 

@@ -65,10 +65,13 @@ make backend-up
 ## Dependency caveat (important)
 
 The test needs the experimental sticky-events SDK. `matrix-rtc-livekit/Cargo.toml`
-pins it to **`BillCarsonFr/matrix-rust-sdk` rev `1815b08c`** — see the long
-comment there for why the rev cannot move freely (it pairs a ruma fork carrying
-the MSC4143 event types with the "keep encryption info for sticky events"
-commit this crate's bridge relies on).
+pins it to **`BillCarsonFr/matrix-rust-sdk` rev `3773300`** — see the long
+comment there for why the rev cannot move freely (it pairs a ruma fork whose
+MSC4143 event types match the 2026 rewrite with the "keep encryption info for
+sticky events" commit this crate's bridge relies on). `m.rtc.encryption_key`
+to-device messages deserialize through ruma's typed `AnyToDeviceEvent`; member
+events still go through `matrix_rtc_core::RawStickyEventContent`, since the
+core cannot depend on ruma.
 
 The root `Cargo.toml` also carries a `[patch.crates-io]` block copied from the fork
 (cargo doesn't propagate a git dep's own patches to the consumer).

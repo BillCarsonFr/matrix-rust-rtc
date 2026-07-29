@@ -51,6 +51,18 @@ cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -
 
 See [`crates/matrix-rtc-livekit/tests/E2E_CALL.md`](../../crates/matrix-rtc-livekit/tests/E2E_CALL.md).
 
+## Why auth-service shares the LiveKit container's network namespace
+
+lk-jwt uses `LIVEKIT_URL` both as the SFU URL it returns to clients in
+`/get_token` responses **and** as its own RoomService endpoint for creating the
+room on the SFU, so a single URL has to work from the host and from inside the
+container. `network_mode: "service:livekit"` makes `ws://localhost:7880` do
+both: in-container it loops back to the SFU directly, on the host it goes
+through the published port. That is also why the `6080` port mapping lives on
+the `livekit` service. (Element Call's dev stack solves the same problem with
+an nginx hostname that resolves on both sides — that arrives here with the
+future TLS overlay.)
+
 ## Why Synapse has a TLS listener (and why you never see it)
 
 lk-jwt-service validates client OpenID tokens against Synapse's federation API

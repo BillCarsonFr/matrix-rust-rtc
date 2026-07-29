@@ -71,8 +71,11 @@ jobs:
         env:
           RUST_LOG: info
 
-      - name: Dump backend logs
-        if: failure()
+      # Always, not just on failure: the auth-service (lk-jwt) logs are the
+      # only visibility into the OpenID/token hop, and green runs that log
+      # oddities are how drift gets spotted early.
+      - name: Backend logs
+        if: always()
         run: docker compose -f demo/backend/docker-compose.yml logs --no-color
 
       # The recorded audio is the best evidence when tone detection fails.

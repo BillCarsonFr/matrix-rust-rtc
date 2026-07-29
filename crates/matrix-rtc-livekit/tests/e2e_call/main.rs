@@ -407,7 +407,9 @@ async fn join_rtc(
 /// Register a to-device handler that forwards decrypted
 /// `m.rtc.encryption_key` events to the key pump.
 ///
-/// The handler is `Send` (it only moves owned key data into a channel), which
+/// Uses ruma's typed event — the pinned ruma models the rewritten MSC4143, so
+/// its content shape matches what `matrix-rtc-core` sends. The handler is
+/// `Send` (it only moves owned key data into a channel), which
 /// `add_event_handler` requires; the `!Send` work happens in the pump.
 fn register_key_receiver(client: &Client, key_tx: UnboundedSender<ReceivedKey>) {
     client.add_event_handler(
@@ -499,19 +501,23 @@ async fn wait_for_members(
     target: usize,
     label: &str,
 ) -> bool {
+    let mut last_count = 0;
     for _ in 0..60 {
-        let count = manager
+        last_count = manager
             .lock()
             .await
             .member_count(room_id, slot_id)
             .unwrap_or(0);
-        if count >= target {
-            println!("[{label}] sees {count} members (sticky round-trip OK)");
+        if last_count >= target {
+            println!("[{label}] sees {last_count} members (sticky round-trip OK)");
             return true;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    println!("[{label}] WARNING: did not observe {target} members within 30s");
+    // The count separates failure modes: 0 = the slot/room-state projection
+    // dropped everyone (even ourselves); 1 = own membership round-tripped but
+    // the peer's sticky never arrived.
+    println!("[{label}] WARNING: observed {last_count} of {target} members within 30s");
     false
 }
 

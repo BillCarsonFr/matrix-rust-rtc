@@ -69,21 +69,29 @@ services:
   # MatrixRTC authorisation service (MSC4195 /get_token).
   auth-service:
     image: ghcr.io/element-hq/lk-jwt-service:0.4.4
+    # lk-jwt uses LIVEKIT_URL for two things at once: the URL it hands back to
+    # clients in /get_token responses, AND its own RoomService endpoint for
+    # creating the room on the SFU (full-access path). One URL must therefore
+    # work from the host and from inside this container. Sharing the SFU's
+    # network namespace makes `localhost:7880` mean the SFU in both places
+    # (host side via the published port). DNS for `synapse` still resolves —
+    # the shared namespace is livekit's, which sits on the compose network.
+    network_mode: "service:livekit"
     environment:
       LIVEKIT_JWT_PORT: "6080"
-      # Returned verbatim to clients in the /get_token response, so it must be
-      # reachable from wherever the clients run (the host, for the e2e test).
-      # Override via .env for non-localhost setups.
       LIVEKIT_URL: "${LIVEKIT_WS_URL:-ws://localhost:7880}"
       LIVEKIT_KEY: devkey
       LIVEKIT_SECRET: secret
       LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse
       # Synapse's federation listener uses the self-signed cert from init-certs.
       LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
-    ports:
-      - "6080:6080"
+      # Verbose by default: this is a dev/test stack and the auth hop is the
+      # most opaque failure point (CI dumps these logs after every run).
+      LIVEKIT_LOG_LEVEL: debug
     depends_on:
       synapse:
+        condition: service_healthy
+      livekit:
         condition: service_healthy
     # No healthcheck: 0.4.4 is a FROM-scratch image (no shell, no healthcheck
     # binary — that only exists on unreleased main). wait-ready.sh probes
@@ -99,6 +107,7 @@ services:
       - "7880:7880/tcp" # signalling WebSocket + HTTP
       - "7881:7881/tcp" # ICE over TCP (fallback when UDP is blocked)
       - "50100-50200:50100-50200/udp" # WebRTC media (keep the range small: one iptables entry per port)
+      - "6080:6080/tcp" # auth-service (it shares this network namespace, see above)
     # Same probe the official livekit-helm chart uses; the alpine base ships
     # busybox wget.
     healthcheck:
