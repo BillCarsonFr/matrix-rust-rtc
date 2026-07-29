@@ -84,9 +84,10 @@ matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev
 # matrix-rtc-core), and the `connect` / `e2e_call` examples. Off by default to
 # keep the base crate light and buildable without the git SDK.
 matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-ui", "dep:matrix-sdk-base"]
-# Exposes the `media` module of synthetic-audio test utilities (tone gen /
-# record / WAV / frequency detect) for examples and integration tests. Not for
-# production use; the module is otherwise only compiled under `cfg(test)`.
+# Exposes the test-only parts of the `media` module (tone generator, Goertzel
+# frequency detector) for examples and integration tests; recording/WAV
+# helpers in that module are shipped API and need no feature. Otherwise the
+# test-only parts compile only under `cfg(test)`.
 testing = []
 
 # The end-to-end call test (see tests/E2E_CALL.md). `required-features` keeps
@@ -99,7 +100,8 @@ path = "tests/e2e_call/main.rs"
 required-features = ["matrix-sdk", "testing"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
+# `signal` for the join_and_record example's Ctrl-C hang-up.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The dependency tree pulls in rustls with BOTH the `ring` and `aws-lc-rs`
 # crypto backends (livekit/reqwest vs matrix-sdk), so rustls cannot pick a
@@ -111,3 +113,9 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 [[example]]
 name = "connect"
 required-features = ["matrix-sdk"]
+
+# The quick-start example (see README.md). `testing` only for the optional
+# PUBLISH_TONE test-tone publisher, so two instances can call each other.
+[[example]]
+name = "join_and_record"
+required-features = ["matrix-sdk", "testing"]

@@ -66,15 +66,18 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Implements the MSC4195 LiveKit transport: the "LiveKit SDK" layer that turns
   `matrix-rtc-core`'s membership/key outputs into a live SFU media session.
 - Owns the authorisation-service `/get_token` exchange (`token`) and the MSC4195
-  hash derivations (`identity`), drives a LiveKit `Room` (`session`, subscribe-only
-  for now), and bridges core media keys toward LiveKit frame encryption (`keys`).
+  hash derivations (`identity`), drives a LiveKit `Room` (`session`), and bridges
+  core media keys into LiveKit per-participant frame encryption (`keys`,
+  `MediaKeyBridge` → `KeyProvider`, HKDF mode, GCM frames).
 - Obtains the Matrix OpenID token via the `OpenIdTokenSource` trait; a default
   `matrix_sdk::Client` impl sits behind the optional `matrix-sdk` feature, so the
   crate is not hard-wired to a particular Matrix SDK.
+- Behind `matrix-sdk` it also ships the integration layers: `matrix_bridge`
+  (SDK-backed `RtcCommandSender` + the sticky/room-state bridge into the core)
+  and `call` — a `Call::join`/`Call::leave` facade wrapping membership
+  signalling, key exchange, transport discovery, and the E2EE SFU connection in
+  one handle (the crate README's quick start; also what the e2e test drives).
 - Native-only by nature (the LiveKit client pulls in `libwebrtc`); never targets wasm.
-- E2EE frame encryption is deferred: the LiveKit Rust SDK lacks the per-participant
-  HKDF key import MSC4195 specifies (livekit/rust-sdks#796), so media is currently
-  unencrypted and the key bridge only records signalled material.
 
 ## Spec alignment
 

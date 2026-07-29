@@ -26,24 +26,28 @@
 //!   service ([`token`]);
 //! - deriving the MSC4195 `livekit_alias` and pseudonymous participant identity
 //!   ([`identity`]);
-//! - connecting to the SFU and subscribing to remote media (added in a
-//!   subsequent step);
+//! - connecting to the SFU with per-participant GCM frame E2EE ([`session`],
+//!   [`connect_e2ee`]);
 //! - bridging `matrix-rtc-core`'s media keys into LiveKit frame encryption
-//!   (added in a subsequent step).
+//!   ([`keys`]).
+//!
+//! With the `matrix-sdk` feature, [`matrix_bridge`] connects the core to a
+//! `matrix_sdk::Client`, and [`call::Call`] wraps the whole stack in a
+//! join/leave facade — start there.
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
 pub mod identity;
 pub mod keys;
+// Audio helpers. Recording a subscribed track and writing WAVs is shipped API
+// (the recording-bot use case); the synthetic-tone generator and frequency
+// detector inside are test utilities gated on `cfg(test)`/the `testing` feature.
+pub mod media;
 pub mod session;
 pub mod token;
 
-// Synthetic-audio test utilities (tone gen / record / WAV / frequency detect),
-// used by the `e2e_call` example and integration tests. Gated so they never
-// enter a normal build — enabled by `cfg(test)` and the `testing` feature.
-#[cfg(any(test, feature = "testing"))]
-pub mod media;
-
+#[cfg(feature = "matrix-sdk")]
+pub mod call;
 #[cfg(feature = "matrix-sdk")]
 pub mod matrix_bridge;
 
@@ -54,6 +58,8 @@ pub use keys::{
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};
 
+#[cfg(feature = "matrix-sdk")]
+pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_slot};
 #[cfg(feature = "matrix-sdk")]
 pub use matrix_bridge::{SdkCommandSender, run_sticky_bridge};
 
