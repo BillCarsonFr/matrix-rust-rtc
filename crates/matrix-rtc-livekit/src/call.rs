@@ -314,6 +314,16 @@ impl Call {
 
     /// The LiveKit room event stream (participants joining, tracks
     /// subscribed, disconnects, ...).
+    ///
+    /// The stream ending (`recv()` returning `None`) means the call is over:
+    /// the room closes its event channel on [`Call::leave`] and after any
+    /// unrecoverable disconnect (server eviction, reconnects exhausted, ...) —
+    /// in the latter case a [`RoomEvent::Disconnected`] carrying the reason is
+    /// delivered first, so match it only if the reason matters. Transient
+    /// network drops are resumed internally (`Reconnecting`/`Reconnected`
+    /// events) and do not end the stream. There is no built-in deadline:
+    /// waiting for an event that may never come (e.g. a track from a peer who
+    /// never publishes) should be wrapped in a timeout by the caller.
     pub fn events(&mut self) -> &mut UnboundedReceiver<RoomEvent> {
         &mut self.connection.events
     }

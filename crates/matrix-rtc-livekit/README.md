@@ -70,6 +70,13 @@ Two things the snippet glosses over:
   room creator opens one with `matrix_rtc_livekit::open_slot(...)` (see the
   example below).
 
+- **When the loop ends.** The event stream ending *is* the "call is over"
+  signal: the channel closes on `leave()` and after any unrecoverable
+  disconnect (a `RoomEvent::Disconnected` with the reason arrives first;
+  transient drops auto-resume and don't end the stream). What the stream does
+  **not** have is a deadline — if no peer ever publishes, the loop above waits
+  forever, so a real bot should wrap the wait in `tokio::time::timeout`.
+
 The runnable version is [`examples/join_and_record.rs`](examples/join_and_record.rs) —
 it adds slot opening and an optional test-tone publisher, so **two instances of
 it can call each other** against the local [`demo/backend`](../../demo/backend/README.md)

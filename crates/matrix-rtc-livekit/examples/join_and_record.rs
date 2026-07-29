@@ -185,6 +185,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         let event = tokio::select! {
             event = call.events().recv() => match event {
                 Some(event) => event,
+                // Stream end == call over (leave or unrecoverable disconnect;
+                // a Disconnected event with the reason precedes it).
                 None => break,
             },
             _ = tokio::signal::ctrl_c() => break,

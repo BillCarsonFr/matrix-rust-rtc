@@ -227,6 +227,12 @@ Still outstanding:
    and skips the update when the fetch fails. The real fix is adding the slot
    type to the fork SDK's sliding sync `required_state`, then reverting
    `slot_snapshot` to the state store.
+4. **A unified `CallEvent` stream on the `Call` facade** — the facade exposes
+   LiveKit media events as a stream (`Call::events`) but Matrix-side session
+   state only by polling (`member_count`). The eventual shape is one merged
+   facade-level stream — peer joined/left, track subscribed, key imported,
+   ended-with-reason — which would also give item 1 (slot-close reaction) a
+   natural place to surface.
 
 ## Non-goals in this first skeleton
 
