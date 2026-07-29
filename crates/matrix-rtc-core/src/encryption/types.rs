@@ -89,6 +89,10 @@ pub enum KeyRejection {
         /// The user that actually sent the key.
         actual: String,
     },
+    /// The member event names no sending device, so the required match cannot
+    /// be performed at all. Not expected in practice for an encrypted member
+    /// event — Olm messages carry the sender's device keys.
+    UnverifiableDevice,
     /// The sending device does not match the one that sent the member event.
     DeviceMismatch {
         /// The device the member event was encrypted by.
@@ -103,6 +107,10 @@ impl std::fmt::Display for KeyRejection {
         match self {
             Self::Cleartext => write!(f, "sent in cleartext"),
             Self::NotCrossSigned => write!(f, "sending device is not cross-signed"),
+            Self::UnverifiableDevice => write!(
+                f,
+                "the member event names no sending device to check this against"
+            ),
             Self::RoomMismatch { claimed } => write!(f, "claims a different room ({claimed})"),
             Self::SenderMismatch { expected, actual } => {
                 write!(

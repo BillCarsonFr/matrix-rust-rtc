@@ -22,8 +22,8 @@
 
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,
-    LeaveSessionParams, RawRtcTransport, RawStickyEvent, RawStickyEventUpdate, RtcSession,
-    RtcSessionManager, RtcTransport, StickyEventsUpdate,
+    LeaveSessionParams, RawRtcTransport, RawSlotEvent, RawStickyEvent, RawStickyEventUpdate,
+    RtcSession, RtcSessionManager, RtcTransport, StickyEventsUpdate,
 };
 
 mod commands;
@@ -110,6 +110,57 @@ impl WasmRtcSessionManager {
             .sticky_update_for_room(&room_id, mapped)
             .await
             .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Applies a room's complete `m.rtc.slot` state.
+    ///
+    /// Calling this is what makes the MSC4143 open-slot condition apply to the
+    /// room: until then it cannot be evaluated and is not enforced. Any slot in
+    /// the room *not* present in `slots` is treated as closed, so always pass
+    /// the full set — an empty array included.
+    ///
+    /// Each entry is `{ slot_id, content }`, where `content` is the raw
+    /// `m.rtc.slot` content.
+    pub async fn on_room_slots_received(
+        &mut self,
+        room_id: String,
+        slots: JsValue,
+    ) -> Result<(), JsError> {
+        let input: Vec<WasmSlotEvent> = serde_wasm_bindgen::from_value(slots)
+            .map_err(|err| JsError::new(&format!("invalid slot payload: {err}")))?;
+
+        let mapped: Vec<RawSlotEvent> = input
+            .into_iter()
+            .map(|slot| RawSlotEvent {
+                room_id: room_id.clone(),
+                slot_id: slot.slot_id,
+                content: slot.content,
+            })
+            .collect();
+
+        self.inner.on_room_slots_received(&room_id, mapped).await;
+        Ok(())
+    }
+
+    /// Sets the users currently joined to a room.
+    ///
+    /// MSC4143 only counts a member event while its sender is still joined to
+    /// the room; until this is called that condition is not enforced.
+    pub async fn on_room_members_received(&mut self, room_id: String, joined_user_ids: JsValue) {
+        let members: Vec<String> =
+            serde_wasm_bindgen::from_value(joined_user_ids).unwrap_or_default();
+        self.inner.on_room_members_received(&room_id, members).await;
+    }
+
+    /// Reports whether a room is end-to-end encrypted.
+    ///
+    /// MSC4143 requires RTC encryption in encrypted rooms and forbids it
+    /// elsewhere, so this changes how the room's slots resolve and whether
+    /// cleartext member events count.
+    pub async fn on_room_encryption_received(&mut self, room_id: String, encrypted: bool) {
+        self.inner
+            .on_room_encryption_received(&room_id, encrypted)
+            .await;
     }
 
     /// Returns the number of active sessions currently tracked by the manager.
@@ -521,6 +572,11 @@ struct WasmStickyEvent {
     /// self-asserted device field, so the host must supply this.
     #[serde(default)]
     sender_device_id: Option<String>,
+    /// Whether the event arrived encrypted; MSC4143 requires member events to be
+    /// encrypted in encrypted rooms. Omit if unknown — omitting it is not the
+    /// same as `false`, which would drop the member in an encrypted room.
+    #[serde(default)]
+    was_encrypted: Option<bool>,
     #[serde(rename = "type")]
     event_type: String,
     content: WasmStickyEventContent,
@@ -536,6 +592,13 @@ struct WasmStickyEventContent {
     transports: Option<WasmTransports>,
     #[serde(default)]
     leave_reason: Option<WasmLeaveReason>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WasmSlotEvent {
+    slot_id: String,
+    #[serde(default)]
+    content: matrix_rtc_core::RawSlotEventContent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -608,7 +671,11 @@ impl From<WasmStickyEvent> for RawStickyEvent {
         RawStickyEvent {
             room_id: value.room_id,
             sender: value.sender,
-            sender_device_id: value.sender_device_id,
+            origin: match value.was_encrypted {
+                Some(true) => matrix_rtc_core::EventOrigin::encrypted(value.sender_device_id),
+                Some(false) => matrix_rtc_core::EventOrigin::Cleartext,
+                None => matrix_rtc_core::EventOrigin::Unknown,
+            },
             event_type: value.event_type,
             content: matrix_rtc_core::RawStickyEventContent {
                 slot_id: value.content.slot_id,

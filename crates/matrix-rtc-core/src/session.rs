@@ -30,9 +30,10 @@ use crate::commands::RtcCommandSender;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
+use crate::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::own_membership::{OwnMembershipMachine, transport_to_json};
-use crate::slot::SlotState;
+use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::RtcTransport;
 
 #[allow(unused_imports)]
@@ -72,6 +73,9 @@ pub struct RtcSession<T: RtcCommandSender> {
     /// Users currently joined to the room, when the host supplies them; `None`
     /// leaves the room-membership condition unenforced.
     room_members: Option<HashSet<String>>,
+    /// Whether the room is encrypted, which decides whether member events are
+    /// required to be encrypted.
+    room_encryption: RoomEncryption,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
     /// Command sender for sending events to the Matrix room.
     command_sender: Option<Arc<T>>,
@@ -88,6 +92,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             members: self.members.clone(),
             slot: self.slot.clone(),
             room_members: self.room_members.clone(),
+            room_encryption: self.room_encryption,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             command_sender: self.command_sender.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
@@ -106,6 +111,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             members: Vec::new(),
             slot: SlotKnowledge::default(),
             room_members: None,
+            room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
             command_sender: None,
             own_membership_machine: None,
@@ -122,6 +128,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             members: Vec::new(),
             slot: SlotKnowledge::default(),
             room_members: None,
+            room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
             command_sender: Some(command_sender),
             own_membership_machine: None,
@@ -252,7 +259,13 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             move || members_tx.borrow().clone()
         };
 
-        let encryption_config = params.encryption_config();
+        let mut encryption_config = params.encryption_config();
+        if let Some(negotiated) = self.negotiated_encryption() {
+            // The slot decides whether RTC data is encrypted; the local flag only
+            // applies where no slot state has been supplied to negotiate from.
+            encryption_config.manage_media_keys = negotiated;
+        }
+
         let mut encryption_manager = EncryptionManager::new(
             command_sender.clone(),
             params.user_id.clone(),
@@ -401,6 +414,15 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             SlotKnowledge::Known(_) => return false,
         }
 
+        // MSC4143: in an encrypted room `m.rtc.member` events MUST be
+        // encrypted, and one that is not "MUST be considered left". An event
+        // whose encryption the host did not report is not judged.
+        if self.room_encryption == RoomEncryption::Encrypted
+            && candidate.origin.was_encrypted() == Some(false)
+        {
+            return false;
+        }
+
         match &self.room_members {
             Some(joined) => joined.contains(&candidate.sender),
             None => true,
@@ -460,6 +482,49 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     pub(crate) fn seed_room_members(&mut self, room_members: HashSet<String>) {
         debug_assert!(self.candidates.is_empty(), "seeding a populated session");
         self.room_members = Some(room_members);
+    }
+
+    /// Sets the room encryption state on a session that has no members yet.
+    pub(crate) fn seed_room_encryption(&mut self, room_encryption: RoomEncryption) {
+        debug_assert!(self.candidates.is_empty(), "seeding a populated session");
+        self.room_encryption = room_encryption;
+    }
+
+    /// Sets whether the room is encrypted.
+    ///
+    /// In an encrypted room, members whose `m.rtc.member` event arrived in the
+    /// clear stop counting as joined.
+    pub async fn set_room_encryption(&mut self, room_encryption: RoomEncryption) {
+        if self.room_encryption == room_encryption {
+            return;
+        }
+        self.room_encryption = room_encryption;
+        self.refresh().await;
+    }
+
+    /// Whether RTC data should be encrypted, per the slot and the room.
+    ///
+    /// `None` means there is nothing to negotiate from — no room state has been
+    /// supplied — and the caller's own configuration stands. Otherwise this is
+    /// authoritative: MSC4143 prescribes the mechanism through the slot's
+    /// `encryption` object, and forbids encryption outright in unencrypted
+    /// rooms, so a local preference cannot override either way.
+    ///
+    /// NOTE: this is read when the session joins. A slot whose mechanism changes
+    /// mid-session is not renegotiated; the dangerous direction (the slot
+    /// closing) is already covered, since that leaves every member and so stops
+    /// key distribution.
+    pub fn negotiated_encryption(&self) -> Option<bool> {
+        let SlotKnowledge::Known(state) = &self.slot else {
+            return None;
+        };
+
+        Some(
+            state
+                .open()
+                .and_then(|slot| slot.mechanism.as_ref())
+                .is_some_and(|mechanism| mechanism.is_supported()),
+        )
     }
 
     /// The slot state this session is applying, if any has been supplied.
@@ -626,14 +691,12 @@ pub struct JoinedMembership {
     pub slot_id: String,
     /// Sender user ID of the membership event.
     pub sender: String,
-    /// Device that sent the membership event, from the event's decryption
-    /// metadata rather than from its content.
+    /// How the member event reached us.
     ///
-    /// MSC4143 removed the self-asserted `member.claimed_device_id`; key
-    /// distribution instead targets "the devices that were used to encrypt these
-    /// member events". `None` for events received in the clear, or when the host
-    /// SDK could not supply it.
-    pub sender_device_id: Option<String>,
+    /// MSC4143 removed the self-asserted `member.claimed_device_id`, so the
+    /// sending device comes from here — key distribution targets "the devices
+    /// that were used to encrypt these member events".
+    pub origin: EventOrigin,
     /// Sticky key identifying this membership stream (equal to `member_id`).
     pub sticky_key: String,
     /// `member.id` — identifies this participation, unique per join.

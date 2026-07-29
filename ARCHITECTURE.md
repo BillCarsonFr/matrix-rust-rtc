@@ -97,10 +97,9 @@ proposal. The `m.rtc.member` wire format now matches it:
   array.
 - `member.claimed_user_id`, `member.claimed_device_id`, `versions`,
   `m.relates_to` and `created_ts` are gone. The sending device now comes from the
-  event's decryption metadata and rides on `RawStickyEvent::sender_device_id`,
-  which the LiveKit bridge fills from `EncryptionInfo::sender_device` — available
-  since the SDK's "keep encryption info for sticky events" commit, which is why
-  the pin moved.
+  event's decryption metadata and rides on `RawStickyEvent::origin`, which the
+  LiveKit bridge fills from `EncryptionInfo` — available since the SDK's "keep
+  encryption info for sticky events" commit, which is why the pin moved.
 - `member.id` is generated fresh per join (`generate_member_id`), as the spec
   requires; it is no longer derived from the user and device IDs.
 
@@ -110,9 +109,16 @@ stored and signalled once it has been matched against the sender's member event:
 - The host reports how the message arrived via `KeyOrigin`, built from Olm
   decryption metadata. Cleartext messages are discarded, since nothing in the
   payload can be trusted to identify a sender.
-- The to-device sender and its device must equal the sender and
-  `sender_device_id` of the `m.rtc.member` event the message names, or the key is
-  discarded. A key naming another room is discarded too.
+- The to-device sender and its device must equal the sender and sending device
+  of the `m.rtc.member` event the message names, or the key is discarded. A key
+  naming another room is discarded too.
+- If the member event names no device to check against — cleartext, or encrypted
+  but not attributable to one — the match cannot be performed, so the key is
+  discarded rather than accepted on the user match alone. An encrypted member
+  event should always resolve to a device (Olm messages carry the sender's device
+  keys), so that half is a backstop rather than an expected path. The exception
+  is `EventOrigin::Unknown`, where the host reported nothing at all and the rule
+  is skipped like every other unreported fact.
 - Keys from devices that are not cross-signed are discarded unless
   `EncryptionConfig::require_cross_signed_sender` is turned off (MSC4153).
 - A key that arrives before its member event is buffered *with its origin* and
@@ -148,17 +154,49 @@ session for hosts that do not yet feed room state. The LiveKit bridge feeds both
 `open_slot` / `close_slot` send the state event through the command sender's new
 `send_state_event`.
 
+### Encryption negotiation
+
+Whether RTC data is encrypted is prescribed by the slot, not chosen locally.
+`RawSlotEvent::resolve` takes the room's encryption state alongside the event,
+because MSC4143 ties the two together in both directions:
+
+- **Encrypted room.** A slot MUST carry an `encryption` object, so one without it
+  resolves closed. A mechanism this client cannot implement also closes the slot,
+  since encryption is required there and taking part without it would break the
+  same requirement. `m.per_member` (and its unstable id) is the only one
+  implemented.
+- **Unencrypted room.** RTC encryption MUST NOT be used, so a declared mechanism
+  is dropped rather than honoured. The slot stays open; `OpenSlot::mechanism` is
+  `None` while `OpenSlot::encryption` still reports what was declared, so callers
+  can see the mismatch.
+- **Unknown.** Neither rule applies and the declared mechanism is taken at face
+  value, matching how the other room-state conditions stay unenforced until a
+  host opts in via `on_room_encryption_received`.
+
+`RtcSession::negotiated_encryption` turns that into the key-management decision
+at join time, overriding `EncryptionConfig::manage_media_keys`; the local flag
+only applies where there is no slot state to negotiate from. A slot whose
+mechanism changes mid-session is not renegotiated — the dangerous direction, the
+slot closing, is already covered because that leaves every member.
+
+Separately, a member event that arrived in the clear does not count as joined in
+an encrypted room. That and the sending device are one value,
+`RawStickyEvent::origin` (`EventOrigin`), because both come from the same
+decryption metadata — a cleartext event cannot carry a sending device, and the
+type makes that unrepresentable. `EventOrigin::Unknown` is distinct from
+`Cleartext`: it means the host did not report, so the rule is skipped rather
+than failed. The flat `sender_device_id` / `was_encrypted` pair survives only in
+the wasm and FFI wire records, which converge into the enum at the boundary.
+
 Still outstanding, in the order they are planned:
 
-1. **Encryption negotiation** — whether to encrypt, and with which mechanism,
-   should come from the slot's `encryption.type` plus room encryption rather than
-   a local config flag. `SlotState::Open` already carries the parsed
-   `encryption` object for this.
-2. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
+1. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
    implemented; LiveKit URLs come from configuration.
-3. **Prompt reaction to slot changes** — the LiveKit bridge re-reads room state
+2. **Prompt reaction to slot changes** — the LiveKit bridge re-reads room state
    on sticky-event ticks, so a slot closing in an otherwise idle room is noticed
    late. A room-state subscription would fix it.
+3. **Mid-session renegotiation** — a slot that changes its encryption mechanism
+   while a session is live keeps the mechanism negotiated at join.
 
 ## Non-goals in this first skeleton
 

@@ -160,6 +160,7 @@ type GetMembershipsFn = Arc<Mutex<Box<dyn Fn() -> Vec<JoinedMembership> + Send>>
 
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
+use crate::event::EventOrigin;
 use crate::session::JoinedMembership;
 
 /// Message type for to-device encryption key distribution (MSC4143).
@@ -591,7 +592,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             })
             .map(|m| ParticipantDeviceInfo {
                 user_id: m.sender.clone(),
-                device_id: m.sender_device_id.clone().unwrap_or_default(),
+                device_id: m.origin.sender_device_id().unwrap_or_default().to_owned(),
                 member_id: m.member_id.clone(),
             })
             .collect();
@@ -816,7 +817,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 // member event. Falling back to "*" (every device of that user)
                 // keeps cleartext-room sessions working; Olm still encrypts
                 // per-device, so this widens delivery, not readership.
-                let target_device_id = membership.sender_device_id.as_deref().unwrap_or("*");
+                let target_device_id = membership.origin.sender_device_id().unwrap_or("*");
 
                 log::debug!(
                     "[{}:{}] Sending key to user={}, device={}",
@@ -895,16 +896,27 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             });
         }
 
-        // A member event received in the clear carries no sending device, so
-        // there is nothing to compare against. MSC4143 only allows RTC
-        // encryption in encrypted rooms, so this means the peer is misbehaving
-        // or the room is unencrypted; either way the user match is all we have.
-        let Some(expected_device) = membership.sender_device_id.as_deref() else {
-            log::warn!(
-                "cannot verify sending device for member {}: its member event was not encrypted",
-                membership.member_id,
-            );
-            return Ok(());
+        let expected_device = match &membership.origin {
+            EventOrigin::Encrypted {
+                sender_device_id: Some(device),
+            } => device.as_str(),
+
+            // The host never said how the member event arrived, so there is
+            // nothing to check against and nothing to accuse it of — the same
+            // stance the rest of the design takes on unreported facts.
+            EventOrigin::Unknown => return Ok(()),
+
+            // Either the member event was encrypted but could not be attributed
+            // to a device — which should not happen, since Olm messages carry
+            // the sender's device keys — or it arrived in the clear. Both leave
+            // no device to bind this key to, and MSC4143 makes that match a
+            // MUST, so the check has not been satisfied. This is a backstop
+            // rather than a path traffic is expected to take: skipping it would
+            // quietly downgrade the requirement to a user-only match.
+            EventOrigin::Encrypted {
+                sender_device_id: None,
+            }
+            | EventOrigin::Cleartext => return Err(KeyRejection::UnverifiableDevice),
         };
 
         if sender_device_id.as_deref() != Some(expected_device) {
@@ -1067,7 +1079,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let rtc_backend_id = match &self.identity_mapper {
             Some(mapper) => mapper(
                 &membership.sender,
-                membership.sender_device_id.as_deref().unwrap_or(""),
+                membership.origin.sender_device_id().unwrap_or(""),
                 &membership.member_id,
             ),
             None => membership.member_id.clone(),
@@ -1197,6 +1209,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 mod tests {
     use super::*;
     use crate::commands::{MockCommandSender, NoopCommandSender};
+    use crate::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
 
@@ -1211,7 +1224,7 @@ mod tests {
             room_id: ROOM_ID.to_string(),
             slot_id: SLOT_ID.to_string(),
             sender: "@bob:example.org".to_string(),
-            sender_device_id: Some("device456".to_string()),
+            origin: EventOrigin::encrypted(Some("device456".to_string())),
             sticky_key: "bob-device456-uuid".to_string(),
             member_id: "bob-device456-uuid".to_string(),
             application: Some("m.call".to_string()),
@@ -1444,6 +1457,74 @@ mod tests {
             sender_is_cross_signed: true,
         };
         assert_discarded(&manager, key).await;
+    }
+
+    /// A member event that was encrypted but could not be attributed to a device
+    /// gives nothing to bind the key to, so the MSC4143 device match cannot be
+    /// satisfied. Accepting anyway would downgrade it to a user-only check,
+    /// which any of that user's devices could then pass.
+    #[tokio::test]
+    async fn key_is_discarded_when_the_member_event_has_no_attributable_device() {
+        let unattributable = JoinedMembership {
+            origin: EventOrigin::encrypted(None),
+            ..bob_membership()
+        };
+        let manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![unattributable]),
+        );
+
+        assert_discarded(&manager, bob_key(vec![1u8; 32], 0)).await;
+    }
+
+    /// Same for a member event known to have arrived in the clear.
+    #[tokio::test]
+    async fn key_is_discarded_when_the_member_event_was_cleartext() {
+        let cleartext = JoinedMembership {
+            origin: EventOrigin::Cleartext,
+            ..bob_membership()
+        };
+        let manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![cleartext]),
+        );
+
+        assert_discarded(&manager, bob_key(vec![1u8; 32], 0)).await;
+    }
+
+    /// But an unreported origin is not an accusation: hosts that do not supply
+    /// decryption metadata keep working, as everywhere else in the design.
+    #[tokio::test]
+    async fn key_is_accepted_when_the_member_events_origin_is_unreported() {
+        let unreported = JoinedMembership {
+            origin: EventOrigin::Unknown,
+            ..bob_membership()
+        };
+        let manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![unreported]),
+        );
+
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 0))
+            .await
+            .expect("should succeed");
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
     }
 
     /// MSC4153: keys from devices that are not cross-signed are discarded when

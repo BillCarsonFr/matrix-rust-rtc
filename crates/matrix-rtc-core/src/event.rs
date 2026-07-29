@@ -30,6 +30,62 @@ use crate::session::{
 use crate::transport::{MemberTransports, RawRtcTransport};
 use thiserror::Error;
 
+/// How an event reached us, and what its decryption metadata says.
+///
+/// MSC4143 asks two things of this: member events MUST be encrypted in
+/// encrypted rooms, and a member's device is identified by the device that
+/// encrypted their member event rather than by any field in the content. Both
+/// come from the same place, so they are modelled as one value — a cleartext
+/// event cannot carry a sending device, and that is unrepresentable here.
+///
+/// This mirrors [`KeyOrigin`], which does the same job for to-device messages.
+///
+/// [`KeyOrigin`]: crate::KeyOrigin
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventOrigin {
+    /// The host did not report how the event arrived. Rules that depend on it
+    /// are not applied.
+    #[default]
+    Unknown,
+    /// The event arrived in the clear.
+    Cleartext,
+    /// The event arrived encrypted and was decrypted.
+    Encrypted {
+        /// The sending device, as decryption attributed it.
+        ///
+        /// Optional only because the SDK types it that way. Modern Olm messages
+        /// carry the sender's device keys, so a decrypted event should always
+        /// resolve to a device; an absent one means something is off rather than
+        /// being a normal case to design around.
+        sender_device_id: Option<String>,
+    },
+}
+
+impl EventOrigin {
+    /// Builds an origin for an event the host decrypted.
+    pub fn encrypted(sender_device_id: Option<String>) -> Self {
+        Self::Encrypted { sender_device_id }
+    }
+
+    /// The sending device, if the event was encrypted and attributable.
+    pub fn sender_device_id(&self) -> Option<&str> {
+        match self {
+            Self::Encrypted { sender_device_id } => sender_device_id.as_deref(),
+            Self::Unknown | Self::Cleartext => None,
+        }
+    }
+
+    /// Whether the event arrived encrypted; `None` when the host did not say.
+    pub fn was_encrypted(&self) -> Option<bool> {
+        match self {
+            Self::Unknown => None,
+            Self::Cleartext => Some(false),
+            Self::Encrypted { .. } => Some(true),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 /// Minimal sticky event DTO received from host SDK layers.
 pub struct RawStickyEvent {
@@ -37,13 +93,8 @@ pub struct RawStickyEvent {
     pub room_id: String,
     /// Sender user ID of the event.
     pub sender: String,
-    /// Device that sent the event, taken from its decryption metadata.
-    ///
-    /// MSC4143 identifies a member's device by the device that encrypted their
-    /// member event, not by a field in the content. Hosts that can supply this
-    /// (e.g. from `EncryptionInfo::sender_device`) should; `None` for cleartext
-    /// events.
-    pub sender_device_id: Option<String>,
+    /// How the event reached us, including the sending device.
+    pub origin: EventOrigin,
     /// Matrix event type, e.g. `m.rtc.member`.
     pub event_type: String,
     /// Event content subset needed by the core.
@@ -174,7 +225,7 @@ impl RawStickyEvent {
             room_id: self.room_id,
             slot_id: self.content.slot_id,
             sender: self.sender,
-            sender_device_id: self.sender_device_id,
+            origin: self.origin,
             sticky_key: self.content.sticky_key,
             member_id,
             application: application_type,
@@ -289,7 +340,7 @@ mod tests {
         RawStickyEvent {
             room_id: "!room:example.org".to_owned(),
             sender: "@alice:example.org".to_owned(),
-            sender_device_id: Some("DEVICEID".to_owned()),
+            origin: EventOrigin::encrypted(Some("DEVICEID".to_owned())),
             event_type: "m.rtc.member".to_owned(),
             content,
         }
@@ -301,6 +352,29 @@ mod tests {
             .expect("conversion must succeed")
     }
 
+    /// The two facts MSC4143 needs from decryption — was it encrypted, and by
+    /// which device — travel together, so a cleartext event cannot claim a
+    /// sending device.
+    #[test]
+    fn origin_reports_encryption_and_device_together() {
+        let attributed = EventOrigin::encrypted(Some("DEVICEID".to_owned()));
+        assert_eq!(attributed.was_encrypted(), Some(true));
+        assert_eq!(attributed.sender_device_id(), Some("DEVICEID"));
+
+        // Encrypted but unattributable: the SDK could not name the device.
+        let unattributed = EventOrigin::encrypted(None);
+        assert_eq!(unattributed.was_encrypted(), Some(true));
+        assert_eq!(unattributed.sender_device_id(), None);
+
+        assert_eq!(EventOrigin::Cleartext.was_encrypted(), Some(false));
+        assert_eq!(EventOrigin::Cleartext.sender_device_id(), None);
+
+        // Unreported is distinct from cleartext: the rules that depend on it
+        // are skipped rather than failed.
+        assert_eq!(EventOrigin::Unknown.was_encrypted(), None);
+        assert_eq!(EventOrigin::default(), EventOrigin::Unknown);
+    }
+
     #[test]
     fn spec_shaped_join_event_parses() {
         match parse(JOIN_JSON) {
@@ -309,7 +383,7 @@ mod tests {
                 assert_eq!(joined.sticky_key, "xyzABCDEF0123");
                 assert_eq!(joined.application.as_deref(), Some("m.call"));
                 assert_eq!(joined.can_subscribe, vec!["livekit".to_owned()]);
-                assert_eq!(joined.sender_device_id.as_deref(), Some("DEVICEID"));
+                assert_eq!(joined.origin.sender_device_id(), Some("DEVICEID"));
                 match &joined.transports[..] {
                     [RtcTransport::LiveKit(livekit)] => {
                         assert_eq!(livekit.livekit_service_url, "https://sfu.example.com/jwt");

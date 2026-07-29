@@ -50,6 +50,10 @@ pub struct StickyEvent {
     /// self-asserted device field, so the host must supply this for key
     /// distribution to target a single device.
     pub sender_device_id: Option<String>,
+    /// Whether the event arrived encrypted; MSC4143 requires member events to be
+    /// encrypted in encrypted rooms. `None` if unknown — which is not the same
+    /// as `false`, which would drop the member in an encrypted room.
+    pub was_encrypted: Option<bool>,
     pub event_type: String,
     pub slot_id: String,
     pub sticky_key: String,
@@ -74,6 +78,32 @@ impl From<FfiLeaveReason> for matrix_rtc_core::LeaveReason {
             code: matrix_rtc_core::LeaveCode::from_code(&value.code),
             reason: value.reason,
         }
+    }
+}
+
+/// An `m.rtc.slot` state event, with its content as a JSON string.
+///
+/// The content is passed as JSON rather than a typed record so that
+/// application- and mechanism-specific fields survive the FFI boundary.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct SlotEvent {
+    /// The event's state key, which is the slot id.
+    pub slot_id: String,
+    /// The raw `m.rtc.slot` content as JSON.
+    pub content_json: String,
+}
+
+impl SlotEvent {
+    fn into_core(self, room_id: &str) -> Result<matrix_rtc_core::RawSlotEvent, MatrixRtcFfiError> {
+        let content = serde_json::from_str(&self.content_json).map_err(|error| {
+            MatrixRtcFfiError::InvalidInput(format!("invalid m.rtc.slot content: {error}"))
+        })?;
+
+        Ok(matrix_rtc_core::RawSlotEvent {
+            room_id: room_id.to_owned(),
+            slot_id: self.slot_id,
+            content,
+        })
     }
 }
 
@@ -333,6 +363,66 @@ impl RtcSessionManagerHandle {
         })
     }
 
+    /// Applies a room's complete `m.rtc.slot` state.
+    ///
+    /// Calling this is what makes the MSC4143 open-slot condition apply to the
+    /// room; until then it cannot be evaluated and is not enforced. Any slot in
+    /// the room not present in `slots` is treated as closed, so always pass the
+    /// full set — an empty list included.
+    pub fn on_room_slots_received(
+        &self,
+        room_id: String,
+        slots: Vec<SlotEvent>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let mapped = slots
+            .into_iter()
+            .map(|slot| slot.into_core(&room_id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut manager = lock_mutex(&self.inner)?;
+        futures::executor::block_on(async {
+            manager.on_room_slots_received(&room_id, mapped).await;
+            Ok(())
+        })
+    }
+
+    /// Sets the users currently joined to a room.
+    ///
+    /// MSC4143 only counts a member event while its sender is still joined to
+    /// the room; until this is called that condition is not enforced.
+    pub fn on_room_members_received(
+        &self,
+        room_id: String,
+        joined_user_ids: Vec<String>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let mut manager = lock_mutex(&self.inner)?;
+        futures::executor::block_on(async {
+            manager
+                .on_room_members_received(&room_id, joined_user_ids)
+                .await;
+            Ok(())
+        })
+    }
+
+    /// Reports whether a room is end-to-end encrypted.
+    ///
+    /// MSC4143 requires RTC encryption in encrypted rooms and forbids it
+    /// elsewhere, so this changes how the room's slots resolve and whether
+    /// cleartext member events count.
+    pub fn on_room_encryption_received(
+        &self,
+        room_id: String,
+        encrypted: bool,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let mut manager = lock_mutex(&self.inner)?;
+        futures::executor::block_on(async {
+            manager
+                .on_room_encryption_received(&room_id, encrypted)
+                .await;
+            Ok(())
+        })
+    }
+
     pub fn session_count(&self) -> Result<u64, MatrixRtcFfiError> {
         let manager = lock_mutex(&self.inner)?;
         Ok(manager.session_count() as u64)
@@ -455,7 +545,11 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
     RawStickyEvent {
         room_id: event.room_id,
         sender: event.sender,
-        sender_device_id: event.sender_device_id,
+        origin: match event.was_encrypted {
+            Some(true) => matrix_rtc_core::EventOrigin::encrypted(event.sender_device_id),
+            Some(false) => matrix_rtc_core::EventOrigin::Cleartext,
+            None => matrix_rtc_core::EventOrigin::Unknown,
+        },
         event_type: event.event_type,
         content: RawStickyEventContent {
             slot_id: event.slot_id,
@@ -518,7 +612,7 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         room_id: member.room_id,
         slot_id: member.slot_id,
         sender: member.sender,
-        sender_device_id: member.sender_device_id,
+        sender_device_id: member.origin.sender_device_id().map(str::to_owned),
         sticky_key: member.sticky_key,
         member_id: member.member_id,
         application: member.application,
@@ -547,6 +641,7 @@ mod tests {
             room_id: "!room:example.org".to_owned(),
             sender: "@alice:example.org".to_owned(),
             sender_device_id: Some("DEVICEID".to_owned()),
+            was_encrypted: Some(true),
             event_type: "m.rtc.member".to_owned(),
             slot_id: "m.call#ROOM".to_owned(),
             sticky_key: "alice-device-a".to_owned(),

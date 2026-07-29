@@ -42,7 +42,7 @@ pub use encryption::{
 };
 pub use error::{CommandError, JoinError, LeaveError};
 pub use event::{
-    EventConversionError, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
+    EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     StickyEventsUpdate,
 };
 pub use join::{JoinSessionParams, LeaveSessionParams, generate_member_id};
@@ -55,8 +55,8 @@ pub use session::{
     MemberInfo, Membership, RtcSession,
 };
 pub use slot::{
-    OpenSlot, RawSlotEvent, RawSlotEventContent, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
-    SlotStatus,
+    EncryptionMechanism, OpenSlot, RawSlotEvent, RawSlotEventContent, RoomEncryption,
+    SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus,
 };
 pub use transport::{
     LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
@@ -66,6 +66,7 @@ pub use transport::{
 mod tests {
     use super::*;
     use crate::commands::NoopCommandSender;
+    use std::sync::Arc;
 
     const ROOM_ID: &str = "!room:example.org";
     const EVENT_TYPE_RTC_MEMBER: &str = "m.rtc.member";
@@ -81,7 +82,7 @@ mod tests {
         RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
             sender: sender.to_owned(),
-            sender_device_id: None,
+            origin: EventOrigin::default(),
             event_type: EVENT_TYPE_RTC_MEMBER.to_owned(),
             content: RawStickyEventContent {
                 slot_id: slot_id.to_owned(),
@@ -356,6 +357,198 @@ mod tests {
         assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
     }
 
+    /// MSC4143: in an encrypted room a member event that was not encrypted
+    /// "MUST be considered left".
+    #[tokio::test]
+    async fn cleartext_member_events_are_left_in_an_encrypted_room() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        let encrypted = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+            ..joined_event("@alice:example.org", "m.call#ROOM", "alice-a")
+        };
+        let cleartext = RawStickyEvent {
+            origin: EventOrigin::Cleartext,
+            ..joined_event("@bob:example.org", "m.call#ROOM", "bob-a")
+        };
+
+        manager
+            .initial_sticky_for_room(ROOM_ID, vec![encrypted, cleartext])
+            .await
+            .unwrap();
+        // Nothing has reported the room's encryption yet, so neither is judged.
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(2));
+
+        manager.on_room_encryption_received(ROOM_ID, true).await;
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+    }
+
+    /// An unencrypted room imposes no such requirement.
+    #[tokio::test]
+    async fn cleartext_member_events_are_fine_in_an_unencrypted_room() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        let cleartext = RawStickyEvent {
+            origin: EventOrigin::Cleartext,
+            ..joined_event("@bob:example.org", "m.call#ROOM", "bob-a")
+        };
+        manager
+            .initial_sticky_for_room(ROOM_ID, vec![cleartext])
+            .await
+            .unwrap();
+        manager.on_room_encryption_received(ROOM_ID, false).await;
+
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+    }
+
+    /// A slot with no encryption object is closed in an encrypted room, so its
+    /// members are left even though everything else about them is valid.
+    #[tokio::test]
+    async fn unencrypted_slot_closes_in_an_encrypted_room() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+        manager
+            .initial_sticky_for_room(
+                ROOM_ID,
+                vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+
+        manager.on_room_encryption_received(ROOM_ID, true).await;
+
+        assert_eq!(
+            manager.slot_state(ROOM_ID, "m.call#ROOM"),
+            Some(SlotState::Closed)
+        );
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
+    }
+
+    /// Room encryption arriving after the slot re-resolves it, and vice versa;
+    /// the manager keeps slots unresolved so either order works.
+    #[tokio::test]
+    async fn slot_resolution_reacts_to_room_encryption_in_either_order() {
+        let encrypted_slot = || {
+            slot_event(
+                "m.call#ROOM",
+                r#"{ "status": "open",
+                     "application": { "type": "m.call" },
+                     "encryption": { "type": "m.per_member" } }"#,
+            )
+        };
+
+        // Encryption first, then the slot.
+        let mut a: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        a.on_room_encryption_received(ROOM_ID, true).await;
+        a.on_room_slots_received(ROOM_ID, vec![encrypted_slot()])
+            .await;
+        assert!(a.slot_state(ROOM_ID, "m.call#ROOM").unwrap().is_open());
+
+        // Slot first, then encryption.
+        let mut b: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        b.on_room_slots_received(ROOM_ID, vec![encrypted_slot()])
+            .await;
+        b.on_room_encryption_received(ROOM_ID, true).await;
+        assert!(b.slot_state(ROOM_ID, "m.call#ROOM").unwrap().is_open());
+    }
+
+    /// The slot's `encryption` object — not local configuration — decides
+    /// whether media keys are distributed. Exercised end to end: joining a slot
+    /// that prescribes `m.per_member` in an encrypted room produces key
+    /// to-device traffic to the other member.
+    #[tokio::test]
+    async fn slot_encryption_turns_key_distribution_on() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+
+        manager.on_room_encryption_received(ROOM_ID, true).await;
+        manager
+            .on_room_slots_received(
+                ROOM_ID,
+                vec![slot_event(
+                    "m.call#ROOM",
+                    r#"{ "status": "open",
+                         "application": { "type": "m.call" },
+                         "encryption": { "type": "m.per_member" } }"#,
+                )],
+            )
+            .await;
+
+        // Local config asks for NO keys; the slot must override it upward.
+        join_and_admit_a_peer(&mut manager, false).await;
+
+        assert!(
+            !sender.to_device_messages.lock().unwrap().is_empty(),
+            "keys should be distributed when the slot prescribes a mechanism"
+        );
+    }
+
+    /// Conversely, MSC4143 forbids RTC encryption in an unencrypted room, so no
+    /// keys are distributed there however the client is configured.
+    #[tokio::test]
+    async fn absent_slot_encryption_turns_key_distribution_off() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+
+        manager.on_room_encryption_received(ROOM_ID, false).await;
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+
+        // Local config asks for keys; the slot must override it downward.
+        join_and_admit_a_peer(&mut manager, true).await;
+
+        assert!(
+            sender.to_device_messages.lock().unwrap().is_empty(),
+            "no keys should be distributed when the slot prescribes no mechanism"
+        );
+    }
+
+    /// Joins as alice with `local_manage_media_keys` as the caller's own
+    /// preference, then lets bob in so a membership change triggers key
+    /// distribution (if it is enabled at all).
+    async fn join_and_admit_a_peer(
+        manager: &mut RtcSessionManager<crate::commands::MockCommandSender>,
+        local_manage_media_keys: bool,
+    ) {
+        let mut params = JoinSessionParams::new(
+            "@alice:example.org".to_owned(),
+            "ALICEDEV".to_owned(),
+            ROOM_ID.to_owned(),
+            "m.call#ROOM".to_owned(),
+            "m.call".to_owned(),
+            RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://example.com/jwt".to_owned(),
+            }),
+        );
+        params.membership_id = Some("alice-a".to_owned());
+        params.encryption_config = Some(EncryptionConfig {
+            manage_media_keys: local_manage_media_keys,
+            ..EncryptionConfig::default()
+        });
+        manager.join(params).await.expect("join should succeed");
+
+        let bob = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+            ..joined_event("@bob:example.org", "m.call#ROOM", "bob-a")
+        };
+        manager
+            .sticky_update_for_room(
+                ROOM_ID,
+                StickyEventsUpdate {
+                    added: vec![bob],
+                    updated: Vec::new(),
+                    removed: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn joined_event_with_livekit_transport_is_parsed_correctly() {
         use crate::transport::{RawRtcTransport, RtcTransport};
@@ -370,7 +563,7 @@ mod tests {
         let event = RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
             sender: "@alice:example.org".to_owned(),
-            sender_device_id: None,
+            origin: EventOrigin::default(),
             event_type: "m.rtc.member".to_owned(),
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
@@ -424,7 +617,7 @@ mod tests {
         let event = RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
             sender: "@alice:example.org".to_owned(),
-            sender_device_id: None,
+            origin: EventOrigin::default(),
             event_type: "m.rtc.member".to_owned(),
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),

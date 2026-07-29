@@ -52,8 +52,9 @@ use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 
 use matrix_rtc_core::{
-    CommandError, RawSlotEvent, RawSlotEventContent, RawStickyEvent, RawStickyEventContent,
-    RtcCommandSender, RtcSessionManager, SLOT_EVENT_TYPE, StickyEventsUpdate,
+    CommandError, EventOrigin, RawSlotEvent, RawSlotEventContent, RawStickyEvent,
+    RawStickyEventContent, RtcCommandSender, RtcSessionManager, SLOT_EVENT_TYPE,
+    StickyEventsUpdate,
 };
 
 /// Sticky duration for `m.rtc.member` events, clamped to one hour by the SDK.
@@ -273,14 +274,31 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
                 return None;
             }
             let content: RawStickyEventContent = entry.raw().get_field("content").ok().flatten()?;
-            let sender_device_id = entry
-                .encryption_info()
-                .and_then(|info| info.sender_device.as_ref())
-                .map(|device| device.to_string());
+            // The sticky map only files plaintext and successfully decrypted
+            // events, so the presence of decryption metadata is exactly whether
+            // this arrived encrypted — never "we don't know".
+            let origin = match entry.encryption_info() {
+                Some(info) => {
+                    let device = info.sender_device.as_ref().map(|device| device.to_string());
+                    if device.is_none() {
+                        // Olm messages carry the sender's device keys, so a
+                        // decrypted event should always name one. Worth saying
+                        // out loud here: downstream this member cannot be bound
+                        // to a device, so their media keys get rejected.
+                        log::warn!(
+                            "decrypted {} from {} resolved to no sending device",
+                            event_type,
+                            entry.key.sender,
+                        );
+                    }
+                    EventOrigin::encrypted(device)
+                }
+                None => EventOrigin::Cleartext,
+            };
             Some(RawStickyEvent {
                 room_id: room_id.clone(),
                 sender: entry.key.sender.to_string(),
-                sender_device_id,
+                origin,
                 event_type,
                 content,
             })
@@ -360,9 +378,22 @@ async fn joined_members_snapshot(room: &Room) -> Vec<String> {
 async fn feed_room_state(room: &Room, manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>) {
     let slots = slot_snapshot(room).await;
     let members = joined_members_snapshot(room).await;
+    let encrypted = room
+        .latest_encryption_state()
+        .await
+        .map(|state| state.is_encrypted());
     let room_id = room.room_id().as_str();
 
     let mut manager = manager.lock().await;
+    // Encryption first: it decides how the slots that follow resolve.
+    match encrypted {
+        Ok(encrypted) => {
+            manager
+                .on_room_encryption_received(room_id, encrypted)
+                .await
+        }
+        Err(error) => log::warn!("failed to read room encryption state: {error}"),
+    }
     manager.on_room_slots_received(room_id, slots).await;
     manager.on_room_members_received(room_id, members).await;
 }
