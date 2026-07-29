@@ -222,16 +222,16 @@ impl RtcCommandSender for SdkCommandSender {
         let raw: Raw<AnyToDeviceEventContent> =
             Raw::new(&content).map_err(command_error)?.cast_unchecked();
 
-        // `AllDevices` sends to every device regardless of verification/cross-
-        // signing state, which the throwaway logins in the e2e test lack. A
-        // production integration should prefer `IdentityBasedStrategy` (MSC4153)
-        // to refuse sending keys to unverified identities.
         let failures = encryption
             .encrypt_and_send_raw_to_device(
                 recipients,
                 &message_type,
                 raw,
-                CollectStrategy::AllDevices,
+                // `AllDevices` sends to every device regardless of verification/cross-
+                // signing state. A production integration should prefer
+                // `IdentityBasedStrategy` (MSC4153) to refuse sending keys to
+                // unverified identities.
+                CollectStrategy::IdentityBasedStrategy,
             )
             .await
             .map_err(command_error)?;

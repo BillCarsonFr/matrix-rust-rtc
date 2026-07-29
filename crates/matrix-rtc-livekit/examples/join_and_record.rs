@@ -36,17 +36,24 @@
 //! Env vars: `HOMESERVER_URL` (default `http://localhost:8008`), `MX_USER`,
 //! `MX_PASSWORD`, `ROOM_ID` (required), `SLOT_ID` (default `m.call#ROOM`),
 //! `LIVEKIT_SERVICE_URL` (default `http://localhost:6080`, used when the
-//! homeserver doesn't advertise a transport), `OPEN_SLOT`, `PUBLISH_TONE`,
-//! `RECORD_SECS` (default 5), `OUT_WAV` (default `<temp_dir>/call_recording.wav`),
-//! `INSECURE_TLS`.
+//! homeserver doesn't advertise a transport), `RECOVERY_KEY` (see below),
+//! `OPEN_SLOT`, `PUBLISH_TONE`, `RECORD_SECS` (default 5), `OUT_WAV`
+//! (default `<temp_dir>/call_recording.wav`), `INSECURE_TLS`.
+//!
+//! **Cross-signing:** every run logs a fresh device into the account, and
+//! MSC4153 (enforced by the core) requires media-key senders to be
+//! cross-signed. The first run per user sets up cross-signing + recovery and
+//! prints a recovery key; pass it as `RECOVERY_KEY` on subsequent runs so the
+//! new device joins the existing identity.
 
 use std::env;
 use std::error::Error;
 use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
-use matrix_rtc_core::{EncryptionConfig, SlotEncryption};
+use matrix_rtc_core::SlotEncryption;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
+use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::RoomId;
 use matrix_sdk_ui::sync_service::SyncService;
 
@@ -92,7 +99,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     // 1. Log in and start syncing. Under `unstable-msc4354`, sliding sync
     //    auto-enables the sticky-events extension that carries `m.rtc.member`.
-    let mut builder = matrix_sdk::Client::builder().homeserver_url(&homeserver);
+    //    Cross-signing is bootstrapped automatically on a first-ever login.
+    let mut builder = matrix_sdk::Client::builder()
+        .homeserver_url(&homeserver)
+        .with_encryption_settings(EncryptionSettings {
+            auto_enable_cross_signing: true,
+            ..EncryptionSettings::default()
+        });
     if insecure_tls {
         builder = builder.disable_ssl_verification();
     }
@@ -104,10 +117,41 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .send()
         .await?;
     println!("logged in as {user}");
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+
+    // 2. Cross-sign this device. MSC4153 requires media-key senders to be
+    //    cross-signed and the core enforces it by default, but each run of
+    //    this example logs a *fresh* device into the account — only the
+    //    account's recovery key can bring it into the existing identity.
+    //    The first run per user sets recovery up and prints that key.
+    let recovery = client.encryption().recovery();
+    match env::var("RECOVERY_KEY") {
+        Ok(key) => {
+            recovery.recover(key.trim()).await?;
+            println!("recovered cross-signing; this device is now cross-signed");
+        }
+        Err(_) => match recovery.enable().await {
+            Ok(key) => {
+                println!("recovery enabled for {user}; pass RECOVERY_KEY='{key}' to future runs")
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not enable recovery ({error}); if this account was used before, \
+                     rerun with RECOVERY_KEY=<key printed on its first run> so this new \
+                     device can be cross-signed, or register a fresh user"
+                )
+                .into());
+            }
+        },
+    }
+
     let sync = SyncService::builder(client.clone()).build().await?;
     sync.start().await;
 
-    // 2. Wait for the room to come down sync.
+    // 3. Wait for the room to come down sync.
     let mut room = None;
     for _ in 0..60 {
         room = client.get_room(&room_id);
@@ -118,7 +162,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     let room = room.ok_or("room did not sync within 30s — is the user a member?")?;
 
-    // 3. Optionally open the slot (needs the room power level for `m.rtc.slot`
+    // 4. Optionally open the slot (needs the room power level for `m.rtc.slot`
     //    state; typically the room creator does this once per call).
     if env::var("OPEN_SLOT").is_ok() {
         open_slot(
@@ -135,7 +179,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         println!("opened slot {slot_id}");
     }
 
-    // 4. Join the call: membership signalling, key exchange, and an
+    // 5. Join the call: membership signalling, key exchange, and an
     //    E2EE-enabled SFU connection in one step.
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure_tls)
@@ -145,13 +189,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         CallOptions {
             slot_id,
             livekit_service_url_fallback: Some(livekit_service_url),
-            // The demo-stack users have no cross-signing set up, so the
-            // MSC4153 default would reject every media key they exchange.
-            // Production clients must leave this at the core's default.
-            encryption_config: Some(EncryptionConfig {
-                require_cross_signed_sender: false,
-                ..EncryptionConfig::default()
-            }),
             http: Some(http),
             ..CallOptions::default()
         },
@@ -173,7 +210,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    // 5. React to room events: record the first subscribed audio track, or —
+    // 6. React to room events: record the first subscribed audio track, or —
     //    when publishing — keep the call up until Ctrl-C.
     let out_wav = env::var("OUT_WAV").unwrap_or_else(|_| {
         env::temp_dir()
@@ -217,7 +254,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // 6. Hang up: sends the leave event and closes the SFU connection.
+    // 7. Hang up: sends the leave event and closes the SFU connection.
     call.leave().await?;
     println!("left the call");
     Ok(())

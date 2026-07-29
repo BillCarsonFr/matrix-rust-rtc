@@ -52,6 +52,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
+use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
 use matrix_sdk::ruma::events::InitialStateEvent;
 use matrix_sdk::ruma::events::room::history_visibility::{
@@ -61,7 +62,7 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 
-use matrix_rtc_core::{EncryptionConfig, SlotEncryption};
+use matrix_rtc_core::SlotEncryption;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
 
 use provision::Credentials;
@@ -133,8 +134,17 @@ async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn
 /// Log in and start the sync service. Under `unstable-msc4354`, sliding sync
 /// auto-enables the sticky-events extension, so `m.rtc.member` stickies flow
 /// into the base room's sticky store (see `matrix_bridge`).
+///
+/// Cross-signing is bootstrapped at login: each user is freshly registered
+/// with a single device, so that device self-signs and the MSC4153
+/// cross-signed-sender requirement holds at its (default) strictest.
 async fn login_and_sync(cfg: &Config, who: &Credentials) -> Result<SyncedClient, Box<dyn Error>> {
-    let mut builder = Client::builder().homeserver_url(&cfg.homeserver);
+    let mut builder = Client::builder()
+        .homeserver_url(&cfg.homeserver)
+        .with_encryption_settings(EncryptionSettings {
+            auto_enable_cross_signing: true,
+            ..EncryptionSettings::default()
+        });
     if cfg.insecure_tls {
         builder = builder.disable_ssl_verification();
     }
@@ -145,6 +155,12 @@ async fn login_and_sync(cfg: &Config, who: &Credentials) -> Result<SyncedClient,
         .initial_device_display_name("matrix-rtc-livekit e2e_call")
         .send()
         .await?;
+    // The bootstrap runs as a background task; block until the device is
+    // actually cross-signed so key exchange can't race it.
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
     let user_id = client
         .user_id()
         .ok_or("no user id after login")?
@@ -199,13 +215,6 @@ async fn join_call(
         CallOptions {
             slot_id: cfg.slot_id.clone(),
             livekit_service_url_fallback: Some(cfg.livekit_service_url.clone()),
-            // The two clients here are throwaway logins with no cross-signing
-            // set up, so the MSC4153 requirement would discard every key they
-            // send each other. A real client keeps the core's default.
-            encryption_config: Some(EncryptionConfig {
-                require_cross_signed_sender: false,
-                ..EncryptionConfig::default()
-            }),
             http: Some(http),
             ..CallOptions::default()
         },
