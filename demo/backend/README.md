@@ -75,10 +75,10 @@ service name — so gomatrixserverlib's discovery fallback (`synapse:8448`)
 resolves inside the compose network. The port is not published to the host;
 everything client-facing stays plain HTTP.
 
-## Registering a user by hand
+## Registering users and a room by hand
 
-For the interactive `connect` example (or curl poking), either use open
-registration:
+For the interactive examples (`join_and_record`, `connect` — or curl poking),
+either use open registration:
 
 ```sh
 curl -s -X POST http://localhost:8008/_matrix/client/v3/register \
@@ -93,6 +93,23 @@ turned off):
 ```sh
 docker compose -f demo/backend/docker-compose.yml exec synapse \
   register_new_matrix_user -u alice -p secret -a -c /cfg/homeserver.yaml http://localhost:8008
+```
+
+The `join_and_record` example additionally needs a room both users have
+joined. With `alice` and `bob` registered as above:
+
+```sh
+TOKEN() { curl -s -X POST http://localhost:8008/_matrix/client/v3/login \
+  -d "{\"type\": \"m.login.password\", \"user\": \"$1\", \"password\": \"secret\"}" | jq -r .access_token; }
+ALICE=$(TOKEN alice); BOB=$(TOKEN bob)
+
+# alice creates the room and invites bob (add "initial_state" for an encrypted room)
+ROOM=$(curl -s -X POST "http://localhost:8008/_matrix/client/v3/createRoom?access_token=$ALICE" \
+  -d '{"invite": ["@bob:synapse"]}' | jq -r .room_id)
+
+# bob accepts
+curl -s -X POST "http://localhost:8008/_matrix/client/v3/join/$ROOM?access_token=$BOB" -d '{}'
+echo "ROOM_ID=$ROOM"
 ```
 
 ## Future: Element Web / Element Call + TLS

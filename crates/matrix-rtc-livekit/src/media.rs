@@ -15,36 +15,44 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Synthetic audio **test utilities** for end-to-end media testing.
+//! Audio helpers: recording remote tracks, plus synthetic-audio test utilities.
 //!
-//! This module is not part of the shipped library API: it is gated behind
-//! `cfg(any(test, feature = "testing"))` so it is available to the crate's own
-//! unit tests, to integration tests, and to examples (which enable the `testing`
-//! feature), but never compiled into a normal build.
+//! [`record_track`] (drain a subscribed remote track into PCM) and
+//! [`write_wav`] are shipped API — they are what a recording bot needs after
+//! [`Call::join`](crate::call::Call::join) hands it a subscribed track.
 //!
-//! No microphone or hardware is involved: [`publish_tone`] pushes a generated
-//! sine wave into a LiveKit track (via the session's public
-//! [`LiveKitSession::room`](crate::session::LiveKitSession::room)),
-//! [`record_track`] drains a subscribed remote track into PCM, and
-//! [`detect_tone`] confirms a given frequency dominates the received signal (via
-//! a Goertzel filter). The SFU re-encodes to Opus, so we verify *frequency
-//! energy*, not sample equality.
+//! The rest is test-only, gated behind `cfg(any(test, feature = "testing"))`:
+//! [`publish_tone`] pushes a generated sine wave into a LiveKit track (via the
+//! session's public [`LiveKitSession::room`](crate::session::LiveKitSession::room))
+//! and [`detect_tone`] confirms a given frequency dominates the received signal
+//! (via a Goertzel filter). The SFU re-encodes to Opus, so tests verify
+//! *frequency energy*, not sample equality.
 
-use std::borrow::Cow;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use livekit::options::TrackPublishOptions;
-use livekit::prelude::{
-    LocalAudioTrack, LocalTrack, RemoteAudioTrack, RtcAudioSource, TrackSource,
-};
-use livekit::webrtc::audio_source::AudioSourceOptions;
-use livekit::webrtc::audio_source::native::NativeAudioSource;
+use livekit::prelude::RemoteAudioTrack;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
+
+#[cfg(any(test, feature = "testing"))]
+use std::borrow::Cow;
+
+#[cfg(any(test, feature = "testing"))]
+use livekit::options::TrackPublishOptions;
+#[cfg(any(test, feature = "testing"))]
+use livekit::prelude::{LocalAudioTrack, LocalTrack, RtcAudioSource, TrackSource};
+#[cfg(any(test, feature = "testing"))]
+use livekit::webrtc::audio_source::AudioSourceOptions;
+#[cfg(any(test, feature = "testing"))]
+use livekit::webrtc::audio_source::native::NativeAudioSource;
+#[cfg(any(test, feature = "testing"))]
 use livekit::webrtc::prelude::AudioFrame;
+#[cfg(any(test, feature = "testing"))]
 use tokio::task::JoinHandle;
 
+#[cfg(any(test, feature = "testing"))]
 use crate::Error;
+#[cfg(any(test, feature = "testing"))]
 use crate::session::LiveKitSession;
 
 /// Sample rate used for the synthetic tone (Hz). 48 kHz is LiveKit's native rate.
@@ -52,13 +60,16 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// Channel count used for the synthetic tone (mono).
 pub const CHANNELS: u32 = 1;
 /// Duration of each captured audio frame (10 ms is the WebRTC convention).
+#[cfg(any(test, feature = "testing"))]
 const FRAME_MS: u32 = 10;
 
 /// Handle to a running tone generator. Dropping it stops the capture loop.
+#[cfg(any(test, feature = "testing"))]
 pub struct ToneHandle {
     task: JoinHandle<()>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Drop for ToneHandle {
     fn drop(&mut self) {
         self.task.abort();
@@ -68,6 +79,7 @@ impl Drop for ToneHandle {
 /// Publish a continuous `freq_hz` sine-wave audio track to the SFU, via the
 /// session's public [`LiveKitSession::room`]. Publishing continues until the
 /// returned [`ToneHandle`] is dropped.
+#[cfg(any(test, feature = "testing"))]
 pub async fn publish_tone(session: &LiveKitSession, freq_hz: f64) -> Result<ToneHandle, Error> {
     let source = NativeAudioSource::new(AudioSourceOptions::default(), SAMPLE_RATE, CHANNELS, 1000);
     let track = LocalAudioTrack::create_audio_track("tone", RtcAudioSource::Native(source.clone()));
@@ -87,6 +99,7 @@ pub async fn publish_tone(session: &LiveKitSession, freq_hz: f64) -> Result<Tone
 
 /// Spawn a task that pushes a continuous `freq_hz` sine wave into `source` in
 /// 10 ms frames until the returned [`ToneHandle`] is dropped.
+#[cfg(any(test, feature = "testing"))]
 fn spawn_tone(source: NativeAudioSource, freq_hz: f64) -> ToneHandle {
     let samples_per_frame = (SAMPLE_RATE / 1000 * FRAME_MS) as usize;
     let amplitude = 0.5 * f64::from(i16::MAX);
@@ -170,6 +183,7 @@ pub fn write_wav(path: &str, pcm: &[i16], sample_rate: u32) -> std::io::Result<(
 ///
 /// Computed with a Goertzel filter. A clean tone at `target_hz` yields a value
 /// near `1.0`; silence or an unrelated signal yields a value near `0.0`.
+#[cfg(any(test, feature = "testing"))]
 pub fn detect_tone(pcm: &[i16], sample_rate: u32, target_hz: f64) -> f32 {
     if pcm.is_empty() {
         return 0.0;

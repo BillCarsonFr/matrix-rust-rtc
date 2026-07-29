@@ -29,6 +29,10 @@ registration).
 
 ## How it's wired
 
+Each participant is a `matrix_rtc_livekit::Call` (`src/call.rs`) — the crate's
+join/leave facade, so the test exercises exactly what a consumer would use.
+Inside `Call::join`:
+
 ```
 matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext auto-on under unstable-msc4354)
         │                              │
@@ -48,7 +52,7 @@ matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext au
    ──(mpsc, Send)──▶ spawn_local key pump ──▶ RtcSessionManager::receive_encryption_key
 ```
 
-The manager/bridge/heartbeat futures are `!Send` (the core `RtcCommandSender` is
+The futures behind `Call::join` are `!Send` (the core `RtcCommandSender` is
 `?Send`), so the test runs on a single-thread `tokio::task::LocalSet`, with a
 300 s overall timeout so a wedged stack fails fast.
 
