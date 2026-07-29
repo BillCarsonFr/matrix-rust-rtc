@@ -40,18 +40,20 @@ use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, update_delayed_event,
 };
 use matrix_sdk::ruma::events::{
-    AnyMessageLikeEventContent, AnyToDeviceEventContent, MessageLikeEventType,
+    AnyMessageLikeEventContent, AnyToDeviceEventContent, MessageLikeEventType, StateEventType,
 };
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{DeviceId, RoomId, TransactionId, UserId};
-use matrix_sdk::{Client, Room};
+use matrix_sdk::{Client, Room, RoomMemberships};
 use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_base::deserialized_responses::RawAnySyncOrStrippedState;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 
 use matrix_rtc_core::{
-    CommandError, RawStickyEvent, RawStickyEventContent, RtcCommandSender, RtcSessionManager,
+    CommandError, EventOrigin, RawSlotEvent, RawSlotEventContent, RawStickyEvent,
+    RawStickyEventContent, RtcCommandSender, RtcSessionManager, SLOT_EVENT_TYPE,
     StickyEventsUpdate,
 };
 
@@ -154,6 +156,25 @@ impl RtcCommandSender for SdkCommandSender {
         Ok(())
     }
 
+    async fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        let room = self.room(&room_id)?;
+        // Normalise through ruma, which registers `m.rtc.slot` as an alias of
+        // the MSC4143 id and stringifies back to whichever it currently treats
+        // as primary — `org.matrix.msc4143.rtc.slot` today, the stable id once
+        // ruma flips after FCP. Same mechanism as `wire_event_type`.
+        let event_type = StateEventType::from(event_type).to_string();
+        room.send_state_event_raw(&event_type, &state_key, &content)
+            .await
+            .map_err(command_error)?;
+        Ok(())
+    }
+
     async fn send_to_device_message(
         &self,
         user_id: String,
@@ -236,6 +257,13 @@ fn sticky_id(event: &RawStickyEvent) -> StickyId {
 }
 
 /// Snapshot the room's live `m.rtc.member` sticky events as core DTOs.
+///
+/// The sending device comes from the event's decryption metadata, which is the
+/// only place MSC4143 leaves it: the proposal removed the self-asserted
+/// `member.claimed_device_id`, and key distribution targets "the devices that
+/// were used to encrypt these member events". Cleartext events have no such
+/// metadata, so `sender_device_id` stays `None` and key delivery falls back to
+/// all of the sender's devices.
 fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
     let room_id = room.room_id().to_string();
     room.live_sticky_events()
@@ -245,15 +273,129 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
             if event_type != "m.rtc.member" && event_type != "org.matrix.msc4143.rtc.member" {
                 return None;
             }
-            let content: RawStickyEventContent = entry.event.get_field("content").ok().flatten()?;
+            let content: RawStickyEventContent = entry.raw().get_field("content").ok().flatten()?;
+            // The sticky map only files plaintext and successfully decrypted
+            // events, so the presence of decryption metadata is exactly whether
+            // this arrived encrypted — never "we don't know".
+            let origin = match entry.encryption_info() {
+                Some(info) => {
+                    let device = info.sender_device.as_ref().map(|device| device.to_string());
+                    if device.is_none() {
+                        // Olm messages carry the sender's device keys, so a
+                        // decrypted event should always name one. Worth saying
+                        // out loud here: downstream this member cannot be bound
+                        // to a device, so their media keys get rejected.
+                        log::warn!(
+                            "decrypted {} from {} resolved to no sending device",
+                            event_type,
+                            entry.key.sender,
+                        );
+                    }
+                    EventOrigin::encrypted(device)
+                }
+                None => EventOrigin::Cleartext,
+            };
             Some(RawStickyEvent {
                 room_id: room_id.clone(),
                 sender: entry.key.sender.to_string(),
+                origin,
                 event_type,
                 content,
             })
         })
         .collect()
+}
+
+/// Snapshot the room's `m.rtc.slot` state as core DTOs.
+///
+/// The state key is the slot id. Events whose content will not parse are still
+/// reported, with empty content, so the slot resolves closed rather than
+/// vanishing — an unreadable slot event is not an open slot.
+///
+/// NOTE: unlike the member path — which filters raw type strings out of the
+/// sticky map and so accepts the stable and unstable ids alike — this queries
+/// the state store *by type*, and ruma can only name one id at a time (the
+/// other is an alias it normalises away). So this reads whichever id ruma
+/// currently designates, and a homeserver serving the other one looks like a
+/// room with no slots, i.e. every member left. Bumping ruma is what carries
+/// this across the stable transition.
+async fn slot_snapshot(room: &Room) -> Vec<RawSlotEvent> {
+    let room_id = room.room_id().to_string();
+    let event_type = StateEventType::from(SLOT_EVENT_TYPE.to_owned());
+
+    let states = match room.get_state_events(event_type).await {
+        Ok(states) => states,
+        Err(error) => {
+            log::warn!("failed to read m.rtc.slot state: {error}");
+            return Vec::new();
+        }
+    };
+
+    states
+        .into_iter()
+        .filter_map(|state| {
+            // Read the fields off the raw JSON either way: an invited room's
+            // stripped state still carries the slot id and content.
+            let (state_key, content) = match &state {
+                RawAnySyncOrStrippedState::Sync(raw) => (
+                    raw.get_field::<String>("state_key").ok().flatten(),
+                    raw.get_field::<RawSlotEventContent>("content")
+                        .ok()
+                        .flatten(),
+                ),
+                RawAnySyncOrStrippedState::Stripped(raw) => (
+                    raw.get_field::<String>("state_key").ok().flatten(),
+                    raw.get_field::<RawSlotEventContent>("content")
+                        .ok()
+                        .flatten(),
+                ),
+            };
+
+            Some(RawSlotEvent {
+                room_id: room_id.clone(),
+                slot_id: state_key?,
+                content: content.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Snapshot the users currently joined to the room.
+async fn joined_members_snapshot(room: &Room) -> Vec<String> {
+    match room.members(RoomMemberships::JOIN).await {
+        Ok(members) => members
+            .into_iter()
+            .map(|member| member.user_id().to_string())
+            .collect(),
+        Err(error) => {
+            log::warn!("failed to read room members: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// Push the room state that gates MSC4143 membership into `manager`.
+async fn feed_room_state(room: &Room, manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>) {
+    let slots = slot_snapshot(room).await;
+    let members = joined_members_snapshot(room).await;
+    let encrypted = room
+        .latest_encryption_state()
+        .await
+        .map(|state| state.is_encrypted());
+    let room_id = room.room_id().as_str();
+
+    let mut manager = manager.lock().await;
+    // Encryption first: it decides how the slots that follow resolve.
+    match encrypted {
+        Ok(encrypted) => {
+            manager
+                .on_room_encryption_received(room_id, encrypted)
+                .await
+        }
+        Err(error) => log::warn!("failed to read room encryption state: {error}"),
+    }
+    manager.on_room_slots_received(room_id, slots).await;
+    manager.on_room_members_received(room_id, members).await;
 }
 
 /// Feed a room's live sticky events into `manager` until the room is dropped.
@@ -271,6 +413,11 @@ pub async fn run_sticky_bridge(
 ) {
     let mut receiver = room.subscribe_to_sticky_events();
 
+    // Seed the room state that gates membership before any member event is
+    // applied, so members are never briefly considered joined to a slot that
+    // room state says is closed.
+    feed_room_state(&room, &manager).await;
+
     let mut known: HashMap<StickyId, RawStickyEvent> = HashMap::new();
     let initial = snapshot(&room);
     for event in &initial {
@@ -286,6 +433,13 @@ pub async fn run_sticky_bridge(
     }
 
     while let Ok(_) | Err(RecvError::Lagged(_)) = receiver.recv().await {
+        // Re-read room state each tick: a slot can close or a member can leave
+        // the room at any time, and MSC4143 requires clients to respect the
+        // latest state. NOTE: this only re-checks when sticky traffic arrives.
+        // Reacting promptly to a slot change in an otherwise idle room needs a
+        // room-state subscription of its own; that is a follow-up.
+        feed_room_state(&room, &manager).await;
+
         let current = snapshot(&room);
         let current_ids: HashMap<StickyId, RawStickyEvent> =
             current.iter().map(|e| (sticky_id(e), e.clone())).collect();

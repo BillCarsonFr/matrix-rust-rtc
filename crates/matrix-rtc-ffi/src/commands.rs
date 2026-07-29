@@ -67,6 +67,9 @@ pub struct FfiEncryptionConfig {
     pub key_rotation_grace_period_ms: Option<u64>,
     /// Whether to manage media keys (default: true).
     pub manage_media_keys: Option<bool>,
+    /// Whether to discard keys from devices that are not cross-signed
+    /// (default: true, per MSC4153).
+    pub require_cross_signed_sender: Option<bool>,
 }
 
 /// FFI-friendly join session parameters.
@@ -84,8 +87,12 @@ pub struct FfiJoinSessionParams {
     pub slot_id: String,
     /// Application type (e.g., "m.call")
     pub application: String,
-    /// Transport configuration
-    pub transport: FfiTransportConfig,
+    /// The transport to publish on. `None` joins without publishing — valid per
+    /// MSC4143, and what a recorder or other observer wants.
+    pub transport: Option<FfiTransportConfig>,
+    /// Transport types this member can receive on. Only read when `transport`
+    /// is `None`; a publishing member advertises its own transport's type.
+    pub can_subscribe: Vec<String>,
     /// Optional keep-alive timeout in milliseconds (default: 30000)
     pub keep_alive_timeout_ms: Option<u64>,
     /// Optional encryption configuration
@@ -95,8 +102,8 @@ pub struct FfiJoinSessionParams {
 /// FFI-friendly leave session parameters.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiLeaveSessionParams {
-    /// Optional reason for leaving (e.g., "user_left", "ice_failed")
-    pub disconnect_reason: Option<String>,
+    /// Optional MSC4143 leave reason. Defaults to `code = "leave"` when unset.
+    pub leave_reason: Option<crate::FfiLeaveReason>,
 }
 
 /// Conversion from FFI transport config to core transport type.
@@ -137,6 +144,7 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms.unwrap_or(5000),
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
+            require_cross_signed_sender: value.require_cross_signed_sender.unwrap_or(true),
         }
     }
 }
@@ -146,7 +154,12 @@ impl FfiJoinSessionParams {
     pub fn into_core(
         self,
     ) -> Result<matrix_rtc_core::JoinSessionParams, matrix_rtc_core::CommandError> {
-        let transport = self.transport.into_core()?;
+        let transport = match self.transport {
+            Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport.into_core()?),
+            None => matrix_rtc_core::TransportIntent::ReceiveOnly {
+                can_subscribe: self.can_subscribe,
+            },
+        };
         let encryption_config = self.encryption_config.map(Into::into);
         Ok(matrix_rtc_core::JoinSessionParams {
             user_id: self.user_id,
@@ -166,7 +179,7 @@ impl FfiJoinSessionParams {
 impl FfiLeaveSessionParams {
     pub fn into_core(self) -> matrix_rtc_core::LeaveSessionParams {
         matrix_rtc_core::LeaveSessionParams {
-            disconnect_reason: self.disconnect_reason,
+            leave_reason: self.leave_reason.map(Into::into),
         }
     }
 }
@@ -214,6 +227,27 @@ pub trait CommandSenderCallback: Send + Sync {
         content_json: String,
         delay_ms: u64,
     ) -> Result<String, CommandSenderError>;
+
+    /// Called when a state event needs to be sent.
+    ///
+    /// Used for `m.rtc.slot`. Sending room state usually needs a raised power
+    /// level, so return an error if the homeserver rejects it.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID where the event should be sent
+    /// * `event_type` - The event type (e.g., "m.rtc.slot")
+    /// * `state_key` - The state key (for a slot, the slot id)
+    /// * `content_json` - The event content as a JSON string
+    ///
+    /// # Returns
+    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content_json: String,
+    ) -> Result<(), CommandSenderError>;
 
     /// Called when a previously scheduled delayed event needs to be canceled.
     ///
@@ -330,6 +364,22 @@ impl RtcCommandSender for FfiCommandSender {
             .map_err(CommandError::from)?;
         Ok(())
     }
+
+    async fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+        self.callback
+            .send_state_event(room_id, event_type, state_key, content_json)
+            .map_err(CommandError::from)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +416,20 @@ mod tests {
                 room_id, event_type, delay_ms, content_json
             );
             Ok(format!("event-{}-{}", room_id, event_type))
+        }
+
+        fn send_state_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            state_key: String,
+            content_json: String,
+        ) -> Result<(), CommandSenderError> {
+            println!(
+                "Mock send_state_event: room={}, type={}, state_key={}, content={}",
+                room_id, event_type, state_key, content_json
+            );
+            Ok(())
         }
 
         fn cancel_delayed_event(

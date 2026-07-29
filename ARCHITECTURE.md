@@ -83,6 +83,140 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 Current implementation only establishes event intake and membership state wiring; protocol completeness is intentionally deferred.
 
+### MSC4143 catch-up status
+
+The vendored reference in `skills/msc/references/msc4143.md` tracks the rewritten
+proposal. The `m.rtc.member` wire format now matches it:
+
+- `member.membership` (`join` / `leave`) is the explicit join signal; the old
+  inference from content shape is gone.
+- `leave_reason {code, reason}` replaces `disconnect_reason {class, reason,
+  description}`. Note the inversion: `code` is the machine-readable half and
+  `reason` the human-readable one.
+- `transports {published, can_subscribe}` replaces the flat `rtc_transports`
+  array.
+- `member.claimed_user_id`, `member.claimed_device_id`, `versions`,
+  `m.relates_to` and `created_ts` are gone. The sending device now comes from the
+  event's decryption metadata and rides on `RawStickyEvent::origin`, which the
+  LiveKit bridge fills from `EncryptionInfo` — available since the SDK's "keep
+  encryption info for sticky events" commit, which is why the pin moved.
+- `member.id` is generated fresh per join (`generate_member_id`), as the spec
+  requires; it is no longer derived from the user and device IDs.
+
+Inbound `m.rtc.encryption_key` messages are checked before use. A key is only
+stored and signalled once it has been matched against the sender's member event:
+
+- The host reports how the message arrived via `KeyOrigin`, built from Olm
+  decryption metadata. Cleartext messages are discarded, since nothing in the
+  payload can be trusted to identify a sender.
+- The to-device sender and its device must equal the sender and sending device
+  of the `m.rtc.member` event the message names, or the key is discarded. A key
+  naming another room is discarded too.
+- If the member event names no device to check against — cleartext, or encrypted
+  but not attributable to one — the match cannot be performed, so the key is
+  discarded rather than accepted on the user match alone. An encrypted member
+  event should always resolve to a device (Olm messages carry the sender's device
+  keys), so that half is a backstop rather than an expected path. The exception
+  is `EventOrigin::Unknown`, where the host reported nothing at all and the rule
+  is skipped like every other unreported fact.
+- Keys from devices that are not cross-signed are discarded unless
+  `EncryptionConfig::require_cross_signed_sender` is turned off (MSC4153).
+- A key that arrives before its member event is buffered *with its origin* and
+  checked when the membership shows up — verification is deferred, never
+  skipped. Rejected keys never reach the outdated-key filter, so a bogus key
+  cannot take the `(member, index)` slot and suppress the genuine one.
+
+The outgoing key message declares `format: 0` as the spec requires.
+
+### Slots and the join conditions
+
+`m.rtc.slot` is modelled in `slot.rs` and resolved to `SlotState::Open`/`Closed`
+per MSC4143: open requires `status = "open"` plus an application whose `type`
+agrees with the state key, and anything else — a closed status, a missing
+application, empty content, a status from a future revision — is closed.
+
+A session keeps its member events as *candidates* and projects the joined set
+from them, so the conditions are re-evaluated whenever their inputs move rather
+than only at ingestion. Closing a slot therefore leaves everyone in it, and
+reopening restores whoever is still sticky. The projection also drives key
+distribution, so a member who drops out of the joined set stops receiving keys.
+
+The two room-state conditions are only enforced once a host supplies the state:
+
+- `RtcSessionManager::on_room_slots_received` takes a room's complete slot state.
+  Calling it is what switches the room from "unknown" (condition unevaluable, so
+  unenforced) to enforcing; a slot absent from that call is closed, not unknown.
+- `RtcSessionManager::on_room_members_received` supplies the room's joined users.
+
+This is deliberate: enforcing an unevaluable condition would silently empty every
+session for hosts that do not yet feed room state. The LiveKit bridge feeds both.
+
+`open_slot` / `close_slot` send the state event through the command sender's new
+`send_state_event`.
+
+### Encryption negotiation
+
+Whether RTC data is encrypted is prescribed by the slot, not chosen locally.
+`RawSlotEvent::resolve` takes the room's encryption state alongside the event,
+because MSC4143 ties the two together in both directions:
+
+- **Encrypted room.** A slot MUST carry an `encryption` object, so one without it
+  resolves closed. A mechanism this client cannot implement also closes the slot,
+  since encryption is required there and taking part without it would break the
+  same requirement. `m.per_member` (and its unstable id) is the only one
+  implemented.
+- **Unencrypted room.** RTC encryption MUST NOT be used, so a declared mechanism
+  is dropped rather than honoured. The slot stays open; `OpenSlot::mechanism` is
+  `None` while `OpenSlot::encryption` still reports what was declared, so callers
+  can see the mismatch.
+- **Unknown.** Neither rule applies and the declared mechanism is taken at face
+  value, matching how the other room-state conditions stay unenforced until a
+  host opts in via `on_room_encryption_received`.
+
+`RtcSession::negotiated_encryption` turns that into the key-management decision
+at join time, overriding `EncryptionConfig::manage_media_keys`; the local flag
+only applies where there is no slot state to negotiate from. A slot whose
+mechanism changes mid-session is not renegotiated — the dangerous direction, the
+slot closing, is already covered because that leaves every member.
+
+Separately, a member event that arrived in the clear does not count as joined in
+an encrypted room. That and the sending device are one value,
+`RawStickyEvent::origin` (`EventOrigin`), because both come from the same
+decryption metadata — a cleartext event cannot carry a sending device, and the
+type makes that unrepresentable. `EventOrigin::Unknown` is distinct from
+`Cleartext`: it means the host did not report, so the rule is skipped rather
+than failed. The flat `sender_device_id` / `was_encrypted` pair survives only in
+the wasm and FFI wire records, which converge into the enum at the boundary.
+
+### Transports and who chooses them
+
+Transport discovery is deliberately **not** in the core. Which transport to
+publish on is an application decision: the app calls
+`GET /_matrix/client/v1/rtc/transports` itself and passes the result into
+`join`. The core has no HTTP of its own, and adding a fetch would have meant
+every host implementing one whose result it then handed back to itself.
+`examples/e2e_call.rs` shows the pattern, using ruma's
+`api::client::rtc::transports` endpoint and falling back to a configured URL
+where the homeserver has not implemented it.
+
+What the core does model is the *intent*, via `TransportIntent`:
+
+- `Publish(transport)` — publish on this transport, and advertise its type as
+  `can_subscribe`.
+- `ReceiveOnly { can_subscribe }` — publish nothing. MSC4143 puts no REQUIRED
+  marker on `transports`, so a member that only receives — a recorder, an
+  observer — is a valid participant rather than a broken one. Stating
+  `can_subscribe` still matters, since that is what tells other members which
+  transport to publish on so this one can hear them.
+
+Still outstanding:
+
+1. **Prompt reaction to slot changes** — the LiveKit bridge re-reads room state
+   on sticky-event ticks, so a slot closing in an otherwise idle room is noticed
+   late. A room-state subscription would fix it.
+2. **Mid-session renegotiation** — a slot that changes its encryption mechanism
+   while a session is live keeps the mechanism negotiated at join.
+
 ## Non-goals in this first skeleton
 
 - No dependency on `ruma` in core.
@@ -97,4 +231,4 @@ Current implementation only establishes event intake and membership state wiring
 2. Introduce explicit machine outputs (commands/events) to communicate with host clients.
 3. Add persistence abstraction for sessions and sticky membership maps.
 4. Add transport discovery and focus modeling (`MSC4195`).
-5. Model `rtc_transports` in sticky membership DTOs and membership projections (`MSC4143` / `MSC4195`).
+5. Model `transports.published` / `can_subscribe` in sticky membership DTOs and membership projections (`MSC4143` / `MSC4195`).

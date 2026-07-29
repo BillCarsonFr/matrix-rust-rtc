@@ -61,6 +61,37 @@ pub struct RawRtcTransport {
     pub extra_fields: BTreeMap<String, serde_json::Value>,
 }
 
+/// The `content.transports` object of an `m.rtc.member` event (MSC4143).
+///
+/// Replaces the earlier flat `rtc_transports` array: publishing and subscribing
+/// are now described separately, so peers can pick a transport that every member
+/// can actually receive.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MemberTransports {
+    /// Transports this member publishes media on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published: Vec<RawRtcTransport>,
+    /// Transport types this member is able to subscribe to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub can_subscribe: Vec<String>,
+}
+
+impl MemberTransports {
+    /// True when neither list carries anything (used to skip serialization).
+    pub fn is_empty(&self) -> bool {
+        self.published.is_empty() && self.can_subscribe.is_empty()
+    }
+
+    /// Builds the object for a member publishing on `transport`, declaring that
+    /// it can also subscribe to that transport type.
+    pub fn publishing(transport: RawRtcTransport) -> Self {
+        Self {
+            can_subscribe: vec![transport.transport_type.clone()],
+            published: vec![transport],
+        }
+    }
+}
+
 impl RawRtcTransport {
     /// Convert into a typed RtcTransport.
     /// Known transport types are parsed into their specific variants,

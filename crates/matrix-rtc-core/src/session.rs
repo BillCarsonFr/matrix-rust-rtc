@@ -22,23 +22,60 @@
 //! manager layer.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::commands::RtcCommandSender;
+use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::join::{JoinSessionParams, LeaveSessionParams};
+use crate::event::EventOrigin;
+use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
 use crate::own_membership::{OwnMembershipMachine, transport_to_json};
-use crate::transport::RtcTransport;
+use crate::slot::{RoomEncryption, SlotState};
+use crate::transport::{MemberTransports, RtcTransport};
 
 #[allow(unused_imports)]
 use log::*;
 
+/// What a session knows about the room state governing its slot.
+///
+/// MSC4143 makes an open `m.rtc.slot` a precondition for anyone being joined,
+/// so "no open slot" and "nobody has told us about the slot" have to be
+/// distinguished: the first means every member is left, the second means the
+/// condition cannot be evaluated yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SlotKnowledge {
+    /// No room state has been supplied for this room, so the slot condition is
+    /// not enforced. Hosts opt in by calling
+    /// [`RtcSessionManager::on_room_slots_received`].
+    ///
+    /// [`RtcSessionManager::on_room_slots_received`]: crate::RtcSessionManager::on_room_slots_received
+    #[default]
+    Unsupplied,
+    /// Room state has been supplied; this is the slot's resolved state. A slot
+    /// with no state event in the room resolves to [`SlotState::Closed`].
+    Known(SlotState),
+}
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession<T: RtcCommandSender> {
+    /// Member events that are join-shaped and still sticky. These are
+    /// candidates only: the remaining MSC4143 join conditions depend on room
+    /// state, which can change under them at any time.
+    candidates: Vec<JoinedMembership>,
+    /// The candidates that currently satisfy every join condition. This is what
+    /// gets published and what the encryption manager distributes keys to.
     members: Vec<JoinedMembership>,
+    /// The slot this session's members are joined to.
+    slot: SlotKnowledge,
+    /// Users currently joined to the room, when the host supplies them; `None`
+    /// leaves the room-membership condition unenforced.
+    room_members: Option<HashSet<String>>,
+    /// Whether the room is encrypted, which decides whether member events are
+    /// required to be encrypted.
+    room_encryption: RoomEncryption,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
     /// Command sender for sending events to the Matrix room.
     command_sender: Option<Arc<T>>,
@@ -51,7 +88,11 @@ pub struct RtcSession<T: RtcCommandSender> {
 impl<T: RtcCommandSender> Clone for RtcSession<T> {
     fn clone(&self) -> Self {
         Self {
+            candidates: self.candidates.clone(),
             members: self.members.clone(),
+            slot: self.slot.clone(),
+            room_members: self.room_members.clone(),
+            room_encryption: self.room_encryption,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             command_sender: self.command_sender.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
@@ -66,7 +107,11 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
         Self {
+            candidates: Vec::new(),
             members: Vec::new(),
+            slot: SlotKnowledge::default(),
+            room_members: None,
+            room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
             command_sender: None,
             own_membership_machine: None,
@@ -79,7 +124,11 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
         Self {
+            candidates: Vec::new(),
             members: Vec::new(),
+            slot: SlotKnowledge::default(),
+            room_members: None,
+            room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
             command_sender: Some(command_sender),
             own_membership_machine: None,
@@ -133,29 +182,15 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Feeds a media encryption key received from a peer (MSC4143 to-device
     /// message) into this session's encryption manager.
     ///
-    /// A no-op if the session has not joined yet (no encryption manager).
+    /// The key is only used if it passes the MSC4143 checks; see
+    /// [`EncryptionManager::receive_key`]. A no-op if the session has not
+    /// joined yet (no encryption manager).
     pub async fn receive_encryption_key(
         &self,
-        sender_user_id: String,
-        sender_device_id: String,
-        key_b64: String,
-        key_index: u8,
-        member_id: String,
-        room_id: String,
+        received: ReceivedEncryptionKey,
     ) -> Result<(), CommandError> {
         match &self.encryption_manager {
-            Some(manager) => {
-                manager
-                    .receive_key(
-                        sender_user_id,
-                        sender_device_id,
-                        key_b64,
-                        key_index,
-                        member_id,
-                        room_id,
-                    )
-                    .await
-            }
+            Some(manager) => manager.receive_key(received).await,
             None => Ok(()),
         }
     }
@@ -198,21 +233,27 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             return Err(JoinError::AlreadyJoined(membership_id));
         }
 
-        // Create the own membership machine
-        let transport_json = transport_to_json(&params.transport);
+        let transports = match &params.transport {
+            TransportIntent::Publish(transport) => MemberTransports::publishing(
+                serde_json::from_value(transport_to_json(transport))
+                    .expect("a transport always serializes to an object with a type"),
+            ),
+            TransportIntent::ReceiveOnly { can_subscribe } => MemberTransports {
+                published: Vec::new(),
+                can_subscribe: can_subscribe.clone(),
+            },
+        };
         let machine = OwnMembershipMachine::new(
             command_sender.clone(),
             params.room_id.clone(),
             params.slot_id.clone(),
             membership_id.clone(),
-            params.user_id.clone(),
-            params.device_id.clone(),
             params.application.clone(),
             params.keep_alive_timeout_ms(),
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        machine.join(Some(transport_json)).await?;
+        machine.join(transports).await?;
 
         // Store the machine
         self.own_membership_machine = Some(machine);
@@ -226,7 +267,13 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             move || members_tx.borrow().clone()
         };
 
-        let encryption_config = params.encryption_config();
+        let mut encryption_config = params.encryption_config();
+        if let Some(negotiated) = self.negotiated_encryption() {
+            // The slot decides whether RTC data is encrypted; the local flag only
+            // applies where no slot state has been supplied to negotiate from.
+            encryption_config.manage_media_keys = negotiated;
+        }
+
         let mut encryption_manager = EncryptionManager::new(
             command_sender.clone(),
             params.user_id.clone(),
@@ -272,7 +319,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             .ok_or(LeaveError::NotJoined)?;
 
         // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
-        machine.leave(params.disconnect_reason.clone()).await?;
+        machine.leave(params.leave_reason.clone()).await?;
 
         // Clean up the encryption manager
         if let Some(encryption_manager) = self.encryption_manager.take() {
@@ -333,77 +380,226 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     }
 
     async fn apply_membership_event(&mut self, event: CallMembershipEvent) {
-        let membership_changed = match event {
+        match event {
             CallMembershipEvent::Joined(joined) => {
-                let key_sender = joined.sender.clone();
-                let key_sticky = joined.sticky_key.clone();
-
-                if let Some(index) = self.members.iter().position(|member| {
-                    member.sender == key_sender && member.sticky_key == key_sticky
-                }) {
-                    if self.members[index] == joined {
-                        return;
-                    }
-
-                    self.members[index] = joined;
-                } else {
-                    self.members.push(joined);
-                }
-
-                self.publish_membership_snapshot();
-                true
-            }
-            CallMembershipEvent::Left(left) => {
-                let before = self.members.len();
-                self.members.retain(|member| {
-                    !(member.sender == left.sender && member.sticky_key == left.sticky_key)
+                let existing = self.candidates.iter().position(|candidate| {
+                    candidate.sender == joined.sender && candidate.sticky_key == joined.sticky_key
                 });
 
-                if self.members.len() != before {
-                    self.publish_membership_snapshot();
-                    true
-                } else {
-                    false
+                match existing {
+                    Some(index) if self.candidates[index] == joined => return,
+                    Some(index) => self.candidates[index] = joined,
+                    None => self.candidates.push(joined),
                 }
             }
-        };
+            CallMembershipEvent::Left(left) => {
+                let before = self.candidates.len();
+                self.candidates.retain(|candidate| {
+                    !(candidate.sender == left.sender && candidate.sticky_key == left.sticky_key)
+                });
 
-        // Notify encryption manager of membership changes
-        if membership_changed && let Some(ref encryption_manager) = self.encryption_manager {
-            // Notify the encryption manager directly (async)
+                if self.candidates.len() == before {
+                    return;
+                }
+            }
+        }
+
+        self.refresh().await;
+    }
+
+    /// Whether `candidate` satisfies the MSC4143 join conditions that depend on
+    /// room state.
+    ///
+    /// The other two conditions are handled before this point: `membership =
+    /// join` when the event is converted, and stickiness by the host's sticky
+    /// map, whose removals arrive as leaves.
+    fn is_joined(&self, candidate: &JoinedMembership) -> bool {
+        match &self.slot {
+            // Nothing has told us about the slot, so this condition cannot be
+            // evaluated; enforcing it would drop every member.
+            SlotKnowledge::Unsupplied => {}
+            SlotKnowledge::Known(state) if state.is_open() => {}
+            SlotKnowledge::Known(_) => return false,
+        }
+
+        // MSC4143: in an encrypted room `m.rtc.member` events MUST be
+        // encrypted, and one that is not "MUST be considered left". An event
+        // whose encryption the host did not report is not judged.
+        if self.room_encryption == RoomEncryption::Encrypted
+            && candidate.origin.was_encrypted() == Some(false)
+        {
+            return false;
+        }
+
+        match &self.room_members {
+            Some(joined) => joined.contains(&candidate.sender),
+            None => true,
+        }
+    }
+
+    /// Recomputes the joined set and publishes it if it changed.
+    ///
+    /// Every input to the join conditions routes through here, so a slot
+    /// closing or a member leaving the room takes effect the same way a leave
+    /// event does — including telling the encryption manager to stop sharing
+    /// keys with whoever dropped out.
+    async fn refresh(&mut self) {
+        let members: Vec<JoinedMembership> = self
+            .candidates
+            .iter()
+            .filter(|candidate| self.is_joined(candidate))
+            .cloned()
+            .collect();
+
+        if members == self.members {
+            return;
+        }
+
+        self.members = members;
+        self.membership_snapshots_tx
+            .send_replace(self.members.clone());
+
+        if let Some(ref encryption_manager) = self.encryption_manager {
             let _ = encryption_manager.on_memberships_update().await;
         }
     }
 
-    fn publish_membership_snapshot(&self) {
-        self.membership_snapshots_tx
-            .send_replace(self.members.clone());
+    /// Applies the room state governing this session's slot.
+    ///
+    /// Closing a slot leaves every member of it, and reopening it restores the
+    /// ones whose member events are still sticky — MSC4143 requires clients to
+    /// track the latest room state at all times, not just at join.
+    pub async fn set_slot_state(&mut self, state: SlotState) {
+        if self.slot == SlotKnowledge::Known(state.clone()) {
+            return;
+        }
+        self.slot = SlotKnowledge::Known(state);
+        self.refresh().await;
+    }
+
+    /// Sets the slot state on a session that has no members yet.
+    ///
+    /// Used when a session is created after its room state was already known;
+    /// [`RtcSession::set_slot_state`] is the one to use once it is live.
+    pub(crate) fn seed_slot_state(&mut self, state: SlotState) {
+        debug_assert!(self.candidates.is_empty(), "seeding a populated session");
+        self.slot = SlotKnowledge::Known(state);
+    }
+
+    /// Sets the room members on a session that has no members yet.
+    pub(crate) fn seed_room_members(&mut self, room_members: HashSet<String>) {
+        debug_assert!(self.candidates.is_empty(), "seeding a populated session");
+        self.room_members = Some(room_members);
+    }
+
+    /// Sets the room encryption state on a session that has no members yet.
+    pub(crate) fn seed_room_encryption(&mut self, room_encryption: RoomEncryption) {
+        debug_assert!(self.candidates.is_empty(), "seeding a populated session");
+        self.room_encryption = room_encryption;
+    }
+
+    /// Sets whether the room is encrypted.
+    ///
+    /// In an encrypted room, members whose `m.rtc.member` event arrived in the
+    /// clear stop counting as joined.
+    pub async fn set_room_encryption(&mut self, room_encryption: RoomEncryption) {
+        if self.room_encryption == room_encryption {
+            return;
+        }
+        self.room_encryption = room_encryption;
+        self.refresh().await;
+    }
+
+    /// Whether RTC data should be encrypted, per the slot and the room.
+    ///
+    /// `None` means there is nothing to negotiate from — no room state has been
+    /// supplied — and the caller's own configuration stands. Otherwise this is
+    /// authoritative: MSC4143 prescribes the mechanism through the slot's
+    /// `encryption` object, and forbids encryption outright in unencrypted
+    /// rooms, so a local preference cannot override either way.
+    ///
+    /// NOTE: this is read when the session joins. A slot whose mechanism changes
+    /// mid-session is not renegotiated; the dangerous direction (the slot
+    /// closing) is already covered, since that leaves every member and so stops
+    /// key distribution.
+    pub fn negotiated_encryption(&self) -> Option<bool> {
+        let SlotKnowledge::Known(state) = &self.slot else {
+            return None;
+        };
+
+        Some(
+            state
+                .open()
+                .and_then(|slot| slot.mechanism.as_ref())
+                .is_some_and(|mechanism| mechanism.is_supported()),
+        )
+    }
+
+    /// The slot state this session is applying, if any has been supplied.
+    pub fn slot_state(&self) -> Option<&SlotState> {
+        match &self.slot {
+            SlotKnowledge::Known(state) => Some(state),
+            SlotKnowledge::Unsupplied => None,
+        }
+    }
+
+    /// Sets the users currently joined to the room.
+    ///
+    /// Until this is called the room-membership condition is not enforced. A
+    /// member who leaves the room stops being joined to the slot even if their
+    /// member event is still sticky.
+    pub async fn set_room_members(&mut self, room_members: HashSet<String>) {
+        if self.room_members.as_ref() == Some(&room_members) {
+            return;
+        }
+        self.room_members = Some(room_members);
+        self.refresh().await;
     }
 }
 
-/// MSC4143: Relates-to reference for event continuity
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelatesTo {
-    #[serde(rename = "rel_type")]
-    pub relation_type: String,
-    pub event_id: String,
+/// MSC4143: the intended membership status carried in `content.member.membership`.
+///
+/// Unknown values round-trip through [`Membership::Unknown`] rather than failing
+/// the whole event: a member event using a status from a future spec revision
+/// still has to parse, and simply doesn't count as joined.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Membership {
+    /// The member intends to be joined to the slot.
+    Join,
+    /// The member has left the slot.
+    Leave,
+    /// A status this client does not understand; treated as left.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
-/// MSC4143: Member object
+/// MSC4143: Member object (`content.member`).
+///
+/// Note that the pre-2026 `claimed_user_id` / `claimed_device_id` fields are gone:
+/// the sending user is authenticated by the event's `sender`, and the sending
+/// device by the event's decryption metadata (see
+/// [`JoinedMembership::sender_device_id`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberInfo {
-    /// UUID to distinguish multiple participations
+    /// Identifier distinguishing this participation, unique per join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Matrix device identifier
-    pub claimed_device_id: Option<String>,
-    /// Matrix user ID
-    pub claimed_user_id: Option<String>,
+    /// The intended membership status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<Membership>,
 }
 
 impl MemberInfo {
-    /// True when no member fields are set (used to skip serialization for leave events).
+    /// True when no member fields are set (used to skip serialization).
     pub fn is_empty(&self) -> bool {
-        self.id.is_none() && self.claimed_device_id.is_none() && self.claimed_user_id.is_none()
+        self.id.is_none() && self.membership.is_none()
+    }
+
+    /// True when this member object declares `membership = join` with a usable id.
+    pub fn is_join(&self) -> bool {
+        matches!(self.membership, Some(Membership::Join))
+            && self.id.as_deref().is_some_and(|id| !id.is_empty())
     }
 }
 
@@ -423,16 +619,66 @@ impl ApplicationInfo {
     }
 }
 
-/// MSC4143: Disconnect reason
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisconnectReason {
-    /// High-level category (e.g., "user_action", "server_error", "client_error")
-    pub class: Option<String>,
-    /// Machine-readable identifier (e.g., "hangup", "ice_failed")
+/// MSC4143: the generic `leave_reason.code` values defined by the core proposal.
+///
+/// Applications and transports may define further codes, which land in
+/// [`LeaveCode::Other`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaveCode {
+    /// The member left intentionally (e.g. by hanging up a call).
+    Leave,
+    /// The member left through a scheduled delayed leave event.
+    DelayedLeave,
+    /// The member left because the slot was closed mid-session.
+    SlotClosed,
+    /// A code defined outside this proposal.
+    #[serde(untagged)]
+    Other(String),
+}
+
+impl LeaveCode {
+    /// Parses a wire `leave_reason.code`, keeping application- and
+    /// transport-defined codes intact as [`LeaveCode::Other`].
+    ///
+    /// The bindings use this so every entry point agrees on the mapping.
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "leave" => Self::Leave,
+            "delayed_leave" => Self::DelayedLeave,
+            "slot_closed" => Self::SlotClosed,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+/// MSC4143: Leave reason (`content.leave_reason`).
+///
+/// Replaces the earlier `disconnect_reason` object. `code` is the machine-readable
+/// identifier and `reason` the optional human-readable explanation — note that in
+/// the old shape `reason` was the machine-readable half.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveReason {
+    /// Identifier for the specific leave cause.
+    pub code: LeaveCode,
+    /// Optional human-readable explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Optional human-readable explanation
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+}
+
+impl LeaveReason {
+    /// A leave reason carrying just a code.
+    pub fn new(code: LeaveCode) -> Self {
+        Self { code, reason: None }
+    }
+
+    /// A leave reason with a human-readable explanation.
+    pub fn with_reason(code: LeaveCode, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -444,7 +690,7 @@ pub enum CallMembershipEvent {
     Left(LeftMembership),
 }
 
-/// MSC4143: Connected membership payload.
+/// MSC4143: Joined membership payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinedMembership {
     /// Room where the membership is active.
@@ -453,23 +699,26 @@ pub struct JoinedMembership {
     pub slot_id: String,
     /// Sender user ID of the membership event.
     pub sender: String,
-    /// Sticky key identifying this membership stream.
+    /// How the member event reached us.
+    ///
+    /// MSC4143 removed the self-asserted `member.claimed_device_id`, so the
+    /// sending device comes from here — key distribution targets "the devices
+    /// that were used to encrypt these member events".
+    pub origin: EventOrigin,
+    /// Sticky key identifying this membership stream (equal to `member_id`).
     pub sticky_key: String,
-    /// Application info (MSC4143).
+    /// `member.id` — identifies this participation, unique per join.
+    pub member_id: String,
+    /// Application type from `content.application.type`.
     pub application: Option<String>,
-    /// Member info (MSC4143).
-    pub member: MemberInfo,
-    /// Protocol versions (MSC4143).
-    pub versions: Vec<String>,
-    /// Optional relates-to reference (MSC4143).
-    pub m_relates_to: Option<RelatesTo>,
-    /// RTC transports for this member (MSC4143 / MSC4195).
+    /// Transports this member publishes on (`content.transports.published`).
     pub transports: Vec<RtcTransport>,
-    /// Timestamp (ms) when this membership was created (MSC4143).
-    pub created_ts: Option<u64>,
+    /// Transport types this member can subscribe to
+    /// (`content.transports.can_subscribe`).
+    pub can_subscribe: Vec<String>,
 }
 
-/// MSC4143: Disconnected membership payload.
+/// MSC4143: Left membership payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeftMembership {
     /// Room where the membership was active.
@@ -480,10 +729,11 @@ pub struct LeftMembership {
     pub sender: String,
     /// Sticky key identifying this membership stream.
     pub sticky_key: String,
-    /// Optional disconnect reason (MSC4143 compliant object).
-    pub disconnect_reason: Option<DisconnectReason>,
-    /// Optional relates-to reference (MSC4143).
-    pub m_relates_to: Option<RelatesTo>,
+    /// `member.id`, when the event carried one. Absent on malformed events and
+    /// on sticky removals, which are treated as leaves regardless of content.
+    pub member_id: Option<String>,
+    /// Optional leave reason (MSC4143).
+    pub leave_reason: Option<LeaveReason>,
 }
 
 impl<T: RtcCommandSender + 'static> Default for RtcSession<T> {

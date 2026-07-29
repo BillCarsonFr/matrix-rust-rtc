@@ -12,24 +12,26 @@ function bobJoinEvent() {
     room_id: ROOM_ID,
     type: 'org.matrix.msc4143.rtc.member',
     sender: '@bob:synapse.othersite.m.localhost',
+    sender_device_id: 'WDQHAPEYDK',
     content: {
       application: {
         type: 'm.call',
         'm.call.intent': 'video',
       },
       slot_id: SLOT_ID,
-      rtc_transports: [
-        {
-          type: 'livekit',
-          livekit_service_url: 'https://matrix-rtc.othersite.m.localhost/livekit/jwt',
-        },
-      ],
-      member: {
-        device_id: 'WDQHAPEYDK',
-        user_id: '@bob:synapse.othersite.m.localhost',
-        id: 'bcab799f-abae-4d38-bf1b-77238346349a',
+      transports: {
+        published: [
+          {
+            type: 'livekit',
+            livekit_service_url: 'https://matrix-rtc.othersite.m.localhost/livekit/jwt',
+          },
+        ],
+        can_subscribe: ['livekit'],
       },
-      versions: [],
+      member: {
+        id: 'bcab799f-abae-4d38-bf1b-77238346349a',
+        membership: 'join',
+      },
       msc4354_sticky_key: 'bcab799f-abae-4d38-bf1b-77238346349a',
       sticky_key: 'bcab799f-abae-4d38-bf1b-77238346349a',
     },
@@ -42,24 +44,26 @@ function aliceJoinEvent() {
     room_id: ROOM_ID,
     type: 'org.matrix.msc4143.rtc.member',
     sender: '@alice:synapse.m.localhost',
+    sender_device_id: 'VJHNJJCVOA',
     content: {
       application: {
         type: 'm.call',
         'm.call.intent': 'video',
       },
       slot_id: SLOT_ID,
-      rtc_transports: [
-        {
-          type: 'livekit',
-          livekit_service_url: 'https://matrix-rtc.m.localhost/livekit/jwt',
-        },
-      ],
-      member: {
-        device_id: 'VJHNJJCVOA',
-        user_id: '@alice:synapse.m.localhost',
-        id: 'd50437bd-424a-498d-912f-b0f1d2ba7f18',
+      transports: {
+        published: [
+          {
+            type: 'livekit',
+            livekit_service_url: 'https://matrix-rtc.m.localhost/livekit/jwt',
+          },
+        ],
+        can_subscribe: ['livekit'],
       },
-      versions: [],
+      member: {
+        id: 'd50437bd-424a-498d-912f-b0f1d2ba7f18',
+        membership: 'join',
+      },
       msc4354_sticky_key: 'd50437bd-424a-498d-912f-b0f1d2ba7f18',
       sticky_key: 'd50437bd-424a-498d-912f-b0f1d2ba7f18',
     },
@@ -74,6 +78,11 @@ function aliceLeaveEvent() {
     sender: '@alice:synapse.m.localhost',
     content: {
       slot_id: SLOT_ID,
+      member: {
+        id: 'd50437bd-424a-498d-912f-b0f1d2ba7f18',
+        membership: 'leave',
+      },
+      leave_reason: { code: 'leave' },
       msc4354_sticky_key: 'd50437bd-424a-498d-912f-b0f1d2ba7f18',
       sticky_key: 'd50437bd-424a-498d-912f-b0f1d2ba7f18',
     },
@@ -138,13 +147,13 @@ describe('RTC manager with real-world data', () => {
       content: {
         application: { type: 'm.call' },
         slot_id: SLOT_ID,
-        rtc_transports: [
-          { type: 'unknown_transport' },
-        ],
+        transports: {
+          published: [{ type: 'unknown_transport' }],
+          can_subscribe: ['unknown_transport'],
+        },
         member: {
-          device_id: 'TEST',
-          user_id: '@test:example.org',
           id: 'test-id',
+          membership: 'join',
         },
         sticky_key: 'test-id',
       },

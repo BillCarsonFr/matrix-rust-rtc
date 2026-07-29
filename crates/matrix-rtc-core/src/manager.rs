@@ -20,10 +20,11 @@
 //! The manager owns many `RtcSession` instances and dispatches room-scoped
 //! sticky snapshots/updates to the right session by `(room_id, slot_id)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::commands::RtcCommandSender;
+use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::{
@@ -31,6 +32,9 @@ use crate::event::{
 };
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::session::{CallMembershipEvent, RtcSession};
+use crate::slot::{
+    RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
+};
 
 /// Holds and routes all active RTC sessions.
 pub struct RtcSessionManager<T: RtcCommandSender> {
@@ -38,6 +42,18 @@ pub struct RtcSessionManager<T: RtcCommandSender> {
     /// Command sender for sending events to Matrix rooms.
     /// This is passed to sessions when they are created or when they need to send commands.
     command_sender: Option<Arc<T>>,
+    /// Slot events per `(room, slot)`, kept unresolved because resolving them
+    /// also depends on the room's encryption state, which can arrive later or
+    /// change. Held here as well as on the sessions so that state arriving
+    /// before a session exists still applies when one is created.
+    slots: HashMap<SessionKey, RawSlotEvent>,
+    /// Rooms whose `m.rtc.slot` state has been supplied. A slot in one of these
+    /// rooms with no entry in `slots` is closed, as opposed to unknown.
+    rooms_with_slot_state: HashSet<String>,
+    /// Joined room members per room, for rooms where the host supplies them.
+    room_members: HashMap<String, HashSet<String>>,
+    /// Room encryption per room, for rooms where the host reports it.
+    room_encryption: HashMap<String, RoomEncryption>,
 }
 
 impl<T: RtcCommandSender + 'static> Default for RtcSessionManager<T> {
@@ -51,7 +67,14 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     // when sessions are created/removed (separate from per-session membership snapshots).
     /// Creates an empty session manager without a command sender.
     pub fn new() -> Self {
-        Default::default()
+        Self {
+            sessions: HashMap::new(),
+            command_sender: None,
+            slots: HashMap::new(),
+            rooms_with_slot_state: HashSet::new(),
+            room_members: HashMap::new(),
+            room_encryption: HashMap::new(),
+        }
     }
 
     /// Creates an empty session manager with a command sender.
@@ -59,6 +82,10 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         Self {
             sessions: HashMap::new(),
             command_sender: Some(command_sender),
+            slots: HashMap::new(),
+            rooms_with_slot_state: HashSet::new(),
+            room_members: HashMap::new(),
+            room_encryption: HashMap::new(),
         }
     }
 
@@ -95,12 +122,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             .clone();
 
         let key = SessionKey::new(params.room_id.clone(), params.slot_id.clone());
-
-        // Get or create the session
-        let session = self
-            .sessions
-            .entry(key)
-            .or_insert_with(|| RtcSession::with_command_sender(command_sender.clone()));
+        let session = self.session_for_key(key);
 
         // If the session doesn't have a command sender yet, set it
         if !session.has_command_sender() {
@@ -119,7 +141,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// * `room_id` - The room ID of the session to leave
     /// * `slot_id` - The slot ID of the session to leave
-    /// * `params` - The leave parameters including optional disconnect reason
+    /// * `params` - The leave parameters including the optional MSC4143 leave reason
     ///
     /// # Returns
     ///
@@ -357,7 +379,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     }
 
     /// Routes a media encryption key received from a peer into every session in
-    /// `room_id`.
+    /// the room it names.
     ///
     /// The MSC4143 key to-device content carries no `slot_id`, so the key is
     /// fanned out to all sessions of the room. This is exact for the common
@@ -365,32 +387,224 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// every slot (harmless — unmatched keys are buffered/ignored).
     pub async fn receive_encryption_key(
         &self,
-        room_id: &str,
-        sender_user_id: String,
-        sender_device_id: String,
-        key_b64: String,
-        key_index: u8,
-        member_id: String,
+        received: ReceivedEncryptionKey,
     ) -> Result<(), CommandError> {
         for (key, session) in self.sessions.iter() {
-            if key.room_id == room_id {
-                session
-                    .receive_encryption_key(
-                        sender_user_id.clone(),
-                        sender_device_id.clone(),
-                        key_b64.clone(),
-                        key_index,
-                        member_id.clone(),
-                        room_id.to_owned(),
-                    )
-                    .await?;
+            if key.room_id == received.room_id {
+                session.receive_encryption_key(received.clone()).await?;
             }
         }
         Ok(())
     }
 
+    /// Applies the `m.rtc.slot` state of a room.
+    ///
+    /// `slots` must be the room's complete set of `m.rtc.slot` state events:
+    /// any slot in this room *not* named by it is taken to be closed. Calling
+    /// this is what switches the room from "slot state unknown" (where the
+    /// MSC4143 open-slot condition cannot be evaluated, so is not enforced) to
+    /// enforcing it, so hosts should call it with whatever they have — an empty
+    /// list included — as soon as room state is available, and again on every
+    /// change.
+    pub async fn on_room_slots_received(
+        &mut self,
+        room_id: &str,
+        slots: impl IntoIterator<Item = RawSlotEvent>,
+    ) {
+        self.rooms_with_slot_state.insert(room_id.to_owned());
+
+        // Replace this room's slots wholesale; a slot that vanished from room
+        // state is closed, not merely stale.
+        self.slots.retain(|key, _| key.room_id != room_id);
+        for slot in slots {
+            if slot.room_id != room_id {
+                continue;
+            }
+            let key = SessionKey::new(room_id.to_owned(), slot.slot_id.clone());
+            self.slots.insert(key, slot);
+        }
+
+        self.push_slot_state(room_id).await;
+    }
+
+    /// Reports whether a room is end-to-end encrypted.
+    ///
+    /// MSC4143 requires RTC encryption in encrypted rooms and forbids it
+    /// elsewhere, so this changes how the room's slots resolve. Until a host
+    /// calls it neither rule is applied.
+    pub async fn on_room_encryption_received(&mut self, room_id: &str, encrypted: bool) {
+        let encryption = if encrypted {
+            RoomEncryption::Encrypted
+        } else {
+            RoomEncryption::Unencrypted
+        };
+
+        if self.room_encryption.insert(room_id.to_owned(), encryption) == Some(encryption) {
+            return;
+        }
+
+        // Slots already held for this room resolve differently now.
+        self.push_slot_state(room_id).await;
+
+        for (key, session) in self.sessions.iter_mut() {
+            if key.room_id != room_id {
+                continue;
+            }
+            session.set_room_encryption(encryption).await;
+        }
+    }
+
+    /// Resolves this room's slots against its current encryption state and
+    /// pushes the result to every session in the room.
+    async fn push_slot_state(&mut self, room_id: &str) {
+        if !self.rooms_with_slot_state.contains(room_id) {
+            return;
+        }
+
+        let encryption = self.room_encryption_for(room_id);
+        let resolved: HashMap<SessionKey, SlotState> = self
+            .slots
+            .iter()
+            .filter(|(key, _)| key.room_id == room_id)
+            .map(|(key, slot)| (key.clone(), slot.resolve(encryption)))
+            .collect();
+
+        for (key, session) in self.sessions.iter_mut() {
+            if key.room_id != room_id {
+                continue;
+            }
+            let state = resolved.get(key).cloned().unwrap_or(SlotState::Closed);
+            session.set_slot_state(state).await;
+        }
+    }
+
+    fn room_encryption_for(&self, room_id: &str) -> RoomEncryption {
+        self.room_encryption
+            .get(room_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Sets the users currently joined to a room.
+    ///
+    /// MSC4143 only counts a member event as joined while its sender is still
+    /// joined to the room. Until a host calls this, that condition is not
+    /// enforced.
+    pub async fn on_room_members_received(
+        &mut self,
+        room_id: &str,
+        joined_user_ids: impl IntoIterator<Item = String>,
+    ) {
+        let members: HashSet<String> = joined_user_ids.into_iter().collect();
+        self.room_members
+            .insert(room_id.to_owned(), members.clone());
+
+        for (key, session) in self.sessions.iter_mut() {
+            if key.room_id != room_id {
+                continue;
+            }
+            session.set_room_members(members.clone()).await;
+        }
+    }
+
+    /// Opens a slot by sending an `m.rtc.slot` state event.
+    ///
+    /// The slot id doubles as the state key and MSC4143 requires it to start
+    /// with `{application_type}#`, so that is checked here rather than letting
+    /// the homeserver accept a slot every client will treat as closed.
+    ///
+    /// Sending room state usually needs a raised power level; a rejection
+    /// surfaces as [`CommandError`].
+    pub async fn open_slot(
+        &self,
+        room_id: String,
+        slot_id: String,
+        application_type: String,
+        encryption: Option<SlotEncryption>,
+    ) -> Result<(), CommandError> {
+        if !slot_id.starts_with(&format!("{application_type}#")) {
+            return Err(CommandError::from_message(format!(
+                "slot id '{slot_id}' does not match application type '{application_type}': \
+                 MSC4143 requires the state key to be '{{application_type}}#{{slot}}'"
+            )));
+        }
+
+        let content = RawSlotEventContent::for_open(application_type, encryption);
+        self.send_slot_state(room_id, slot_id, content).await
+    }
+
+    /// Closes a slot by setting its `m.rtc.slot` status to `closed`.
+    ///
+    /// Members of the slot become left as soon as the new state is applied.
+    pub async fn close_slot(&self, room_id: String, slot_id: String) -> Result<(), CommandError> {
+        self.send_slot_state(room_id, slot_id, RawSlotEventContent::for_close())
+            .await
+    }
+
+    async fn send_slot_state(
+        &self,
+        room_id: String,
+        slot_id: String,
+        content: RawSlotEventContent,
+    ) -> Result<(), CommandError> {
+        let command_sender = self
+            .command_sender
+            .as_ref()
+            .ok_or_else(|| CommandError::from_message("no command sender configured"))?;
+
+        let content =
+            serde_json::to_value(content).expect("m.rtc.slot content is always serializable");
+
+        command_sender
+            .send_state_event(room_id, SLOT_EVENT_TYPE.to_owned(), slot_id, content)
+            .await
+    }
+
+    /// The resolved state of a slot, if its room's state has been supplied.
+    pub fn slot_state(&self, room_id: &str, slot_id: &str) -> Option<SlotState> {
+        if !self.rooms_with_slot_state.contains(room_id) {
+            return None;
+        }
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        Some(
+            self.slots
+                .get(&key)
+                .map(|slot| slot.resolve(self.room_encryption_for(room_id)))
+                .unwrap_or(SlotState::Closed),
+        )
+    }
+
+    /// Returns the session for `key`, creating it if needed.
+    ///
+    /// A newly created session is seeded with whatever room state the manager
+    /// already holds, so slot state that arrived before the session existed
+    /// still governs it. Seeding is synchronous because a session with no
+    /// members has nothing to republish.
     fn session_for_key(&mut self, key: SessionKey) -> &mut RtcSession<T> {
-        self.sessions.entry(key).or_default()
+        let encryption = self.room_encryption_for(&key.room_id);
+        let slot = self.rooms_with_slot_state.contains(&key.room_id).then(|| {
+            self.slots
+                .get(&key)
+                .map(|slot| slot.resolve(encryption))
+                .unwrap_or(SlotState::Closed)
+        });
+        let room_members = self.room_members.get(&key.room_id).cloned();
+        let command_sender = self.command_sender.clone();
+
+        self.sessions.entry(key).or_insert_with(|| {
+            let mut session = match command_sender {
+                Some(sender) => RtcSession::with_command_sender(sender),
+                None => RtcSession::new(),
+            };
+            if let Some(slot) = slot {
+                session.seed_slot_state(slot);
+            }
+            if let Some(room_members) = room_members {
+                session.seed_room_members(room_members);
+            }
+            session.seed_room_encryption(encryption);
+            session
+        })
     }
 
     fn try_convert_membership_event(

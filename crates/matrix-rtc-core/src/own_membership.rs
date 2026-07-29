@@ -36,8 +36,8 @@ use std::sync::{Arc, Mutex};
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
 use crate::event::RawStickyEventContent;
-use crate::session::DisconnectReason;
-use crate::transport::{RawRtcTransport, RtcTransport};
+use crate::session::{LeaveCode, LeaveReason};
+use crate::transport::{MemberTransports, RtcTransport};
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
@@ -110,12 +110,8 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     room_id: String,
     /// Slot ID for the session.
     slot_id: String,
-    /// Sticky key (membership ID) for our membership.
+    /// Our `member.id`, which doubles as the sticky key (MSC4143).
     sticky_key: String,
-    /// Matrix user ID (for member.claimed_user_id in MSC4143).
-    user_id: String,
-    /// Device ID (for member.claimed_device_id in MSC4143).
-    device_id: String,
     /// Application type (for application.type in MSC4143, e.g., "m.call").
     application_type: String,
     /// Current state of the membership machine.
@@ -134,19 +130,14 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// * `command_sender` - The command sender for sending events
     /// * `room_id` - The room ID for the session
     /// * `slot_id` - The slot ID for the session
-    /// * `sticky_key` - The sticky key (membership ID) for our membership
-    /// * `user_id` - Matrix user ID (for MSC4143 member.claimed_user_id)
-    /// * `device_id` - Device ID (for MSC4143 member.claimed_device_id)
+    /// * `sticky_key` - Our `member.id`, which doubles as the sticky key
     /// * `application_type` - Application type (for MSC4143 application.type, e.g., "m.call")
     /// * `keep_alive_timeout_ms` - The keep-alive timeout in milliseconds (default: 30000)
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         command_sender: Arc<T>,
         room_id: String,
         slot_id: String,
         sticky_key: String,
-        user_id: String,
-        device_id: String,
         application_type: String,
         keep_alive_timeout_ms: u64,
     ) -> Self {
@@ -155,8 +146,6 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             room_id,
             slot_id,
             sticky_key,
-            user_id,
-            device_id,
             application_type,
             state: Arc::new(Mutex::new(OwnMembershipState::NotJoined)),
             keep_alive_info: Arc::new(Mutex::new(None)),
@@ -170,8 +159,6 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         room_id: String,
         slot_id: String,
         sticky_key: String,
-        user_id: String,
-        device_id: String,
         application_type: String,
     ) -> Self {
         Self::new(
@@ -179,8 +166,6 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             room_id,
             slot_id,
             sticky_key,
-            user_id,
-            device_id,
             application_type,
             DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
         )
@@ -227,21 +212,16 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     ///
     /// # Arguments
     ///
-    /// * `transport_json` - Optional JSON representing the transport configuration
+    /// * `transports` - The `transports` object to publish for this member
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if both the delayed leave and join were scheduled/sent successfully.
     /// Returns an error if either operation fails.
-    pub async fn join(
-        &self,
-        transport_json: Option<serde_json::Value>,
-    ) -> Result<(), CommandError> {
+    pub async fn join(&self, transports: MemberTransports) -> Result<(), CommandError> {
         let room_id = self.room_id.clone();
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
-        let user_id = self.user_id.clone();
-        let device_id = self.device_id.clone();
         let application_type = self.application_type.clone();
         let keep_alive_timeout_ms = self.keep_alive_timeout_ms;
 
@@ -254,7 +234,6 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         // Step 1: Schedule delayed leave event FIRST (safety net)
         // If client dies at any point, worst case we're cleaning up.
         // **We await this to ensure the delayed event is scheduled before proceeding.**
-        // MSC4143: disconnect_reason must be an object with class and reason fields
         let delayed_content = self.build_delayed_leave_content(&slot_id, &sticky_key);
 
         log::info!(
@@ -285,14 +264,8 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
         // Step 2: Send join membership event
         // **Only sent after delayed leave is confirmed scheduled.**
-        let join_content = self.build_join_content(
-            &slot_id,
-            &sticky_key,
-            &user_id,
-            &device_id,
-            &application_type,
-            transport_json,
-        );
+        let join_content =
+            self.build_join_content(&slot_id, &sticky_key, &application_type, transports);
 
         log::info!(
             "[{}] Sending join membership event (step 2 of dead man's switch)",
@@ -319,45 +292,36 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     }
 
     /// Builds MSC4143-compliant content for a delayed leave event (dead man's switch).
+    ///
+    /// The homeserver sends this on our behalf when we stop heartbeating, which is
+    /// exactly what MSC4143's `delayed_leave` code describes.
     fn build_delayed_leave_content(&self, slot_id: &str, sticky_key: &str) -> Value {
-        let disconnect_reason = DisconnectReason {
-            class: Some("server_error".to_string()),
-            reason: Some("keep_alive_timeout".to_string()),
-            description: Some("Dead man's switch: client failed to heartbeat".to_string()),
-        };
+        let leave_reason = LeaveReason::with_reason(
+            LeaveCode::DelayedLeave,
+            "Dead man's switch: client failed to heartbeat",
+        );
         let content = RawStickyEventContent::for_leave(
             slot_id.to_string(),
             sticky_key.to_string(),
-            Some(disconnect_reason),
+            Some(leave_reason),
         );
         serde_json::to_value(content).expect("m.rtc.member content is always serializable")
     }
 
     /// Builds MSC4143-compliant content for a join membership event.
     ///
-    /// The `transport_json` comes pre-serialized from `transport_to_json()`; it is parsed
-    /// back into the typed `RawRtcTransport` (a lossless round-trip) so the whole content
-    /// is built from the single shared `RawStickyEventContent` type.
     fn build_join_content(
         &self,
         slot_id: &str,
         sticky_key: &str,
-        user_id: &str,
-        device_id: &str,
         application_type: &str,
-        transport_json: Option<Value>,
+        transports: MemberTransports,
     ) -> Value {
-        let rtc_transports = transport_json
-            .and_then(|v| serde_json::from_value::<RawRtcTransport>(v).ok())
-            .map(|t| vec![t]);
-
         let content = RawStickyEventContent::for_join(
             slot_id.to_string(),
             sticky_key.to_string(),
-            user_id.to_string(),
-            device_id.to_string(),
             application_type.to_string(),
-            rtc_transports,
+            transports,
         );
         serde_json::to_value(content).expect("m.rtc.member content is always serializable")
     }
@@ -369,25 +333,17 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// 2. Cancels the active delayed leave event (if any)
     ///
     /// Both operations are awaited to ensure proper cleanup.
-    pub async fn leave(&self, disconnect_reason: Option<String>) -> Result<(), CommandError> {
+    pub async fn leave(&self, leave_reason: Option<LeaveReason>) -> Result<(), CommandError> {
         let room_id = self.room_id.clone();
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
 
-        // Build MSC4143-compliant leave content.
-        // Map any simple string reason to a typed disconnect_reason object.
-        let disconnect_reason = disconnect_reason.map(|reason| {
-            let (class, reason_str) = self.map_reason_to_msc4143(&reason);
-            DisconnectReason {
-                class: Some(class),
-                reason: Some(reason_str),
-                description: Some(reason),
-            }
-        });
+        // A voluntary leave with no stated cause is MSC4143's plain `leave` code.
+        let leave_reason = Some(leave_reason.unwrap_or_else(|| LeaveReason::new(LeaveCode::Leave)));
         let leave_content = serde_json::to_value(RawStickyEventContent::for_leave(
             slot_id.clone(),
             sticky_key.clone(),
-            disconnect_reason,
+            leave_reason,
         ))
         .expect("m.rtc.member content is always serializable");
 
@@ -428,33 +384,6 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         log::info!("[{}] Successfully left session", room_id);
 
         Ok(())
-    }
-
-    /// Maps a simple disconnect reason string to MSC4143 class and reason.
-    ///
-    /// This is a helper for backward compatibility with code that passes simple string reasons.
-    fn map_reason_to_msc4143(&self, reason: &str) -> (String, String) {
-        // Map common reason strings to MSC4143 class/reason pairs
-        match reason {
-            // User actions
-            "user_left" | "hangup" | "user_hung_up" => {
-                ("user_action".to_string(), "hangup".to_string())
-            }
-            "switch_device" => ("user_action".to_string(), "switch_device".to_string()),
-
-            // Client errors
-            "ice_failed" | "media_error" | "transport_failure" | "encryption_error" => {
-                ("client_error".to_string(), reason.to_string())
-            }
-
-            // Server errors
-            "keep_alive_timeout" | "network_error" => {
-                ("server_error".to_string(), reason.to_string())
-            }
-
-            // Default: treat as user action
-            _ => ("user_action".to_string(), reason.to_string()),
-        }
     }
 
     /// Restarts the keep-alive by canceling the current delayed leave and scheduling a new one.
@@ -554,9 +483,8 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 mod tests {
     use super::*;
     use crate::commands::{MockCommandSender, NoopCommandSender};
+    use crate::transport::RawRtcTransport;
 
-    const USER_ID: &str = "@alice:example.org";
-    const DEVICE_ID: &str = "device123";
     const APPLICATION_TYPE: &str = "m.call";
 
     #[test]
@@ -566,8 +494,6 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
@@ -582,8 +508,6 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
@@ -597,8 +521,6 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
@@ -612,8 +534,6 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
@@ -628,12 +548,13 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
-        machine.join(None).await.expect("join should succeed");
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
 
         // Check that delayed events were scheduled
         let delayed_events = mock_sender.delayed_events.lock().unwrap();
@@ -644,8 +565,21 @@ mod tests {
         assert_eq!(room_id, "!room:example.org");
         assert_eq!(event_type, "m.rtc.member");
 
-        // Check that the content has the disconnect_reason
-        assert!(content.get("disconnect_reason").is_some());
+        // The homeserver fires this on our behalf when heartbeats stop, so it must
+        // be distinguishable from a user-initiated leave.
+        let leave_reason = content
+            .get("leave_reason")
+            .expect("leave_reason should be present");
+        assert_eq!(
+            leave_reason.get("code").and_then(|v| v.as_str()),
+            Some("delayed_leave")
+        );
+        assert_eq!(
+            content
+                .pointer("/member/membership")
+                .and_then(|v| v.as_str()),
+            Some("leave")
+        );
     }
 
     #[tokio::test]
@@ -656,12 +590,13 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
-        machine.join(None).await.expect("join should succeed");
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
 
         // Check that sticky events were sent
         let sticky_events = mock_sender.sticky_events.lock().unwrap();
@@ -685,27 +620,40 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
-        let transport = json!({
-            "type": "livekit",
-            "livekit_service_url": "https://example.com"
+        let transport = MemberTransports::publishing(RawRtcTransport {
+            transport_type: "livekit".to_owned(),
+            extra_fields: [(
+                "livekit_service_url".to_owned(),
+                serde_json::Value::String("https://example.com".to_owned()),
+            )]
+            .into_iter()
+            .collect(),
         });
 
-        machine
-            .join(Some(transport))
-            .await
-            .expect("join should succeed");
+        machine.join(transport).await.expect("join should succeed");
 
         // Check that the join event includes the transport
         let sticky_events = mock_sender.sticky_events.lock().unwrap();
         assert_eq!(sticky_events.len(), 1);
 
+        // Publishing a transport also declares we can subscribe to its type, so
+        // peers can pick one every member can receive.
         let (_, _, content) = &sticky_events[0];
-        assert!(content.get("rtc_transports").is_some());
+        assert_eq!(
+            content
+                .pointer("/transports/published/0/type")
+                .and_then(|v| v.as_str()),
+            Some("livekit")
+        );
+        assert_eq!(
+            content
+                .pointer("/transports/can_subscribe/0")
+                .and_then(|v| v.as_str()),
+            Some("livekit")
+        );
     }
 
     #[tokio::test]
@@ -716,13 +664,14 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
         machine
-            .leave(Some("user_left".to_string()))
+            .leave(Some(LeaveReason::with_reason(
+                LeaveCode::Leave,
+                "user hung up",
+            )))
             .await
             .expect("leave should succeed");
 
@@ -734,12 +683,18 @@ mod tests {
         assert_eq!(room_id, "!room:example.org");
         assert_eq!(event_type, "m.rtc.member");
 
-        // MSC4143: disconnect_reason is now an object, not a string
-        let disconnect_reason = content
-            .get("disconnect_reason")
-            .expect("disconnect_reason should be present");
-        assert!(disconnect_reason.get("class").is_some());
-        assert!(disconnect_reason.get("reason").is_some());
+        let leave_reason = content
+            .get("leave_reason")
+            .expect("leave_reason should be present");
+        assert_eq!(
+            leave_reason.get("code").and_then(|v| v.as_str()),
+            Some("leave")
+        );
+        assert_eq!(
+            leave_reason.get("reason").and_then(|v| v.as_str()),
+            Some("user hung up")
+        );
+        assert!(leave_reason.get("class").is_none());
     }
 
     #[tokio::test]
@@ -750,13 +705,14 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
         // Join to start the initial delayed leave
-        machine.join(None).await.expect("join should succeed");
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
 
         // Get initial delayed event count
         let initial_count = {
@@ -785,8 +741,6 @@ mod tests {
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
             APPLICATION_TYPE.to_string(),
         )
     }
@@ -799,7 +753,7 @@ mod tests {
     async fn test_join_and_delayed_leave_use_unstable_sticky_key() {
         let mock_sender = Arc::new(MockCommandSender::new());
         test_machine(mock_sender.clone())
-            .join(None)
+            .join(MemberTransports::default())
             .await
             .expect("join should succeed");
 
@@ -811,8 +765,14 @@ mod tests {
             Some("alice-device-a")
         );
         assert!(join_content.get("sticky_key").is_none());
-        // Join events carry no disconnect_reason.
-        assert!(join_content.get("disconnect_reason").is_none());
+        // `leave_reason` is skipped rather than serialized as null on a join.
+        assert!(join_content.get("leave_reason").is_none());
+        assert_eq!(
+            join_content
+                .pointer("/member/membership")
+                .and_then(|v| v.as_str()),
+            Some("join")
+        );
 
         let (_, _, delayed_content, _) = &mock_sender.delayed_events.lock().unwrap()[0];
         assert_eq!(
@@ -830,7 +790,10 @@ mod tests {
 
         let mock_sender = Arc::new(MockCommandSender::new());
         test_machine(mock_sender.clone())
-            .leave(Some("user_left".to_string()))
+            .leave(Some(LeaveReason::with_reason(
+                LeaveCode::Leave,
+                "user hung up",
+            )))
             .await
             .expect("leave should succeed");
 
@@ -842,10 +805,20 @@ mod tests {
             Some("alice-device-a")
         );
         assert!(leave_content.get("sticky_key").is_none());
-        // Leave events carry only slot_id / sticky_key / disconnect_reason.
+        // A leave carries only slot_id / sticky_key / member / leave_reason; the
+        // join-only fields must be skipped, not emitted empty.
         assert!(leave_content.get("application").is_none());
-        assert!(leave_content.get("member").is_none());
-        assert!(leave_content.get("versions").is_none());
+        assert!(leave_content.get("transports").is_none());
+        assert_eq!(
+            leave_content
+                .pointer("/member/membership")
+                .and_then(|v| v.as_str()),
+            Some("leave")
+        );
+        assert_eq!(
+            leave_content.pointer("/member/id").and_then(|v| v.as_str()),
+            Some("alice-device-a")
+        );
 
         // The emitted content must deserialize back through the shared struct with the
         // sticky_key intact — this is the exact regression the refactor guards against.

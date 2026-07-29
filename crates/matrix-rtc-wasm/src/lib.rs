@@ -22,8 +22,8 @@
 
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,
-    LeaveSessionParams, RawRtcTransport, RawStickyEvent, RawStickyEventUpdate, RtcSession,
-    RtcSessionManager, RtcTransport, StickyEventsUpdate,
+    LeaveSessionParams, RawRtcTransport, RawSlotEvent, RawStickyEvent, RawStickyEventUpdate,
+    RtcSession, RtcSessionManager, RtcTransport, StickyEventsUpdate,
 };
 
 mod commands;
@@ -112,6 +112,57 @@ impl WasmRtcSessionManager {
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
+    /// Applies a room's complete `m.rtc.slot` state.
+    ///
+    /// Calling this is what makes the MSC4143 open-slot condition apply to the
+    /// room: until then it cannot be evaluated and is not enforced. Any slot in
+    /// the room *not* present in `slots` is treated as closed, so always pass
+    /// the full set — an empty array included.
+    ///
+    /// Each entry is `{ slot_id, content }`, where `content` is the raw
+    /// `m.rtc.slot` content.
+    pub async fn on_room_slots_received(
+        &mut self,
+        room_id: String,
+        slots: JsValue,
+    ) -> Result<(), JsError> {
+        let input: Vec<WasmSlotEvent> = serde_wasm_bindgen::from_value(slots)
+            .map_err(|err| JsError::new(&format!("invalid slot payload: {err}")))?;
+
+        let mapped: Vec<RawSlotEvent> = input
+            .into_iter()
+            .map(|slot| RawSlotEvent {
+                room_id: room_id.clone(),
+                slot_id: slot.slot_id,
+                content: slot.content,
+            })
+            .collect();
+
+        self.inner.on_room_slots_received(&room_id, mapped).await;
+        Ok(())
+    }
+
+    /// Sets the users currently joined to a room.
+    ///
+    /// MSC4143 only counts a member event while its sender is still joined to
+    /// the room; until this is called that condition is not enforced.
+    pub async fn on_room_members_received(&mut self, room_id: String, joined_user_ids: JsValue) {
+        let members: Vec<String> =
+            serde_wasm_bindgen::from_value(joined_user_ids).unwrap_or_default();
+        self.inner.on_room_members_received(&room_id, members).await;
+    }
+
+    /// Reports whether a room is end-to-end encrypted.
+    ///
+    /// MSC4143 requires RTC encryption in encrypted rooms and forbids it
+    /// elsewhere, so this changes how the room's slots resolve and whether
+    /// cleartext member events count.
+    pub async fn on_room_encryption_received(&mut self, room_id: String, encrypted: bool) {
+        self.inner
+            .on_room_encryption_received(&room_id, encrypted)
+            .await;
+    }
+
     /// Returns the number of active sessions currently tracked by the manager.
     pub fn session_count(&self) -> u32 {
         self.inner.session_count() as u32
@@ -160,7 +211,10 @@ impl WasmRtcSessionManager {
     /// * `room_id` - The room ID of the session to leave
     /// * `slot_id` - The slot ID of the session to leave
     /// * `params` - Optional JSON object containing leave parameters:
-    ///   - `disconnect_reason`: Optional reason for leaving (e.g., "user_left", "ice_failed")
+    ///   - `leave_reason`: Optional MSC4143 leave reason, an object of
+    ///     `{ code, reason }` — e.g. `{ code: "leave" }` for an intentional
+    ///     hang-up, or `{ code: "ice_failed", reason: "no candidates" }` for a
+    ///     transport-defined cause. Defaults to `{ code: "leave" }`.
     pub async fn leave(
         &mut self,
         room_id: String,
@@ -195,7 +249,14 @@ pub struct WasmJoinSessionParams {
     pub room_id: String,
     pub slot_id: String,
     pub application: String,
-    pub transport: WasmTransportConfig,
+    /// The transport to publish on. Omit to join without publishing — valid per
+    /// MSC4143, and what a recorder or other observer wants.
+    #[serde(default)]
+    pub transport: Option<WasmTransportConfig>,
+    /// Transport types this member can receive on. Only read when `transport`
+    /// is omitted; a publishing member advertises its own transport's type.
+    #[serde(default)]
+    pub can_subscribe: Vec<String>,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -211,6 +272,10 @@ pub struct WasmEncryptionConfig {
     pub key_rotation_grace_period_ms: u64,
     #[serde(default = "default_manage_media_keys")]
     pub manage_media_keys: bool,
+    /// Whether to discard keys from devices that are not cross-signed
+    /// (default: true, per MSC4153).
+    #[serde(default = "default_require_cross_signed_sender")]
+    pub require_cross_signed_sender: bool,
 }
 
 fn default_delay_before_use_ms() -> u64 {
@@ -222,6 +287,9 @@ fn default_key_rotation_grace_period_ms() -> u64 {
 fn default_manage_media_keys() -> bool {
     true
 }
+fn default_require_cross_signed_sender() -> bool {
+    true
+}
 
 impl From<WasmEncryptionConfig> for EncryptionConfig {
     fn from(value: WasmEncryptionConfig) -> Self {
@@ -229,13 +297,14 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms,
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms,
             manage_media_keys: value.manage_media_keys,
+            require_cross_signed_sender: value.require_cross_signed_sender,
         }
     }
 }
 
 impl WasmJoinSessionParams {
     pub fn into_core(self) -> Result<JoinSessionParams, JsError> {
-        let transport = self.transport.into_core()?;
+        let transport = self.transport.map(|t| t.into_core()).transpose()?;
         let encryption_config = self.encryption_config.map(Into::into);
         Ok(JoinSessionParams {
             user_id: self.user_id,
@@ -244,7 +313,12 @@ impl WasmJoinSessionParams {
             room_id: self.room_id,
             slot_id: self.slot_id,
             application: self.application,
-            transport,
+            transport: match transport {
+                Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport),
+                None => matrix_rtc_core::TransportIntent::ReceiveOnly {
+                    can_subscribe: self.can_subscribe,
+                },
+            },
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             encryption_config,
         })
@@ -297,13 +371,31 @@ impl WasmTransportConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct WasmLeaveSessionParams {
     #[serde(default)]
-    pub disconnect_reason: Option<String>,
+    pub leave_reason: Option<WasmLeaveReason>,
+}
+
+/// MSC4143 `leave_reason`: a machine-readable `code` plus an optional
+/// human-readable `reason`.
+#[derive(Debug, Deserialize)]
+pub struct WasmLeaveReason {
+    pub code: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl From<WasmLeaveReason> for matrix_rtc_core::LeaveReason {
+    fn from(value: WasmLeaveReason) -> Self {
+        matrix_rtc_core::LeaveReason {
+            code: matrix_rtc_core::LeaveCode::from_code(&value.code),
+            reason: value.reason,
+        }
+    }
 }
 
 impl WasmLeaveSessionParams {
     pub fn into_core(self) -> LeaveSessionParams {
         LeaveSessionParams {
-            disconnect_reason: self.disconnect_reason,
+            leave_reason: self.leave_reason.map(Into::into),
         }
     }
 }
@@ -488,6 +580,15 @@ impl WasmMembershipSnapshotSubscription {
 struct WasmStickyEvent {
     room_id: String,
     sender: String,
+    /// Device that sent the event, from its decryption metadata. MSC4143 has no
+    /// self-asserted device field, so the host must supply this.
+    #[serde(default)]
+    sender_device_id: Option<String>,
+    /// Whether the event arrived encrypted; MSC4143 requires member events to be
+    /// encrypted in encrypted rooms. Omit if unknown — omitting it is not the
+    /// same as `false`, which would drop the member in an encrypted room.
+    #[serde(default)]
+    was_encrypted: Option<bool>,
     #[serde(rename = "type")]
     event_type: String,
     content: WasmStickyEventContent,
@@ -499,9 +600,25 @@ struct WasmStickyEventContent {
     sticky_key: String,
     application: Option<WasmApplication>,
     member: Option<WasmMember>,
-    disconnect_reason: Option<String>,
     #[serde(default)]
-    rtc_transports: Option<Vec<WasmRawRtcTransport>>,
+    transports: Option<WasmTransports>,
+    #[serde(default)]
+    leave_reason: Option<WasmLeaveReason>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WasmSlotEvent {
+    slot_id: String,
+    #[serde(default)]
+    content: matrix_rtc_core::RawSlotEventContent,
+}
+
+#[derive(Debug, Deserialize)]
+struct WasmTransports {
+    #[serde(default)]
+    published: Vec<WasmRawRtcTransport>,
+    #[serde(default)]
+    can_subscribe: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,6 +638,9 @@ struct WasmApplication {
 #[derive(Debug, Deserialize)]
 struct WasmMember {
     id: String,
+    /// MSC4143 `member.membership`: "join" or "leave".
+    #[serde(default)]
+    membership: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,9 +667,27 @@ impl From<WasmRawRtcTransport> for RawRtcTransport {
 
 impl From<WasmStickyEvent> for RawStickyEvent {
     fn from(value: WasmStickyEvent) -> Self {
+        let member = value
+            .content
+            .member
+            .map(|member| matrix_rtc_core::MemberInfo {
+                id: Some(member.id),
+                membership: member.membership.map(|m| match m.as_str() {
+                    "join" => matrix_rtc_core::Membership::Join,
+                    "leave" => matrix_rtc_core::Membership::Leave,
+                    _ => matrix_rtc_core::Membership::Unknown(m),
+                }),
+            })
+            .unwrap_or_default();
+
         RawStickyEvent {
             room_id: value.room_id,
             sender: value.sender,
+            origin: match value.was_encrypted {
+                Some(true) => matrix_rtc_core::EventOrigin::encrypted(value.sender_device_id),
+                Some(false) => matrix_rtc_core::EventOrigin::Cleartext,
+                None => matrix_rtc_core::EventOrigin::Unknown,
+            },
             event_type: value.event_type,
             content: matrix_rtc_core::RawStickyEventContent {
                 slot_id: value.content.slot_id,
@@ -558,25 +696,15 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                     application_type: value.content.application.map(|app| app.kind),
                     extra: std::collections::BTreeMap::new(),
                 },
-                member: matrix_rtc_core::MemberInfo {
-                    id: value.content.member.map(|member| member.id),
-                    claimed_device_id: None,
-                    claimed_user_id: None,
-                },
-                versions: Vec::new(),
-                disconnect_reason: value.content.disconnect_reason.map(|reason| {
-                    matrix_rtc_core::DisconnectReason {
-                        class: None,
-                        reason: Some(reason),
-                        description: None,
-                    }
-                }),
-                m_relates_to: None,
-                rtc_transports: value
+                member,
+                transports: value
                     .content
-                    .rtc_transports
-                    .map(|v| v.into_iter().map(Into::into).collect()),
-                created_ts: None,
+                    .transports
+                    .map(|t| matrix_rtc_core::MemberTransports {
+                        published: t.published.into_iter().map(Into::into).collect(),
+                        can_subscribe: t.can_subscribe,
+                    }),
+                leave_reason: value.content.leave_reason.map(Into::into),
             },
         }
     }
@@ -604,7 +732,6 @@ mod tests {
         sticky_key: String,
         application: Option<TestApplication>,
         member: Option<TestMember>,
-        disconnect_reason: Option<String>,
     }
 
     #[derive(Serialize)]
@@ -616,6 +743,7 @@ mod tests {
     #[derive(Serialize)]
     struct TestMember {
         id: String,
+        membership: String,
     }
 
     fn joined_event() -> TestStickyEvent {
@@ -631,8 +759,8 @@ mod tests {
                 }),
                 member: Some(TestMember {
                     id: "alice-device-a".to_owned(),
+                    membership: "join".to_owned(),
                 }),
-                disconnect_reason: None,
             },
         }
     }

@@ -65,13 +65,20 @@ pub fn livekit_alias(room_id: &str, slot_id: &str) -> String {
 }
 
 /// Derive the pseudonymous LiveKit participant identity from MSC4195:
-/// `base64(SHA256(JSON.serialize([user_id, claimed_device_id, member_id])))`.
+/// `base64(SHA256(JSON.serialize([user_id, device_id, member_id])))`.
 ///
 /// This is the `sub` the authorisation service places in the JWT, and the value
-/// used to associate an inbound `m.rtc.encryption_keys` key with a LiveKit
+/// used to associate an inbound `m.rtc.encryption_key` key with a LiveKit
 /// participant.
-pub fn pseudonymous_identity(user_id: &str, claimed_device_id: &str, member_id: &str) -> String {
-    hash_string_array(&[user_id, claimed_device_id, member_id])
+///
+/// MSC4195 names the middle component `claimed_device_id` after the
+/// `m.rtc.member` field of the same name. MSC4143 has since removed that field,
+/// so for a peer the value is the device that encrypted their member event
+/// (`EncryptionInfo::sender_device`) — the same device, now authenticated rather
+/// than self-asserted. The hash itself is unchanged, so MSC4195's test vectors
+/// still hold.
+pub fn pseudonymous_identity(user_id: &str, device_id: &str, member_id: &str) -> String {
+    hash_string_array(&[user_id, device_id, member_id])
 }
 
 #[cfg(test)]

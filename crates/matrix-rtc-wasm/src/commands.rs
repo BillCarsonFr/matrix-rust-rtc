@@ -161,6 +161,40 @@ impl RtcCommandSender for JsCommandSender {
         Ok(())
     }
 
+    async fn send_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content: Value,
+    ) -> Result<(), CommandError> {
+        self.log_command(&format!(
+            "send_state_event: room={}, type={}, state_key={}",
+            room_id, event_type, state_key
+        ));
+
+        let js_content = serde_wasm_bindgen::to_value(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+        let promise = self
+            .call_js_promise_method(
+                "sendStateEvent",
+                vec![
+                    JsValue::from_str(&room_id),
+                    JsValue::from_str(&event_type),
+                    JsValue::from_str(&state_key),
+                    js_content,
+                ],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        Ok(())
+    }
+
     async fn send_delayed_event(
         &self,
         room_id: String,

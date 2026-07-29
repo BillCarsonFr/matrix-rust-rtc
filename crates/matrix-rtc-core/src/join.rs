@@ -22,12 +22,53 @@
 //! call intent.
 
 use crate::encryption::types::EncryptionConfig;
+use crate::session::{LeaveCode, LeaveReason};
 use crate::transport::RtcTransport;
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
 ///
 /// This is the delay before the cleanup event would fire if not restarted.
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
+
+/// Generates a fresh `member.id` for a join.
+///
+/// MSC4143 requires the id to be unique per join and suggests it be
+/// unpredictable, since transports may use it as entropy when deriving
+/// pseudonymous participant identities. 16 random bytes, hex encoded.
+pub fn generate_member_id() -> String {
+    use rand::RngCore;
+    use rand_core::OsRng;
+
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What a joining member intends to do with transports.
+///
+/// Which transport to publish on is the application's decision — discovering
+/// what the homeserver offers (`GET /_matrix/client/v1/rtc/transports`) and
+/// choosing among them happens above this crate, and the result is passed in
+/// here.
+///
+/// MSC4143 does not require a member to publish anything — `transports` carries
+/// no REQUIRED marker — so a member that only receives, such as a recorder, is
+/// a valid participant rather than a degraded one.
+#[derive(Clone, Debug)]
+pub enum TransportIntent {
+    /// Publish on this transport.
+    Publish(RtcTransport),
+
+    /// Never publish; only receive. Suits a recorder or any other observer.
+    ///
+    /// `can_subscribe` is what other members use to pick a transport this one
+    /// can actually receive on, so stating it matters even though nothing is
+    /// published. An empty list is legal but leaves peers without that cue.
+    ReceiveOnly {
+        /// Transport types this member can receive on.
+        can_subscribe: Vec<String>,
+    },
+}
 
 /// Parameters for joining an RTC session.
 ///
@@ -43,10 +84,11 @@ pub struct JoinSessionParams {
     /// This is used to create a unique sticky key for this membership.
     pub device_id: String,
 
-    /// The membership ID (sticky key) for this join.
+    /// The `member.id` (and sticky key) for this join.
     ///
-    /// This uniquely identifies this user/device's membership in the session.
-    /// If not provided, it will be generated as "{user_id}-{device_id}".
+    /// MSC4143 requires this to be unique for *each* join, so that leaving and
+    /// rejoining never reuses an identifier. If not provided, a fresh random id
+    /// is generated per call to [`JoinSessionParams::membership_id`].
     pub membership_id: Option<String>,
 
     /// The room ID where the session is taking place.
@@ -58,8 +100,8 @@ pub struct JoinSessionParams {
     /// The application type, usually "m.call".
     pub application: String,
 
-    /// The RTC transport to use for this session.
-    pub transport: RtcTransport,
+    /// What this member does with transports.
+    pub transport: TransportIntent,
 
     /// Keep-alive timeout in milliseconds.
     ///
@@ -91,20 +133,43 @@ impl JoinSessionParams {
             room_id,
             slot_id,
             application,
+            transport: TransportIntent::Publish(transport),
+            keep_alive_timeout_ms: None,
+            encryption_config: None,
+        }
+    }
+
+    /// Creates join parameters with the given transport intent.
+    pub fn with_transport_intent(
+        user_id: String,
+        device_id: String,
+        room_id: String,
+        slot_id: String,
+        application: String,
+        transport: TransportIntent,
+    ) -> Self {
+        Self {
+            user_id,
+            device_id,
+            membership_id: None,
+            room_id,
+            slot_id,
+            application,
             transport,
             keep_alive_timeout_ms: None,
             encryption_config: None,
         }
     }
 
-    /// Gets the membership ID (sticky key) to use for this join.
+    /// Gets the `member.id` (sticky key) to use for this join.
     ///
-    /// If a membership_id was explicitly set, returns that.
-    /// Otherwise, generates one from user_id and device_id.
+    /// If a membership_id was explicitly set, returns that. Otherwise generates a
+    /// fresh random id: MSC4143 requires a different identifier on every join, so
+    /// this must not be derived from stable values like the user and device IDs.
     pub fn membership_id(&self) -> String {
         self.membership_id
             .clone()
-            .unwrap_or_else(|| format!("{}-{}", self.user_id, self.device_id))
+            .unwrap_or_else(generate_member_id)
     }
 
     /// Gets the keep-alive timeout to use.
@@ -149,21 +214,26 @@ impl JoinSessionParams {
 /// Parameters for leaving an RTC session.
 #[derive(Clone, Debug, Default)]
 pub struct LeaveSessionParams {
-    /// Optional disconnect reason (e.g., "user_left", "ice_failed").
-    pub disconnect_reason: Option<String>,
+    /// Optional MSC4143 leave reason. Defaults to `code = leave` when unset.
+    pub leave_reason: Option<LeaveReason>,
 }
 
 impl LeaveSessionParams {
-    /// Creates new leave parameters with no disconnect reason.
+    /// Creates new leave parameters with no explicit leave reason.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates new leave parameters with a disconnect reason.
-    pub fn with_reason(reason: String) -> Self {
+    /// Creates new leave parameters carrying a leave reason.
+    pub fn with_leave_reason(leave_reason: LeaveReason) -> Self {
         Self {
-            disconnect_reason: Some(reason),
+            leave_reason: Some(leave_reason),
         }
+    }
+
+    /// Creates new leave parameters from a bare MSC4143 leave code.
+    pub fn with_code(code: LeaveCode) -> Self {
+        Self::with_leave_reason(LeaveReason::new(code))
     }
 }
 
@@ -172,8 +242,10 @@ mod tests {
     use super::*;
     use crate::transport::{LiveKitTransport, RtcTransport};
 
+    /// MSC4143 requires `member.id` to differ on every join, so a generated id
+    /// must not be derived from the (stable) user and device IDs.
     #[test]
-    fn test_membership_id_generation() {
+    fn test_membership_id_is_unique_per_call() {
         let params = JoinSessionParams::new(
             "@alice:example.org".to_string(),
             "device123".to_string(),
@@ -185,7 +257,13 @@ mod tests {
             }),
         );
 
-        assert_eq!(params.membership_id(), "@alice:example.org-device123");
+        let first = params.membership_id();
+        let second = params.membership_id();
+
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 32);
+        assert!(!first.contains("@alice:example.org"));
+        assert!(!first.contains("device123"));
     }
 
     #[test]

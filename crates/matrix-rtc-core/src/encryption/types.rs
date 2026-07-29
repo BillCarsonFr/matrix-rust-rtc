@@ -46,6 +46,112 @@ impl ParticipantDeviceInfo {
     }
 }
 
+/// Authenticated provenance of an inbound `m.rtc.encryption_key` to-device
+/// message.
+///
+/// MSC4143 requires the recipient to check the message against the sender's
+/// `m.rtc.member` event, so the core needs to know who actually sent it. That
+/// is only knowable from Olm decryption metadata, which the host supplies —
+/// nothing in the message content is trustworthy for this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyOrigin {
+    /// The message arrived Olm-encrypted; these values come from the
+    /// decryption metadata, not from the payload.
+    Encrypted {
+        /// User the message was decrypted as coming from.
+        sender_user_id: String,
+        /// Device the message was decrypted as coming from, when the host
+        /// could determine it.
+        sender_device_id: Option<String>,
+        /// Whether that device is cross-signed (MSC4153).
+        sender_is_cross_signed: bool,
+    },
+    /// The message arrived in the clear, so it has no authenticated sender.
+    Cleartext,
+}
+
+/// Why an inbound `m.rtc.encryption_key` message was discarded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyRejection {
+    /// Sent in cleartext, so the sender cannot be authenticated (MSC4143).
+    Cleartext,
+    /// The sending device is not cross-signed (MSC4153).
+    NotCrossSigned,
+    /// The message names a different room than this session's.
+    RoomMismatch {
+        /// The `room_id` carried in the message.
+        claimed: String,
+    },
+    /// The sender does not match the one on the member event it claims.
+    SenderMismatch {
+        /// The user the member event was sent by.
+        expected: String,
+        /// The user that actually sent the key.
+        actual: String,
+    },
+    /// The member event names no sending device, so the required match cannot
+    /// be performed at all. Not expected in practice for an encrypted member
+    /// event — Olm messages carry the sender's device keys.
+    UnverifiableDevice,
+    /// The sending device does not match the one that sent the member event.
+    DeviceMismatch {
+        /// The device the member event was encrypted by.
+        expected: String,
+        /// The device that actually sent the key, if known.
+        actual: Option<String>,
+    },
+}
+
+impl std::fmt::Display for KeyRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cleartext => write!(f, "sent in cleartext"),
+            Self::NotCrossSigned => write!(f, "sending device is not cross-signed"),
+            Self::UnverifiableDevice => write!(
+                f,
+                "the member event names no sending device to check this against"
+            ),
+            Self::RoomMismatch { claimed } => write!(f, "claims a different room ({claimed})"),
+            Self::SenderMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "sent by {actual}, but the member event is from {expected}"
+                )
+            }
+            Self::DeviceMismatch { expected, actual } => write!(
+                f,
+                "sent by device {}, but the member event came from {expected}",
+                actual.as_deref().unwrap_or("<unknown>")
+            ),
+        }
+    }
+}
+
+/// An inbound `m.rtc.encryption_key` message, with the provenance needed to
+/// decide whether to trust it.
+#[derive(Clone, Debug)]
+pub struct ReceivedEncryptionKey {
+    /// How the message reached us, and from whom.
+    pub origin: KeyOrigin,
+    /// The `room_id` carried in the message content.
+    pub room_id: String,
+    /// The `member_id` carried in the message content, naming the sender's
+    /// `m.rtc.member` event.
+    pub member_id: String,
+    /// The key material, encoded per the message's `format`.
+    pub key_b64: String,
+    /// The rolling key index (0-255).
+    pub key_index: u8,
+}
+
+/// An inbound key whose `m.rtc.member` event has not arrived yet, held with the
+/// provenance needed to verify it once the membership shows up.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingInboundKey {
+    pub key: InboundEncryptionKey,
+    pub origin: KeyOrigin,
+}
+
 /// An inbound encryption key received from another participant.
 ///
 /// These keys are used to decrypt media streams from other participants.
@@ -120,6 +226,16 @@ pub struct EncryptionConfig {
     /// key material to the application. This is useful for testing or for
     /// sessions that don't require encryption.
     pub manage_media_keys: bool,
+
+    /// Whether to discard keys from devices that are not cross-signed
+    /// (default: true).
+    ///
+    /// MSC4143 defers to [MSC4153] here: clients that exclude insecure devices
+    /// elsewhere SHOULD also exclude them as key sources. Turn this off only
+    /// where unverified devices are expected, such as throwaway test logins.
+    ///
+    /// [MSC4153]: https://github.com/matrix-org/matrix-spec-proposals/pull/4153
+    pub require_cross_signed_sender: bool,
 }
 
 impl Default for EncryptionConfig {
@@ -128,6 +244,7 @@ impl Default for EncryptionConfig {
             delay_before_use_ms: 5000,            // MSC4143 default
             key_rotation_grace_period_ms: 10_000, // MSC4143 default
             manage_media_keys: true,
+            require_cross_signed_sender: true,
         }
     }
 }

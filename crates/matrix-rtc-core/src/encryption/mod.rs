@@ -72,7 +72,7 @@
 //! # Example Usage
 //!
 //! ```no_run
-//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, RtcCommandSender};
+//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, RtcCommandSender};
 //! use async_trait::async_trait;
 //! use std::sync::Arc;
 //! use base64::{Engine as _, engine::general_purpose};
@@ -92,6 +92,9 @@
 //!         Ok(())
 //!     }
 //!     async fn send_to_device_message(&self, _user_id: String, _device_id: String, _message_type: String, _content: serde_json::Value) -> Result<(), CommandError> {
+//!         Ok(())
+//!     }
+//!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }
 //! }
@@ -115,21 +118,26 @@
 //!     delay_before_use_ms: 5000,
 //!     key_rotation_grace_period_ms: 10000,
 //!     manage_media_keys: true,
+//!     require_cross_signed_sender: true,
 //! });
 //!
 //! // Join the session (creates first key)
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! manager.join().await.unwrap();
 //!
-//! // Handle received keys (from to-device messages)
-//! manager.receive_key(
-//!     "@bob:example.org".to_string(),
-//!     "device456".to_string(),
-//!     general_purpose::STANDARD.encode(vec![1u8; 32]),
-//!     0,
-//!     "bob-member-id".to_string(),
-//!     "!room:example.org".to_string(),
-//! ).await.unwrap();
+//! // Handle received keys (from to-device messages). `origin` carries the Olm
+//! // decryption metadata, which is what the MSC4143 checks are made against.
+//! manager.receive_key(ReceivedEncryptionKey {
+//!     origin: KeyOrigin::Encrypted {
+//!         sender_user_id: "@bob:example.org".to_string(),
+//!         sender_device_id: Some("device456".to_string()),
+//!         sender_is_cross_signed: true,
+//!     },
+//!     room_id: "!room:example.org".to_string(),
+//!     member_id: "bob-member-id".to_string(),
+//!     key_b64: general_purpose::STANDARD.encode(vec![1u8; 32]),
+//!     key_index: 0,
+//! }).await.unwrap();
 //!
 //! // Get current keys for application layer
 //! let keys = manager.get_encryption_keys();
@@ -152,6 +160,7 @@ type GetMembershipsFn = Arc<Mutex<Box<dyn Fn() -> Vec<JoinedMembership> + Send>>
 
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
+use crate::event::EventOrigin;
 use crate::session::JoinedMembership;
 
 /// Message type for to-device encryption key distribution (MSC4143).
@@ -253,7 +262,7 @@ pub struct EncryptionManager<T: RtcCommandSender> {
     key_buffer: Arc<Mutex<OutdatedKeyFilter>>,
 
     /// Keys that arrived before their membership was known (waiting for RTC membership)
-    keys_without_membership: Arc<Mutex<Vec<InboundEncryptionKey>>>,
+    keys_without_membership: Arc<Mutex<Vec<PendingInboundKey>>>,
 }
 
 impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
@@ -481,23 +490,19 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             (guard)()
         };
 
-        for key in keys_to_process {
-            // Find membership matching the member_id
-            // For now, we search by member_id in the memberships
-            // In practice, JoinedMembership should have a member_id field
-            let full_membership = known_memberships
+        for pending in keys_to_process {
+            let membership = known_memberships
                 .iter()
-                .find(|m| m.member.id.as_deref() == Some(&key.member_id));
+                .find(|m| m.member_id == pending.key.member_id);
 
-            if let Some(membership) = full_membership {
-                // We now have the membership, add the key properly
-                self.add_key_to_participant(key, membership).await;
-            } else {
-                // Still no membership, put it back
-                {
-                    let mut guard = self.keys_without_membership.lock().unwrap();
-                    guard.push(key);
+            match membership {
+                // The membership is now known, so the MSC4143 sender/device
+                // check that could not run at receive time runs here.
+                Some(membership) => {
+                    self.accept_verified_key(pending.key, &pending.origin, membership)
+                        .await
                 }
+                None => self.keys_without_membership.lock().unwrap().push(pending),
             }
         }
     }
@@ -583,12 +588,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             .iter()
             .filter(|m| {
                 // Exclude ourselves - we don't send keys to ourselves
-                m.member.id.as_deref() != Some(&self.own_member_id)
+                m.member_id != self.own_member_id
             })
             .map(|m| ParticipantDeviceInfo {
                 user_id: m.sender.clone(),
-                device_id: m.member.claimed_device_id.clone().unwrap_or_default(),
-                member_id: m.member.id.clone().unwrap_or_default(),
+                device_id: m.origin.sender_device_id().unwrap_or_default().to_owned(),
+                member_id: m.member_id.clone(),
             })
             .collect();
 
@@ -788,7 +793,8 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 "index": index,
                 "key": key_b64
             },
-            "version": "0"
+            // MSC4143 `format`: 0 means the raw key bytes, unpadded-base64 encoded.
+            "format": 0
         });
 
         log::trace!(
@@ -801,19 +807,17 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         // Find the target participant in our membership list
         let memberships = (self.get_memberships.lock().unwrap())();
-        let target = memberships
-            .iter()
-            .find(|m| m.member.id.as_deref() == Some(target_member_id));
+        let target = memberships.iter().find(|m| m.member_id == target_member_id);
 
         match target {
             Some(membership) => {
                 // Send to the specific user and device
                 let target_user_id = &membership.sender;
-                let target_device_id = membership
-                    .member
-                    .claimed_device_id
-                    .as_deref()
-                    .unwrap_or("*");
+                // MSC4143: key material goes to the device that encrypted the
+                // member event. Falling back to "*" (every device of that user)
+                // keeps cleartext-room sessions working; Olm still encrypts
+                // per-device, so this widens delivery, not readership.
+                let target_device_id = membership.origin.sender_device_id().unwrap_or("*");
 
                 log::debug!(
                     "[{}:{}] Sending key to user={}, device={}",
@@ -866,32 +870,108 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         }
     }
 
+    /// Checks an inbound key against the sender's `m.rtc.member` event.
+    ///
+    /// MSC4143: having matched the message's `member_id` to a member event,
+    /// "clients verify that the sender and device that was used to send the
+    /// member event match the sender and device of the to-device message.
+    /// Otherwise the message MUST be discarded."
+    fn verify_against_membership(
+        origin: &KeyOrigin,
+        membership: &JoinedMembership,
+    ) -> Result<(), KeyRejection> {
+        let KeyOrigin::Encrypted {
+            sender_user_id,
+            sender_device_id,
+            ..
+        } = origin
+        else {
+            return Err(KeyRejection::Cleartext);
+        };
+
+        if sender_user_id != &membership.sender {
+            return Err(KeyRejection::SenderMismatch {
+                expected: membership.sender.clone(),
+                actual: sender_user_id.clone(),
+            });
+        }
+
+        let expected_device = match &membership.origin {
+            EventOrigin::Encrypted {
+                sender_device_id: Some(device),
+            } => device.as_str(),
+
+            // The host never said how the member event arrived, so there is
+            // nothing to check against and nothing to accuse it of — the same
+            // stance the rest of the design takes on unreported facts.
+            EventOrigin::Unknown => return Ok(()),
+
+            // Either the member event was encrypted but could not be attributed
+            // to a device — which should not happen, since Olm messages carry
+            // the sender's device keys — or it arrived in the clear. Both leave
+            // no device to bind this key to, and MSC4143 makes that match a
+            // MUST, so the check has not been satisfied. This is a backstop
+            // rather than a path traffic is expected to take: skipping it would
+            // quietly downgrade the requirement to a user-only match.
+            EventOrigin::Encrypted {
+                sender_device_id: None,
+            }
+            | EventOrigin::Cleartext => return Err(KeyRejection::UnverifiableDevice),
+        };
+
+        if sender_device_id.as_deref() != Some(expected_device) {
+            return Err(KeyRejection::DeviceMismatch {
+                expected: expected_device.to_owned(),
+                actual: sender_device_id.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Checks the parts of an inbound key that do not depend on the membership.
+    fn verify_origin(&self, key: &ReceivedEncryptionKey) -> Result<(), KeyRejection> {
+        if key.room_id != self.room_id {
+            return Err(KeyRejection::RoomMismatch {
+                claimed: key.room_id.clone(),
+            });
+        }
+
+        match &key.origin {
+            KeyOrigin::Cleartext => Err(KeyRejection::Cleartext),
+            KeyOrigin::Encrypted {
+                sender_is_cross_signed,
+                ..
+            } if self.config.require_cross_signed_sender && !sender_is_cross_signed => {
+                Err(KeyRejection::NotCrossSigned)
+            }
+            KeyOrigin::Encrypted { .. } => Ok(()),
+        }
+    }
+
     /// Receives an encryption key from a to-device message.
     ///
     /// This is called when we receive a to-device message with type
     /// `org.matrix.msc4143.rtc.encryption_key`.
     ///
-    /// # Arguments
-    /// * `sender_user_id` - User ID of the sender (from Olm decryption metadata)
-    /// * `sender_device_id` - Device ID of the sender (from Olm decryption metadata)
-    /// * `key_b64` - Base64-encoded key bytes
-    /// * `key_index` - Key index (0-255)
-    /// * `member_id` - The `member_id` from the message content
-    /// * `room_id` - The `room_id` from the message content
-    pub async fn receive_key(
-        &self,
-        _sender_user_id: String,
-        _sender_device_id: String,
-        key_b64: String,
-        key_index: u8,
-        member_id: String,
-        _room_id: String,
-    ) -> Result<(), CommandError> {
-        // Verify the room_id matches our session
-        // (We could add this check if we want to be strict)
+    /// Keys that fail the MSC4143 checks are discarded, and keys whose member
+    /// event has not arrived yet are buffered together with their provenance so
+    /// they can be checked once it does — a key is never signalled to the
+    /// application before it has been verified.
+    pub async fn receive_key(&self, received: ReceivedEncryptionKey) -> Result<(), CommandError> {
+        if let Err(rejection) = self.verify_origin(&received) {
+            log::warn!(
+                "[{}:{}] Discarding key for member {}: {}",
+                self.room_id,
+                self.slot_id,
+                received.member_id,
+                rejection
+            );
+            return Ok(());
+        }
 
         let key_bytes = general_purpose::STANDARD
-            .decode(key_b64)
+            .decode(&received.key_b64)
             .map_err(|e| CommandError::SendError(format!("Failed to decode key: {}", e)))?;
 
         if key_bytes.len() != 32 {
@@ -903,31 +983,11 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             );
         }
 
-        let now = self.timestamp_ms();
-
-        // Check if key is outdated using the filter
-        let outdated = {
-            let mut guard = self.key_buffer.lock().unwrap();
-            guard.check_and_add(member_id.clone(), key_index, now)
-        };
-
-        if outdated {
-            log::info!(
-                "[{}:{}] Received outdated key from member {}, index {}, dropping",
-                self.room_id,
-                self.slot_id,
-                member_id,
-                key_index
-            );
-            return Ok(());
-        }
-
-        // Create the inbound key
         let inbound_key = InboundEncryptionKey {
             key: key_bytes,
-            key_index,
-            member_id: member_id.clone(),
-            creation_ts: now,
+            key_index: received.key_index,
+            member_id: received.member_id.clone(),
+            creation_ts: self.timestamp_ms(),
         };
 
         // Check if we know about this membership
@@ -935,28 +995,75 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             let guard = self.get_memberships.lock().unwrap();
             (guard)()
         };
-        let full_membership = known_memberships
+        let membership = known_memberships
             .iter()
-            .find(|m| m.member.id.as_deref() == Some(&member_id));
+            .find(|m| m.member_id == received.member_id);
 
-        if let Some(membership) = full_membership {
-            // We have the membership, add the key
-            self.add_key_to_participant(inbound_key, membership).await;
-        } else {
-            // No membership yet, buffer the key
-            log::debug!(
-                "[{}:{}] No matching RTC membership for key from member {}, buffering",
-                self.room_id,
-                self.slot_id,
-                member_id
-            );
-            self.keys_without_membership
-                .lock()
-                .unwrap()
-                .push(inbound_key);
+        match membership {
+            Some(membership) => {
+                self.accept_verified_key(inbound_key, &received.origin, membership)
+                    .await
+            }
+            None => {
+                log::debug!(
+                    "[{}:{}] No matching RTC membership for key from member {}, buffering",
+                    self.room_id,
+                    self.slot_id,
+                    received.member_id
+                );
+                self.keys_without_membership
+                    .lock()
+                    .unwrap()
+                    .push(PendingInboundKey {
+                        key: inbound_key,
+                        origin: received.origin,
+                    });
+            }
         }
 
         Ok(())
+    }
+
+    /// Verifies a key against its member event and, if it passes, stores and
+    /// signals it.
+    ///
+    /// The outdated-key filter is only consulted for keys that got this far, so
+    /// a rejected key cannot poison the filter and suppress the genuine key at
+    /// the same index.
+    async fn accept_verified_key(
+        &self,
+        key: InboundEncryptionKey,
+        origin: &KeyOrigin,
+        membership: &JoinedMembership,
+    ) {
+        if let Err(rejection) = Self::verify_against_membership(origin, membership) {
+            log::warn!(
+                "[{}:{}] Discarding key for member {}: {}",
+                self.room_id,
+                self.slot_id,
+                key.member_id,
+                rejection
+            );
+            return;
+        }
+
+        let outdated = {
+            let mut guard = self.key_buffer.lock().unwrap();
+            guard.check_and_add(key.member_id.clone(), key.key_index, key.creation_ts)
+        };
+
+        if outdated {
+            log::info!(
+                "[{}:{}] Received outdated key from member {}, index {}, dropping",
+                self.room_id,
+                self.slot_id,
+                key.member_id,
+                key.key_index
+            );
+            return;
+        }
+
+        self.add_key_to_participant(key, membership).await;
     }
 
     /// Adds a key to a participant.
@@ -972,16 +1079,10 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let rtc_backend_id = match &self.identity_mapper {
             Some(mapper) => mapper(
                 &membership.sender,
-                membership.member.claimed_device_id.as_deref().unwrap_or(""),
-                membership.member.id.as_deref().unwrap_or(""),
+                membership.origin.sender_device_id().unwrap_or(""),
+                &membership.member_id,
             ),
-            None => membership.member.id.clone().unwrap_or_else(|| {
-                format!(
-                    "{}:{}",
-                    membership.sender,
-                    membership.member.claimed_device_id.as_deref().unwrap_or("")
-                )
-            }),
+            None => membership.member_id.clone(),
         };
 
         // Store the key
@@ -1108,7 +1209,8 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 mod tests {
     use super::*;
     use crate::commands::{MockCommandSender, NoopCommandSender};
-    use crate::session::{JoinedMembership, MemberInfo};
+    use crate::event::EventOrigin;
+    use crate::session::JoinedMembership;
     use std::sync::Arc;
 
     const ROOM_ID: &str = "!room:example.org";
@@ -1122,17 +1224,26 @@ mod tests {
             room_id: ROOM_ID.to_string(),
             slot_id: SLOT_ID.to_string(),
             sender: "@bob:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("device456".to_string())),
             sticky_key: "bob-device456-uuid".to_string(),
+            member_id: "bob-device456-uuid".to_string(),
             application: Some("m.call".to_string()),
-            member: MemberInfo {
-                id: Some("bob-device456-uuid".to_string()),
-                claimed_device_id: Some("device456".to_string()),
-                claimed_user_id: Some("@bob:example.org".to_string()),
-            },
-            versions: vec!["v0".to_string()],
-            m_relates_to: None,
             transports: Vec::new(),
-            created_ts: Some(2000),
+            can_subscribe: Vec::new(),
+        }
+    }
+
+    fn bob_key(key: Vec<u8>, index: u8) -> ReceivedEncryptionKey {
+        ReceivedEncryptionKey {
+            origin: KeyOrigin::Encrypted {
+                sender_user_id: "@bob:example.org".to_string(),
+                sender_device_id: Some("device456".to_string()),
+                sender_is_cross_signed: true,
+            },
+            room_id: ROOM_ID.to_string(),
+            member_id: "bob-device456-uuid".to_string(),
+            key_b64: general_purpose::STANDARD.encode(key),
+            key_index: index,
         }
     }
 
@@ -1236,17 +1347,8 @@ mod tests {
             get_memberships,
         );
 
-        // Receive a key from Bob
-        let key_b64 = general_purpose::STANDARD.encode(vec![1u8; 32]);
         manager
-            .receive_key(
-                "@bob:example.org".to_string(),
-                "device456".to_string(),
-                key_b64,
-                0,
-                "bob-device456-uuid".to_string(),
-                ROOM_ID.to_string(),
-            )
+            .receive_key(bob_key(vec![1u8; 32], 0))
             .await
             .expect("receive_key should succeed");
 
@@ -1272,31 +1374,14 @@ mod tests {
             get_memberships,
         );
 
-        // Receive a key with index 1 and ts=2000
-        let key_b64 = general_purpose::STANDARD.encode(vec![1u8; 32]);
         manager
-            .receive_key(
-                "@bob:example.org".to_string(),
-                "device456".to_string(),
-                key_b64,
-                1,
-                "bob-device456-uuid".to_string(),
-                ROOM_ID.to_string(),
-            )
+            .receive_key(bob_key(vec![1u8; 32], 1))
             .await
             .expect("receive_key should succeed");
 
-        // Try to receive an older key with index 1 and ts=1000 (should be dropped)
-        let old_key_b64 = general_purpose::STANDARD.encode(vec![2u8; 32]);
+        // A second key at the same index, no newer than the first, is outdated.
         manager
-            .receive_key(
-                "@bob:example.org".to_string(),
-                "device456".to_string(),
-                old_key_b64,
-                1,
-                "bob-device456-uuid".to_string(),
-                ROOM_ID.to_string(),
-            )
+            .receive_key(bob_key(vec![2u8; 32], 1))
             .await
             .expect("receive_key should succeed");
 
@@ -1305,6 +1390,275 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key_index, 1);
         assert_eq!(keys[0].key, vec![1u8; 32]);
+    }
+
+    /// Helper: a manager with Bob joined, using the default (strict) config.
+    fn manager_with_bob() -> EncryptionManager<NoopCommandSender> {
+        EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![bob_membership()]),
+        )
+    }
+
+    async fn assert_discarded(
+        manager: &EncryptionManager<NoopCommandSender>,
+        key: ReceivedEncryptionKey,
+    ) {
+        let member_id = key.member_id.clone();
+        manager
+            .receive_key(key)
+            .await
+            .expect("a discarded key is not an error");
+        assert!(
+            manager.get_inbound_keys(&member_id).is_empty(),
+            "key should have been discarded"
+        );
+    }
+
+    /// MSC4143: "clients SHOULD discard any m.rtc.encryption_key events that
+    /// were sent in cleartext" — an unencrypted message has no authenticated
+    /// sender, so nothing can be checked against the member event.
+    #[tokio::test]
+    async fn cleartext_key_is_discarded() {
+        let manager = manager_with_bob();
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.origin = KeyOrigin::Cleartext;
+        assert_discarded(&manager, key).await;
+    }
+
+    /// MSC4143 MUST: the to-device sender has to match the sender of the member
+    /// event it claims. Otherwise any room member could publish keys as anyone.
+    #[tokio::test]
+    async fn key_from_wrong_user_is_discarded() {
+        let manager = manager_with_bob();
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@mallory:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
+            sender_is_cross_signed: true,
+        };
+        assert_discarded(&manager, key).await;
+    }
+
+    /// MSC4143 MUST: same for the device — another of Bob's own devices cannot
+    /// speak for the device that published the membership.
+    #[tokio::test]
+    async fn key_from_wrong_device_is_discarded() {
+        let manager = manager_with_bob();
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@bob:example.org".to_string(),
+            sender_device_id: Some("someOtherDevice".to_string()),
+            sender_is_cross_signed: true,
+        };
+        assert_discarded(&manager, key).await;
+    }
+
+    /// A member event that was encrypted but could not be attributed to a device
+    /// gives nothing to bind the key to, so the MSC4143 device match cannot be
+    /// satisfied. Accepting anyway would downgrade it to a user-only check,
+    /// which any of that user's devices could then pass.
+    #[tokio::test]
+    async fn key_is_discarded_when_the_member_event_has_no_attributable_device() {
+        let unattributable = JoinedMembership {
+            origin: EventOrigin::encrypted(None),
+            ..bob_membership()
+        };
+        let manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![unattributable]),
+        );
+
+        assert_discarded(&manager, bob_key(vec![1u8; 32], 0)).await;
+    }
+
+    /// Same for a member event known to have arrived in the clear.
+    #[tokio::test]
+    async fn key_is_discarded_when_the_member_event_was_cleartext() {
+        let cleartext = JoinedMembership {
+            origin: EventOrigin::Cleartext,
+            ..bob_membership()
+        };
+        let manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![cleartext]),
+        );
+
+        assert_discarded(&manager, bob_key(vec![1u8; 32], 0)).await;
+    }
+
+    /// But an unreported origin is not an accusation: hosts that do not supply
+    /// decryption metadata keep working, as everywhere else in the design.
+    #[tokio::test]
+    async fn key_is_accepted_when_the_member_events_origin_is_unreported() {
+        let unreported = JoinedMembership {
+            origin: EventOrigin::Unknown,
+            ..bob_membership()
+        };
+        let manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![unreported]),
+        );
+
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 0))
+            .await
+            .expect("should succeed");
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
+    }
+
+    /// MSC4153: keys from devices that are not cross-signed are discarded when
+    /// the client is configured to exclude insecure devices.
+    #[tokio::test]
+    async fn key_from_non_cross_signed_device_is_discarded_when_required() {
+        let manager = manager_with_bob();
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@bob:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
+            sender_is_cross_signed: false,
+        };
+        assert_discarded(&manager, key).await;
+    }
+
+    /// ...and accepted when the deployment has opted out of that requirement.
+    #[tokio::test]
+    async fn key_from_non_cross_signed_device_is_accepted_when_not_required() {
+        let mut manager = manager_with_bob();
+        manager.set_config(EncryptionConfig {
+            require_cross_signed_sender: false,
+            ..EncryptionConfig::default()
+        });
+
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@bob:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
+            sender_is_cross_signed: false,
+        };
+        manager.receive_key(key).await.expect("should succeed");
+
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
+    }
+
+    /// The manager fans keys out to every session in a room, so a key naming a
+    /// different room is not ours to hold.
+    #[tokio::test]
+    async fn key_for_another_room_is_discarded() {
+        let manager = manager_with_bob();
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.room_id = "!other:example.org".to_string();
+        assert_discarded(&manager, key).await;
+    }
+
+    /// A key arriving before its member event is held, then verified once the
+    /// membership shows up — the check cannot simply be skipped for these.
+    #[tokio::test]
+    async fn buffered_key_is_verified_when_membership_arrives() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let manager = {
+            let memberships = memberships.clone();
+            EncryptionManager::new(
+                Arc::new(NoopCommandSender),
+                USER_ID.to_string(),
+                DEVICE_ID.to_string(),
+                MEMBER_ID.to_string(),
+                ROOM_ID.to_string(),
+                SLOT_ID.to_string(),
+                move || memberships.lock().unwrap().clone(),
+            )
+        };
+
+        // Two keys claiming Bob's membership: one genuinely from Bob's device,
+        // one from an impostor. Neither can be checked yet.
+        let mut impostor = bob_key(vec![9u8; 32], 0);
+        impostor.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@mallory:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
+            sender_is_cross_signed: true,
+        };
+        manager.receive_key(impostor).await.unwrap();
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 1))
+            .await
+            .unwrap();
+        assert!(manager.get_inbound_keys("bob-device456-uuid").is_empty());
+
+        // Bob's membership arrives; the buffer is drained and checked.
+        *memberships.lock().unwrap() = vec![bob_membership()];
+        manager.on_memberships_update().await.unwrap();
+
+        let keys = manager.get_inbound_keys("bob-device456-uuid");
+        assert_eq!(keys.len(), 1, "only the genuine key should survive");
+        assert_eq!(keys[0].key, vec![1u8; 32]);
+    }
+
+    /// A discarded key must not occupy its (member, index) slot in the
+    /// outdated-key filter, or an impostor could suppress the genuine key.
+    #[tokio::test]
+    async fn discarded_key_does_not_block_the_genuine_one() {
+        let manager = manager_with_bob();
+
+        let mut impostor = bob_key(vec![9u8; 32], 0);
+        impostor.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@mallory:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
+            sender_is_cross_signed: true,
+        };
+        manager.receive_key(impostor).await.unwrap();
+
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 0))
+            .await
+            .unwrap();
+
+        let keys = manager.get_inbound_keys("bob-device456-uuid");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, vec![1u8; 32]);
+    }
+
+    /// The to-device payload states its encoding in `format`, which MSC4143
+    /// defines as a number; `0` is raw bytes, base64 encoded.
+    #[tokio::test]
+    async fn distributed_key_declares_msc4143_format() {
+        let sender = Arc::new(MockCommandSender::new());
+        let manager = EncryptionManager::new(
+            sender.clone(),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            create_mock_get_memberships(vec![bob_membership()]),
+        );
+
+        manager.join().await.unwrap();
+        manager.on_memberships_update().await.unwrap();
+
+        let messages = sender.to_device_messages.lock().unwrap();
+        let (_, _, _, content) = messages.first().expect("a key should have been sent");
+        assert_eq!(content.get("format").and_then(|v| v.as_u64()), Some(0));
+        assert!(content.get("version").is_none());
     }
 
     #[tokio::test]
