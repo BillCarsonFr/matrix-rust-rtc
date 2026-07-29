@@ -45,7 +45,7 @@ pub use event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     StickyEventsUpdate,
 };
-pub use join::{JoinSessionParams, LeaveSessionParams, generate_member_id};
+pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
 pub use manager::RtcSessionManager;
 pub use own_membership::{
     KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
@@ -547,6 +547,105 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// A member that only receives — a recorder, say — is a valid participant
+    /// under MSC4143: `transports` carries no REQUIRED marker, so publishing
+    /// nothing is a legitimate choice rather than a broken join.
+    #[tokio::test]
+    async fn a_receive_only_member_joins_and_publishes_nothing() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+
+        let params = JoinSessionParams::with_transport_intent(
+            "@recorder:example.org".to_owned(),
+            "RECORDERDEV".to_owned(),
+            ROOM_ID.to_owned(),
+            "m.call#ROOM".to_owned(),
+            "m.call".to_owned(),
+            TransportIntent::ReceiveOnly {
+                can_subscribe: vec!["livekit".to_owned()],
+            },
+        );
+        manager.join(params).await.expect("join should succeed");
+
+        let sticky = sender.sticky_events.lock().unwrap();
+        let (_, _, content) = sticky.first().expect("a join should have been sent");
+
+        // Nothing published, but peers are still told what it can receive on,
+        // so they pick a transport it can actually hear.
+        assert!(content.pointer("/transports/published/0").is_none());
+        assert_eq!(
+            content
+                .pointer("/transports/can_subscribe/0")
+                .and_then(|v| v.as_str()),
+            Some("livekit")
+        );
+        assert_eq!(
+            content
+                .pointer("/member/membership")
+                .and_then(|v| v.as_str()),
+            Some("join")
+        );
+    }
+
+    /// Stating nothing at all is legal too; the object is then omitted entirely
+    /// rather than emitted empty.
+    #[tokio::test]
+    async fn a_receive_only_member_with_no_cue_omits_transports() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+
+        let params = JoinSessionParams::with_transport_intent(
+            "@recorder:example.org".to_owned(),
+            "RECORDERDEV".to_owned(),
+            ROOM_ID.to_owned(),
+            "m.call#ROOM".to_owned(),
+            "m.call".to_owned(),
+            TransportIntent::ReceiveOnly {
+                can_subscribe: Vec::new(),
+            },
+        );
+        manager.join(params).await.expect("join should succeed");
+
+        let sticky = sender.sticky_events.lock().unwrap();
+        let (_, _, content) = sticky.first().expect("a join should have been sent");
+        assert!(content.get("transports").is_none());
+    }
+
+    /// A publishing member advertises the transport the application chose, and
+    /// declares it can receive on that type too.
+    #[tokio::test]
+    async fn a_publishing_member_advertises_its_transport() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+
+        let params = JoinSessionParams::new(
+            "@alice:example.org".to_owned(),
+            "ALICEDEV".to_owned(),
+            ROOM_ID.to_owned(),
+            "m.call#ROOM".to_owned(),
+            "m.call".to_owned(),
+            RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://sfu.example.com/jwt".to_owned(),
+            }),
+        );
+        manager.join(params).await.expect("join should succeed");
+
+        let sticky = sender.sticky_events.lock().unwrap();
+        let (_, _, content) = sticky.first().expect("a join should have been sent");
+        assert_eq!(
+            content
+                .pointer("/transports/published/0/livekit_service_url")
+                .and_then(|v| v.as_str()),
+            Some("https://sfu.example.com/jwt")
+        );
+        assert_eq!(
+            content
+                .pointer("/transports/can_subscribe/0")
+                .and_then(|v| v.as_str()),
+            Some("livekit")
+        );
     }
 
     #[test]

@@ -31,10 +31,10 @@ use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::EventOrigin;
-use crate::join::{JoinSessionParams, LeaveSessionParams};
+use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
 use crate::own_membership::{OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
-use crate::transport::RtcTransport;
+use crate::transport::{MemberTransports, RtcTransport};
 
 #[allow(unused_imports)]
 use log::*;
@@ -233,8 +233,16 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             return Err(JoinError::AlreadyJoined(membership_id));
         }
 
-        // Create the own membership machine
-        let transport_json = transport_to_json(&params.transport);
+        let transports = match &params.transport {
+            TransportIntent::Publish(transport) => MemberTransports::publishing(
+                serde_json::from_value(transport_to_json(transport))
+                    .expect("a transport always serializes to an object with a type"),
+            ),
+            TransportIntent::ReceiveOnly { can_subscribe } => MemberTransports {
+                published: Vec::new(),
+                can_subscribe: can_subscribe.clone(),
+            },
+        };
         let machine = OwnMembershipMachine::new(
             command_sender.clone(),
             params.room_id.clone(),
@@ -245,7 +253,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        machine.join(Some(transport_json)).await?;
+        machine.join(transports).await?;
 
         // Store the machine
         self.own_membership_machine = Some(machine);

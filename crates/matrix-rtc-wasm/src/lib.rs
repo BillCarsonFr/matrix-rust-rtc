@@ -249,7 +249,14 @@ pub struct WasmJoinSessionParams {
     pub room_id: String,
     pub slot_id: String,
     pub application: String,
-    pub transport: WasmTransportConfig,
+    /// The transport to publish on. Omit to join without publishing — valid per
+    /// MSC4143, and what a recorder or other observer wants.
+    #[serde(default)]
+    pub transport: Option<WasmTransportConfig>,
+    /// Transport types this member can receive on. Only read when `transport`
+    /// is omitted; a publishing member advertises its own transport's type.
+    #[serde(default)]
+    pub can_subscribe: Vec<String>,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -297,7 +304,7 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
 
 impl WasmJoinSessionParams {
     pub fn into_core(self) -> Result<JoinSessionParams, JsError> {
-        let transport = self.transport.into_core()?;
+        let transport = self.transport.map(|t| t.into_core()).transpose()?;
         let encryption_config = self.encryption_config.map(Into::into);
         Ok(JoinSessionParams {
             user_id: self.user_id,
@@ -306,7 +313,12 @@ impl WasmJoinSessionParams {
             room_id: self.room_id,
             slot_id: self.slot_id,
             application: self.application,
-            transport,
+            transport: match transport {
+                Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport),
+                None => matrix_rtc_core::TransportIntent::ReceiveOnly {
+                    can_subscribe: self.can_subscribe,
+                },
+            },
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             encryption_config,
         })

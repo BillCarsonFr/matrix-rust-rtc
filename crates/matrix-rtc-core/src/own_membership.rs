@@ -37,7 +37,7 @@ use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
 use crate::event::RawStickyEventContent;
 use crate::session::{LeaveCode, LeaveReason};
-use crate::transport::{RawRtcTransport, RtcTransport};
+use crate::transport::{MemberTransports, RtcTransport};
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
@@ -212,16 +212,13 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     ///
     /// # Arguments
     ///
-    /// * `transport_json` - Optional JSON representing the transport configuration
+    /// * `transports` - The `transports` object to publish for this member
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if both the delayed leave and join were scheduled/sent successfully.
     /// Returns an error if either operation fails.
-    pub async fn join(
-        &self,
-        transport_json: Option<serde_json::Value>,
-    ) -> Result<(), CommandError> {
+    pub async fn join(&self, transports: MemberTransports) -> Result<(), CommandError> {
         let room_id = self.room_id.clone();
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
@@ -268,7 +265,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         // Step 2: Send join membership event
         // **Only sent after delayed leave is confirmed scheduled.**
         let join_content =
-            self.build_join_content(&slot_id, &sticky_key, &application_type, transport_json);
+            self.build_join_content(&slot_id, &sticky_key, &application_type, transports);
 
         log::info!(
             "[{}] Sending join membership event (step 2 of dead man's switch)",
@@ -313,24 +310,18 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
     /// Builds MSC4143-compliant content for a join membership event.
     ///
-    /// The `transport_json` comes pre-serialized from `transport_to_json()`; it is parsed
-    /// back into the typed `RawRtcTransport` (a lossless round-trip) so the whole content
-    /// is built from the single shared `RawStickyEventContent` type.
     fn build_join_content(
         &self,
         slot_id: &str,
         sticky_key: &str,
         application_type: &str,
-        transport_json: Option<Value>,
+        transports: MemberTransports,
     ) -> Value {
-        let published =
-            transport_json.and_then(|v| serde_json::from_value::<RawRtcTransport>(v).ok());
-
         let content = RawStickyEventContent::for_join(
             slot_id.to_string(),
             sticky_key.to_string(),
             application_type.to_string(),
-            published,
+            transports,
         );
         serde_json::to_value(content).expect("m.rtc.member content is always serializable")
     }
@@ -492,6 +483,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 mod tests {
     use super::*;
     use crate::commands::{MockCommandSender, NoopCommandSender};
+    use crate::transport::RawRtcTransport;
 
     const APPLICATION_TYPE: &str = "m.call";
 
@@ -559,7 +551,10 @@ mod tests {
             APPLICATION_TYPE.to_string(),
         );
 
-        machine.join(None).await.expect("join should succeed");
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
 
         // Check that delayed events were scheduled
         let delayed_events = mock_sender.delayed_events.lock().unwrap();
@@ -598,7 +593,10 @@ mod tests {
             APPLICATION_TYPE.to_string(),
         );
 
-        machine.join(None).await.expect("join should succeed");
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
 
         // Check that sticky events were sent
         let sticky_events = mock_sender.sticky_events.lock().unwrap();
@@ -625,15 +623,17 @@ mod tests {
             APPLICATION_TYPE.to_string(),
         );
 
-        let transport = json!({
-            "type": "livekit",
-            "livekit_service_url": "https://example.com"
+        let transport = MemberTransports::publishing(RawRtcTransport {
+            transport_type: "livekit".to_owned(),
+            extra_fields: [(
+                "livekit_service_url".to_owned(),
+                serde_json::Value::String("https://example.com".to_owned()),
+            )]
+            .into_iter()
+            .collect(),
         });
 
-        machine
-            .join(Some(transport))
-            .await
-            .expect("join should succeed");
+        machine.join(transport).await.expect("join should succeed");
 
         // Check that the join event includes the transport
         let sticky_events = mock_sender.sticky_events.lock().unwrap();
@@ -709,7 +709,10 @@ mod tests {
         );
 
         // Join to start the initial delayed leave
-        machine.join(None).await.expect("join should succeed");
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
 
         // Get initial delayed event count
         let initial_count = {
@@ -750,7 +753,7 @@ mod tests {
     async fn test_join_and_delayed_leave_use_unstable_sticky_key() {
         let mock_sender = Arc::new(MockCommandSender::new());
         test_machine(mock_sender.clone())
-            .join(None)
+            .join(MemberTransports::default())
             .await
             .expect("join should succeed");
 

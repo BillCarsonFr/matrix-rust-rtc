@@ -54,9 +54,11 @@ use std::time::Duration;
 use livekit::{RoomEvent, track::RemoteTrack};
 use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
 use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
+use matrix_sdk::ruma::api::client::rtc::transports::v1 as rtc_transports;
 use matrix_sdk::ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
+use matrix_sdk::ruma::events::rtc::transport::RtcTransport as RumaRtcTransport;
 use matrix_sdk::ruma::events::{AnyToDeviceEvent, InitialStateEvent};
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
@@ -180,6 +182,47 @@ async fn create_encrypted_room(
     Ok(room.room_id().to_owned())
 }
 
+/// Ask the homeserver which RTC transports it offers, and take the LiveKit one.
+///
+/// Discovery is the application's job, not the SDK's: `matrix-rtc-core` takes
+/// whichever transport it is handed. MSC4143 returns them in descending order of
+/// preference, so the first LiveKit entry wins.
+///
+/// Falls back to `LIVEKIT_SERVICE_URL` when the homeserver does not implement
+/// the endpoint yet, which keeps this runnable against older backends.
+async fn discover_livekit_transport(
+    client: &Client,
+    fallback_url: &str,
+) -> Result<LiveKitTransport, Box<dyn Error>> {
+    match client.send(rtc_transports::Request::new()).await {
+        Ok(response) => {
+            for transport in response.rtc_transports {
+                if let RumaRtcTransport::LiveKit(livekit) = transport {
+                    println!(
+                        "[discovery] homeserver offers livekit at {}",
+                        livekit.service_url
+                    );
+                    return Ok(LiveKitTransport {
+                        livekit_service_url: livekit.service_url,
+                    });
+                }
+            }
+            println!(
+                "[discovery] homeserver advertises no livekit transport; using the configured URL"
+            );
+        }
+        Err(error) => {
+            println!(
+                "[discovery] transports endpoint unavailable ({error}); using the configured URL"
+            );
+        }
+    }
+
+    Ok(LiveKitTransport {
+        livekit_service_url: fallback_url.to_owned(),
+    })
+}
+
 /// Join the RTC session for an already-synced client that is a joined member of
 /// `room`: publishes our own membership sticky + arms the dead man's switch
 /// delayed leave, then exchanges a token and connects to the SFU.
@@ -225,15 +268,14 @@ async fn join_rtc(
     // derived from the (stable) user and device IDs.
     let membership_id = generate_member_id();
     let own_identity = pseudonymous_identity(&user_id, &device_id, &membership_id);
+    let livekit = discover_livekit_transport(&client, &cfg.livekit_service_url).await?;
     let mut params = JoinSessionParams::new(
         user_id.clone(),
         device_id.clone(),
         room_id.to_owned(),
         cfg.slot_id.clone(),
         "m.call".to_owned(),
-        RtcTransport::LiveKit(LiveKitTransport {
-            livekit_service_url: cfg.livekit_service_url.clone(),
-        }),
+        RtcTransport::LiveKit(livekit.clone()),
     );
     params.membership_id = Some(membership_id.clone());
     // The two clients here are throwaway logins with no cross-signing set up, so
@@ -299,7 +341,7 @@ async fn join_rtc(
         .danger_accept_invalid_certs(cfg.insecure_tls)
         .build()?;
     let lk_config = LiveKitTransportConfig {
-        livekit_service_url: cfg.livekit_service_url.clone(),
+        livekit_service_url: livekit.livekit_service_url.clone(),
         room_id: room_id.to_owned(),
         slot_id: cfg.slot_id.clone(),
         member: MemberClaims {

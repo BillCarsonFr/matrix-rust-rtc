@@ -27,7 +27,7 @@ use crate::session::{
     ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveReason, LeftMembership,
     MemberInfo, Membership,
 };
-use crate::transport::{MemberTransports, RawRtcTransport};
+use crate::transport::MemberTransports;
 use thiserror::Error;
 
 /// How an event reached us, and what its decryption metadata says.
@@ -275,7 +275,7 @@ impl RawStickyEventContent {
         slot_id: String,
         member_id: String,
         application_type: String,
-        published: Option<RawRtcTransport>,
+        transports: MemberTransports,
     ) -> Self {
         Self {
             slot_id,
@@ -288,7 +288,9 @@ impl RawStickyEventContent {
                 membership: Some(Membership::Join),
             },
             sticky_key: member_id,
-            transports: published.map(MemberTransports::publishing),
+            // Skipped entirely when this member neither publishes nor states
+            // anything it can receive.
+            transports: (!transports.is_empty()).then_some(transports),
             leave_reason: None,
         }
     }
@@ -320,6 +322,7 @@ impl RawStickyEventContent {
 mod tests {
     use super::*;
     use crate::session::LeaveCode;
+    use crate::transport::RawRtcTransport;
     use crate::transport::RtcTransport;
 
     /// A spec-shaped join event as another client would send it on the wire.
@@ -478,7 +481,7 @@ mod tests {
             "m.call#ROOM".to_owned(),
             "xyzABCDEF0123".to_owned(),
             "m.call".to_owned(),
-            Some(RawRtcTransport {
+            MemberTransports::publishing(RawRtcTransport {
                 transport_type: "livekit".to_owned(),
                 extra_fields: Default::default(),
             }),

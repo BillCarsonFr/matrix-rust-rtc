@@ -44,6 +44,32 @@ pub fn generate_member_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// What a joining member intends to do with transports.
+///
+/// Which transport to publish on is the application's decision — discovering
+/// what the homeserver offers (`GET /_matrix/client/v1/rtc/transports`) and
+/// choosing among them happens above this crate, and the result is passed in
+/// here.
+///
+/// MSC4143 does not require a member to publish anything — `transports` carries
+/// no REQUIRED marker — so a member that only receives, such as a recorder, is
+/// a valid participant rather than a degraded one.
+#[derive(Clone, Debug)]
+pub enum TransportIntent {
+    /// Publish on this transport.
+    Publish(RtcTransport),
+
+    /// Never publish; only receive. Suits a recorder or any other observer.
+    ///
+    /// `can_subscribe` is what other members use to pick a transport this one
+    /// can actually receive on, so stating it matters even though nothing is
+    /// published. An empty list is legal but leaves peers without that cue.
+    ReceiveOnly {
+        /// Transport types this member can receive on.
+        can_subscribe: Vec<String>,
+    },
+}
+
 /// Parameters for joining an RTC session.
 ///
 /// Contains all the information needed to construct and send a membership event
@@ -74,8 +100,8 @@ pub struct JoinSessionParams {
     /// The application type, usually "m.call".
     pub application: String,
 
-    /// The RTC transport to use for this session.
-    pub transport: RtcTransport,
+    /// What this member does with transports.
+    pub transport: TransportIntent,
 
     /// Keep-alive timeout in milliseconds.
     ///
@@ -99,6 +125,28 @@ impl JoinSessionParams {
         slot_id: String,
         application: String,
         transport: RtcTransport,
+    ) -> Self {
+        Self {
+            user_id,
+            device_id,
+            membership_id: None,
+            room_id,
+            slot_id,
+            application,
+            transport: TransportIntent::Publish(transport),
+            keep_alive_timeout_ms: None,
+            encryption_config: None,
+        }
+    }
+
+    /// Creates join parameters with the given transport intent.
+    pub fn with_transport_intent(
+        user_id: String,
+        device_id: String,
+        room_id: String,
+        slot_id: String,
+        application: String,
+        transport: TransportIntent,
     ) -> Self {
         Self {
             user_id,

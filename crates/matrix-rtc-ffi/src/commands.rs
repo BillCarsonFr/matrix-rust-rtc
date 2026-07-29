@@ -87,8 +87,12 @@ pub struct FfiJoinSessionParams {
     pub slot_id: String,
     /// Application type (e.g., "m.call")
     pub application: String,
-    /// Transport configuration
-    pub transport: FfiTransportConfig,
+    /// The transport to publish on. `None` joins without publishing — valid per
+    /// MSC4143, and what a recorder or other observer wants.
+    pub transport: Option<FfiTransportConfig>,
+    /// Transport types this member can receive on. Only read when `transport`
+    /// is `None`; a publishing member advertises its own transport's type.
+    pub can_subscribe: Vec<String>,
     /// Optional keep-alive timeout in milliseconds (default: 30000)
     pub keep_alive_timeout_ms: Option<u64>,
     /// Optional encryption configuration
@@ -150,7 +154,12 @@ impl FfiJoinSessionParams {
     pub fn into_core(
         self,
     ) -> Result<matrix_rtc_core::JoinSessionParams, matrix_rtc_core::CommandError> {
-        let transport = self.transport.into_core()?;
+        let transport = match self.transport {
+            Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport.into_core()?),
+            None => matrix_rtc_core::TransportIntent::ReceiveOnly {
+                can_subscribe: self.can_subscribe,
+            },
+        };
         let encryption_config = self.encryption_config.map(Into::into);
         Ok(matrix_rtc_core::JoinSessionParams {
             user_id: self.user_id,

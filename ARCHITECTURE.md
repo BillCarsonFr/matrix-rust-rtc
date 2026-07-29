@@ -188,14 +188,33 @@ type makes that unrepresentable. `EventOrigin::Unknown` is distinct from
 than failed. The flat `sender_device_id` / `was_encrypted` pair survives only in
 the wasm and FFI wire records, which converge into the enum at the boundary.
 
-Still outstanding, in the order they are planned:
+### Transports and who chooses them
 
-1. **Transport discovery** — `GET /_matrix/client/v1/rtc/transports` is not
-   implemented; LiveKit URLs come from configuration.
-2. **Prompt reaction to slot changes** — the LiveKit bridge re-reads room state
+Transport discovery is deliberately **not** in the core. Which transport to
+publish on is an application decision: the app calls
+`GET /_matrix/client/v1/rtc/transports` itself and passes the result into
+`join`. The core has no HTTP of its own, and adding a fetch would have meant
+every host implementing one whose result it then handed back to itself.
+`examples/e2e_call.rs` shows the pattern, using ruma's
+`api::client::rtc::transports` endpoint and falling back to a configured URL
+where the homeserver has not implemented it.
+
+What the core does model is the *intent*, via `TransportIntent`:
+
+- `Publish(transport)` — publish on this transport, and advertise its type as
+  `can_subscribe`.
+- `ReceiveOnly { can_subscribe }` — publish nothing. MSC4143 puts no REQUIRED
+  marker on `transports`, so a member that only receives — a recorder, an
+  observer — is a valid participant rather than a broken one. Stating
+  `can_subscribe` still matters, since that is what tells other members which
+  transport to publish on so this one can hear them.
+
+Still outstanding:
+
+1. **Prompt reaction to slot changes** — the LiveKit bridge re-reads room state
    on sticky-event ticks, so a slot closing in an otherwise idle room is noticed
    late. A room-state subscription would fix it.
-3. **Mid-session renegotiation** — a slot that changes its encryption mechanism
+2. **Mid-session renegotiation** — a slot that changes its encryption mechanism
    while a session is live keeps the mechanism negotiated at join.
 
 ## Non-goals in this first skeleton
