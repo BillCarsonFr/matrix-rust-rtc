@@ -152,10 +152,6 @@ END-TO-END TEST PASSED (with per-participant frame E2EE)
 - Media is **subscribe-only on the receiver** (only `alice` publishes; `bob`
   records). Frame E2EE is now enabled in both directions, but only `alice→bob`
   media is exercised.
-- Key distribution uses `CollectStrategy::AllDevices` (sends to every device
-  regardless of verification state) because the throwaway logins have no
-  cross-signing set up. A production integration should prefer
-  `IdentityBasedStrategy` (MSC4153).
 - `receive_encryption_key` fans a received key out to every session in the room
   (the MSC4143 key content carries no `slot_id`); exact for one slot per room.
 - The dead-man's-switch delayed leave is a *plain* (non-sticky) delayed event, so

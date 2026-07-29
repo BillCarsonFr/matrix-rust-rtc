@@ -95,9 +95,11 @@ cargo run -p matrix-rtc-livekit --example join_and_record --features matrix-sdk,
 ```
 
 (Register the users and create the room as described in the
-[`demo/backend` README](../../demo/backend/README.md). Note the example
-disables the MSC4153 cross-signing requirement because dev-stack users have no
-cross-signing — production clients must keep the core's default.)
+[`demo/backend` README](../../demo/backend/README.md). The MSC4153
+cross-signing requirement stays at the core's default: each user's first run
+bootstraps cross-signing and prints a **recovery key**, and since every run
+logs in a fresh device, subsequent runs need that key passed as
+`RECOVERY_KEY=...` so the new device gets cross-signed.)
 
 ## Module map
 
