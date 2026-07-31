@@ -80,7 +80,13 @@ pub struct RtcSession<T: RtcCommandSender> {
     /// Command sender for sending events to the Matrix room.
     command_sender: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
-    own_membership_machine: Option<OwnMembershipMachine<T>>,
+    ///
+    /// Held behind an `Arc` so callers can take a handle out (see
+    /// [`Self::own_membership_handle`]) and drive the heartbeat without holding
+    /// the session — the beat performs a network round trip, and blocking every
+    /// other session operation (including `leave`) for its duration is how a
+    /// rate-limited homeserver turns into a stuck call.
+    own_membership_machine: Option<Arc<OwnMembershipMachine<T>>>,
     /// Encryption manager for key distribution and management.
     encryption_manager: Option<EncryptionManager<T>>,
 }
@@ -95,7 +101,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             room_encryption: self.room_encryption,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             command_sender: self.command_sender.clone(),
-            own_membership_machine: None, // Don't clone the machine - it's not cloneable
+            own_membership_machine: None, // A clone must not co-own our live membership
             encryption_manager: None,     // Don't clone the encryption manager
         }
     }
@@ -256,7 +262,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         machine.join(transports).await?;
 
         // Store the machine
-        self.own_membership_machine = Some(machine);
+        self.own_membership_machine = Some(Arc::new(machine));
 
         // Create the encryption manager
         // We need a closure that can access self.members
@@ -339,6 +345,10 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     ///
     /// Returns `true` if the heartbeat was processed successfully.
     /// Returns `false` if not joined (no membership machine active).
+    ///
+    /// Prefer [`Self::own_membership_handle`] when the session is reached
+    /// through a lock: this method holds `&mut self` across the beat's network
+    /// round trip.
     pub async fn heartbeat(&mut self) -> bool {
         if let Some(machine) = self.own_membership_machine.as_ref() {
             machine.heartbeat().await;
@@ -346,6 +356,15 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         } else {
             false
         }
+    }
+
+    /// A handle to our own-membership machine, if this session has joined.
+    ///
+    /// Lets a caller that reached the session through a mutex release it before
+    /// awaiting [`OwnMembershipMachine::heartbeat`], so the keep-alive's HTTP
+    /// round trip does not serialise with the rest of the session's work.
+    pub fn own_membership_handle(&self) -> Option<Arc<OwnMembershipMachine<T>>> {
+        self.own_membership_machine.clone()
     }
 
     /// Returns the number of currently tracked joined members.

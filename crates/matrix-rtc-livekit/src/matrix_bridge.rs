@@ -30,26 +30,29 @@
 //! Requires the `matrix-sdk` feature.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use matrix_sdk::config::RequestConfig;
 use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, update_delayed_event,
 };
-use matrix_sdk::ruma::api::client::state::get_state_events;
+use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
 use matrix_sdk::ruma::events::{
-    AnyMessageLikeEventContent, AnyToDeviceEventContent, MessageLikeEventType, StateEventType,
+    AnyMessageLikeEventContent, AnyStateEventContent, AnyToDeviceEventContent,
+    MessageLikeEventType, StateEventType,
 };
 use matrix_sdk::ruma::serde::Raw;
-use matrix_sdk::ruma::{DeviceId, RoomId, TransactionId, UserId};
-use matrix_sdk::{Client, Room, RoomMemberships};
+use matrix_sdk::ruma::{DeviceId, OwnedDeviceId, OwnedUserId, RoomId, TransactionId, UserId};
+use matrix_sdk::{Client, Room, RoomMemberships, RoomState};
 use matrix_sdk_base::crypto::CollectStrategy;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use matrix_rtc_core::{
     CommandError, EventOrigin, RawSlotEvent, RawSlotEventContent, RawStickyEvent,
@@ -66,8 +69,71 @@ use matrix_rtc_core::{
 /// expiring; making the delayed leave itself sticky is a follow-up.
 const STICKY_DURATION_MS: u32 = 60 * 60 * 1000;
 
+/// Hard wall-clock cap on one keep-alive command.
+///
+/// [`keepalive_request_config`] bounds the SDK's retrying, with one gap it cannot
+/// close: when a homeserver answers `M_LIMIT_EXCEEDED` with an explicit
+/// `retry_after`, the SDK honours that value verbatim, above any configured
+/// backoff cap. A 60-second `retry_after` on a heartbeat is a disconnection, so
+/// the whole command gets a deadline comfortably inside the keep-alive timeout
+/// (`matrix_rtc_core::DEFAULT_KEEP_ALIVE_TIMEOUT_MS`, 30 s). Giving up early
+/// leaves the *existing* delayed leave in place and the next beat 15 s later
+/// tries again, which is strictly better than blocking past the deadline.
+const KEEPALIVE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Minimum gap between two full room-state fetches in [`run_sticky_bridge`].
+///
+/// Membership churn broadcasts once per sticky event, and each tick costs a
+/// `GET /rooms/{id}/state` plus a member read. A mass join would fire N of them
+/// back to back and rate-limit the very session it is trying to track, so ticks
+/// arriving inside this window are coalesced into one fetch.
+const ROOM_STATE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 fn command_error(error: impl std::fmt::Display) -> CommandError {
     CommandError::from_message(error.to_string())
+}
+
+/// Request policy for the bridge's ordinary traffic: member stickies, slot state
+/// writes, room-state reads.
+///
+/// The SDK's default is a poor fit for RTC signalling in both directions. With
+/// `retry_limit: None` it retries transient failures (429 / 5xx) for up to
+/// fifteen minutes, long after the call has moved on — *and* it declines to
+/// retry plain network errors at all, because the network-failure arm is only
+/// armed when a retry limit is set. Setting one fixes both halves: a dropped
+/// connection is retried, and the transient budget is bounded.
+fn rtc_request_config() -> RequestConfig {
+    RequestConfig::default()
+        .timeout(Duration::from_secs(10))
+        .retry_limit(4)
+        .max_retry_time(Duration::from_secs(5))
+}
+
+/// Request policy for the dead man's switch (delayed-event) commands.
+///
+/// Deliberately tighter than [`rtc_request_config`]: these run on the heartbeat,
+/// and every second spent retrying is a second closer to the delayed leave
+/// firing and dropping us from the call. Three attempts of three seconds with
+/// the backoff capped at one second fits inside [`KEEPALIVE_DEADLINE`].
+fn keepalive_request_config() -> RequestConfig {
+    RequestConfig::default()
+        .timeout(Duration::from_secs(3))
+        .retry_limit(3)
+        .max_retry_time(Duration::from_secs(1))
+}
+
+/// Run a keep-alive command under [`KEEPALIVE_DEADLINE`].
+async fn with_keepalive_deadline<T>(
+    what: &str,
+    command: impl Future<Output = Result<T, CommandError>>,
+) -> Result<T, CommandError> {
+    match tokio::time::timeout(KEEPALIVE_DEADLINE, command).await {
+        Ok(result) => result,
+        Err(_) => Err(CommandError::from_message(format!(
+            "{what} did not complete within {}s",
+            KEEPALIVE_DEADLINE.as_secs()
+        ))),
+    }
 }
 
 /// The sole conversion from a core event-type string to the wire type.
@@ -114,8 +180,13 @@ impl RtcCommandSender for SdkCommandSender {
     ) -> Result<(), CommandError> {
         let room = self.room(&room_id)?;
         let event_type = wire_event_type(event_type).to_string();
+        // Retrying is safe here: the transaction id is minted once, when the
+        // request is built, so every attempt carries the same one and a
+        // homeserver that already accepted the event dedupes the resend rather
+        // than filing a second membership.
         room.send_raw(&event_type, &content)
             .with_sticky_duration_ms(STICKY_DURATION_MS)
+            .with_request_config(rtc_request_config())
             .await
             .map_err(command_error)?;
         Ok(())
@@ -139,7 +210,14 @@ impl RtcCommandSender for SdkCommandSender {
             },
             Raw::<AnyMessageLikeEventContent>::from_json(raw),
         );
-        let response = self.client.send(request).await.map_err(command_error)?;
+        let response = with_keepalive_deadline("scheduling the delayed leave", async {
+            self.client
+                .send(request)
+                .with_request_config(keepalive_request_config())
+                .await
+                .map_err(command_error)
+        })
+        .await?;
         // The trait's "event_id" is the delay_id used to restart/cancel it.
         Ok(response.delay_id)
     }
@@ -152,7 +230,36 @@ impl RtcCommandSender for SdkCommandSender {
         // `event_id` is the delay_id returned by `send_delayed_event`.
         let request =
             update_delayed_event::unstable_v1::Request::new(event_id, UpdateAction::Cancel);
-        self.client.send(request).await.map_err(command_error)?;
+        with_keepalive_deadline("cancelling the delayed leave", async {
+            self.client
+                .send(request)
+                .with_request_config(keepalive_request_config())
+                .await
+                .map_err(command_error)
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        // MSC4140's `restart`: resets the timer, keeps the delay id, and — unlike
+        // cancel + reschedule — never leaves the membership without a scheduled
+        // leave. The core falls back to the two-step path if this errors, which
+        // is what a homeserver answers for a delay id it has already fired.
+        let request =
+            update_delayed_event::unstable_v1::Request::new(event_id, UpdateAction::Restart);
+        with_keepalive_deadline("restarting the delayed leave", async {
+            self.client
+                .send(request)
+                .with_request_config(keepalive_request_config())
+                .await
+                .map_err(command_error)
+        })
+        .await?;
         Ok(())
     }
 
@@ -169,7 +276,27 @@ impl RtcCommandSender for SdkCommandSender {
         // as primary — `org.matrix.msc4143.rtc.slot` today, the stable id once
         // ruma flips after FCP. Same mechanism as `wire_event_type`.
         let event_type = StateEventType::from(event_type).to_string();
-        room.send_state_event_raw(&event_type, &state_key, &content)
+        if room.state() != RoomState::Joined {
+            return Err(CommandError::from_message(format!(
+                "cannot send {event_type} to {}: room not joined",
+                room.room_id()
+            )));
+        }
+        // Built by hand rather than via `Room::send_state_event_raw`, which only
+        // takes a `RequestConfig` under the SDK's
+        // `experimental-encrypted-state-events` feature; without it, it is a
+        // plain `async fn` on the client default. This is the same request it
+        // would build, with our retry policy attached.
+        let raw = serde_json::value::to_raw_value(&content).map_err(command_error)?;
+        let request = send_state_event::v3::Request::new_raw(
+            room.room_id().to_owned(),
+            event_type.into(),
+            state_key,
+            Raw::<AnyStateEventContent>::from_json(raw),
+        );
+        self.client
+            .send(request)
+            .with_request_config(rtc_request_config())
             .await
             .map_err(command_error)?;
         Ok(())
@@ -217,14 +344,18 @@ impl RtcCommandSender for SdkCommandSender {
             log::warn!("no devices to send to-device {message_type} to {user_id}");
             return Ok(());
         }
-        let recipients: Vec<&Device> = devices.iter().collect();
 
         let raw: Raw<AnyToDeviceEventContent> =
             Raw::new(&content).map_err(command_error)?.cast_unchecked();
 
+        // No retry policy of our own here: the SDK sends `/sendToDevice` under
+        // its own `short_retry` config (three attempts, transient errors and
+        // network failures alike) and then, rather than failing, *reports* the
+        // devices it could not reach. All that is missing is saying so.
+        let attempted = devices.len();
         let failures = encryption
             .encrypt_and_send_raw_to_device(
-                recipients,
+                devices.iter().collect::<Vec<&Device>>(),
                 &message_type,
                 raw,
                 // `AllDevices` sends to every device regardless of verification/cross-
@@ -235,14 +366,40 @@ impl RtcCommandSender for SdkCommandSender {
             )
             .await
             .map_err(command_error)?;
-        if !failures.is_empty() {
-            log::warn!(
-                "to-device {message_type}: {} device(s) did not receive the key",
-                failures.len()
-            );
+
+        if failures.is_empty() {
+            return Ok(());
         }
+
+        // Reaching no device at all means this member is not getting the key,
+        // which the core must hear about as an error — the alternative is a
+        // participant that stays silently undecryptable. A partial failure still
+        // delivered the key, so it is reported without failing the distribution.
+        //
+        // Note the reported failures also include devices deliberately *withheld*
+        // by `IdentityBasedStrategy` (unverified identity), indistinguishable
+        // here from a delivery failure.
+        if failures.len() >= attempted {
+            return Err(CommandError::from_message(format!(
+                "to-device {message_type}: no device of {user_id} received the key ({})",
+                format_failures(&failures)
+            )));
+        }
+        log::warn!(
+            "to-device {message_type}: {} of {attempted} device(s) did not receive the key: {}",
+            failures.len(),
+            format_failures(&failures)
+        );
         Ok(())
     }
+}
+
+fn format_failures(failures: &[(OwnedUserId, OwnedDeviceId)]) -> String {
+    failures
+        .iter()
+        .map(|(user, device)| format!("{user}:{device}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Identifies one sticky entry across snapshots: `(sender, type, sticky_key)`.
@@ -328,7 +485,12 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
 async fn slot_snapshot(room: &Room) -> Option<Vec<RawSlotEvent>> {
     let room_id = room.room_id().to_string();
     let request = get_state_events::v3::Request::new(room.room_id().to_owned());
-    let response = match room.client().send(request).await {
+    let response = match room
+        .client()
+        .send(request)
+        .with_request_config(rtc_request_config())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             log::warn!("failed to fetch room state for m.rtc.slot: {error}");
@@ -439,12 +601,31 @@ pub async fn run_sticky_bridge(
         log::warn!("failed to apply initial sticky snapshot: {error}");
     }
 
+    let mut last_state_fetch = tokio::time::Instant::now();
+
     while let Ok(_) | Err(RecvError::Lagged(_)) = receiver.recv().await {
+        // Coalesce bursts. Churn broadcasts once per sticky event, and the state
+        // read below is two requests; a mass join would fire them N times over.
+        // Waiting out the remainder of the window and *then* draining whatever
+        // piled up collapses the burst into one round trip. Note this waits
+        // rather than skips: dropping the fetch would let the sticky diff be
+        // applied against stale slot knowledge, which is exactly the ordering
+        // the seed above is careful to avoid.
+        let since_fetch = last_state_fetch.elapsed();
+        if since_fetch < ROOM_STATE_MIN_INTERVAL {
+            tokio::time::sleep(ROOM_STATE_MIN_INTERVAL - since_fetch).await;
+        }
+        // Drain the rest of the burst; the snapshot below covers all of it. A
+        // closed channel drops out here too, and is left for the outer `recv()`
+        // to observe one harmless pass from now.
+        while let Ok(_) | Err(TryRecvError::Lagged(_)) = receiver.try_recv() {}
+
         // Re-read room state each tick: a slot can close or a member can leave
         // the room at any time, and MSC4143 requires clients to respect the
         // latest state. NOTE: this only re-checks when sticky traffic arrives.
         // Reacting promptly to a slot change in an otherwise idle room needs a
         // room-state subscription of its own; that is a follow-up.
+        last_state_fetch = tokio::time::Instant::now();
         feed_room_state(&room, &manager).await;
 
         let current = snapshot(&room);

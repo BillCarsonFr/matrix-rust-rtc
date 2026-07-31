@@ -263,6 +263,25 @@ pub trait CommandSenderCallback: Send + Sync {
         event_id: String,
     ) -> Result<(), CommandSenderError>;
 
+    /// Called on every heartbeat to reset a scheduled delayed event's timer,
+    /// keeping its id (MSC4140's `restart` action).
+    ///
+    /// Implement with the SDK's delayed-event update endpoint. Return an error
+    /// if the homeserver no longer knows the delay id; the core then falls back
+    /// to `cancel_delayed_event` + `send_delayed_event`.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID where the delayed event was scheduled
+    /// * `event_id` - The event ID returned by send_delayed_event
+    ///
+    /// # Returns
+    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandSenderError>;
+
     /// Called when a to-device message needs to be sent (MSC4143).
     ///
     /// # Arguments
@@ -345,6 +364,17 @@ impl RtcCommandSender for FfiCommandSender {
     ) -> Result<(), CommandError> {
         self.callback
             .cancel_delayed_event(room_id, event_id)
+            .map_err(CommandError::from)?;
+        Ok(())
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        self.callback
+            .restart_delayed_event(room_id, event_id)
             .map_err(CommandError::from)?;
         Ok(())
     }
@@ -439,6 +469,18 @@ mod tests {
         ) -> Result<(), CommandSenderError> {
             println!(
                 "Mock cancel_delayed_event: room={}, event_id={}",
+                room_id, event_id
+            );
+            Ok(())
+        }
+
+        fn restart_delayed_event(
+            &self,
+            room_id: String,
+            event_id: String,
+        ) -> Result<(), CommandSenderError> {
+            println!(
+                "Mock restart_delayed_event: room={}, event_id={}",
                 room_id, event_id
             );
             Ok(())

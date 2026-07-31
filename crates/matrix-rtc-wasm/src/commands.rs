@@ -30,7 +30,8 @@ use wasm_bindgen::prelude::*;
 /// WASM implementation of the RtcCommandSender trait.
 ///
 /// This sender delegates to a JavaScript object that provides the actual Matrix SDK integration.
-/// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+/// The client must implement methods: sendStickyEvent, sendDelayedEvent,
+/// cancelDelayedEvent, restartDelayedEvent.
 #[wasm_bindgen]
 pub struct JsCommandSender {
     /// The JavaScript Matrix client that handles the actual event sending
@@ -49,6 +50,7 @@ impl JsCommandSender {
     /// - sendStickyEvent(roomId, eventType, content, callback)
     /// - sendDelayedEvent(roomId, eventType, content, delayMs, callback)
     /// - cancelDelayedEvent(roomId, eventId, callback)
+    /// - restartDelayedEvent(roomId, eventId, callback)
     /// - sendToDeviceMessage(userId, deviceId, messageType, content, callback)
     #[wasm_bindgen(constructor)]
     pub fn new(client: JsValue) -> Self {
@@ -257,6 +259,32 @@ impl RtcCommandSender for JsCommandSender {
             .map_err(JsCommandSender::convert_js_error)?;
 
         // Convert the Promise to a Rust Future and await it
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        Ok(())
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        self.log_command(&format!(
+            "restart_delayed_event: room={}, event_id={}",
+            room_id, event_id
+        ));
+
+        // MSC4140's `restart` action. An error here means the homeserver no
+        // longer knows this delay id; the core falls back to cancel + schedule.
+        let promise = self
+            .call_js_promise_method(
+                "restartDelayedEvent",
+                vec![JsValue::from_str(&room_id), JsValue::from_str(&event_id)],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
+
         wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(JsCommandSender::convert_js_error)?;

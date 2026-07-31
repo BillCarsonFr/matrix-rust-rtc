@@ -31,6 +31,7 @@ use crate::event::{
     EventConversionError, RawStickyEvent, RawStickyEventUpdate, StickyEventsUpdate,
 };
 use crate::join::{JoinSessionParams, LeaveSessionParams};
+use crate::own_membership::OwnMembershipMachine;
 use crate::session::{CallMembershipEvent, RtcSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
@@ -331,12 +332,31 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// Call periodically (e.g. every 15 s) while joined so the dead man's switch
     /// timer keeps getting pushed back. Returns `false` if no such session is
     /// joined.
+    ///
+    /// Callers that hold the manager behind a mutex should prefer
+    /// [`Self::own_membership_handle`], which lets them release the lock before
+    /// the beat's network round trip.
     pub async fn heartbeat(&mut self, room_id: &str, slot_id: &str) -> bool {
         let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
         match self.sessions.get_mut(&key) {
             Some(session) => session.heartbeat().await,
             None => false,
         }
+    }
+
+    /// A handle to the own-membership machine of one `(room_id, slot_id)`
+    /// session, or `None` when there is no such joined session.
+    ///
+    /// The point is to get the keep-alive's HTTP traffic out from under whatever
+    /// lock guards this manager: take the handle, drop the guard, then await
+    /// [`OwnMembershipMachine::heartbeat`].
+    pub fn own_membership_handle(
+        &self,
+        room_id: &str,
+        slot_id: &str,
+    ) -> Option<Arc<OwnMembershipMachine<T>>> {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions.get(&key)?.own_membership_handle()
     }
 
     /// Returns the number of tracked sessions.

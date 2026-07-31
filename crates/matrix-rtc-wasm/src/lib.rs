@@ -55,7 +55,8 @@ impl WasmRtcSessionManager {
     /// Sets up the command sender for this manager with a Matrix client.
     ///
     /// This must be called before join/leave operations.
-    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    /// The client must implement methods: sendStickyEvent, sendDelayedEvent,
+    /// cancelDelayedEvent, restartDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());
@@ -424,7 +425,8 @@ impl WasmRtcSession {
     /// Sets up the command sender for this session with a Matrix client.
     ///
     /// This must be called before join/leave operations.
-    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    /// The client must implement methods: sendStickyEvent, sendDelayedEvent,
+    /// cancelDelayedEvent, restartDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());

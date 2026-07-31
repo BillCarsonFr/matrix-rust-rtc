@@ -91,6 +91,9 @@
 //!     async fn cancel_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }
+//!     async fn restart_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
+//!         Ok(())
+//!     }
 //!     async fn send_to_device_message(&self, _user_id: String, _device_id: String, _message_type: String, _content: serde_json::Value) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }

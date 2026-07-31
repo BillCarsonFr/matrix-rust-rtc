@@ -97,6 +97,27 @@ pub trait RtcCommandSender: Send + Sync {
         event_id: String,
     ) -> Result<(), CommandError>;
 
+    /// Reset the timer of a scheduled delayed event, keeping its id.
+    ///
+    /// This is MSC4140's `restart` action and the way the heartbeat pushes the
+    /// dead man's switch back: one request, and the delayed event stays
+    /// scheduled throughout, so a failure cannot leave the membership
+    /// unprotected the way cancel + reschedule can.
+    ///
+    /// Callers must treat an error as "the schedule is gone or unknown" and
+    /// fall back to scheduling a fresh delayed event — a homeserver answers a
+    /// restart for an already-fired or expired delay id with an error.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID where the delayed event was scheduled
+    /// * `event_id` - The event ID returned by `send_delayed_event`
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError>;
+
     /// Send a to-device message to a specific device.
     ///
     /// This is used for encryption key distribution as specified in MSC4143.
@@ -181,6 +202,14 @@ impl RtcCommandSender for NoopCommandSender {
         Ok(())
     }
 
+    async fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+    ) -> Result<(), CommandError> {
+        Ok(())
+    }
+
     async fn send_to_device_message(
         &self,
         _user_id: String,
@@ -211,14 +240,28 @@ pub struct MockCommandSender {
     pub sticky_events: std::sync::Mutex<Vec<(String, String, Value)>>,
     pub delayed_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
     pub cancelled_events: std::sync::Mutex<Vec<(String, String)>>,
+    pub restarted_events: std::sync::Mutex<Vec<(String, String)>>,
     pub to_device_messages: std::sync::Mutex<Vec<(String, String, String, Value)>>,
     pub state_events: std::sync::Mutex<Vec<(String, String, String, Value)>>,
+    /// Make `restart_delayed_event` fail, as a homeserver does for a delay id it
+    /// no longer knows, so the heartbeat's fallback path can be exercised.
+    pub restart_fails: bool,
 }
 
 #[cfg(test)]
 impl MockCommandSender {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A sender whose delayed-event restart always fails, exercising the
+    /// heartbeat's cancel + reschedule fallback.
+    #[allow(dead_code)]
+    pub fn with_failing_delayed_restart() -> Self {
+        Self {
+            restart_fails: true,
+            ..Default::default()
+        }
     }
 
     #[allow(dead_code)]
@@ -289,6 +332,21 @@ impl RtcCommandSender for MockCommandSender {
             .lock()
             .unwrap()
             .push((room_id, event_id));
+        Ok(())
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        self.restarted_events
+            .lock()
+            .unwrap()
+            .push((room_id, event_id));
+        if self.restart_fails {
+            return Err(CommandError::from_message("unknown delay id"));
+        }
         Ok(())
     }
 

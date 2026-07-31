@@ -507,6 +507,11 @@ fn spawn_key_pump(manager: Manager, mut key_rx: UnboundedReceiver<ReceivedKey>) 
 }
 
 /// Keep pushing the dead man's switch delayed leave back while joined.
+///
+/// Takes the own-membership handle out from under the manager's mutex and drops
+/// the guard before beating: the beat is an HTTP round trip, and holding the
+/// mutex across it would block every other session operation — `leave`
+/// included — for as long as the homeserver takes to answer.
 fn spawn_heartbeat(
     manager: Manager,
     room_id: String,
@@ -517,7 +522,13 @@ fn spawn_heartbeat(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            manager.lock().await.heartbeat(&room_id, &slot_id).await;
+            let membership = manager
+                .lock()
+                .await
+                .own_membership_handle(&room_id, &slot_id);
+            if let Some(membership) = membership {
+                membership.heartbeat().await;
+            }
         }
     })
 }

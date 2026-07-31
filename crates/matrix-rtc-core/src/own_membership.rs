@@ -386,10 +386,15 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         Ok(())
     }
 
-    /// Restarts the keep-alive by canceling the current delayed leave and scheduling a new one.
+    /// Pushes the keep-alive delayed leave back so our membership stays alive.
     ///
     /// This is called periodically (heartbeat) to keep our membership active.
     /// The strategy is to always have a delayed leave scheduled, and restart it periodically.
+    ///
+    /// Uses MSC4140's in-place `restart` — one request, and the delayed leave
+    /// stays armed throughout — falling back to cancel + reschedule when the
+    /// restart fails, which is what a homeserver answers for a delay id it no
+    /// longer knows.
     ///
     /// This method is fire-and-forget (doesn't return Result) because heartbeat failures
     /// should not break the application - we'll retry on the next heartbeat.
@@ -397,8 +402,28 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         let room_id = self.room_id.clone();
         log::debug!("[{}] Heartbeat: restarting keep-alive", room_id);
 
-        // First, cancel the existing delayed event if one exists
         if let Some(event_id) = self.delayed_event_id() {
+            match self
+                .command_sender
+                .restart_delayed_event(room_id.clone(), event_id.clone())
+                .await
+            {
+                Ok(()) => {
+                    // The delay id is unchanged, so `keep_alive_info` still
+                    // describes the live schedule — nothing to store.
+                    log::debug!("[{}] Delayed leave restarted", room_id);
+                    return;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Failed to restart delayed leave, falling back to \
+                         cancel + reschedule: {:?}",
+                        room_id,
+                        e
+                    );
+                }
+            }
+
             match self
                 .command_sender
                 .cancel_delayed_event(room_id.clone(), event_id.clone())
@@ -408,8 +433,15 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                     log::debug!("[{}] Previous delayed leave canceled", room_id);
                 }
                 Err(e) => {
-                    log::warn!("[{}] Failed to cancel delayed leave: {:?}", room_id, e);
-                    // Continue anyway - we'll try to schedule a new one
+                    // The old delayed leave may well still be scheduled, and it
+                    // will fire and disconnect us even though we are about to
+                    // schedule a replacement. Nothing better to do than say so
+                    // and re-arm: leaving no delayed leave at all is worse.
+                    log::warn!(
+                        "[{}] Failed to cancel delayed leave; it may still fire: {:?}",
+                        room_id,
+                        e
+                    );
                 }
             }
 
@@ -697,40 +729,58 @@ mod tests {
         assert!(leave_reason.get("class").is_none());
     }
 
+    /// A beat is a single `restart`: no cancel, no re-schedule, and the stored
+    /// delay id survives — the delayed leave is never momentarily unarmed.
     #[tokio::test]
     async fn test_machine_heartbeat_restarts_delayed_leave() {
         let mock_sender = Arc::new(MockCommandSender::new());
-        let machine = OwnMembershipMachine::with_default_timeout(
-            mock_sender.clone(),
-            "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
-            "alice-device-a".to_string(),
-            APPLICATION_TYPE.to_string(),
-        );
+        let machine = test_machine(mock_sender.clone());
 
-        // Join to start the initial delayed leave
         machine
             .join(MemberTransports::default())
             .await
             .expect("join should succeed");
+        let delay_id = machine
+            .delayed_event_id()
+            .expect("join schedules a delayed leave");
+        let scheduled_after_join = mock_sender.delayed_events.lock().unwrap().len();
 
-        // Get initial delayed event count
-        let initial_count = {
-            let delayed_events = mock_sender.delayed_events.lock().unwrap();
-            delayed_events.len()
-        };
-
-        // Heartbeat should cancel and reschedule
         machine.heartbeat().await;
 
-        // Check that another delayed event was scheduled
-        let new_count = {
-            let delayed_events = mock_sender.delayed_events.lock().unwrap();
-            delayed_events.len()
-        };
+        assert_eq!(
+            *mock_sender.restarted_events.lock().unwrap(),
+            vec![("!room:example.org".to_string(), delay_id.clone())]
+        );
+        assert!(mock_sender.cancelled_events.lock().unwrap().is_empty());
+        assert_eq!(
+            mock_sender.delayed_events.lock().unwrap().len(),
+            scheduled_after_join
+        );
+        assert_eq!(machine.delayed_event_id(), Some(delay_id));
+    }
 
-        // Should have scheduled at least one more (the cancel may or may not have been processed)
-        assert!(new_count > initial_count);
+    /// A restart the homeserver rejects (expired or unknown delay id) must not
+    /// leave us unprotected: the beat falls back to cancel + reschedule.
+    #[tokio::test]
+    async fn test_machine_heartbeat_falls_back_when_restart_fails() {
+        let mock_sender = Arc::new(MockCommandSender::with_failing_delayed_restart());
+        let machine = test_machine(mock_sender.clone());
+
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+        let scheduled_after_join = mock_sender.delayed_events.lock().unwrap().len();
+
+        machine.heartbeat().await;
+
+        assert_eq!(mock_sender.restarted_events.lock().unwrap().len(), 1);
+        assert_eq!(mock_sender.cancelled_events.lock().unwrap().len(), 1);
+        assert_eq!(
+            mock_sender.delayed_events.lock().unwrap().len(),
+            scheduled_after_join + 1
+        );
+        assert!(machine.delayed_event_id().is_some());
     }
 
     fn test_machine(

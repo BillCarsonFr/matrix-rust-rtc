@@ -25,6 +25,7 @@ function createMockMatrixClient() {
   const stickyEventsSent = [];
   const delayedEventsSent = [];
   const cancelledEvents = [];
+  const restartedEvents = [];
   const stateEventsSent = [];
 
   const client = {
@@ -42,6 +43,12 @@ function createMockMatrixClient() {
       cancelledEvents.push({ roomId, eventId });
       return Promise.resolve();
     }),
+    // MSC4140 `restart`: what the heartbeat uses to push the dead man's switch
+    // back. Rejecting here is what makes the core fall back to cancel + schedule.
+    restartDelayedEvent: vi.fn((roomId, eventId) => {
+      restartedEvents.push({ roomId, eventId });
+      return Promise.resolve();
+    }),
     // Used for m.rtc.slot, the only MatrixRTC event that lives in room state.
     sendStateEvent: vi.fn((roomId, eventType, stateKey, content) => {
       stateEventsSent.push({ roomId, eventType, stateKey, content });
@@ -51,11 +58,13 @@ function createMockMatrixClient() {
     _getStickyEvents: () => stickyEventsSent,
     _getDelayedEvents: () => delayedEventsSent,
     _getCancelledEvents: () => cancelledEvents,
+    _getRestartedEvents: () => restartedEvents,
     _getStateEvents: () => stateEventsSent,
     _clear: () => {
       stickyEventsSent.length = 0;
       delayedEventsSent.length = 0;
       cancelledEvents.length = 0;
+      restartedEvents.length = 0;
       stateEventsSent.length = 0;
     }
   };
