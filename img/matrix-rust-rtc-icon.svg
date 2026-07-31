@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="44 14 600 600" role="img">
+  <title>matrix-rust-rtc icon: a cute crab taking a selfie of a video call at eye level</title>
+  <desc>A kawaii orange crab, Rust's Ferris style, holds a Matrix-green selfie stick with a phone at eye level showing video-call participant tiles.</desc>
+
+  <line x1="490" y1="292" x2="560" y2="250" stroke="#0A8F69" stroke-width="12" stroke-linecap="round"/>
+  <line x1="490" y1="292" x2="560" y2="250" stroke="#0DBD8B" stroke-width="8" stroke-linecap="round"/>
+
+  <rect x="548" y="140" width="74" height="112" rx="13" fill="#2E4054" stroke="#5A6B7A" stroke-width="2.5"/>
+  <rect x="556" y="153" width="58" height="86" rx="7" fill="#0DBD8B"/>
+  <ellipse cx="566" cy="206" rx="6" ry="4.5" fill="#F5813B" stroke="#C4501B" stroke-width="1.2"/>
+  <ellipse cx="604" cy="206" rx="6" ry="4.5" fill="#F5813B" stroke="#C4501B" stroke-width="1.2"/>
+  <line x1="580" y1="185" x2="579" y2="176" stroke="#E0692A" stroke-width="2.4" stroke-linecap="round"/>
+  <line x1="590" y1="185" x2="591" y2="176" stroke="#E0692A" stroke-width="2.4" stroke-linecap="round"/>
+  <circle cx="585" cy="201" r="20" fill="#F5813B" stroke="#C4501B" stroke-width="1.6"/>
+  <ellipse cx="585" cy="208" rx="12" ry="8" fill="#FFC48C" opacity="0.9"/>
+  <circle cx="578" cy="175" r="5" fill="#FFFFFF" stroke="#C4501B" stroke-width="1"/>
+  <circle cx="592" cy="175" r="5" fill="#FFFFFF" stroke="#C4501B" stroke-width="1"/>
+  <circle cx="579" cy="176" r="2.1" fill="#2B2B2B"/>
+  <circle cx="593" cy="176" r="2.1" fill="#2B2B2B"/>
+  <ellipse cx="574" cy="204" rx="3" ry="2" fill="#FF8FA3" opacity="0.85"/>
+  <ellipse cx="596" cy="204" rx="3" ry="2" fill="#FF8FA3" opacity="0.85"/>
+  <path d="M580,206 q5,4 10,0" stroke="#C4501B" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+  <circle cx="606" cy="148" r="4.5" fill="#FF4D4D"/>
+
+  <g stroke="#E0692A" stroke-width="12" stroke-linecap="round" fill="none">
+    <path d="M215,432 Q182,456 160,450"/>
+    <path d="M236,448 Q206,474 182,472"/>
+    <path d="M262,458 Q243,486 220,488"/>
+    <path d="M385,432 Q418,456 440,450"/>
+    <path d="M364,448 Q394,474 418,472"/>
+    <path d="M338,458 Q357,486 380,488"/>
+  </g>
+
+  <path d="M180,340 Q135,360 115,398" stroke="#E0692A" stroke-width="26" stroke-linecap="round" fill="none"/>
+  <ellipse cx="108" cy="404" rx="42" ry="30" fill="#F5813B" stroke="#C4501B" stroke-width="3"/>
+  <ellipse cx="118" cy="368" rx="36" ry="21" fill="#FF9A4D" stroke="#C4501B" stroke-width="3"/>
+  <path d="M86,392 L128,388" stroke="#C4501B" stroke-width="3" stroke-linecap="round"/>
+
+  <path d="M420,332 Q460,320 486,300" stroke="#E0692A" stroke-width="26" stroke-linecap="round" fill="none"/>
+  <ellipse cx="488" cy="306" rx="34" ry="24" fill="#F5813B" stroke="#C4501B" stroke-width="3"/>
+  <ellipse cx="500" cy="282" rx="28" ry="17" fill="#FF9A4D" stroke="#C4501B" stroke-width="3"/>
+
+  <ellipse cx="300" cy="345" rx="162" ry="118" fill="#F5813B" stroke="#C4501B" stroke-width="3.5"/>
+  <ellipse cx="300" cy="300" rx="120" ry="42" fill="#FF9A4D" opacity="0.55"/>
+  <ellipse cx="300" cy="380" rx="102" ry="60" fill="#FFC48C" opacity="0.9"/>
+
+  <line x1="268" y1="252" x2="258" y2="196" stroke="#E0692A" stroke-width="12" stroke-linecap="round"/>
+  <line x1="332" y1="252" x2="342" y2="196" stroke="#E0692A" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="255" cy="182" r="33" fill="#FFFFFF" stroke="#C4501B" stroke-width="3"/>
+  <circle cx="345" cy="182" r="33" fill="#FFFFFF" stroke="#C4501B" stroke-width="3"/>
+  <circle cx="264" cy="186" r="14" fill="#2B2B2B"/>
+  <circle cx="354" cy="186" r="14" fill="#2B2B2B"/>
+  <circle cx="258" cy="179" r="5.5" fill="#FFFFFF"/>
+  <circle cx="348" cy="179" r="5.5" fill="#FFFFFF"/>
+
+  <ellipse cx="214" cy="362" rx="23" ry="13" fill="#FF8FA3" opacity="0.8"/>
+  <ellipse cx="386" cy="362" rx="23" ry="13" fill="#FF8FA3" opacity="0.8"/>
+  <path d="M274,392 Q300,414 326,392" stroke="#C4501B" stroke-width="4.5" stroke-linecap="round" fill="none"/>
+</svg>

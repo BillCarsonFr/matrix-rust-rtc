@@ -4,6 +4,10 @@
 
 > **Note:** This project is developed with AI assistance.
 
+<p align="center">
+  <img src="img/matrix-rust-rtc-icon.svg" height="300">
+</p>
+
 A Rust implementation of a Matrix RTC (Real-Time Communication) client SDK:
 MSC4143 call-membership signalling, per-participant media-key exchange, and a
 **transport-agnostic media layer** — one Rust codebase behind Kotlin/Swift
