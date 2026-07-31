@@ -1,0 +1,124 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+# Builds the MEDIA=1 mobile artifacts (matrix-rtc-ffi `media` feature:
+# frame streams + publishing over libwebrtc). This exercises the packaging
+# path that media-ffi.yml (a plain linux-host build) cannot: NDK
+# resolution, libwebrtc.jar discovery and AAR bundling, uniffi Kotlin/Swift
+# codegen of the media surface, and xcframework assembly.
+#
+# These jobs are heavy (libwebrtc download + link per target), so PRs run
+# them only when they touch something that can break mobile media
+# packaging; every push to main/develop runs them unfiltered as a backstop
+# for anything the path list misses.
+
+name: Build Mobile Media Libraries
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'crates/matrix-rtc-ffi/**'
+      - 'crates/matrix-rtc-media/**'
+      - 'crates/matrix-rtc-livekit/**'
+      - 'scripts/build-*.sh'
+      - 'mobile/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/build-mobile-media.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-media:
+    name: Build Android AAR (media)
+    runs-on: ubuntu-latest
+    # Uncached, three android targets each compile the libwebrtc-carrying
+    # stack; a warm rust-cache brings the job down to a few minutes.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-media
+
+      # The runner image ships the NDK under $ANDROID_HOME/ndk/<version>;
+      # the build script's resolve_ndk() finds it there (and normalises it
+      # to the versioned path webrtc-sys requires).
+      - name: Build Android AAR (media)
+        run: make build-android-media
+
+      - name: Upload AAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-rtc-android-aar-media
+          path: mobile/android/matrixrtc/build/outputs/aar/
+
+  build-ios-media:
+    name: Build iOS XCFramework (media)
+    # macos-latest is Apple Silicon, matching the media variant's
+    # arm64-only simulator support (livekit publishes no libwebrtc for the
+    # Intel iOS simulator; the script skips that slice under MEDIA=1).
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ios-media
+
+      - name: Build iOS XCFramework (media)
+        run: make build-ios-media
+
+      - name: Upload XCFramework artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-rtc-ios-xcframework-media
+          path: mobile/ios/build/MatrixRtcFFI.xcframework/
+
+      - name: Upload Swift bindings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-rtc-swift-bindings-media
+          path: mobile/ios/generated/

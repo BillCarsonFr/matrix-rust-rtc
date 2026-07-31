@@ -179,6 +179,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compat"
+version = "0.2.5"
+source = "git+https://github.com/element-hq/async-compat?rev=5a27c8b290f1f1dcfc0c4ec22c464e38528aa591#5a27c8b290f1f1dcfc0c4ec22c464e38528aa591"
+dependencies = [
+ "futures-core",
+ "futures-io",
+ "once_cell",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2453,7 +2465,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "jni 0.21.1",
+ "log",
  "matrix-rtc-core",
+ "matrix-rtc-livekit",
+ "matrix-rtc-media",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2468,9 +2485,11 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
+ "jni 0.21.1",
  "livekit",
  "log",
  "matrix-rtc-core",
+ "matrix-rtc-media",
  "matrix-sdk",
  "matrix-sdk-base",
  "matrix-sdk-ui",
@@ -2482,6 +2501,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "matrix-rtc-media"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "futures-util",
+ "log",
+ "matrix-rtc-core",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -5028,6 +5060,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f38a9a27529ccff732f8efddb831b65b1e07f7dea3fd4cacd4a35a8c4b253b98"
 dependencies = [
  "anyhow",
+ "async-compat",
  "bytes",
  "once_cell",
  "static_assertions",
@@ -6189,11 +6222,6 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[patch.unused]]
-name = "async-compat"
-version = "0.2.5"
-source = "git+https://github.com/element-hq/async-compat?rev=5a27c8b290f1f1dcfc0c4ec22c464e38528aa591#5a27c8b290f1f1dcfc0c4ec22c464e38528aa591"
 
 [[patch.unused]]
 name = "tracing"

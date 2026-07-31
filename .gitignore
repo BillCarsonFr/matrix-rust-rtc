@@ -28,6 +28,12 @@ demo/backend/data/
 
 mobile/android/.gradle/
 
+# libwebrtc's Java classes for the media AAR. Re-materialized on every
+# MEDIA=1 build by scripts/build-android-aar.sh from the SAME libwebrtc
+# bundle the native code was linked against — committing it would invite
+# version skew between the jar and the .so (runtime JNI breakage).
+mobile/android/matrixrtc/libs/
+
 mobile/android/local.properties
 
 mobile/android/build/

@@ -35,6 +35,12 @@
 //! 6. `alice` publishes a 440 Hz tone and `bob` records what the SFU forwards
 //!    and verifies the frequency.
 //!
+//! Two scenarios share this flow: `e2e_call_two_clients_audio` (both on one
+//! SFU, verified over the raw LiveKit event stream) and
+//! `e2e_call_two_clients_two_foci` (each participant on their own SFU —
+//! MSC4195 multi-SFU — with tones in both directions verified through the
+//! transport-agnostic media API).
+//!
 //! Runs against the `demo/backend` stack (see its README) with no further
 //! configuration — every endpoint defaults to the stack's localhost ports and
 //! users are created on the fly:
@@ -64,6 +70,10 @@ use matrix_sdk_ui::sync_service::SyncService;
 
 use matrix_rtc_core::SlotEncryption;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
+use matrix_rtc_media::{
+    I420Buffer, MediaConstraints, MediaStreamKind, Participant as MediaParticipant, PublishOptions,
+    VideoFrame, VideoRotation, VideoSourceConfig,
+};
 
 use provision::Credentials;
 
@@ -88,6 +98,9 @@ struct Config {
     homeserver: String,
     slot_id: String,
     livekit_service_url: String,
+    /// Second focus (authorisation service of SFU 2), used by the two-foci
+    /// scenario: bob publishes here while alice publishes on the first one.
+    livekit_service_url_2: String,
     insecure_tls: bool,
 }
 
@@ -101,9 +114,25 @@ impl Config {
             slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned()),
             livekit_service_url: env::var("LIVEKIT_SERVICE_URL")
                 .unwrap_or_else(|_| "http://localhost:6080".to_owned()),
+            livekit_service_url_2: env::var("LIVEKIT_SERVICE_URL_2")
+                .unwrap_or_else(|_| "http://localhost:6081".to_owned()),
             insecure_tls: env::var("INSECURE_TLS").is_ok(),
         }
     }
+}
+
+/// Which media topology a run exercises.
+#[derive(Clone, Copy, PartialEq)]
+enum RunMode {
+    /// Both participants publish on the same focus (one SFU, one connection
+    /// each). Media is verified through the raw LiveKit event stream.
+    SingleFocus,
+    /// Each participant publishes on their own focus (MSC4195 multi-SFU):
+    /// every client keeps its own-focus connection for publishing and the
+    /// engine opens a second connection to the peer's focus to subscribe.
+    /// Media is verified through the transport-agnostic media API
+    /// (`participants` / `remote_track` / frame streams), in both directions.
+    TwoFoci,
 }
 
 /// Use `ALICE`/`BOB` (+`_PW`) when supplied (long-lived stacks with closed
@@ -205,6 +234,7 @@ async fn join_call(
     synced: SyncedClient,
     room: matrix_sdk::Room,
     user: &str,
+    livekit_service_url: &str,
 ) -> Result<Participant, Box<dyn Error>> {
     let SyncedClient { client: _, sync } = synced;
     let http = reqwest::Client::builder()
@@ -214,7 +244,7 @@ async fn join_call(
         &room,
         CallOptions {
             slot_id: cfg.slot_id.clone(),
-            livekit_service_url_fallback: Some(cfg.livekit_service_url.clone()),
+            livekit_service_url_fallback: Some(livekit_service_url.to_owned()),
             http: Some(http),
             ..CallOptions::default()
         },
@@ -285,20 +315,32 @@ async fn wait_for_members(call: &Call, target: usize, label: &str) -> bool {
 #[test]
 #[ignore = "requires the demo/backend docker stack (make backend-up)"]
 fn e2e_call_two_clients_audio() {
+    harness(RunMode::SingleFocus);
+}
+
+#[test]
+#[ignore = "requires the demo/backend docker stack (make backend-up)"]
+fn e2e_call_two_clients_two_foci() {
+    harness(RunMode::TwoFoci);
+}
+
+/// Process-wide one-time setup, safe to call from every test in this binary.
+fn init_test_process() {
     // The dependency tree enables both rustls crypto backends (`ring` via
     // livekit/reqwest, `aws-lc-rs` via matrix-sdk), so rustls can't auto-select a
     // process-level `CryptoProvider` and panics on first TLS handshake. Install
-    // one explicitly before any TLS happens.
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("failed to install rustls aws-lc-rs crypto provider");
+    // one explicitly before any TLS happens (idempotent across tests).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .init();
+        .try_init();
+}
 
+fn harness(mode: RunMode) {
+    init_test_process();
     let cfg = Config::from_env();
 
     // The futures behind `Call::join` are `!Send` (the core command sender is
@@ -309,7 +351,7 @@ fn e2e_call_two_clients_audio() {
         .expect("failed to build tokio runtime");
     let outcome = runtime.block_on(
         tokio::task::LocalSet::new()
-            .run_until(async { tokio::time::timeout(OVERALL_DEADLINE, run(cfg)).await }),
+            .run_until(async { tokio::time::timeout(OVERALL_DEADLINE, run(cfg, mode)).await }),
     );
 
     match outcome {
@@ -319,7 +361,7 @@ fn e2e_call_two_clients_audio() {
     }
 }
 
-async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
+async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     let (alice_creds, bob_creds) = credentials(&cfg).await?;
 
     // 1. Both clients log in and sync.
@@ -357,21 +399,64 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     println!("[alice] opened slot {}", cfg.slot_id);
 
     // 5. Now both join the call (membership stickies + key exchange + SFU
-    //    connect, all through the facade).
-    let alice = join_call(&cfg, alice, alice_room, &alice_creds.user).await?;
-    let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user).await?;
+    //    connect, all through the facade). In two-foci mode each participant
+    //    publishes on their own SFU; the engines then cross-connect to the
+    //    peer's focus for subscribing (MSC4195 multi-SFU).
+    let bob_url = match mode {
+        RunMode::SingleFocus => cfg.livekit_service_url.clone(),
+        RunMode::TwoFoci => cfg.livekit_service_url_2.clone(),
+    };
+    let alice_url = cfg.livekit_service_url.clone();
+    let alice = join_call(&cfg, alice, alice_room, &alice_creds.user, &alice_url).await?;
+    let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &bob_url).await?;
 
     // Signalling proof: each side discovers the other's membership
     // via stickies (own + peer == 2).
     let alice_sees = wait_for_members(&alice.call, 2, "alice").await;
     let bob_sees = wait_for_members(&bob.call, 2, "bob").await;
 
-    // 6. Media proof: alice publishes a 440 Hz tone; bob records what the SFU
-    //    forwards and checks the frequency.
+    // 6. Media proof. Single focus: alice publishes a 440 Hz tone and bob
+    //    verifies it through the raw LiveKit event stream (the historical
+    //    path). Two foci: tones flow in BOTH directions and are verified
+    //    through the transport-agnostic media API — bob receiving alice's
+    //    tone proves bob's engine connected to alice's focus, and vice versa.
     println!("[alice] publishing 440 Hz tone");
-    let _tone = media::publish_tone(alice.call.session(), 440.0).await?;
+    let _alice_tone = media::publish_tone(alice.call.session(), 440.0).await?;
 
-    let tone_ok = record_and_verify_tone(&mut bob.call).await?;
+    // Bound to the outer scope so the capture tasks are not aborted mid-call:
+    // publishers stay alive through teardown, exactly like the single-focus
+    // scenario's tone.
+    let mut _bob_tone = None;
+    let mut _alice_video = None;
+    let (tone_ok, reverse_tone_ok, video_ok, constraints_ok) = match mode {
+        RunMode::SingleFocus => (
+            record_and_verify_tone(&mut bob.call).await?,
+            true,
+            true,
+            true,
+        ),
+        RunMode::TwoFoci => {
+            println!("[bob] publishing 660 Hz tone");
+            _bob_tone = Some(media::publish_tone(bob.call.session(), 660.0).await?);
+            let bob_hears = record_peer_tone(&bob.call, "bob", 440.0).await?;
+            let alice_hears = record_peer_tone(&alice.call, "alice", 660.0).await?;
+
+            // Video: alice publishes a synthetic half-bright/half-dark
+            // pattern through the transport-agnostic publish path; bob
+            // verifies the luma split across the two SFUs, then exercises
+            // the constraints path by pausing and resuming the stream.
+            println!("[alice] publishing pattern video");
+            _alice_video = Some(publish_pattern_video(&alice.call).await?);
+            let video_ok = verify_video_pattern(&bob.call, "bob").await?;
+            let constraints_ok = if video_ok {
+                verify_constraints_toggle(&bob.call, "bob").await?
+            } else {
+                false
+            };
+
+            (bob_hears, alice_hears, video_ok, constraints_ok)
+        }
+    };
 
     // Encryption proof: bob must have imported alice's media key under alice's
     // MSC4195 pseudonymous identity (the JWT `sub`) — direct evidence the key
@@ -381,12 +466,25 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     println!("[bob] imported alice's per-participant media key: {alice_key_seen_by_bob}");
 
     // Tear down both peers cleanly and symmetrically: `Call::leave` stops the
-    // heartbeat, sends the leave event (cancelling the delayed leave), and
-    // closes the SFU connection. Failures are logged rather than aborting
-    // teardown of the other peer.
+    // heartbeat, sends the leave event (cancelling the delayed leave), shuts
+    // the media engine down (closing peer-focus connections), and closes the
+    // own SFU connection. A per-leave timeout keeps a wedged teardown from
+    // eating the overall deadline; failures are logged rather than aborting
+    // teardown of the other peer, but they fail the test. `Call::leave` logs
+    // each step at debug level (RUST_LOG=matrix_rtc_livekit=debug) so a
+    // timeout here pinpoints which await wedged.
+    let mut teardown_ok = true;
     for (participant, label) in [(alice, "alice"), (bob, "bob")] {
-        if let Err(error) = participant.call.leave().await {
-            eprintln!("[{label}] leave failed: {error}");
+        match tokio::time::timeout(Duration::from_secs(30), participant.call.leave()).await {
+            Ok(Ok(())) => println!("[{label}] left cleanly"),
+            Ok(Err(error)) => {
+                teardown_ok = false;
+                eprintln!("[{label}] leave failed: {error}");
+            }
+            Err(_) => {
+                teardown_ok = false;
+                eprintln!("[{label}] WARNING: leave timed out after 30s (teardown wedged)");
+            }
         }
     }
 
@@ -394,14 +492,381 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     println!("sticky membership discovered by alice: {alice_sees}");
     println!("sticky membership discovered by bob:   {bob_sees}");
     println!("alice's media key received by bob:      {alice_key_seen_by_bob}");
-    println!("440 Hz tone received + verified by bob: {tone_ok}");
+    println!("tone alice->bob received + verified:    {tone_ok}");
+    if mode == RunMode::TwoFoci {
+        println!("tone bob->alice received + verified:    {reverse_tone_ok}");
+        println!("video pattern alice->bob verified:      {video_ok}");
+        println!("constraints pause/resume verified:      {constraints_ok}");
+    }
+    println!("clean teardown (leave both sides):      {teardown_ok}");
 
-    if alice_sees && bob_sees && alice_key_seen_by_bob && tone_ok {
+    if alice_sees
+        && bob_sees
+        && alice_key_seen_by_bob
+        && tone_ok
+        && reverse_tone_ok
+        && video_ok
+        && constraints_ok
+        && teardown_ok
+    {
         println!("END-TO-END TEST PASSED (with per-participant frame E2EE)");
         Ok(())
     } else {
         Err("end-to-end test failed (see WARNING lines above)".into())
     }
+}
+
+/// Poll until the roster shows a remote participant, or `deadline`.
+async fn wait_for_peer(call: &Call, deadline: tokio::time::Instant) -> Option<MediaParticipant> {
+    loop {
+        if let Some(peer) = call.participants().into_iter().find(|p| !p.is_local) {
+            return Some(peer);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Poll until the peer's stream of `kind` is subscribed, or `deadline`.
+async fn wait_for_remote_track(
+    call: &Call,
+    member_id: &str,
+    kind: MediaStreamKind,
+    deadline: tokio::time::Instant,
+) -> Option<std::sync::Arc<dyn matrix_rtc_media::RemoteTrackHandle>> {
+    loop {
+        if let Some(track) = call.remote_track(member_id, kind) {
+            return Some(track);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Abort-on-drop guard for the synthetic video capture task.
+struct VideoPublisher {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for VideoPublisher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+// 640x360 so livekit publishes a regular multi-layer simulcast track; below
+// 480px the SDK emits a single-encoding simulcast (rid "q" only), a shape
+// worth keeping out of a correctness test.
+const PATTERN_WIDTH: u32 = 640;
+const PATTERN_HEIGHT: u32 = 360;
+
+/// An I420 frame whose left half is bright (Y=235) and right half dark
+/// (Y=16) — a split that survives VP8 compression comfortably.
+fn pattern_frame() -> VideoFrame {
+    let width = PATTERN_WIDTH as usize;
+    let height = PATTERN_HEIGHT as usize;
+    let chroma_width = PATTERN_WIDTH.div_ceil(2) as usize;
+    let chroma_height = PATTERN_HEIGHT.div_ceil(2) as usize;
+
+    let mut data_y = vec![16u8; width * height];
+    for row in data_y.chunks_exact_mut(width) {
+        row[..width / 2].fill(235);
+    }
+    VideoFrame {
+        buffer: I420Buffer {
+            width: PATTERN_WIDTH,
+            height: PATTERN_HEIGHT,
+            data_y,
+            stride_y: PATTERN_WIDTH,
+            data_u: vec![128u8; chroma_width * chroma_height],
+            stride_u: chroma_width as u32,
+            data_v: vec![128u8; chroma_width * chroma_height],
+            stride_v: chroma_width as u32,
+        },
+        rotation: VideoRotation::Deg0,
+        timestamp_us: 0,
+    }
+}
+
+/// Publish the pattern as a camera track at ~15 fps through the
+/// transport-agnostic publish path.
+async fn publish_pattern_video(call: &Call) -> Result<VideoPublisher, Box<dyn Error>> {
+    let track = call
+        .publish(PublishOptions::camera(VideoSourceConfig {
+            width: PATTERN_WIDTH,
+            height: PATTERN_HEIGHT,
+        }))
+        .await?;
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(66));
+        let mut captured = 0u64;
+        loop {
+            ticker.tick().await;
+            if let Err(error) = track.capture_video(pattern_frame()) {
+                eprintln!("[alice] video capture failed after {captured} frames: {error}");
+                break;
+            }
+            captured += 1;
+            // ~every 5s at 15fps, so a silent capture-side death is visible.
+            if captured % 75 == 0 {
+                println!("[alice] captured {captured} video frames");
+            }
+        }
+    });
+    Ok(VideoPublisher { task })
+}
+
+/// Mean luma of the left and right halves of a frame, honouring the stride.
+fn halves_mean_luma(buffer: &I420Buffer) -> (f64, f64) {
+    let width = buffer.width as usize;
+    let stride = buffer.stride_y as usize;
+    let half = width / 2;
+    let (mut left, mut right, mut count) = (0u64, 0u64, 0u64);
+    for row in 0..buffer.height as usize {
+        let line = &buffer.data_y[row * stride..][..width];
+        left += line[..half].iter().map(|&y| u64::from(y)).sum::<u64>();
+        right += line[half..].iter().map(|&y| u64::from(y)).sum::<u64>();
+        count += half as u64;
+    }
+    (left as f64 / count as f64, right as f64 / count as f64)
+}
+
+/// Receive the peer's camera stream through the media API and verify the
+/// half-bright/half-dark pattern.
+async fn verify_video_pattern(call: &Call, label: &str) -> Result<bool, Box<dyn Error>> {
+    use futures_util::StreamExt;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let Some(peer) = wait_for_peer(call, deadline).await else {
+        println!("[{label}] WARNING: no remote participant on the roster");
+        return Ok(false);
+    };
+    let Some(track) =
+        wait_for_remote_track(call, &peer.member_id, MediaStreamKind::Camera, deadline).await
+    else {
+        println!(
+            "[{label}] WARNING: no camera stream from {} within 60s",
+            peer.member_id
+        );
+        return Ok(false);
+    };
+    println!("[{label}] receiving camera stream of {}", peer.member_id);
+
+    let mut frames = track
+        .video_frames()
+        .ok_or("camera track has no video frame stream")?;
+    let mut seen = 0usize;
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, frames.next()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                println!("[{label}] WARNING: video frame stream ended");
+                return Ok(false);
+            }
+            Err(_) => {
+                println!("[{label}] WARNING: no video frame within the deadline");
+                return Ok(false);
+            }
+        };
+        seen += 1;
+        // Skip the first few frames: early keyframes can still be settling.
+        if seen < 5 {
+            continue;
+        }
+        let (left, right) = halves_mean_luma(&frame.buffer);
+        println!(
+            "[{label}] video frame {}x{}: left/right luma {left:.0}/{right:.0}",
+            frame.buffer.width, frame.buffer.height,
+        );
+        return Ok(left > 140.0 && right < 90.0);
+    }
+}
+
+/// Exercise both constraint demand states on the peer's camera stream:
+///
+/// 1. `visible = false` → **pause** (subscription kept): frames stop, then
+///    resume instantly on `visible = true` — the scroll case.
+/// 2. `enabled = false` → **off**: the stream is released as fully as the
+///    transport supports (LiveKit currently pauses too — its client-side
+///    resubscribe is unreliable at 0.7.48), then `enabled = true` brings
+///    frames back — the closed-tile case. The re-fetch loop below stays
+///    valid for transports whose `Off` really unsubscribes (new track).
+async fn verify_constraints_toggle(call: &Call, label: &str) -> Result<bool, Box<dyn Error>> {
+    use futures_util::StreamExt;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let Some(peer) = wait_for_peer(call, deadline).await else {
+        return Ok(false);
+    };
+    let Some(track) =
+        wait_for_remote_track(call, &peer.member_id, MediaStreamKind::Camera, deadline).await
+    else {
+        return Ok(false);
+    };
+    let mut frames = track
+        .video_frames()
+        .ok_or("camera track has no video frame stream")?;
+
+    // --- Pause / resume (visible) -----------------------------------------
+    call.set_constraints(
+        &peer.member_id,
+        MediaStreamKind::Camera,
+        MediaConstraints {
+            visible: false,
+            ..Default::default()
+        },
+    );
+
+    // Frames may still be in flight; paused = a 3s window with none.
+    let paused = loop {
+        match tokio::time::timeout(Duration::from_secs(3), frames.next()).await {
+            Ok(Some(_)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+            }
+            Ok(None) => break false,
+            Err(_) => break true,
+        }
+    };
+    println!("[{label}] video paused while visible=false: {paused}");
+
+    call.set_constraints(
+        &peer.member_id,
+        MediaStreamKind::Camera,
+        MediaConstraints::default(),
+    );
+    let resumed = matches!(
+        tokio::time::timeout(Duration::from_secs(15), frames.next()).await,
+        Ok(Some(_))
+    );
+    println!("[{label}] video resumed after visible=true: {resumed}");
+
+    // --- Unsubscribe / resubscribe (enabled) -------------------------------
+    call.set_constraints(
+        &peer.member_id,
+        MediaStreamKind::Camera,
+        MediaConstraints {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+
+    // The unsubscribe drops the track: the frame stream ends (or at least
+    // goes silent while teardown propagates).
+    let stopped = loop {
+        match tokio::time::timeout(Duration::from_secs(5), frames.next()).await {
+            Ok(Some(_)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+            }
+            Ok(None) => break true, // stream ended: track dropped
+            Err(_) => break true,   // silent long enough
+        }
+    };
+    println!("[{label}] video stopped after enabled=false: {stopped}");
+
+    // Re-enabling renegotiates the subscription; a NEW track appears (the
+    // engine re-announces the stream), so re-fetch the handle.
+    call.set_constraints(
+        &peer.member_id,
+        MediaStreamKind::Camera,
+        MediaConstraints::default(),
+    );
+    // Wait out the old handle: the tracks map entry is replaced on
+    // resubscription. Poll for frames on a fresh stream.
+    let restart_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut restarted = false;
+    while tokio::time::Instant::now() < restart_deadline {
+        if let Some(track) = call.remote_track(&peer.member_id, MediaStreamKind::Camera)
+            && let Some(mut fresh_frames) = track.video_frames()
+            && matches!(
+                tokio::time::timeout(Duration::from_secs(5), fresh_frames.next()).await,
+                Ok(Some(_))
+            )
+        {
+            restarted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("[{label}] video restarted after enabled=true: {restarted}");
+
+    Ok(paused && resumed && stopped && restarted)
+}
+
+/// Receive a peer's tone through the transport-agnostic media API: find the
+/// remote participant on the roster, wait for their microphone stream (in
+/// two-foci mode this only appears once the engine has connected to *their*
+/// focus), pull ~2s of PCM off the frame stream, and verify the frequency.
+async fn record_peer_tone(call: &Call, label: &str, freq: f64) -> Result<bool, Box<dyn Error>> {
+    use futures_util::StreamExt;
+    use matrix_rtc_media::MediaStreamKind;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    let peer = loop {
+        if let Some(peer) = call.participants().into_iter().find(|p| !p.is_local) {
+            break peer;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            println!("[{label}] WARNING: no remote participant on the roster within 60s");
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+
+    let track = loop {
+        if let Some(track) = call.remote_track(&peer.member_id, MediaStreamKind::Microphone) {
+            break track;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            println!(
+                "[{label}] WARNING: no microphone stream from {} within 60s",
+                peer.member_id
+            );
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    println!(
+        "[{label}] receiving microphone stream of {} ({})",
+        peer.member_id, peer.user_id
+    );
+
+    let mut frames = track
+        .audio_frames()
+        .ok_or("microphone track has no audio frame stream")?;
+    let target_samples = media::SAMPLE_RATE as usize * 2;
+    let mut pcm: Vec<i16> = Vec::with_capacity(target_samples);
+    while pcm.len() < target_samples {
+        match tokio::time::timeout_at(deadline, frames.next()).await {
+            Ok(Some(frame)) => pcm.extend_from_slice(&frame.data),
+            Ok(None) => {
+                println!("[{label}] frame stream ended after {} samples", pcm.len());
+                break;
+            }
+            Err(_) => {
+                println!(
+                    "[{label}] WARNING: frame stream stalled at {} samples",
+                    pcm.len()
+                );
+                break;
+            }
+        }
+    }
+
+    let energy = media::detect_tone(&pcm, media::SAMPLE_RATE, freq);
+    println!(
+        "[{label}] {freq} Hz energy ratio: {energy:.3} over {} samples",
+        pcm.len()
+    );
+    Ok(energy > 0.5)
 }
 
 /// Consume bob's SFU events until a remote audio track is subscribed, record a

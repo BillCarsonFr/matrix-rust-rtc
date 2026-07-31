@@ -13,8 +13,13 @@ development:
 
 No nginx, no TLS on the client side, no federation pair — this is the minimal
 subset of [Element Call's dev backend](https://github.com/element-hq/element-call)
-that the Rust e2e flow needs. All state lives in `./data/` (git-ignored); wipe
-it for a factory reset.
+that the Rust e2e flow needs. Synapse's state (sqlite DB, media, signing key)
+lives in a docker **named volume** — a bind mount corrupts sqlite on
+macOS/Windows Docker Desktop (`disk I/O error`) — and is wiped by every
+`make backend-down` (`docker compose down -v`), so each stack start is a fresh
+homeserver. Only the TLS dev cert lives in `./data/tls/` (git-ignored);
+`make backend-reset` wipes that too, plus any legacy `./data/synapse` from
+older checkouts.
 
 ## Usage
 
@@ -34,11 +39,18 @@ docker compose -f demo/backend/docker-compose.yml up -d --wait
 Endpoints once up (all on `localhost` — do **not** expose these beyond it;
 registration is open and the secrets are well-known dev values):
 
-| Purpose                     | URL                     |
-| --------------------------- | ----------------------- |
-| Synapse (client-server API) | `http://localhost:8008` |
-| RTC auth service (lk-jwt)   | `http://localhost:6080` |
-| LiveKit SFU (WebSocket)     | `ws://localhost:7880`   |
+| Purpose                       | URL                     |
+| ----------------------------- | ----------------------- |
+| Synapse (client-server API)   | `http://localhost:8008` |
+| RTC auth service (lk-jwt)     | `http://localhost:6080` |
+| LiveKit SFU (WebSocket)       | `ws://localhost:7880`   |
+| RTC auth service 2 (lk-jwt)   | `http://localhost:6081` |
+| LiveKit SFU 2 (WebSocket)     | `ws://localhost:7890`   |
+
+The second SFU + auth-service pair exists for MSC4195 **multi-SFU** scenarios
+(each participant publishing on their own focus, e.g. the two-foci e2e test);
+single-focus development can ignore it. The two SFUs are independent — same
+dev key/secret, disjoint port ranges (UDP `50100-50200` vs `50300-50400`).
 
 ## Running the e2e call test against it
 

@@ -43,6 +43,38 @@ At this stage there is no persistence, network transport, or encryption key dist
   - `RtcSession` exposes reactive membership snapshot subscriptions for a single session.
   - TODO: add a manager-level lifecycle subscription API for session added/removed events.
 
+## `crates/matrix-rtc-media`
+
+- The transport-agnostic media model: `Participant` roster keyed by
+  `member_id`, `CallEvent` (the unified membership + media event stream),
+  owned frame types (`AudioFrame` PCM, `VideoFrame` I420), per-stream
+  `MediaConstraints` (visibility, rendered size, quality cap → subscribe-side
+  simulcast control, debounced and re-applied by the engine whenever a
+  stream (re)appears), and the publish surface (`PublishOptions` →
+  `LocalTrackHandle`; the application pushes captured frames in, the
+  transport owns encoding/simulcast, publications go to the own focus).
+- Defines the `MediaTransport`/`TransportConnection`/`RemoteTrackHandle`
+  traits a transport backend implements (LiveKit today; P2P/WebTransport
+  designed for) and the `CallEngine` that reconciles core membership
+  snapshots with transport `ConnectionEvent`s: reverse identity mapping
+  (pseudonymous identity → membership), buffering of media that arrives
+  before its membership, roster/event emission.
+- The engine owns the **multi-focus connection pool** (MSC4195 multi-SFU):
+  members are grouped by their published transports' connection key
+  (LiveKit: the `livekit_service_url`); the engine connects to every peer
+  focus via `MediaTransport::connect` (exponential backoff on failure),
+  closes connections whose last member left after an idle grace, and
+  reconnects a dead peer-focus connection after tearing down its streams.
+  Only the *own* focus — established synchronously by the caller so join can
+  fail fast, then handed over via `adopt_own_connection` — ends the call
+  when it dies.
+- Depends only on `matrix-rtc-core` + tokio/futures — no LiveKit, no
+  libwebrtc, fully unit-testable (`FakeTransport`). Everything is `Send`:
+  the only core input is the membership `watch` channel, so the core's
+  `?Send` command futures never constrain the media side.
+- Design/feasibility notes and the phased plan:
+  `agent-workspace/media-abstraction/PLAN.md`.
+
 ## `crates/matrix-rtc-wasm`
 
 - Exposes `WasmRtcSessionManager` to JavaScript.
@@ -60,6 +92,26 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Exposes UniFFI objects and records for Swift/Kotlin consumers.
 - Keeps FFI DTOs local to the crate and converts them into core DTOs.
 - Preserves session subscription semantics through a polling subscription object.
+- Signalling extras for media hosts (always available): `transports` flow
+  through both directions (`transports_json` passthrough on inbound sticky
+  events; typed `FfiRtcTransport` on membership records) and decrypted
+  `m.rtc.encryption_key` to-device messages are fed in via
+  `RtcSessionManagerHandle::receive_encryption_key`.
+- Behind the **`media` cargo feature** (default off — pulls the LiveKit
+  client and libwebrtc, ~8–15 MB per ABI): `src/media/` exposes the
+  transport-agnostic media model to mobile. The host joins the slot through
+  the manager as usual, then `connect_media_session` attaches media (E2EE
+  key bridge into the core, the `CallEngine` with its multi-focus pool, the
+  own-focus SFU connection). `MediaSession` surfaces `next_event()` (async
+  pull → Kotlin `Flow` / Swift `AsyncStream`), the participant roster,
+  `set_constraints`, frame streams (audio frames by value; video frames as
+  objects with safe copies *and* zero-copy plane pointers), and local
+  publications the host pushes captured PCM/I420 into. OpenID tokens come
+  from a host-implemented `OpenIdTokenProvider` (async foreign trait);
+  outbound keys ride the existing `CommandSenderCallback`. All media work
+  runs on a dedicated multithreaded tokio runtime — the manager's `?Send`
+  futures never touch it. Android gets a `JNI_OnLoad` that initialises
+  libwebrtc.
 
 ## `crates/matrix-rtc-livekit`
 
@@ -72,11 +124,19 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Obtains the Matrix OpenID token via the `OpenIdTokenSource` trait; a default
   `matrix_sdk::Client` impl sits behind the optional `matrix-sdk` feature, so the
   crate is not hard-wired to a particular Matrix SDK.
+- Implements `matrix-rtc-media`'s transport traits in `transport_impl`
+  (`LiveKitMediaTransport`): connection key = `livekit_service_url`, remote
+  identity = MSC4195 pseudonymous identity, `RoomEvent` → `ConnectionEvent`
+  translation, and `NativeAudioStream` → owned PCM frame streams behind
+  `RemoteTrackHandle`.
 - Behind `matrix-sdk` it also ships the integration layers: `matrix_bridge`
   (SDK-backed `RtcCommandSender` + the sticky/room-state bridge into the core)
   and `call` — a `Call::join`/`Call::leave` facade wrapping membership
-  signalling, key exchange, transport discovery, and the E2EE SFU connection in
-  one handle (the crate README's quick start; also what the e2e test drives).
+  signalling, key exchange, transport discovery, the E2EE SFU connection, and
+  a `CallEngine` in one handle (the crate README's quick start; also what the
+  e2e test drives). `Call::subscribe_call_events`/`Call::participants` are the
+  transport-agnostic surface; the raw `Call::events`/`Call::session` accessors
+  remain during the transition.
 - Native-only by nature (the LiveKit client pulls in `libwebrtc`); never targets wasm.
 
 ## Spec alignment
@@ -227,12 +287,12 @@ Still outstanding:
    and skips the update when the fetch fails. The real fix is adding the slot
    type to the fork SDK's sliding sync `required_state`, then reverting
    `slot_snapshot` to the state store.
-4. **A unified `CallEvent` stream on the `Call` facade** — the facade exposes
-   LiveKit media events as a stream (`Call::events`) but Matrix-side session
-   state only by polling (`member_count`). The eventual shape is one merged
-   facade-level stream — peer joined/left, track subscribed, key imported,
-   ended-with-reason — which would also give item 1 (slot-close reaction) a
-   natural place to surface.
+4. **A unified `CallEvent` stream on the `Call` facade** — landed as
+   `matrix-rtc-media::CallEvent` via `Call::subscribe_call_events` (peer
+   joined/left, stream started/stopped, key imported, connection health,
+   ended-with-reason). Remaining: migrate the e2e test and examples off the
+   raw `Call::events`/`Call::session` accessors and delete them, and surface
+   slot-close (item 1) as `CallEvent::Ended`.
 
 ## Non-goals in this first skeleton
 

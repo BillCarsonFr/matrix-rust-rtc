@@ -31,5 +31,7 @@ probe() {
 probe "synapse" "http://localhost:8008/health"
 probe "lk-jwt-service" "http://localhost:6080/healthz"
 probe "livekit" "http://localhost:7880/"
+probe "lk-jwt-service-2" "http://localhost:6081/healthz"
+probe "livekit-2" "http://localhost:7890/"
 
 echo "[wait-ready] backend stack is ready"

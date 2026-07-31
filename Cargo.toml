@@ -18,6 +18,7 @@
 [workspace]
 members = [
     "crates/matrix-rtc-core",
+    "crates/matrix-rtc-media",
     "crates/matrix-rtc-wasm",
     "crates/matrix-rtc-ffi",
     "crates/matrix-rtc-livekit",

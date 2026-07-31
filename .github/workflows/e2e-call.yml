@@ -67,7 +67,9 @@ jobs:
         run: ./demo/backend/wait-ready.sh
 
       - name: Run e2e call test
-        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
+        # --test-threads=1: the single-focus and two-foci scenarios share the
+        # compose stack; run them sequentially.
+        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
         env:
           RUST_LOG: info
 

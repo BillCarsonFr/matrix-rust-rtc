@@ -26,6 +26,8 @@ registration).
 | **Transport** | MSC4195 OpenID→JWT token exchange and SFU connect for both clients. |
 | **Encryption** | The core `EncryptionManager` generates a per-participant media key and distributes it to the peer as an Olm-encrypted `m.rtc.encryption_key` to-device message (`SdkCommandSender::send_to_device_message`). Each side imports received keys into its LiveKit `KeyProvider` (`MediaKeyBridge`), addressed by the MSC4195 pseudonymous identity. Success = `bob` imported `alice`'s key. |
 | **Media** | 440 Hz tone published by `alice`, **GCM frame-encrypted** at the SFU, decrypted and recorded by `bob`, verified with a Goertzel filter (`media::detect_tone > 0.5`). A WAV is written to `<temp_dir>/e2e_received.wav` (uploaded as a CI artifact on failure). The tone only decodes because the keys were exchanged and mapped correctly. |
+| **Multi-SFU** (`e2e_call_two_clients_two_foci`) | The same flow with `alice` publishing on SFU 1 and `bob` on SFU 2 (the backend stack runs two SFU + lk-jwt pairs). Each client's `CallEngine` reads the peer's `transports` from their membership and opens a second connection to the peer's focus (MSC4195 multi-SFU). Tones flow in **both directions** (alice 440 Hz, bob 660 Hz) and are received through the transport-agnostic media API (`Call::participants` → `Call::remote_track` → frame streams) instead of raw LiveKit events. |
+| **Video + constraints** (same scenario) | `alice` publishes a synthetic half-bright/half-dark I420 pattern through `Call::publish` (camera track, simulcast + dynacast); `bob` receives it via `video_frames()` across the SFUs and verifies the luma split (robust to VP8 compression). Then `bob` exercises both constraint demand states: `visible = false` **pauses** the stream (frames stop, subscription kept — `set_enabled(false)`) and `visible = true` resumes it instantly; `enabled = false` turns it **off** (released as fully as the transport supports — LiveKit currently pauses here too, because its client-side resubscribe is unreliable at 0.7.48) and `enabled = true` brings frames back. |
 
 ## How it's wired
 
@@ -144,14 +146,25 @@ END-TO-END TEST PASSED (with per-participant frame E2EE)
   that ever produces duplicate-symbol link errors, switch to `-force_load <libwebrtc.a>`.
 - **`room … did not sync within 30s`** — the freshly created room (or `bob`'s
   invite) hasn't come down sliding sync yet; usually a transient re-run fixes it.
+- **Registration 500 (`M_UNKNOWN` Internal Server Error) / requests hanging
+  mid-test** — synapse's sqlite hit `disk I/O error` (check
+  `make backend-logs`). Historically caused by the DB living on a Docker
+  Desktop bind mount; it now lives in a named volume, so
+  `make backend-down && make backend-up` gives a fresh homeserver. If you see
+  this on a checkout that still bind-mounts `./data/synapse`, run
+  `make backend-reset`. A wedged homeserver also explains a `leave timed out`
+  teardown: RTC sends are bounded (15 s × 3 attempts) so they error out
+  instead of hanging forever.
 - **Stale `Cargo.lock`** resolving crates.io `matrix-sdk 0.18` → run
   `cargo update -p matrix-sdk`.
 
 ## Current limitations / follow-ups
 
-- Media is **subscribe-only on the receiver** (only `alice` publishes; `bob`
-  records). Frame E2EE is now enabled in both directions, but only `alice→bob`
-  media is exercised.
+- In the single-focus scenario media is **subscribe-only on the receiver**
+  (only `alice` publishes; `bob` records) and verified over the raw LiveKit
+  event stream. The two-foci scenario exercises both directions through the
+  media API; migrating the single-focus scenario off the raw accessors (and
+  deleting them) is the remaining step.
 - `receive_encryption_key` fans a received key out to every session in the room
   (the MSC4143 key content carries no `slot_id`); exact for one slot per room.
 - The dead-man's-switch delayed leave is a *plain* (non-sticky) delayed event, so

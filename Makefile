@@ -41,9 +41,12 @@ help:
 	@echo ""
 	@echo "Build Mobile:"
 	@echo "  make build-mobile       Build both Android AAR and iOS XCFramework (interactive)"
-	@echo "  make build-android      Build Android AAR"
-	@echo "  make build-ios          Build iOS XCFramework"
+	@echo "  make build-android      Build Android AAR (slim, signalling only)"
+	@echo "  make build-ios          Build iOS XCFramework (slim, signalling only)"
+	@echo "  make build-android-media Build Android AAR with media (frame streams; libwebrtc)"
+	@echo "  make build-ios-media    Build iOS XCFramework with media (frame streams; libwebrtc)"
 	@echo "  make build-ffi          Build FFI crate only"
+	@echo "  make test-ffi-media     Run the media FFI smoke tests (needs libwebrtc build)"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean              Clean build artifacts"
@@ -82,6 +85,21 @@ build-android:
 build-ios:
 	./scripts/build-ios-xcframework.sh
 
+# Media variants: matrix-rtc-ffi with the `media` feature (frame streams,
+# publishing, constraints). Pulls libwebrtc — needs a C++ toolchain / the NDK
+# and grows the binaries; see mobile/PACKAGING.md.
+.PHONY: build-android-media build-ios-media test-ffi-media
+build-android-media:
+	MEDIA=1 ./scripts/build-android-aar.sh
+
+build-ios-media:
+	MEDIA=1 ./scripts/build-ios-xcframework.sh
+
+# In-process smoke tests of the media FFI surface (no SFU or homeserver
+# needed, but compiles libwebrtc).
+test-ffi-media:
+	cargo test -p matrix-rtc-ffi --features media
+
 clean:
 	cargo clean
 	rm -rf mobile/ios/build
@@ -96,11 +114,20 @@ backend-up:
 backend-down:
 	docker compose -f demo/backend/docker-compose.yml down -v
 
+# Full reset: also wipe the persisted homeserver state (./data is a bind
+# mount, so `down -v` alone keeps it). Use when synapse starts returning 500s
+# (e.g. a wedged sqlite writer / stale WAL after a killed run) — everything in
+# the stack is throwaway dev state and regenerates on the next backend-up.
+backend-reset: backend-down
+	rm -rf demo/backend/data/synapse demo/backend/data/tls
+
 backend-logs:
 	docker compose -f demo/backend/docker-compose.yml logs -f
 
+# --test-threads=1: the single-focus and two-foci scenarios share the compose
+# stack; running them in parallel would double the load and interleave logs.
 test-e2e: backend-up
-	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
+	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
 
 .PHONY: quality-check
 quality-check: fmt-check clippy test build-check

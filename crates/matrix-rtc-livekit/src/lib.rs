@@ -45,6 +45,7 @@ pub mod keys;
 pub mod media;
 pub mod session;
 pub mod token;
+pub mod transport_impl;
 
 #[cfg(feature = "matrix-sdk")]
 pub mod call;
@@ -52,11 +53,23 @@ pub mod call;
 pub mod matrix_bridge;
 
 pub use keys::{
-    MediaKeyBridge, NATIVE_KEY_RING_MAX, ParticipantKey, msc4195_key_provider,
+    KeyImportListener, MediaKeyBridge, NATIVE_KEY_RING_MAX, ParticipantKey, msc4195_key_provider,
     msc4195_key_provider_options,
 };
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};
+pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
+
+/// Android initialisation, re-exported so consumers (e.g. the FFI crate)
+/// don't need a direct `livekit`/`libwebrtc` dependency for it.
+#[cfg(target_os = "android")]
+pub mod android {
+    /// Initialise libwebrtc's JVM hooks. Must run before any peer
+    /// connection is created — typically from `JNI_OnLoad`.
+    pub fn initialize_android(vm: &jni::JavaVM) {
+        livekit::webrtc::android::initialize_android(vm);
+    }
+}
 
 #[cfg(feature = "matrix-sdk")]
 pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_slot};
@@ -133,6 +146,9 @@ pub async fn connect_e2ee(
         encryption_type: EncryptionType::Gcm,
         key_provider,
     });
+    // Publisher-side layer control: the SFU tells us which simulcast layers
+    // are actually subscribed and unneeded ones stop being encoded.
+    options.dynacast = true;
     LiveKitSession::connect_with_options(&sfu_token, options).await
 }
 

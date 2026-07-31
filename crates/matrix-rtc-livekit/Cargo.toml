@@ -27,6 +27,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# Transport-agnostic media model this crate implements (`transport_impl`).
+matrix-rtc-media = { path = "../matrix-rtc-media" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
@@ -77,6 +79,11 @@ matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev =
 # rev as matrix-sdk so cargo unifies the source; `e2e-encryption` gates the
 # `crypto` re-export.
 matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["e2e-encryption"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# For the `android::initialize_android` re-export's signature; unifies with
+# the jni version libwebrtc itself uses.
+jni = "0.21"
 
 [features]
 # Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`,
