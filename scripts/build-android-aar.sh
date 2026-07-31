@@ -20,13 +20,26 @@ set -e
 
 # Build Android AAR from Rust FFI crate
 # Supports arm64-v8a, armeabi-v7a, and x86_64 ABIs
+#
+# MEDIA=1 builds the media-enabled variant (matrix-rtc-ffi `media` feature):
+# participants + frame streams + publishing. This compiles libwebrtc (needs
+# the NDK's C++ toolchain and network access for the prebuilt download on
+# first build) and bundles libwebrtc.jar into the AAR. Expect the .so to grow
+# by roughly 8-15 MB per ABI — see mobile/PACKAGING.md.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 ANDROID_MODULE_ROOT="$PROJECT_ROOT/mobile/android/matrixrtc"
 JNI_LIBS_DIR="$ANDROID_MODULE_ROOT/src/main/jniLibs"
+MODULE_LIBS_DIR="$ANDROID_MODULE_ROOT/libs"
 
-echo "Building Android AAR..."
+FEATURE_ARGS=()
+if [ "${MEDIA:-0}" = "1" ]; then
+    FEATURE_ARGS=(--features media)
+    echo "Building Android AAR (MEDIA variant: frame streams + publishing)..."
+else
+    echo "Building Android AAR (slim signalling-only variant; MEDIA=1 for media)..."
+fi
 echo "Project root: $PROJECT_ROOT"
 echo "Android module: $ANDROID_MODULE_ROOT"
 
@@ -34,6 +47,67 @@ echo "Android module: $ANDROID_MODULE_ROOT"
 if ! command -v cargo-ndk &> /dev/null; then
     echo "Installing cargo-ndk..."
     cargo install cargo-ndk
+fi
+
+if [ "${MEDIA:-0}" = "1" ]; then
+    # webrtc-sys-build runs llvm-readelf over libwebrtc.a (JNI symbol
+    # export) and locates the NDK by joining "toolchains/llvm/prebuilt/..."
+    # onto ANDROID_NDK_HOME *verbatim* — no discovery, unlike gradle or
+    # cargo-ndk. Accept both common conventions (a versioned NDK dir, or
+    # the ndk/ parent of versioned dirs) and normalise to a versioned dir
+    # for THIS BUILD ONLY; your environment stays as it is.
+    resolve_ndk() {
+        candidate="$1"
+        [ -n "$candidate" ] && [ -d "$candidate" ] || return 1
+        if [ -d "$candidate/toolchains" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        # A parent directory of versioned NDK installs: pick the highest.
+        latest="$(ls "$candidate" 2>/dev/null | sort -V | tail -1)"
+        if [ -n "$latest" ] && [ -d "$candidate/$latest/toolchains" ]; then
+            printf '%s\n' "$candidate/$latest"
+            return 0
+        fi
+        return 1
+    }
+
+    NDK_RESOLVED=""
+    for candidate in \
+        "${ANDROID_NDK_HOME:-}" \
+        "${ANDROID_NDK_ROOT:-}" \
+        "${ANDROID_HOME:+$ANDROID_HOME/ndk}" \
+        "${ANDROID_SDK_ROOT:+$ANDROID_SDK_ROOT/ndk}" \
+        "$HOME/Library/Android/sdk/ndk" \
+        "$HOME/Android/Sdk/ndk"; do
+        if NDK_RESOLVED="$(resolve_ndk "$candidate")"; then
+            break
+        fi
+        NDK_RESOLVED=""
+    done
+    if [ -z "$NDK_RESOLVED" ]; then
+        echo "❌ MEDIA=1 needs the Android NDK and none was found."
+        echo "   Checked ANDROID_NDK_HOME, ANDROID_NDK_ROOT, ANDROID_HOME/ndk,"
+        echo "   ANDROID_SDK_ROOT/ndk, and the default SDK locations."
+        exit 1
+    fi
+    export ANDROID_NDK_HOME="$NDK_RESOLVED"
+
+    case "$(uname -s)" in
+        Darwin) HOST_TAG="darwin-x86_64" ;;   # also arm64 macs: NDK keeps this dir name
+        Linux)  HOST_TAG="linux-x86_64" ;;
+        *)      HOST_TAG="" ;;
+    esac
+    READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG/bin/llvm-readelf"
+    if [ -n "$HOST_TAG" ] && [ ! -x "$READELF" ]; then
+        echo "❌ llvm-readelf not found at:"
+        echo "   $READELF"
+        echo "   The resolved NDK looks incomplete; reinstall it or point"
+        echo "   ANDROID_NDK_HOME at another NDK (versioned dir or ndk/ parent"
+        echo "   both work)."
+        exit 1
+    fi
+    echo "Using NDK: $ANDROID_NDK_HOME"
 fi
 
 # Ensure required targets are installed
@@ -47,7 +121,55 @@ cargo ndk \
   -t armeabi-v7a \
   -t x86_64 \
   -o "$JNI_LIBS_DIR" \
-  build -p matrix-rtc-ffi --release
+  build -p matrix-rtc-ffi --release "${FEATURE_ARGS[@]}"
+
+# libwebrtc's Java classes: the native library up-calls into them, so the
+# media AAR must ship the jar (it is architecture-independent). Where
+# webrtc-sys leaves it depends on how it was built:
+#   1. our target dir       — only when webrtc-sys is a path dep (livekit's
+#                             own workspace layout; its get_output_path()
+#                             assumes CARGO_MANIFEST_DIR/../target),
+#   2. the cargo registry   — where that broken relative path actually lands
+#                             for a crates.io build,
+#   3. the downloaded libwebrtc bundle (scratch dir) — always present, the
+#                             file the build copied from in the first place.
+find_webrtc_jar() {
+    candidate="$PROJECT_ROOT/target/aarch64-linux-android/release/libwebrtc.jar"
+    if [ -f "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    candidate="$(find "$cargo_home/registry/src" -maxdepth 6 \
+        -path '*/target/*-linux-android*/release/libwebrtc.jar' 2>/dev/null | head -1)"
+    if [ -n "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    candidate="$(find "$PROJECT_ROOT/target" -path '*livekit_webrtc*' \
+        -name 'libwebrtc.jar' 2>/dev/null | head -1)"
+    if [ -n "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+# Keep the libs dir in a state matching the variant so a slim rebuild
+# doesn't ship a stale jar.
+mkdir -p "$MODULE_LIBS_DIR"
+rm -f "$MODULE_LIBS_DIR/libwebrtc.jar"
+if [ "${MEDIA:-0}" = "1" ]; then
+    if WEBRTC_JAR="$(find_webrtc_jar)"; then
+        echo "Bundling libwebrtc.jar into the module (from $WEBRTC_JAR)..."
+        cp "$WEBRTC_JAR" "$MODULE_LIBS_DIR/libwebrtc.jar"
+    else
+        echo "❌ MEDIA=1 but libwebrtc.jar was not found in the project target"
+        echo "   dir, the cargo registry, or the libwebrtc download directory."
+        echo "   Look for it manually: find ~/.cargo target -name libwebrtc.jar"
+        exit 1
+    fi
+fi
 
 # Generate Kotlin bindings
 echo "Generating Kotlin bindings..."
@@ -57,6 +179,11 @@ cargo run -p uniffi-bindgen -- generate \
   --library "$PROJECT_ROOT/target/aarch64-linux-android/release/libmatrix_rtc_ffi.so" \
   --language kotlin \
   --out-dir "$KOTLIN_OUT"
+
+# Size report (the media variant carries libwebrtc; track it per ABI).
+echo ""
+echo "Native library sizes:"
+find "$JNI_LIBS_DIR" -name 'libmatrix_rtc_ffi.so' -exec du -h {} \;
 
 # Check if Gradle is available in the Android module
 if [ ! -f "$PROJECT_ROOT/mobile/android/gradlew" ]; then

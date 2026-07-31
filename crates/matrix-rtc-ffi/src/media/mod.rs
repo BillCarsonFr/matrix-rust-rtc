@@ -51,6 +51,9 @@ mod types;
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(test)]
+mod tests;
+
 pub use frames::{
     AudioFrameStream, FfiAudioFrame, FfiLocalTrack, FfiVideoFrameData, FfiVideoPlane,
     FfiVideoRotation, VideoFrameRef, VideoFrameStream,

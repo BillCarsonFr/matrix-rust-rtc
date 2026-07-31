@@ -34,6 +34,6 @@ use jni::sys::{JNI_VERSION_1_6, jint};
 #[unsafe(no_mangle)]
 pub extern "C" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
     log::info!("JNI_OnLoad: initialising libwebrtc for Android");
-    livekit::webrtc::android::initialize_android(&vm);
+    matrix_rtc_livekit::android::initialize_android(&vm);
     JNI_VERSION_1_6
 }

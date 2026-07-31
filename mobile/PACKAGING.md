@@ -134,6 +134,99 @@ cargo install uniffi_bindgen cargo-ndk
 ./scripts/build-ios-xcframework.sh
 ```
 
+## The `media` Variant (frame streams, publishing, constraints)
+
+Both scripts accept `MEDIA=1` (or use `make build-android-media` /
+`make build-ios-media`), which builds `matrix-rtc-ffi` with its `media`
+feature: participants with observable audio/video frame streams, local
+publishing, per-stream constraints, and the MSC4195 multi-SFU connection
+pool — with no LiveKit types on the API surface. The default build stays
+the slim signalling-only artifact.
+
+**What changes with `MEDIA=1`:**
+
+| | slim | media |
+| --- | --- | --- |
+| LiveKit client + libwebrtc | no | statically linked |
+| Binary size per ABI | ~1–2 MB | expect **+8–15 MB** (fill in measured numbers below) |
+| Build prerequisites | Rust targets | + C++ toolchain (NDK ≥ r25 / Xcode), network on first build (webrtc-sys downloads the prebuilt libwebrtc) |
+| Android extras | — | `libwebrtc.jar` bundled into the AAR (the native code up-calls into its Java classes); `JNI_OnLoad` initialises libwebrtc automatically when the library loads |
+| iOS extras | — | the **app must add `-ObjC` to "Other Linker Flags"** — libwebrtc's Objective-C categories are dead-stripped from the static archive otherwise and abort at runtime (`+[NSString stringForAbslStringView:]`); if `-ObjC` causes duplicate symbols, use `-force_load` on the archive instead. **Simulator is Apple Silicon only**: livekit publishes no libwebrtc for the Intel (x86_64) iOS simulator, so the media xcframework contains arm64 device + arm64 simulator slices (the slim variant keeps the universal simulator) |
+
+**Measured sizes** (record here after each release build — both scripts
+print them):
+
+| ABI / slice | slim | media |
+| --- | --- | --- |
+| android arm64-v8a | _measure_ | 23 MB `.so` (2026-07-31) |
+| android armeabi-v7a | _measure_ | 14 MB `.so` (2026-07-31) |
+| android x86_64 | _measure_ | 27 MB `.so` (2026-07-31) |
+| ios arm64 (device) | _measure_ | 519 MB `.a` — **pre-link archive, see note** (2026-07-31) |
+| ios arm64 (simulator) | _measure_ | 520 MB `.a` — pre-link archive (2026-07-31) |
+
+### Reading the iOS sizes (why the `.a` is ~520 MB and why that's fine)
+
+The Android and iOS numbers in the table measure **different things**:
+
+- The Android `.so` is a **linked** shared library: symbols resolved, dead
+  code stripped, one binary — that *is* the shipped cost.
+- The iOS `.a` is an **unlinked static archive**: a container of every
+  object file the linker *might* need. The bulk is livekit's prebuilt
+  `libwebrtc.a` for iOS (itself several hundred MB of object code as
+  released), plus the object files of every Rust dependency. Nothing has
+  been dead-stripped, because with a static library that's the *consuming
+  app's* link step, not ours.
+
+When an Xcode project links against `MatrixRtcFFI.xcframework`, only the
+symbols the app actually reaches are pulled in and the rest is discarded.
+The real shipped cost is the **app binary delta**, expected to be in the
+same tens-of-MB range as the Android `.so`. This is the normal shape for
+any iOS library carrying libwebrtc — livekit's own artifacts look the same.
+
+**How to measure the real cost** (record the result in the table above):
+
+1. Create a minimal iOS app target; archive it and note the App Store
+   thinned size (or the `.app` binary size) — that's the baseline.
+2. Link `MatrixRtcFFI.xcframework`, add `-ObjC` to "Other Linker Flags",
+   call one FFI symbol so the linker can't drop everything, re-archive.
+3. The difference between the two is the number that belongs in the table.
+
+**One honest caveat:** `-ObjC` forces the linker to load every object file
+in the archive that contains Objective-C — weakening dead-stripping for
+those objects specifically. That is why the delta should be measured
+rather than assumed. If it comes out worse than expected, the fallback is
+`-force_load` on the archive combined with a version-script-style export
+list, and there is untouched tuning headroom on our side (stripping debug
+info from the archive, a mobile cargo profile with `opt-level = "z"` +
+LTO, as livekit-uniffi does).
+
+Benign build noise with `MEDIA=1`: gradle's `stripReleaseDebugSymbols`
+reports it cannot strip `libmatrix_rtc_ffi.so` (the NDK strip tool doesn't
+match the prebuilt libwebrtc objects; the sizes above are as-shipped), and
+uniffi-bindgen warns about a missing `ktlint` (formatting only).
+
+**Host app responsibilities with media** (see the module docs in
+`crates/matrix-rtc-ffi/src/media/mod.rs` for the full flow):
+
+- Join the slot through the manager first, then call
+  `connectMediaSession(manager, config, tokenProvider)`.
+- Implement `OpenIdTokenProvider` with your Matrix client (it is called for
+  peers' foci too).
+- Feed decrypted `m.rtc.encryption_key` to-device messages to
+  `manager.receiveEncryptionKey(...)`; outbound keys already flow through
+  your `CommandSenderCallback`.
+- Include `transports_json` on the sticky events you feed in — without it
+  peers project as media-unreachable.
+- Render frames from `videoStream(...).next()`: either the safe `data(plane)`
+  copies, or zero-copy via `planePtr(plane)`/`stride(plane)`/`planeLen(plane)`
+  while holding the frame object.
+
+**Smoke test** (no SFU or homeserver needed; compiles libwebrtc):
+
+```bash
+make test-ffi-media
+```
+
 ## Environment Setup
 
 ### Android NDK
@@ -167,6 +260,16 @@ rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-and
 - Check that `ANDROID_NDK_HOME` is set correctly
 - Verify Rust targets: `rustup target list | grep android`
 - Run `./gradlew clean` before retrying
+- `MEDIA=1` + `failed to run llvm-readelf: ... NotFound` from `webrtc-sys`:
+  webrtc-sys locates the NDK by joining `toolchains/llvm/prebuilt/...` onto
+  `ANDROID_NDK_HOME` *verbatim* — it doesn't handle the `ndk/` parent-dir
+  convention that gradle and cargo-ndk accept, so plain compilation can
+  succeed while this step fails. The build script normalises this for you:
+  it accepts `ANDROID_NDK_HOME` pointing at either a versioned NDK or the
+  `ndk/` parent (highest version wins), falls back to
+  `ANDROID_NDK_ROOT`/`ANDROID_HOME`/default SDK paths, exports the resolved
+  versioned path *for the build only*, and preflights `llvm-readelf` with a
+  clear error. Your own environment does not need to change.
 
 ### iOS Build Fails
 

@@ -60,6 +60,17 @@ pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};
 pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
 
+/// Android initialisation, re-exported so consumers (e.g. the FFI crate)
+/// don't need a direct `livekit`/`libwebrtc` dependency for it.
+#[cfg(target_os = "android")]
+pub mod android {
+    /// Initialise libwebrtc's JVM hooks. Must run before any peer
+    /// connection is created — typically from `JNI_OnLoad`.
+    pub fn initialize_android(vm: &jni::JavaVM) {
+        livekit::webrtc::android::initialize_android(vm);
+    }
+}
+
 #[cfg(feature = "matrix-sdk")]
 pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_slot};
 #[cfg(feature = "matrix-sdk")]

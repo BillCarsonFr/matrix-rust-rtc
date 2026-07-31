@@ -80,6 +80,11 @@ matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev =
 # `crypto` re-export.
 matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["e2e-encryption"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+# For the `android::initialize_android` re-export's signature; unifies with
+# the jni version libwebrtc itself uses.
+jni = "0.21"
+
 [features]
 # Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`,
 # the `matrix_bridge` (SDK-backed command sender + sticky-event bridge into

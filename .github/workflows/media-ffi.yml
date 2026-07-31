@@ -1,0 +1,64 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+# Builds matrix-rtc-ffi with the `media` feature (uniffi codegen + the
+# transport-agnostic media surface over libwebrtc) and runs its in-process
+# smoke tests — no SFU or homeserver needed. The plain workspace CI never
+# compiles this combination because the feature is off by default.
+
+name: Media FFI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  media-ffi:
+    name: FFI with media feature
+    runs-on: ubuntu-latest
+    # Uncached, the libwebrtc-carrying build takes a while; warm cache brings
+    # the job to a few minutes.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # webrtc-sys's build script shells out to pkg-config for glib-2.0 (the
+      # prebuilt linux libwebrtc dynamically links it).
+      - name: Install webrtc-sys system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: media-ffi
+
+      - name: Clippy (media feature)
+        run: cargo clippy -p matrix-rtc-ffi --features media -- -D warnings
+
+      - name: Smoke tests (media feature)
+        run: cargo test -p matrix-rtc-ffi --features media

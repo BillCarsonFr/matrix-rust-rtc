@@ -173,7 +173,7 @@ async fn build_media_session(
 /// unified event stream, per-stream constraints, frame streams, and local
 /// publications — with no transport types on the surface.
 ///
-/// End it with [`MediaSession::close`]; leaving the slot itself stays a
+/// End it with [`MediaSession::disconnect`]; leaving the slot itself stays a
 /// manager concern (`RtcSessionManagerHandle::leave`).
 #[derive(uniffi::Object)]
 pub struct MediaSession {
@@ -274,7 +274,11 @@ impl MediaSession {
     /// End the media session: emits `Ended { Left }`, closes every
     /// peer-focus connection, then the own-focus one. Leave the slot via the
     /// manager separately.
-    pub async fn close(&self) -> Result<(), MediaFfiError> {
+    ///
+    /// (Named `disconnect` rather than `close`: uniffi already gives every
+    /// Kotlin object an `AutoCloseable.close()` for handle disposal, and a
+    /// suspend `close()` collides with it.)
+    pub async fn disconnect(&self) -> Result<(), MediaFfiError> {
         self.engine.shutdown().await;
         self.connection
             .close()

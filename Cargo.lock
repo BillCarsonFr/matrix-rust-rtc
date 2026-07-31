@@ -2485,6 +2485,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
+ "jni 0.21.1",
  "livekit",
  "log",
  "matrix-rtc-core",

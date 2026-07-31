@@ -41,9 +41,12 @@ help:
 	@echo ""
 	@echo "Build Mobile:"
 	@echo "  make build-mobile       Build both Android AAR and iOS XCFramework (interactive)"
-	@echo "  make build-android      Build Android AAR"
-	@echo "  make build-ios          Build iOS XCFramework"
+	@echo "  make build-android      Build Android AAR (slim, signalling only)"
+	@echo "  make build-ios          Build iOS XCFramework (slim, signalling only)"
+	@echo "  make build-android-media Build Android AAR with media (frame streams; libwebrtc)"
+	@echo "  make build-ios-media    Build iOS XCFramework with media (frame streams; libwebrtc)"
 	@echo "  make build-ffi          Build FFI crate only"
+	@echo "  make test-ffi-media     Run the media FFI smoke tests (needs libwebrtc build)"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean              Clean build artifacts"
@@ -81,6 +84,21 @@ build-android:
 
 build-ios:
 	./scripts/build-ios-xcframework.sh
+
+# Media variants: matrix-rtc-ffi with the `media` feature (frame streams,
+# publishing, constraints). Pulls libwebrtc — needs a C++ toolchain / the NDK
+# and grows the binaries; see mobile/PACKAGING.md.
+.PHONY: build-android-media build-ios-media test-ffi-media
+build-android-media:
+	MEDIA=1 ./scripts/build-android-aar.sh
+
+build-ios-media:
+	MEDIA=1 ./scripts/build-ios-xcframework.sh
+
+# In-process smoke tests of the media FFI surface (no SFU or homeserver
+# needed, but compiles libwebrtc).
+test-ffi-media:
+	cargo test -p matrix-rtc-ffi --features media
 
 clean:
 	cargo clean

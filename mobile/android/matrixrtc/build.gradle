@@ -68,5 +68,9 @@ dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.0"
     implementation 'net.java.dev.jna:jna:5.13.0'
     implementation 'net.java.dev.jna:jna-platform:5.13.0'
+    // Media variant only: the build script drops libwebrtc.jar in libs/
+    // (libwebrtc's native code up-calls into its Java classes). Empty for
+    // the slim signalling-only build.
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
 }
 
