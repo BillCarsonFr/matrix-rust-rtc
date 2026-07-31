@@ -33,6 +33,38 @@ tokio = { workspace = true, features = ["rt", "sync"] }
 uniffi.workspace = true
 async-trait.workspace = true
 futures = "0.3"
+log.workspace = true
+
+# --- `media` feature only (pulls libwebrtc; see the feature's comment) ------
+matrix-rtc-media = { path = "../matrix-rtc-media", optional = true }
+# Deliberately WITHOUT the `matrix-sdk` feature: the FFI host brings its own
+# Matrix stack; only the transport layer (token exchange, SFU, E2EE bridge)
+# is used.
+matrix-rtc-livekit = { path = "../matrix-rtc-livekit", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# For the JNI_OnLoad libwebrtc initialisation (media feature). Android-only,
+# so it never affects other targets.
+jni = { version = "0.21", optional = true }
+
+[features]
+# Media over the FFI: participants with frame streams, publishing, and
+# constraints (src/media/). Off by default — it pulls the LiveKit client and
+# libwebrtc (native C++, needs a C++ toolchain, adds ~8-15 MB per ABI). The
+# slim signalling-only artifact is the default build.
+media = [
+    "dep:matrix-rtc-media",
+    "dep:matrix-rtc-livekit",
+    "dep:reqwest",
+    "dep:jni",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+    "tokio/time",
+    # `async_runtime = "tokio"` on exported async fns needs uniffi's tokio
+    # integration (async_compat).
+    "uniffi/tokio",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }

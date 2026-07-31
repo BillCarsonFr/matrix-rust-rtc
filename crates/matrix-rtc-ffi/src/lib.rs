@@ -34,6 +34,11 @@ pub use commands::{
     FfiLeaveSessionParams, FfiTransportConfig,
 };
 
+/// Participants with observable frame streams, publishing, and constraints —
+/// see the module docs. Pulls the LiveKit client (libwebrtc): default off.
+#[cfg(feature = "media")]
+pub mod media;
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MatrixRtcFfiError {
     #[error("invalid input: {0}")]
@@ -62,6 +67,12 @@ pub struct StickyEvent {
     /// MSC4143 `member.membership`: "join" or "leave".
     pub membership: Option<String>,
     pub leave_reason: Option<FfiLeaveReason>,
+    /// The raw MSC4143 `content.transports` object as JSON (`{"published":
+    /// [...], "can_subscribe": [...]}`), passed through untyped so
+    /// transport-specific fields survive the boundary. Without it the member
+    /// projects with no transports — media layers then treat them as
+    /// unreachable.
+    pub transports_json: Option<String>,
 }
 
 /// MSC4143 `leave_reason`: a machine-readable `code` plus an optional
@@ -113,6 +124,83 @@ pub struct StickyEventUpdate {
     pub previous: StickyEvent,
 }
 
+/// A decrypted `m.rtc.encryption_key` to-device message, fed into the core so
+/// peers' media keys reach the encryption manager (and, with the `media`
+/// feature, the frame decryptors).
+///
+/// The host's Matrix SDK receives and decrypts the to-device event; the
+/// `sender_*` fields come from its decryption metadata, not the payload.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiReceivedEncryptionKey {
+    /// The `room_id` carried in the message content.
+    pub room_id: String,
+    /// The `member_id` carried in the message content.
+    pub member_id: String,
+    /// The key material, encoded per the message's `format`.
+    pub key_b64: String,
+    /// The rolling key index (0-255).
+    pub key_index: u8,
+    /// Whether the to-device message arrived Olm-encrypted. MSC4143 requires
+    /// it; the core discards cleartext keys.
+    pub was_encrypted: bool,
+    /// User the message was decrypted as coming from (required when
+    /// `was_encrypted`).
+    pub sender_user_id: Option<String>,
+    /// Device the message was decrypted as coming from, when attributable.
+    pub sender_device_id: Option<String>,
+    /// Whether that device is cross-signed (MSC4153).
+    pub sender_is_cross_signed: bool,
+}
+
+impl FfiReceivedEncryptionKey {
+    fn into_core(self) -> Result<matrix_rtc_core::ReceivedEncryptionKey, MatrixRtcFfiError> {
+        let origin = if self.was_encrypted {
+            matrix_rtc_core::KeyOrigin::Encrypted {
+                sender_user_id: self.sender_user_id.ok_or_else(|| {
+                    MatrixRtcFfiError::InvalidInput(
+                        "an encrypted key needs its sender_user_id".into(),
+                    )
+                })?,
+                sender_device_id: self.sender_device_id,
+                sender_is_cross_signed: self.sender_is_cross_signed,
+            }
+        } else {
+            matrix_rtc_core::KeyOrigin::Cleartext
+        };
+        Ok(matrix_rtc_core::ReceivedEncryptionKey {
+            origin,
+            room_id: self.room_id,
+            member_id: self.member_id,
+            key_b64: self.key_b64,
+            key_index: self.key_index,
+        })
+    }
+}
+
+/// A transport a member publishes media on (MSC4143 `transports.published`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRtcTransport {
+    /// MSC4195 LiveKit transport.
+    LiveKit { livekit_service_url: String },
+    /// A transport this SDK does not know; kept for forward compatibility.
+    Unsupported { transport_type: String },
+}
+
+impl From<&matrix_rtc_core::RtcTransport> for FfiRtcTransport {
+    fn from(transport: &matrix_rtc_core::RtcTransport) -> Self {
+        match transport {
+            matrix_rtc_core::RtcTransport::LiveKit(livekit) => FfiRtcTransport::LiveKit {
+                livekit_service_url: livekit.livekit_service_url.clone(),
+            },
+            matrix_rtc_core::RtcTransport::Unsupported(unsupported) => {
+                FfiRtcTransport::Unsupported {
+                    transport_type: unsupported.transport_type.clone(),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct JoinedMembership {
     pub room_id: String,
@@ -122,6 +210,8 @@ pub struct JoinedMembership {
     pub sticky_key: String,
     pub member_id: String,
     pub application: Option<String>,
+    /// Transports this member publishes media on (MSC4143).
+    pub transports: Vec<FfiRtcTransport>,
     /// Transport types this member can subscribe to (MSC4143).
     pub can_subscribe: Vec<String>,
 }
@@ -423,6 +513,23 @@ impl RtcSessionManagerHandle {
         })
     }
 
+    /// Feeds a decrypted `m.rtc.encryption_key` to-device message to every
+    /// session of its room. Call for each such message the host's sync
+    /// delivers; without it peers' media never becomes decryptable.
+    pub fn receive_encryption_key(
+        &self,
+        key: FfiReceivedEncryptionKey,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let received = key.into_core()?;
+        let manager = lock_mutex(&self.inner)?;
+        futures::executor::block_on(async {
+            manager
+                .receive_encryption_key(received)
+                .await
+                .map_err(|error| MatrixRtcFfiError::InvalidInput(error.to_string()))
+        })
+    }
+
     pub fn session_count(&self) -> Result<u64, MatrixRtcFfiError> {
         let manager = lock_mutex(&self.inner)?;
         Ok(manager.session_count() as u64)
@@ -542,6 +649,17 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
         }),
     };
 
+    // A malformed transports object degrades that member to "no transports"
+    // (media layers see them as unreachable) rather than failing the whole
+    // sticky batch — it is host-supplied JSON, not protocol input we control.
+    let transports = event.transports_json.and_then(|json| {
+        serde_json::from_str(&json)
+            .map_err(|error| {
+                log::warn!("ignoring malformed transports JSON on sticky event: {error}");
+            })
+            .ok()
+    });
+
     RawStickyEvent {
         room_id: event.room_id,
         sender: event.sender,
@@ -556,8 +674,7 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
             sticky_key: event.sticky_key,
             application,
             member,
-            // Transports are not yet exposed over the FFI boundary.
-            transports: None,
+            transports,
             leave_reason: event.leave_reason.map(Into::into),
         },
     }
@@ -616,6 +733,7 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         sticky_key: member.sticky_key,
         member_id: member.member_id,
         application: member.application,
+        transports: member.transports.iter().map(Into::into).collect(),
         can_subscribe: member.can_subscribe,
     }
 }
@@ -649,6 +767,10 @@ mod tests {
             member_id: Some("alice-device-a".to_owned()),
             membership: Some("join".to_owned()),
             leave_reason: None,
+            transports_json: Some(
+                r#"{"published":[{"type":"livekit","livekit_service_url":"https://sfu.example.org"}],"can_subscribe":["livekit"]}"#
+                    .to_owned(),
+            ),
         }
     }
 
@@ -659,6 +781,26 @@ mod tests {
         let result = session.on_sticky_events_snapshot_received(vec![join_event()]);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn transports_round_trip_through_the_ffi() {
+        let session = RtcSessionHandle::new();
+        let subscription = session.subscribe_membership_snapshots().unwrap();
+        let _ = subscription.next_snapshot();
+
+        session
+            .on_sticky_events_snapshot_received(vec![join_event()])
+            .unwrap();
+
+        let joined = subscription.next_snapshot().unwrap().unwrap();
+        assert_eq!(
+            joined[0].transports,
+            vec![FfiRtcTransport::LiveKit {
+                livekit_service_url: "https://sfu.example.org".to_owned(),
+            }]
+        );
+        assert_eq!(joined[0].can_subscribe, vec!["livekit".to_owned()]);
     }
 
     #[test]

@@ -92,6 +92,26 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Exposes UniFFI objects and records for Swift/Kotlin consumers.
 - Keeps FFI DTOs local to the crate and converts them into core DTOs.
 - Preserves session subscription semantics through a polling subscription object.
+- Signalling extras for media hosts (always available): `transports` flow
+  through both directions (`transports_json` passthrough on inbound sticky
+  events; typed `FfiRtcTransport` on membership records) and decrypted
+  `m.rtc.encryption_key` to-device messages are fed in via
+  `RtcSessionManagerHandle::receive_encryption_key`.
+- Behind the **`media` cargo feature** (default off — pulls the LiveKit
+  client and libwebrtc, ~8–15 MB per ABI): `src/media/` exposes the
+  transport-agnostic media model to mobile. The host joins the slot through
+  the manager as usual, then `connect_media_session` attaches media (E2EE
+  key bridge into the core, the `CallEngine` with its multi-focus pool, the
+  own-focus SFU connection). `MediaSession` surfaces `next_event()` (async
+  pull → Kotlin `Flow` / Swift `AsyncStream`), the participant roster,
+  `set_constraints`, frame streams (audio frames by value; video frames as
+  objects with safe copies *and* zero-copy plane pointers), and local
+  publications the host pushes captured PCM/I420 into. OpenID tokens come
+  from a host-implemented `OpenIdTokenProvider` (async foreign trait);
+  outbound keys ride the existing `CommandSenderCallback`. All media work
+  runs on a dedicated multithreaded tokio runtime — the manager's `?Send`
+  futures never touch it. Android gets a `JNI_OnLoad` that initialises
+  libwebrtc.
 
 ## `crates/matrix-rtc-livekit`
 
