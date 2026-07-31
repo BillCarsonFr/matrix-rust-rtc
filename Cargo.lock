@@ -2471,6 +2471,7 @@ dependencies = [
  "livekit",
  "log",
  "matrix-rtc-core",
+ "matrix-rtc-media",
  "matrix-sdk",
  "matrix-sdk-base",
  "matrix-sdk-ui",
@@ -2482,6 +2483,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "matrix-rtc-media"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "futures-util",
+ "log",
+ "matrix-rtc-core",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

@@ -92,6 +92,10 @@ impl From<KeyMaterialSignal> for ParticipantKey {
     }
 }
 
+/// Callback invoked after every signalled key has been recorded (and, with a
+/// provider, imported). Must not block: it runs on the signalling path.
+pub type KeyImportListener = Box<dyn Fn(&ParticipantKey) + Send + Sync>;
+
 /// Records media keys signalled by `matrix-rtc-core` and, when built with
 /// [`MediaKeyBridge::with_provider`], imports them into a LiveKit
 /// [`KeyProvider`].
@@ -102,6 +106,7 @@ impl From<KeyMaterialSignal> for ParticipantKey {
 pub struct MediaKeyBridge {
     keys: Mutex<HashMap<String, ParticipantKey>>,
     provider: Option<KeyProvider>,
+    listener: Mutex<Option<KeyImportListener>>,
 }
 
 impl MediaKeyBridge {
@@ -121,7 +126,17 @@ impl MediaKeyBridge {
         Self {
             keys: Mutex::new(HashMap::new()),
             provider: Some(provider),
+            listener: Mutex::new(None),
         }
+    }
+
+    /// Register a callback observing every signalled key (e.g. to surface
+    /// `KeyImported` on a call event stream). Replaces any previous listener.
+    pub fn set_key_import_listener(&self, listener: KeyImportListener) {
+        *self
+            .listener
+            .lock()
+            .expect("key bridge listener mutex poisoned") = Some(listener);
     }
 
     /// The latest recorded key for a participant identity, if any.
@@ -178,7 +193,15 @@ impl EncryptionKeySignalHandler for MediaKeyBridge {
         self.keys
             .lock()
             .expect("key bridge mutex poisoned")
-            .insert(key.rtc_backend_identity.clone(), key);
+            .insert(key.rtc_backend_identity.clone(), key.clone());
+        if let Some(listener) = self
+            .listener
+            .lock()
+            .expect("key bridge listener mutex poisoned")
+            .as_ref()
+        {
+            listener(&key);
+        }
     }
 }
 

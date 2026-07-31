@@ -27,6 +27,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# Transport-agnostic media model this crate implements (`transport_impl`).
+matrix-rtc-media = { path = "../matrix-rtc-media" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true

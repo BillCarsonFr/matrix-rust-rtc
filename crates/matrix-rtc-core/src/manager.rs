@@ -23,6 +23,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use tokio::sync::watch;
+
 use crate::commands::RtcCommandSender;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
@@ -31,7 +33,7 @@ use crate::event::{
     EventConversionError, RawStickyEvent, RawStickyEventUpdate, StickyEventsUpdate,
 };
 use crate::join::{JoinSessionParams, LeaveSessionParams};
-use crate::session::{CallMembershipEvent, RtcSession};
+use crate::session::{CallMembershipEvent, JoinedMembership, RtcSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
@@ -348,6 +350,20 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     pub fn member_count(&self, room_id: &str, slot_id: &str) -> Option<usize> {
         let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
         self.sessions.get(&key).map(RtcSession::member_count)
+    }
+
+    /// Subscribes to membership snapshots of one `(room_id, slot_id)` session
+    /// (see [`RtcSession::subscribe_membership_snapshots`]), or `None` if the
+    /// session does not exist.
+    pub fn subscribe_membership_snapshots(
+        &self,
+        room_id: &str,
+        slot_id: &str,
+    ) -> Option<watch::Receiver<Vec<JoinedMembership>>> {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get(&key)
+            .map(RtcSession::subscribe_membership_snapshots)
     }
 
     /// Registers a media key signal handler for one `(room_id, slot_id)`

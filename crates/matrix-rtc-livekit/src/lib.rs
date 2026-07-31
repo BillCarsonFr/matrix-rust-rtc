@@ -45,6 +45,7 @@ pub mod keys;
 pub mod media;
 pub mod session;
 pub mod token;
+pub mod transport_impl;
 
 #[cfg(feature = "matrix-sdk")]
 pub mod call;
@@ -52,11 +53,12 @@ pub mod call;
 pub mod matrix_bridge;
 
 pub use keys::{
-    MediaKeyBridge, NATIVE_KEY_RING_MAX, ParticipantKey, msc4195_key_provider,
+    KeyImportListener, MediaKeyBridge, NATIVE_KEY_RING_MAX, ParticipantKey, msc4195_key_provider,
     msc4195_key_provider_options,
 };
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};
+pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
 
 #[cfg(feature = "matrix-sdk")]
 pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_slot};

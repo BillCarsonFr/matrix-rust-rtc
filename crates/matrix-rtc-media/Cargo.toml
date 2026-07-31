@@ -1,0 +1,38 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+[package]
+name = "matrix-rtc-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transport-agnostic MatrixRTC media model: participants, frame streams, constraints, and the call engine."
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The engine's actor loop multiplexes channels with `tokio::select!` (`macros`).
+tokio = { workspace = true, features = ["macros"] }
+# `BoxStream` for the frame streams handed out by `RemoteTrackHandle`. Only the
+# type is needed here; combinators stay in the transport implementations.
+futures-core = "0.3"
+async-trait.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
+futures-util = "0.3"

@@ -20,9 +20,14 @@
 //! [`Call::join`] wires together everything a MatrixRTC participant needs —
 //! the [`RtcSessionManager`] with an SDK-backed command sender, the sticky
 //! membership bridge, MSC4143 media-key signalling in both directions, the
-//! MSC4195 token exchange, and an E2EE-enabled SFU connection — and returns a
-//! single handle exposing the LiveKit event stream. [`Call::leave`] tears all
-//! of it down in the right order.
+//! MSC4195 token exchange, and an E2EE-enabled SFU connection driven through
+//! the transport-agnostic [`matrix_rtc_media`] layer. [`Call::leave`] tears
+//! all of it down in the right order.
+//!
+//! Consume the call through the unified stream
+//! ([`Call::subscribe_call_events`]) and the [`Call::participants`] roster;
+//! the raw LiveKit accessors ([`Call::events`], [`Call::session`]) remain for
+//! the transition and will go away once frame streams cover their uses.
 //!
 //! Requires the `matrix-sdk` feature.
 //!
@@ -52,22 +57,24 @@ use matrix_sdk::ruma::api::client::rtc::transports::v1 as rtc_transports;
 use matrix_sdk::ruma::events::AnyToDeviceEvent;
 use matrix_sdk::ruma::events::rtc::transport::RtcTransport as RumaRtcTransport;
 use matrix_sdk::{Client, Room};
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 
 use matrix_rtc_core::{
     EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, ReceivedEncryptionKey,
     RtcIdentityMapper, RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
+use matrix_rtc_media::{
+    CallEngine, CallEvent, ConnectionContext, EngineConfig, MediaStreamKind, OwnMemberClaims,
+    Participant, RemoteTrackHandle,
+};
 
 use crate::identity::pseudonymous_identity;
 use crate::matrix_bridge::{SdkCommandSender, run_sticky_bridge};
 use crate::session::LiveKitSession;
-use crate::{
-    LiveKitConnection, LiveKitTransportConfig, MediaKeyBridge, MemberClaims, connect_e2ee,
-    msc4195_key_provider,
-};
+use crate::transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
+use crate::{MediaKeyBridge, msc4195_key_provider};
 
 type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
 
@@ -81,6 +88,10 @@ pub enum CallError {
     /// A LiveKit transport error (token exchange, SFU connection).
     #[error(transparent)]
     Transport(#[from] crate::Error),
+
+    /// A media transport error surfaced through the media layer.
+    #[error(transparent)]
+    Media(#[from] matrix_rtc_media::TransportError),
 
     /// MatrixRTC signalling through the core failed (membership, slot, keys).
     #[error("MatrixRTC signalling failed: {0}")]
@@ -159,7 +170,9 @@ struct ReceivedKey {
 /// only when the dead man's switch fires.
 pub struct Call {
     manager: Manager,
-    connection: LiveKitConnection,
+    engine: CallEngine,
+    connection: LiveKitTransportConnection,
+    raw_events: UnboundedReceiver<RoomEvent>,
     bridge: Arc<MediaKeyBridge>,
     own_identity: String,
     membership_id: String,
@@ -230,7 +243,8 @@ impl Call {
 
         // Join the RTC session, then — still holding the manager lock so no
         // sticky update can interleave — wire the encryption manager to our
-        // bridge and to the MSC4195 pseudonymous-identity derivation.
+        // bridge and to the MSC4195 pseudonymous-identity derivation, and
+        // take the membership snapshot channel the media engine consumes.
         let mut params = JoinSessionParams::new(
             user_id.clone(),
             device_id.clone(),
@@ -241,7 +255,7 @@ impl Call {
         );
         params.membership_id = Some(membership_id.clone());
         params.encryption_config = options.encryption_config.clone();
-        {
+        let memberships = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;
             let identity_mapper: RtcIdentityMapper =
@@ -254,7 +268,11 @@ impl Call {
                 ));
             }
             mgr.set_encryption_identity_mapper(&room_id, &options.slot_id, identity_mapper);
-        }
+            mgr.subscribe_membership_snapshots(&room_id, &options.slot_id)
+                .ok_or_else(|| {
+                    CallError::Signalling("joined session is not tracked by the manager".into())
+                })?
+        };
 
         let key_pump = AbortOnDrop(spawn_key_pump(manager.clone(), key_rx));
         let heartbeat = AbortOnDrop(spawn_heartbeat(
@@ -264,23 +282,46 @@ impl Call {
             options.heartbeat_interval,
         ));
 
-        // Token exchange + SFU connect (the client is the OpenID token source).
+        // The media layer: a LiveKit transport sharing the E2EE key provider,
+        // and the engine reconciling memberships with connection events. The
+        // client is the OpenID token source for the MSC4195 token exchange.
         let http = match options.http {
             Some(http) => http,
             None => reqwest::Client::new(),
         };
-        let lk_config = LiveKitTransportConfig {
-            livekit_service_url: livekit.livekit_service_url.clone(),
+        let transport = Arc::new(LiveKitMediaTransport::new(
+            http,
+            Arc::new(client.clone()),
+            provider,
+        ));
+        let engine = CallEngine::new(
+            EngineConfig {
+                transports: vec![transport.clone()],
+                own_member_id: membership_id.clone(),
+            },
+            memberships,
+        );
+
+        // Imported media keys surface as `CallEvent::KeyImported`.
+        let engine_handle = engine.handle();
+        bridge.set_key_import_listener(Box::new(move |key| {
+            engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
+        }));
+
+        let ctx = ConnectionContext {
             room_id: room_id.clone(),
             slot_id: options.slot_id.clone(),
-            member: MemberClaims {
-                id: membership_id.clone(),
-                claimed_user_id: user_id,
-                claimed_device_id: device_id,
+            member: OwnMemberClaims {
+                member_id: membership_id.clone(),
+                user_id,
+                device_id,
             },
         };
-        let connection = match connect_e2ee(&http, &lk_config, &client, provider).await {
-            Ok(connection) => connection,
+        let (connection, connection_events) = match transport
+            .connect_livekit(&livekit.livekit_service_url, &ctx)
+            .await
+        {
+            Ok(connected) => connected,
             Err(error) => {
                 // We are signalled as joined but have no media path; leave so
                 // peers don't wait on the dead man's switch to notice.
@@ -296,10 +337,17 @@ impl Call {
                 return Err(error.into());
             }
         };
+        engine.attach_connection(livekit.livekit_service_url.clone(), connection_events);
+
+        // Transition-period raw stream; subscribed immediately after connect,
+        // so only events racing the connect itself can be missed here.
+        let raw_events = connection.session().room().subscribe();
 
         Ok(Call {
             manager,
+            engine,
             connection,
+            raw_events,
             bridge,
             own_identity,
             membership_id,
@@ -312,8 +360,49 @@ impl Call {
         })
     }
 
-    /// The LiveKit room event stream (participants joining, tracks
+    /// The unified call event stream: membership changes, media streams
+    /// starting/stopping, key imports, connection health, call end.
+    ///
+    /// This is the transport-agnostic replacement for [`Call::events`]. Any
+    /// number of subscribers may exist; a subscriber that falls far behind
+    /// observes a `Lagged` error and should resynchronise from
+    /// [`Call::participants`].
+    pub fn subscribe_call_events(&self) -> broadcast::Receiver<CallEvent> {
+        self.engine.subscribe_events()
+    }
+
+    /// The current participant roster (including ourselves), derived from
+    /// membership signalling and enriched with live media streams.
+    pub fn participants(&self) -> Vec<Participant> {
+        self.engine.participants()
+    }
+
+    /// Watch the participant roster; the receiver always holds the latest
+    /// snapshot.
+    pub fn subscribe_participants(&self) -> watch::Receiver<Vec<Participant>> {
+        self.engine.subscribe_participants()
+    }
+
+    /// The frame-stream handle for a participant's subscribed stream, once
+    /// [`CallEvent::StreamStarted`] announced it.
+    pub fn remote_track(
+        &self,
+        member_id: &str,
+        kind: MediaStreamKind,
+    ) -> Option<Arc<dyn RemoteTrackHandle>> {
+        self.engine.remote_track(member_id, kind)
+    }
+
+    /// The media engine driving this call's roster and event stream.
+    pub fn engine(&self) -> &CallEngine {
+        &self.engine
+    }
+
+    /// The raw LiveKit room event stream (participants joining, tracks
     /// subscribed, disconnects, ...).
+    ///
+    /// Transition API: prefer [`Call::subscribe_call_events`]; this accessor
+    /// goes away once frame-level consumers are served by [`Call::remote_track`].
     ///
     /// The stream ending (`recv()` returning `None`) means the call is over:
     /// the room closes its event channel on [`Call::leave`] and after any
@@ -325,12 +414,15 @@ impl Call {
     /// waiting for an event that may never come (e.g. a track from a peer who
     /// never publishes) should be wrapped in a timeout by the caller.
     pub fn events(&mut self) -> &mut UnboundedReceiver<RoomEvent> {
-        &mut self.connection.events
+        &mut self.raw_events
     }
 
     /// The connected SFU session (access the LiveKit room to publish, ...).
+    ///
+    /// Transition API: media access moves behind [`Call::remote_track`] and
+    /// the upcoming publish surface.
     pub fn session(&self) -> &LiveKitSession {
-        &self.connection.session
+        self.connection.session()
     }
 
     /// Our MSC4195 pseudonymous LiveKit identity (the JWT `sub`). Peers see
@@ -386,7 +478,8 @@ impl Call {
             .leave(room_id, slot_id, Default::default())
             .await
             .map_err(signalling_error);
-        let close_result = connection.session.close().await.map_err(CallError::from);
+        use matrix_rtc_media::TransportConnection as _;
+        let close_result = connection.close().await.map_err(CallError::from);
         leave_result.and(close_result)
     }
 }
