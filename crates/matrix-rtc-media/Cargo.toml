@@ -24,8 +24,9 @@ description = "Transport-agnostic MatrixRTC media model: participants, frame str
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
-# The engine's actor loop multiplexes channels with `tokio::select!` (`macros`).
-tokio = { workspace = true, features = ["macros"] }
+# The engine's actor loop multiplexes channels with `tokio::select!`
+# (`macros`) and drives backoff/idle-grace timers (`time`).
+tokio = { workspace = true, features = ["macros", "time"] }
 # `BoxStream` for the frame streams handed out by `RemoteTrackHandle`. Only the
 # type is needed here; combinators stay in the transport implementations.
 futures-core = "0.3"

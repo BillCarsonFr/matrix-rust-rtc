@@ -294,10 +294,24 @@ impl Call {
             Arc::new(client.clone()),
             provider,
         ));
+        let ctx = ConnectionContext {
+            room_id: room_id.clone(),
+            slot_id: options.slot_id.clone(),
+            member: OwnMemberClaims {
+                member_id: membership_id.clone(),
+                user_id,
+                device_id,
+            },
+        };
+        // The engine owns connections to every peer focus (MSC4195 multi-SFU);
+        // only the own focus is connected here, synchronously, so a failed
+        // join can be reported (and signalled away) immediately.
         let engine = CallEngine::new(
             EngineConfig {
                 transports: vec![transport.clone()],
                 own_member_id: membership_id.clone(),
+                ctx: ctx.clone(),
+                own_connection_key: Some(livekit.livekit_service_url.clone()),
             },
             memberships,
         );
@@ -308,15 +322,6 @@ impl Call {
             engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
         }));
 
-        let ctx = ConnectionContext {
-            room_id: room_id.clone(),
-            slot_id: options.slot_id.clone(),
-            member: OwnMemberClaims {
-                member_id: membership_id.clone(),
-                user_id,
-                device_id,
-            },
-        };
         let (connection, connection_events) = match transport
             .connect_livekit(&livekit.livekit_service_url, &ctx)
             .await
@@ -337,7 +342,7 @@ impl Call {
                 return Err(error.into());
             }
         };
-        engine.attach_connection(livekit.livekit_service_url.clone(), connection_events);
+        engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
         // Transition-period raw stream; subscribed immediately after connect,
         // so only events racing the connect itself can be missed here.
@@ -462,6 +467,7 @@ impl Call {
     pub async fn leave(self) -> Result<(), CallError> {
         let Call {
             manager,
+            engine,
             connection,
             heartbeat,
             key_pump,
@@ -472,14 +478,29 @@ impl Call {
         drop(heartbeat);
         drop(key_pump);
 
+        // Step logs bracket every await so a wedged teardown pinpoints itself.
+        log::debug!("[{room_id}] leave: sending matrix leave (membership + delayed-event cancel)");
         let leave_result = manager
             .lock()
             .await
-            .leave(room_id, slot_id, Default::default())
+            .leave(room_id.clone(), slot_id, Default::default())
             .await
             .map_err(signalling_error);
+        log::debug!(
+            "[{room_id}] leave: matrix leave {}; shutting down the media engine",
+            if leave_result.is_ok() {
+                "sent"
+            } else {
+                "FAILED"
+            },
+        );
+        // Emits `CallEvent::Ended { reason: Left }` and closes every
+        // peer-focus connection; the own-focus close below reports its result.
+        engine.shutdown().await;
+        log::debug!("[{room_id}] leave: media engine down; closing own SFU connection");
         use matrix_rtc_media::TransportConnection as _;
         let close_result = connection.close().await.map_err(CallError::from);
+        log::debug!("[{room_id}] leave: complete");
         leave_result.and(close_result)
     }
 }

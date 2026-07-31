@@ -96,11 +96,20 @@ backend-up:
 backend-down:
 	docker compose -f demo/backend/docker-compose.yml down -v
 
+# Full reset: also wipe the persisted homeserver state (./data is a bind
+# mount, so `down -v` alone keeps it). Use when synapse starts returning 500s
+# (e.g. a wedged sqlite writer / stale WAL after a killed run) — everything in
+# the stack is throwaway dev state and regenerates on the next backend-up.
+backend-reset: backend-down
+	rm -rf demo/backend/data/synapse demo/backend/data/tls
+
 backend-logs:
 	docker compose -f demo/backend/docker-compose.yml logs -f
 
+# --test-threads=1: the single-focus and two-foci scenarios share the compose
+# stack; running them in parallel would double the load and interleave logs.
 test-e2e: backend-up
-	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
+	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
 
 .PHONY: quality-check
 quality-check: fmt-check clippy test build-check

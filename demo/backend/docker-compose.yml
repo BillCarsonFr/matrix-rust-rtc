@@ -13,6 +13,11 @@
 
 name: matrix-rtc-backend
 
+volumes:
+  # Synapse state (sqlite DB, media, signing key). See the synapse service's
+  # volumes comment for why this must not be a bind mount.
+  synapse-data:
+
 services:
   # One-shot, idempotent: mints the self-signed cert Synapse's federation
   # listener needs. lk-jwt-service validates OpenID tokens over the federation
@@ -48,7 +53,13 @@ services:
     volumes:
       - ./synapse/homeserver.yaml:/cfg/homeserver.yaml:ro
       - ./synapse/log.config:/cfg/log.config:ro
-      - ./data/synapse:/data
+      # Named volume, NOT a bind mount: synapse's sqlite over a macOS/Windows
+      # bind mount produces `sqlite3.OperationalError: disk I/O error` under
+      # load (observed wedging the whole homeserver mid-test). The volume is
+      # removed by `docker compose down -v` (make backend-down), so every
+      # stack restart starts from a clean homeserver — everything in it is
+      # throwaway dev state (test users are provisioned per run).
+      - synapse-data:/data
       - ./data/tls:/data/tls:ro
     ports:
       # Client-server API, plain HTTP. 8448 (federation, TLS) is deliberately
@@ -112,6 +123,45 @@ services:
     # busybox wget.
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7880/"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # ---- Second focus (MSC4195 multi-SFU scenarios) --------------------------
+  # A full second SFU + authorisation-service pair, so tests can put each
+  # participant on a different focus and exercise cross-focus subscribe. Same
+  # pattern as the first pair; every published port is shifted, and the UDP
+  # media ranges must never overlap between the two SFUs.
+
+  auth-service2:
+    image: ghcr.io/element-hq/lk-jwt-service:0.4.4
+    network_mode: "service:livekit2"
+    environment:
+      LIVEKIT_JWT_PORT: "6081"
+      LIVEKIT_URL: "${LIVEKIT_WS_URL_2:-ws://localhost:7890}"
+      LIVEKIT_KEY: devkey
+      LIVEKIT_SECRET: secret
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse
+      LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
+      LIVEKIT_LOG_LEVEL: debug
+    depends_on:
+      synapse:
+        condition: service_healthy
+      livekit2:
+        condition: service_healthy
+
+  livekit2:
+    image: livekit/livekit-server:v1.10.1
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit/livekit2.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7890:7890/tcp" # signalling WebSocket + HTTP
+      - "7891:7891/tcp" # ICE over TCP
+      - "50300-50400:50300-50400/udp" # WebRTC media (distinct from SFU 1's range)
+      - "6081:6081/tcp" # auth-service2 (shares this network namespace)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7890/"]
       interval: 3s
       timeout: 5s
       retries: 20

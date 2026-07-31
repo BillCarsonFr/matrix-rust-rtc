@@ -1,0 +1,29 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# Second LiveKit SFU for multi-focus (MSC4195 multi-SFU) scenarios: identical
+# to livekit.yaml except every port is shifted so both SFUs can publish on the
+# host. auth-service2 shares this container's network namespace, so the ws
+# port here must equal the one in its LIVEKIT_URL (ws://localhost:7890).
+
+port: 7890
+bind_addresses:
+  - "0.0.0.0"
+rtc:
+  tcp_port: 7891
+  port_range_start: 50300
+  port_range_end: 50400
+  use_external_ip: false
+  # Advertise loopback in ICE candidates: the test clients run on the host and
+  # reach the container through the ports docker publishes on localhost.
+  node_ip: 127.0.0.1
+keys:
+  devkey: secret
+room:
+  auto_create: false

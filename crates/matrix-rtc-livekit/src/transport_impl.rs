@@ -123,7 +123,7 @@ impl LiveKitMediaTransport {
         Ok((
             LiveKitTransportConnection {
                 connection_key: livekit_service_url.to_owned(),
-                session: connection.session,
+                session: Arc::new(connection.session),
             },
             events_rx,
         ))
@@ -173,9 +173,13 @@ impl MediaTransport for LiveKitMediaTransport {
 }
 
 /// One live SFU connection.
+///
+/// A cheap clonable handle: the caller can keep one clone (for raw session
+/// access and the final close) while another is owned by the engine's pool.
+#[derive(Clone)]
 pub struct LiveKitTransportConnection {
     connection_key: String,
-    session: LiveKitSession,
+    session: Arc<LiveKitSession>,
 }
 
 impl LiveKitTransportConnection {

@@ -104,6 +104,19 @@ impl SdkCommandSender {
     }
 }
 
+/// Bounded request behaviour for RTC signalling sends.
+///
+/// The SDK default retries retryable failures without limit, which turns a
+/// wedged homeserver into an indefinitely hanging send (observed: a leave
+/// awaiting forever while synapse was down with sqlite I/O errors). MatrixRTC
+/// state is time-critical — peers act on our membership within seconds — so
+/// fail after a couple of attempts and let the caller decide.
+fn rtc_request_config() -> matrix_sdk::config::RequestConfig {
+    matrix_sdk::config::RequestConfig::new()
+        .timeout(Duration::from_secs(15))
+        .retry_limit(2)
+}
+
 #[async_trait(?Send)]
 impl RtcCommandSender for SdkCommandSender {
     async fn send_sticky_event(
@@ -116,6 +129,7 @@ impl RtcCommandSender for SdkCommandSender {
         let event_type = wire_event_type(event_type).to_string();
         room.send_raw(&event_type, &content)
             .with_sticky_duration_ms(STICKY_DURATION_MS)
+            .with_request_config(rtc_request_config())
             .await
             .map_err(command_error)?;
         Ok(())
@@ -139,7 +153,12 @@ impl RtcCommandSender for SdkCommandSender {
             },
             Raw::<AnyMessageLikeEventContent>::from_json(raw),
         );
-        let response = self.client.send(request).await.map_err(command_error)?;
+        let response = self
+            .client
+            .send(request)
+            .with_request_config(rtc_request_config())
+            .await
+            .map_err(command_error)?;
         // The trait's "event_id" is the delay_id used to restart/cancel it.
         Ok(response.delay_id)
     }
@@ -152,7 +171,11 @@ impl RtcCommandSender for SdkCommandSender {
         // `event_id` is the delay_id returned by `send_delayed_event`.
         let request =
             update_delayed_event::unstable_v1::Request::new(event_id, UpdateAction::Cancel);
-        self.client.send(request).await.map_err(command_error)?;
+        self.client
+            .send(request)
+            .with_request_config(rtc_request_config())
+            .await
+            .map_err(command_error)?;
         Ok(())
     }
 

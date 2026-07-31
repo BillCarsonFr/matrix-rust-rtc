@@ -31,7 +31,11 @@ use crate::participant::MediaStreamKind;
 /// Why the call ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EndedReason {
-    /// The media connection closed and will not be re-established.
+    /// We left the call deliberately.
+    Left,
+    /// The connection to our own focus (the one we publish on) closed and
+    /// will not be re-established. Peer-focus connections closing do not end
+    /// the call — they reconnect.
     ConnectionClosed {
         /// Transport-provided description (e.g. the LiveKit disconnect reason).
         message: String,

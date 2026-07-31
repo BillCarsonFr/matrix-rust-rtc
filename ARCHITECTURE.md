@@ -55,9 +55,16 @@ At this stage there is no persistence, network transport, or encryption key dist
   designed for) and the `CallEngine` that reconciles core membership
   snapshots with transport `ConnectionEvent`s: reverse identity mapping
   (pseudonymous identity → membership), buffering of media that arrives
-  before its membership, roster/event emission. Multi-focus connection
-  pooling (MSC4195 multi-SFU) lands here next; today connections are
-  attached by the caller.
+  before its membership, roster/event emission.
+- The engine owns the **multi-focus connection pool** (MSC4195 multi-SFU):
+  members are grouped by their published transports' connection key
+  (LiveKit: the `livekit_service_url`); the engine connects to every peer
+  focus via `MediaTransport::connect` (exponential backoff on failure),
+  closes connections whose last member left after an idle grace, and
+  reconnects a dead peer-focus connection after tearing down its streams.
+  Only the *own* focus — established synchronously by the caller so join can
+  fail fast, then handed over via `adopt_own_connection` — ends the call
+  when it dies.
 - Depends only on `matrix-rtc-core` + tokio/futures — no LiveKit, no
   libwebrtc, fully unit-testable (`FakeTransport`). Everything is `Send`:
   the only core input is the membership `watch` channel, so the core's
