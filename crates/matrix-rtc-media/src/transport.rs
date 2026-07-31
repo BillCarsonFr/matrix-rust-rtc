@@ -39,7 +39,9 @@ use futures_core::stream::BoxStream;
 use matrix_rtc_core::{JoinedMembership, RtcTransport};
 use tokio::sync::mpsc;
 
+use crate::constraints::ResolvedConstraints;
 use crate::frame::{AudioFrame, VideoFrame};
+use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::MediaStreamKind;
 
 /// Errors produced by media transports.
@@ -216,6 +218,30 @@ pub trait MediaTransport: Send + Sync {
 pub trait TransportConnection: Send + Sync {
     /// The grouping key this connection serves.
     fn connection_key(&self) -> &str;
+
+    /// Publish a local track on this connection (only ever called on the own
+    /// focus). The default rejects publishing, for receive-only transports.
+    async fn publish(
+        &self,
+        _options: PublishOptions,
+    ) -> Result<Arc<dyn LocalTrackHandle>, TransportError> {
+        Err(TransportError::Unsupported(
+            "this transport cannot publish".into(),
+        ))
+    }
+
+    /// Apply resolved subscription constraints for one of this connection's
+    /// remote participants. Transports interpret — LiveKit maps to
+    /// enabled/dimensions/quality (`UpdateTrackSettings`); a transport with
+    /// no subscription control may ignore them (the default).
+    async fn apply_constraints(
+        &self,
+        _identity: &str,
+        _kind: MediaStreamKind,
+        _resolved: ResolvedConstraints,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
 
     /// Close the connection. Idempotent.
     async fn close(&self) -> Result<(), TransportError>;

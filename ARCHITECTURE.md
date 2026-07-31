@@ -47,9 +47,12 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 - The transport-agnostic media model: `Participant` roster keyed by
   `member_id`, `CallEvent` (the unified membership + media event stream),
-  owned frame types (`AudioFrame` PCM, `VideoFrame` I420), and per-stream
+  owned frame types (`AudioFrame` PCM, `VideoFrame` I420), per-stream
   `MediaConstraints` (visibility, rendered size, quality cap → subscribe-side
-  simulcast control).
+  simulcast control, debounced and re-applied by the engine whenever a
+  stream (re)appears), and the publish surface (`PublishOptions` →
+  `LocalTrackHandle`; the application pushes captured frames in, the
+  transport owns encoding/simulcast, publications go to the own focus).
 - Defines the `MediaTransport`/`TransportConnection`/`RemoteTrackHandle`
   traits a transport backend implements (LiveKit today; P2P/WebTransport
   designed for) and the `CallEngine` that reconciles core membership

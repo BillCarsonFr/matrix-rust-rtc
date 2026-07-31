@@ -56,7 +56,9 @@ use matrix_rtc_core::JoinedMembership;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::constraints::MediaConstraints;
 use crate::event::{CallEvent, EndedReason};
+use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 use crate::transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
@@ -77,6 +79,11 @@ const IDLE_GRACE: Duration = Duration::from_secs(10);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Retry delay ceiling.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Constraint changes are coalesced for this long before being applied —
+/// scroll-driven visibility churn is the hot path, and only the final state
+/// matters to the transport.
+const CONSTRAINTS_DEBOUNCE: Duration = Duration::from_millis(150);
 
 fn backoff_delay(attempt: u32) -> Duration {
     BACKOFF_BASE
@@ -152,6 +159,23 @@ enum ActorMessage {
     },
     /// A media decryption key was imported for a transport identity.
     KeyImported { identity: String, key_index: u8 },
+    /// Publish a local track on the own-focus connection.
+    Publish {
+        options: PublishOptions,
+        respond: oneshot::Sender<Result<Arc<dyn LocalTrackHandle>, TransportError>>,
+    },
+    /// Store new constraints for one stream and arm the debounce timer.
+    SetConstraints {
+        member_id: String,
+        kind: MediaStreamKind,
+        constraints: MediaConstraints,
+    },
+    /// A constraints debounce timer elapsed; apply if still current.
+    ApplyConstraints {
+        member_id: String,
+        kind: MediaStreamKind,
+        generation: u64,
+    },
     /// Close every pooled connection and stop.
     Shutdown { ack: oneshot::Sender<()> },
 }
@@ -220,6 +244,8 @@ impl CallEngine {
             roster: Vec::new(),
             members_snapshot: Vec::new(),
             identity_map: HashMap::new(),
+            member_identities: HashMap::new(),
+            constraints: HashMap::new(),
             pending_tracks: HashMap::new(),
             pending_keys: HashMap::new(),
             pool: HashMap::new(),
@@ -283,6 +309,41 @@ impl CallEngine {
         });
     }
 
+    /// Publish a local track on the own-focus connection (see
+    /// [`PublishOptions`]); push captured frames into the returned handle.
+    /// Fails while that connection is not up.
+    pub async fn publish(
+        &self,
+        options: PublishOptions,
+    ) -> Result<Arc<dyn LocalTrackHandle>, TransportError> {
+        let (respond, response) = oneshot::channel();
+        self.messages
+            .send(ActorMessage::Publish { options, respond })
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
+        response
+            .await
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?
+    }
+
+    /// Set the subscription constraints for one stream of one participant.
+    ///
+    /// Applied after a short debounce (rapid changes coalesce, e.g. while
+    /// scrolling a participant grid) and re-applied automatically whenever
+    /// the stream (re)appears. Constraints are keyed by membership: they die
+    /// when the member leaves.
+    pub fn set_constraints(
+        &self,
+        member_id: impl Into<String>,
+        kind: MediaStreamKind,
+        constraints: MediaConstraints,
+    ) {
+        let _ = self.messages.send(ActorMessage::SetConstraints {
+            member_id: member_id.into(),
+            kind,
+            constraints,
+        });
+    }
+
     /// The handle for a participant's subscribed stream, to open frame
     /// streams from. `None` while no such stream is up (see
     /// [`CallEvent::StreamStarted`] / [`CallEvent::StreamStopped`]).
@@ -333,7 +394,9 @@ enum ConnState {
         attempt: u32,
     },
     Up {
-        connection: Box<dyn TransportConnection>,
+        // Arc, not Box: publish/apply-constraints calls run in spawned tasks
+        // that need shared ownership while the entry stays in the pool.
+        connection: Arc<dyn TransportConnection>,
     },
     Backoff {
         attempt: u32,
@@ -356,6 +419,12 @@ struct Actor {
     members_snapshot: Vec<JoinedMembership>,
     /// Transport identity → `member_id`.
     identity_map: HashMap<String, String>,
+    /// `member_id` → transport identity (the reverse of `identity_map`),
+    /// for pushing constraints at a member's connection.
+    member_identities: HashMap<String, String>,
+    /// Latest constraints per stream, with a generation counter that
+    /// invalidates superseded debounce timers.
+    constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
     /// Media that arrived before its membership, flushed when it lands.
     pending_tracks: PendingTracks,
     /// Imported keys awaiting their membership (latest index per identity).
@@ -492,10 +561,122 @@ impl Actor {
                     self.pending_keys.insert(identity, key_index);
                 }
             },
+            ActorMessage::Publish { options, respond } => {
+                // Local tracks always go to the focus we announced in our
+                // membership — that is where peers subscribe to us.
+                let connection = self
+                    .pool
+                    .values()
+                    .find(|entry| entry.is_own)
+                    .and_then(|entry| match &entry.state {
+                        ConnState::Up { connection } => Some(connection.clone()),
+                        _ => None,
+                    });
+                match connection {
+                    Some(connection) => {
+                        tokio::spawn(async move {
+                            let _ = respond.send(connection.publish(options).await);
+                        });
+                    }
+                    None => {
+                        let _ = respond.send(Err(TransportError::Closed(
+                            "the own-focus connection is not up".into(),
+                        )));
+                    }
+                }
+            }
+            ActorMessage::SetConstraints {
+                member_id,
+                kind,
+                constraints,
+            } => {
+                let entry = self
+                    .constraints
+                    .entry((member_id.clone(), kind))
+                    .or_insert((constraints, 0));
+                entry.0 = constraints;
+                entry.1 += 1;
+                let generation = entry.1;
+                let messages = self.messages_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(CONSTRAINTS_DEBOUNCE).await;
+                    let _ = messages.send(ActorMessage::ApplyConstraints {
+                        member_id,
+                        kind,
+                        generation,
+                    });
+                });
+            }
+            ActorMessage::ApplyConstraints {
+                member_id,
+                kind,
+                generation,
+            } => {
+                // Only the newest timer applies; older ones were superseded.
+                if self
+                    .constraints
+                    .get(&(member_id.clone(), kind))
+                    .is_some_and(|(_, current)| *current == generation)
+                {
+                    self.apply_constraints_now(&member_id, kind);
+                }
+            }
             // Handled in the run loop (it must break).
             ActorMessage::Shutdown { ack } => {
                 let _ = ack.send(());
             }
+        }
+    }
+
+    /// Push the resolved constraints for one stream to the connection its
+    /// member lives on. No-op while the member, its identity, or its
+    /// connection is missing — [`Actor::add_stream`] and reconnects re-apply.
+    fn apply_constraints_now(&mut self, member_id: &str, kind: MediaStreamKind) {
+        let Some((constraints, _)) = self.constraints.get(&(member_id.to_owned(), kind)) else {
+            return;
+        };
+        let resolved = constraints.resolve(kind);
+        let Some(identity) = self.member_identities.get(member_id).cloned() else {
+            return;
+        };
+        let connection = self
+            .pool
+            .values()
+            .find(|entry| entry.members.contains(member_id))
+            .and_then(|entry| match &entry.state {
+                ConnState::Up { connection } => Some(connection.clone()),
+                _ => None,
+            });
+        let Some(connection) = connection else {
+            return;
+        };
+        let kind_copy = kind;
+        tokio::spawn(async move {
+            if let Err(error) = connection
+                .apply_constraints(&identity, kind_copy, resolved)
+                .await
+            {
+                log::warn!("applying constraints for {identity} ({kind_copy:?}) failed: {error}");
+            }
+        });
+    }
+
+    /// Re-apply every stored constraint for members living on `key` (used
+    /// after a transport-level reconnect: subscription settings are
+    /// server-side state of the connection).
+    fn reapply_connection_constraints(&mut self, key: &str) {
+        let Some(entry) = self.pool.get(key) else {
+            return;
+        };
+        let members = entry.members.clone();
+        let keys: Vec<(String, MediaStreamKind)> = self
+            .constraints
+            .keys()
+            .filter(|(member_id, _)| members.contains(member_id))
+            .cloned()
+            .collect();
+        for (member_id, kind) in keys {
+            self.apply_constraints_now(&member_id, kind);
         }
     }
 
@@ -516,7 +697,9 @@ impl Actor {
                 backend: None,
                 members,
                 is_own: true,
-                state: ConnState::Up { connection },
+                state: ConnState::Up {
+                    connection: Arc::from(connection),
+                },
                 generation,
                 idle_generation: 0,
             },
@@ -639,7 +822,9 @@ impl Actor {
                 let generation = self.connection_generation;
                 let entry = self.pool.get_mut(key).expect("entry checked above");
                 entry.generation = generation;
-                entry.state = ConnState::Up { connection };
+                entry.state = ConnState::Up {
+                    connection: Arc::from(connection),
+                };
                 log::info!("media connection up: {key}");
                 self.spawn_forwarder(key.to_owned(), generation, events);
                 self.clear_degraded(key);
@@ -807,7 +992,12 @@ impl Actor {
                 self.emit(CallEvent::ActiveSpeakers { member_ids });
             }
             ConnectionEvent::Reconnecting => self.mark_degraded(connection_key),
-            ConnectionEvent::Reconnected => self.clear_degraded(connection_key),
+            ConnectionEvent::Reconnected => {
+                self.clear_degraded(connection_key);
+                // Subscription settings are server-side connection state; a
+                // resumed connection may have lost them.
+                self.reapply_connection_constraints(connection_key);
+            }
             ConnectionEvent::Closed { message } => {
                 let generation = self
                     .pool
@@ -873,6 +1063,8 @@ impl Actor {
         if let Some(identity) = identity {
             self.identity_map
                 .insert(identity.clone(), member.member_id.clone());
+            self.member_identities
+                .insert(member.member_id.clone(), identity.clone());
 
             // Media and keys that arrived before this membership.
             if let Some(pending) = self.pending_tracks.remove(&identity) {
@@ -893,6 +1085,11 @@ impl Actor {
         self.roster
             .retain(|participant| participant.member_id != member_id);
         self.identity_map.retain(|_, mapped| mapped != member_id);
+        self.member_identities.remove(member_id);
+        // A rejoining member gets a fresh member_id, so their constraints
+        // die with the membership.
+        self.constraints
+            .retain(|(member, _), _| member != member_id);
         self.tracks
             .lock()
             .expect("track map mutex poisoned")
@@ -929,6 +1126,13 @@ impl Actor {
             kind,
         });
         self.publish_roster();
+
+        // A fresh subscription starts with server-default settings; push the
+        // stored constraints at it immediately (no debounce — nothing to
+        // coalesce with).
+        if self.constraints.contains_key(&(member_id.to_owned(), kind)) {
+            self.apply_constraints_now(member_id, kind);
+        }
     }
 
     fn remove_stream(&mut self, member_id: &str, kind: MediaStreamKind) {
@@ -1078,6 +1282,10 @@ mod tests {
         senders: StdMutex<HashMap<String, UnboundedSender<ConnectionEvent>>>,
         /// Number of connect attempts (per key) that fail before succeeding.
         fail_attempts: AtomicU32,
+        /// `(connection_key, kind)` of every publish call.
+        published: StdMutex<Vec<(String, MediaStreamKind)>>,
+        /// `(identity, kind, resolved)` of every apply_constraints call.
+        applied: StdMutex<Vec<(String, MediaStreamKind, crate::ResolvedConstraints)>>,
     }
 
     struct FakeTransport {
@@ -1127,9 +1335,46 @@ mod tests {
             &self.key
         }
 
+        async fn publish(
+            &self,
+            options: PublishOptions,
+        ) -> Result<Arc<dyn LocalTrackHandle>, TransportError> {
+            self.state
+                .published
+                .lock()
+                .unwrap()
+                .push((self.key.clone(), options.kind));
+            Ok(Arc::new(FakeLocalTrack { kind: options.kind }))
+        }
+
+        async fn apply_constraints(
+            &self,
+            identity: &str,
+            kind: MediaStreamKind,
+            resolved: crate::ResolvedConstraints,
+        ) -> Result<(), TransportError> {
+            self.state
+                .applied
+                .lock()
+                .unwrap()
+                .push((identity.to_owned(), kind, resolved));
+            Ok(())
+        }
+
         async fn close(&self) -> Result<(), TransportError> {
             self.state.closes.lock().unwrap().push(self.key.clone());
             Ok(())
+        }
+    }
+
+    struct FakeLocalTrack {
+        kind: MediaStreamKind,
+    }
+
+    #[async_trait::async_trait]
+    impl LocalTrackHandle for FakeLocalTrack {
+        fn kind(&self) -> MediaStreamKind {
+            self.kind
         }
     }
 
@@ -1668,6 +1913,121 @@ mod tests {
         tokio::time::sleep(IDLE_GRACE * 2).await;
         assert!(!closed(&fx, PEER_FOCUS));
         assert_eq!(connect_count(&fx, PEER_FOCUS), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_targets_the_own_focus_connection() {
+        let fx = fixture();
+
+        // Before the own connection is adopted, publishing fails.
+        assert!(
+            fx.engine
+                .publish(PublishOptions::microphone())
+                .await
+                .is_err()
+        );
+
+        let _own = adopt(&fx);
+        let handle = fx
+            .engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed once the own focus is up");
+        assert_eq!(handle.kind(), MediaStreamKind::Microphone);
+        assert_eq!(
+            fx.state.published.lock().unwrap().as_slice(),
+            &[(OWN_FOCUS.to_owned(), MediaStreamKind::Microphone)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn constraints_are_debounced_and_apply_the_latest_value() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+
+        // Two rapid updates: only the final state reaches the transport.
+        fx.engine.set_constraints(
+            "bob",
+            MediaStreamKind::Camera,
+            MediaConstraints {
+                visible: false,
+                ..Default::default()
+            },
+        );
+        fx.engine.set_constraints(
+            "bob",
+            MediaStreamKind::Camera,
+            MediaConstraints {
+                visible: true,
+                detail: crate::VideoDetail::Quality(crate::QualityLimit::Low),
+                ..Default::default()
+            },
+        );
+
+        wait_until(|| !fx.state.applied.lock().unwrap().is_empty()).await;
+        // Give any stale timer a chance to (wrongly) fire as well.
+        tokio::time::sleep(CONSTRAINTS_DEBOUNCE * 3).await;
+
+        let applied = fx.state.applied.lock().unwrap().clone();
+        assert_eq!(applied.len(), 1, "debounce should coalesce to one apply");
+        let (identity, kind, resolved) = &applied[0];
+        assert_eq!(identity, "id-bob");
+        assert_eq!(*kind, MediaStreamKind::Camera);
+        assert_eq!(resolved.demand, crate::StreamDemand::Active);
+        assert_eq!(
+            resolved.detail,
+            crate::VideoDetail::Quality(crate::QualityLimit::Low)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn constraints_reapply_on_stream_start_and_reconnect() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+
+        fx.engine.set_constraints(
+            "bob",
+            MediaStreamKind::Camera,
+            MediaConstraints {
+                low_bandwidth: true,
+                ..Default::default()
+            },
+        );
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 1).await;
+
+        // The stream appearing re-applies immediately (fresh subscriptions
+        // start from server defaults)...
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack {
+                    kind: MediaStreamKind::Camera,
+                }),
+            })
+            .unwrap();
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 2).await;
+        // low_bandwidth folds video to a pause (subscription kept).
+        assert_eq!(
+            fx.state.applied.lock().unwrap()[1].2.demand,
+            crate::StreamDemand::Paused
+        );
+
+        // ...and so does a transport-level reconnect.
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(ConnectionEvent::Reconnected)
+            .unwrap();
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 3).await;
     }
 
     #[tokio::test(start_paused = true)]

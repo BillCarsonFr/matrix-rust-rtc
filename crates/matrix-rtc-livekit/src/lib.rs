@@ -135,6 +135,9 @@ pub async fn connect_e2ee(
         encryption_type: EncryptionType::Gcm,
         key_provider,
     });
+    // Publisher-side layer control: the SFU tells us which simulcast layers
+    // are actually subscribed and unneeded ones stop being encoded.
+    options.dynacast = true;
     LiveKitSession::connect_with_options(&sfu_token, options).await
 }
 

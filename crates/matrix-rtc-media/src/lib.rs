@@ -46,13 +46,17 @@ pub mod constraints;
 pub mod engine;
 pub mod event;
 pub mod frame;
+pub mod local;
 pub mod participant;
 pub mod transport;
 
-pub use constraints::{Dimensions, MediaConstraints, QualityLimit, ResolvedConstraints};
+pub use constraints::{
+    Dimensions, MediaConstraints, QualityLimit, ResolvedConstraints, StreamDemand, VideoDetail,
+};
 pub use engine::{CallEngine, EngineConfig, EngineHandle};
 pub use event::{CallEvent, EndedReason};
 pub use frame::{AudioFrame, I420Buffer, VideoFrame, VideoRotation};
+pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSourceConfig};
 pub use participant::{MediaStreamKind, Participant, StreamState};
 pub use transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, OwnMemberClaims, RemoteTrackHandle,

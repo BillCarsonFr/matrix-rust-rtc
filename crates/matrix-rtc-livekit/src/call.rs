@@ -66,8 +66,8 @@ use matrix_rtc_core::{
     RtcIdentityMapper, RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
 use matrix_rtc_media::{
-    CallEngine, CallEvent, ConnectionContext, EngineConfig, MediaStreamKind, OwnMemberClaims,
-    Participant, RemoteTrackHandle,
+    CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
+    MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, RemoteTrackHandle,
 };
 
 use crate::identity::pseudonymous_identity;
@@ -396,6 +396,27 @@ impl Call {
         kind: MediaStreamKind,
     ) -> Option<Arc<dyn RemoteTrackHandle>> {
         self.engine.remote_track(member_id, kind)
+    }
+
+    /// Publish a local track (microphone, camera, screenshare) on our focus;
+    /// push captured frames into the returned handle.
+    pub async fn publish(
+        &self,
+        options: PublishOptions,
+    ) -> Result<Arc<dyn LocalTrackHandle>, CallError> {
+        Ok(self.engine.publish(options).await?)
+    }
+
+    /// Set subscription constraints (visibility, rendered size, quality cap,
+    /// low-bandwidth mode) for one stream of one participant. Applied after a
+    /// short debounce and re-applied whenever the stream (re)appears.
+    pub fn set_constraints(
+        &self,
+        member_id: &str,
+        kind: MediaStreamKind,
+        constraints: MediaConstraints,
+    ) {
+        self.engine.set_constraints(member_id, kind, constraints);
     }
 
     /// The media engine driving this call's roster and event stream.
