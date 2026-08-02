@@ -144,6 +144,13 @@ At this stage there is no persistence, network transport, or encryption key dist
 - `MSC4143` (MatrixRTC): membership events represented by `m.rtc.member`.
 - `MSC4354` (Sticky events): membership updates are received as sticky events.
 
+The core uses the stable ids (`m.rtc.member`, `m.rtc.slot`) internally, but the
+deployed ecosystem still matches on the unstable `org.matrix.msc4143.*` ones, so
+bindings translate on the way out: the `matrix-sdk` host via ruma's alias table
+(`matrix_bridge::wire_event_type`), the FFI and wasm bindings — which hand the
+type to an SDK that puts the string on the wire verbatim — via
+`matrix_rtc_core::wire_event_type`. Inbound, both spellings are accepted.
+
 Current implementation only establishes event intake and membership state wiring; protocol completeness is intentionally deferred.
 
 ### MSC4143 catch-up status
