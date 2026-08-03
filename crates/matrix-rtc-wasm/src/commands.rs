@@ -150,7 +150,7 @@ impl RtcCommandSender for JsCommandSender {
                 "sendStickyEvent",
                 vec![
                     JsValue::from_str(&room_id),
-                    JsValue::from_str(&event_type),
+                    JsValue::from_str(event_type),
                     js_content,
                 ],
             )
@@ -185,7 +185,7 @@ impl RtcCommandSender for JsCommandSender {
                 "sendStateEvent",
                 vec![
                     JsValue::from_str(&room_id),
-                    JsValue::from_str(&event_type),
+                    JsValue::from_str(event_type),
                     JsValue::from_str(&state_key),
                     js_content,
                 ],
@@ -222,7 +222,7 @@ impl RtcCommandSender for JsCommandSender {
                 "sendDelayedEvent",
                 vec![
                     JsValue::from_str(&room_id),
-                    JsValue::from_str(&event_type),
+                    JsValue::from_str(event_type),
                     js_content,
                     JsValue::from_f64(delay_ms as f64),
                 ],
@@ -293,7 +293,7 @@ impl RtcCommandSender for JsCommandSender {
                 vec![
                     JsValue::from_str(&user_id),
                     JsValue::from_str(&device_id),
-                    JsValue::from_str(&message_type),
+                    JsValue::from_str(message_type),
                     js_content,
                 ],
             )
