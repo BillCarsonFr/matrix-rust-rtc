@@ -31,6 +31,7 @@ mod own_membership;
 mod session;
 mod slot;
 mod transport;
+mod wire;
 
 pub use commands::RtcCommandSender;
 pub use encryption::types::{
@@ -61,6 +62,7 @@ pub use slot::{
 pub use transport::{
     LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
 };
+pub use wire::wire_event_type;
 
 #[cfg(test)]
 mod tests {

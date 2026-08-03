@@ -22,9 +22,20 @@
 //!
 //! DTOs are used to decouple core logic from FFI-specific types.
 
-use matrix_rtc_core::{CommandError, RtcCommandSender};
+use matrix_rtc_core::{CommandError, RtcCommandSender, wire_event_type};
 use serde_json::Value;
 use std::sync::Arc;
+
+/// The sole conversion from a core event-type string to the wire type.
+///
+/// The core speaks the stable MSC4143 ids; the host SDK behind these callbacks
+/// (typically the matrix-rust-sdk bindings, whose `sendRaw` puts the string on
+/// the wire verbatim) has no ruma alias table to normalise them, so every send
+/// leaving this binding goes through [`matrix_rtc_core::wire_event_type`].
+/// Without it a membership is published as `m.rtc.member` and no peer sees it.
+fn wire_type(event_type: String) -> String {
+    wire_event_type(&event_type).to_owned()
+}
 
 /// Error type for command sender callback operations.
 ///
@@ -198,7 +209,8 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Arguments
     /// * `room_id` - The room ID where the event should be sent
-    /// * `event_type` - The event type (e.g., "m.rtc.member")
+    /// * `event_type` - The wire event type (e.g., "org.matrix.msc4143.rtc.member");
+    ///   send it verbatim, it is already translated for you
     /// * `content_json` - The event content as a JSON string
     ///
     /// # Returns
@@ -235,7 +247,7 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Arguments
     /// * `room_id` - The room ID where the event should be sent
-    /// * `event_type` - The event type (e.g., "m.rtc.slot")
+    /// * `event_type` - The wire event type (e.g., "org.matrix.msc4143.rtc.slot")
     /// * `state_key` - The state key (for a slot, the slot id)
     /// * `content_json` - The event content as a JSON string
     ///
@@ -318,7 +330,7 @@ impl RtcCommandSender for FfiCommandSender {
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
         self.callback
-            .send_sticky_event(room_id, event_type, content_json)
+            .send_sticky_event(room_id, wire_type(event_type), content_json)
             .map_err(CommandError::from)?;
         Ok(())
     }
@@ -334,7 +346,7 @@ impl RtcCommandSender for FfiCommandSender {
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
         self.callback
-            .send_delayed_event(room_id, event_type, content_json, delay_ms)
+            .send_delayed_event(room_id, wire_type(event_type), content_json, delay_ms)
             .map_err(CommandError::from)
     }
 
@@ -360,7 +372,7 @@ impl RtcCommandSender for FfiCommandSender {
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
         self.callback
-            .send_to_device_message(user_id, device_id, message_type, content_json)
+            .send_to_device_message(user_id, device_id, wire_type(message_type), content_json)
             .map_err(CommandError::from)?;
         Ok(())
     }
@@ -376,7 +388,7 @@ impl RtcCommandSender for FfiCommandSender {
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
         self.callback
-            .send_state_event(room_id, event_type, state_key, content_json)
+            .send_state_event(room_id, wire_type(event_type), state_key, content_json)
             .map_err(CommandError::from)?;
         Ok(())
     }
@@ -385,22 +397,33 @@ impl RtcCommandSender for FfiCommandSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    // Mock implementation of CommandSenderCallback for testing
-    struct MockCommandSenderCallback;
+    /// Mock callback that records the event type each send was given, so tests
+    /// can assert on what a native host would actually put on the wire.
+    #[derive(Default)]
+    struct MockCommandSenderCallback {
+        sent_types: Mutex<Vec<String>>,
+    }
+
+    impl MockCommandSenderCallback {
+        fn record(&self, event_type: &str) {
+            self.sent_types.lock().unwrap().push(event_type.to_owned());
+        }
+
+        fn sent_types(&self) -> Vec<String> {
+            self.sent_types.lock().unwrap().clone()
+        }
+    }
 
     impl CommandSenderCallback for MockCommandSenderCallback {
         fn send_sticky_event(
             &self,
-            room_id: String,
+            _room_id: String,
             event_type: String,
-            content_json: String,
+            _content_json: String,
         ) -> Result<(), CommandSenderError> {
-            println!(
-                "Mock send_sticky_event: room={}, type={}, content={}",
-                room_id, event_type, content_json
-            );
+            self.record(&event_type);
             Ok(())
         }
 
@@ -408,62 +431,53 @@ mod tests {
             &self,
             room_id: String,
             event_type: String,
-            content_json: String,
-            delay_ms: u64,
+            _content_json: String,
+            _delay_ms: u64,
         ) -> Result<String, CommandSenderError> {
-            println!(
-                "Mock send_delayed_event: room={}, type={}, delay={}ms, content={}",
-                room_id, event_type, delay_ms, content_json
-            );
+            self.record(&event_type);
             Ok(format!("event-{}-{}", room_id, event_type))
         }
 
         fn send_state_event(
             &self,
-            room_id: String,
+            _room_id: String,
             event_type: String,
-            state_key: String,
-            content_json: String,
+            _state_key: String,
+            _content_json: String,
         ) -> Result<(), CommandSenderError> {
-            println!(
-                "Mock send_state_event: room={}, type={}, state_key={}, content={}",
-                room_id, event_type, state_key, content_json
-            );
+            self.record(&event_type);
             Ok(())
         }
 
         fn cancel_delayed_event(
             &self,
-            room_id: String,
-            event_id: String,
+            _room_id: String,
+            _event_id: String,
         ) -> Result<(), CommandSenderError> {
-            println!(
-                "Mock cancel_delayed_event: room={}, event_id={}",
-                room_id, event_id
-            );
             Ok(())
         }
 
         fn send_to_device_message(
             &self,
-            user_id: String,
-            device_id: String,
+            _user_id: String,
+            _device_id: String,
             message_type: String,
-            content_json: String,
+            _content_json: String,
         ) -> Result<(), CommandSenderError> {
-            println!(
-                "Mock send_to_device_message: user={}, device={}, type={}, content={}",
-                user_id, device_id, message_type, content_json
-            );
+            self.record(&message_type);
             Ok(())
         }
     }
 
+    fn mock_sender() -> (Arc<MockCommandSenderCallback>, Arc<FfiCommandSender>) {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let sender = FfiCommandSender::new(mock.clone() as Arc<dyn CommandSenderCallback>);
+        (mock, sender)
+    }
+
     #[tokio::test]
     async fn test_ffi_command_sender_sends_sticky_event() {
-        let mock_callback = MockCommandSenderCallback;
-        let callback: Arc<dyn CommandSenderCallback> = Arc::new(mock_callback);
-        let command_sender = FfiCommandSender::new(callback);
+        let (mock, command_sender) = mock_sender();
 
         let result = command_sender
             .send_sticky_event(
@@ -477,13 +491,13 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        // The host must see the unstable id: peers do not match on `m.rtc.member`.
+        assert_eq!(mock.sent_types(), ["org.matrix.msc4143.rtc.member"]);
     }
 
     #[tokio::test]
     async fn test_ffi_command_sender_sends_delayed_event() {
-        let mock_callback = MockCommandSenderCallback;
-        let callback: Arc<dyn CommandSenderCallback> = Arc::new(mock_callback);
-        let command_sender = FfiCommandSender::new(callback);
+        let (mock, command_sender) = mock_sender();
 
         let result = command_sender
             .send_delayed_event(
@@ -498,6 +512,53 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "event-!room:example.org-m.rtc.member");
+        assert_eq!(
+            result.unwrap(),
+            "event-!room:example.org-org.matrix.msc4143.rtc.member"
+        );
+        assert_eq!(mock.sent_types(), ["org.matrix.msc4143.rtc.member"]);
+    }
+
+    /// The delayed leave must carry the same wire id as the join sticky it
+    /// cancels out, and the slot state event the same id other clients read.
+    #[tokio::test]
+    async fn test_ffi_command_sender_translates_every_outbound_type() {
+        let (mock, command_sender) = mock_sender();
+
+        command_sender
+            .send_state_event(
+                "!room:example.org".to_string(),
+                matrix_rtc_core::SLOT_EVENT_TYPE.to_string(),
+                "m.call#ROOM".to_string(),
+                serde_json::json!({ "status": "open" }),
+            )
+            .await
+            .unwrap();
+        command_sender
+            .send_to_device_message(
+                "@bob:example.org".to_string(),
+                "*".to_string(),
+                matrix_rtc_core::KEY_MESSAGE_TYPE.to_string(),
+                serde_json::json!({ "key": "…" }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.sent_types(),
+            [
+                "org.matrix.msc4143.rtc.slot",
+                "org.matrix.msc4143.rtc.encryption_key",
+            ]
+        );
+    }
+
+    /// A host's own event types are none of this binding's business.
+    #[test]
+    fn test_unknown_event_types_pass_through() {
+        assert_eq!(
+            wire_type("com.example.custom".to_owned()),
+            "com.example.custom"
+        );
     }
 }

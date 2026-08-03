@@ -22,7 +22,7 @@
 
 use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
-use matrix_rtc_core::{CommandError, RtcCommandSender};
+use matrix_rtc_core::{CommandError, RtcCommandSender, wire_event_type};
 use serde_json::Value;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -132,6 +132,9 @@ impl RtcCommandSender for JsCommandSender {
         event_type: String,
         content: Value,
     ) -> Result<(), CommandError> {
+        // The JS host puts this string on the wire verbatim, so translate the
+        // core's stable id to the one peers actually match on.
+        let event_type = wire_event_type(&event_type);
         self.log_command(&format!(
             "send_sticky_event: room={}, type={}",
             room_id, event_type
@@ -147,7 +150,7 @@ impl RtcCommandSender for JsCommandSender {
                 "sendStickyEvent",
                 vec![
                     JsValue::from_str(&room_id),
-                    JsValue::from_str(&event_type),
+                    JsValue::from_str(event_type),
                     js_content,
                 ],
             )
@@ -168,6 +171,7 @@ impl RtcCommandSender for JsCommandSender {
         state_key: String,
         content: Value,
     ) -> Result<(), CommandError> {
+        let event_type = wire_event_type(&event_type);
         self.log_command(&format!(
             "send_state_event: room={}, type={}, state_key={}",
             room_id, event_type, state_key
@@ -181,7 +185,7 @@ impl RtcCommandSender for JsCommandSender {
                 "sendStateEvent",
                 vec![
                     JsValue::from_str(&room_id),
-                    JsValue::from_str(&event_type),
+                    JsValue::from_str(event_type),
                     JsValue::from_str(&state_key),
                     js_content,
                 ],
@@ -202,6 +206,7 @@ impl RtcCommandSender for JsCommandSender {
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
+        let event_type = wire_event_type(&event_type);
         self.log_command(&format!(
             "send_delayed_event: room={}, type={}, delay={}ms",
             room_id, event_type, delay_ms
@@ -217,7 +222,7 @@ impl RtcCommandSender for JsCommandSender {
                 "sendDelayedEvent",
                 vec![
                     JsValue::from_str(&room_id),
-                    JsValue::from_str(&event_type),
+                    JsValue::from_str(event_type),
                     js_content,
                     JsValue::from_f64(delay_ms as f64),
                 ],
@@ -271,6 +276,7 @@ impl RtcCommandSender for JsCommandSender {
         message_type: String,
         content: Value,
     ) -> Result<(), CommandError> {
+        let message_type = wire_event_type(&message_type);
         self.log_command(&format!(
             "send_to_device_message: user={}, device={}, type={}",
             user_id, device_id, message_type
@@ -287,7 +293,7 @@ impl RtcCommandSender for JsCommandSender {
                 vec![
                     JsValue::from_str(&user_id),
                     JsValue::from_str(&device_id),
-                    JsValue::from_str(&message_type),
+                    JsValue::from_str(message_type),
                     js_content,
                 ],
             )

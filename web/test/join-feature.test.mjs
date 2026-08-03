@@ -125,7 +125,7 @@ describe('WASM bindings with mock client', () => {
       const stickyEvents = mockClient._getStickyEvents();
       expect(stickyEvents.length).toBe(1);
       expect(stickyEvents[0].roomId).toBe(ROOM_ID);
-      expect(stickyEvents[0].eventType).toBe('m.rtc.member');
+      expect(stickyEvents[0].eventType).toBe('org.matrix.msc4143.rtc.member');
 
       // Check the content
       const content = stickyEvents[0].content;
@@ -141,7 +141,7 @@ describe('WASM bindings with mock client', () => {
       const delayedEvents = mockClient._getDelayedEvents();
       expect(delayedEvents.length).toBe(1);
       expect(delayedEvents[0].roomId).toBe(ROOM_ID);
-      expect(delayedEvents[0].eventType).toBe('m.rtc.member');
+      expect(delayedEvents[0].eventType).toBe('org.matrix.msc4143.rtc.member');
 
       // Check delayed event content
       const delayedContent = delayedEvents[0].content;
@@ -193,7 +193,7 @@ describe('WASM bindings with mock client', () => {
       // Leave should send a sticky event with the leave reason
       const stickyEvents = mockClient._getStickyEvents();
       expect(stickyEvents.length).toBe(1);
-      expect(stickyEvents[0].eventType).toBe('m.rtc.member');
+      expect(stickyEvents[0].eventType).toBe('org.matrix.msc4143.rtc.member');
 
       // Check the content
       const content = stickyEvents[0].content;
