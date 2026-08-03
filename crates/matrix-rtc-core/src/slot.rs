@@ -208,6 +208,11 @@ impl RawSlotEvent {
     ///   declared mechanism is taken at face value.
     pub fn resolve(&self, room_encryption: RoomEncryption) -> SlotState {
         if self.content.status != Some(SlotStatus::Open) {
+            log::debug!(
+                "m.rtc.slot '{}' resolves closed: status={:?}",
+                self.slot_id,
+                self.content.status,
+            );
             return SlotState::Closed;
         }
 
@@ -218,6 +223,10 @@ impl RawSlotEvent {
             .as_deref()
             .filter(|t| !t.is_empty())
         else {
+            log::warn!(
+                "m.rtc.slot '{}' is open but declares no application type; treating it as closed",
+                self.slot_id,
+            );
             return SlotState::Closed;
         };
 
@@ -273,6 +282,12 @@ impl RawSlotEvent {
             }
             RoomEncryption::Unknown => declared,
         };
+
+        log::debug!(
+            "m.rtc.slot '{}' resolves open: application={application_type} \
+             room_encryption={room_encryption:?} mechanism={mechanism:?}",
+            self.slot_id,
+        );
 
         SlotState::Open(OpenSlot {
             application_type: application_type.to_owned(),

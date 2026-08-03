@@ -371,14 +371,14 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// to ensure the transport is listening (as per JS SDK behavior).
     pub async fn join(&self) -> Result<(), CommandError> {
         log::info!(
-            "[{}:{}] EncryptionManager joining",
+            "[{}/{}] EncryptionManager joining",
             self.room_id,
             self.slot_id
         );
 
         if !self.config.manage_media_keys {
             log::debug!(
-                "[{}:{}] Media keys management disabled",
+                "[{}/{}] Media keys management disabled",
                 self.room_id,
                 self.slot_id
             );
@@ -398,7 +398,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         *self.next_key_index.lock().unwrap() = 1; // Next will be 1
 
         log::debug!(
-            "[{}:{}] First outbound key created with index {}",
+            "[{}/{}] First outbound key created with index {}",
             self.room_id,
             self.slot_id,
             0
@@ -412,7 +412,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// Cleans up all state.
     pub fn leave(&self) {
         log::info!(
-            "[{}:{}] EncryptionManager leaving",
+            "[{}/{}] EncryptionManager leaving",
             self.room_id,
             self.slot_id
         );
@@ -427,7 +427,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         *self.keys_without_membership.lock().unwrap() = Vec::new();
 
         log::debug!(
-            "[{}:{}] EncryptionManager state cleaned up",
+            "[{}/{}] EncryptionManager state cleaned up",
             self.room_id,
             self.slot_id
         );
@@ -522,7 +522,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             if *guard {
                 // Mark that we need a new distribution after current completes
                 log::debug!(
-                    "[{}:{}] Key distribution in progress, scheduling follow-up",
+                    "[{}/{}] Key distribution in progress, scheduling follow-up",
                     self.room_id,
                     self.slot_id
                 );
@@ -552,7 +552,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         if needs_followup {
             log::debug!(
-                "[{}:{}] Starting follow-up distribution",
+                "[{}/{}] Starting follow-up distribution",
                 self.room_id,
                 self.slot_id
             );
@@ -564,7 +564,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         if let Err(e) = result {
             log::error!(
-                "[{}:{}] Failed to rollout key: {:?}",
+                "[{}/{}] Failed to rollout key: {:?}",
                 self.room_id,
                 self.slot_id,
                 e
@@ -604,7 +604,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         if current_key.is_none() {
             log::warn!(
-                "[{}:{}] No outbound key available, cannot distribute",
+                "[{}/{}] No outbound key available, cannot distribute",
                 self.room_id,
                 self.slot_id
             );
@@ -650,7 +650,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         if !left.is_empty() || any_membership_changed {
             // Someone left or membership changed, we need to rotate the key
             log::info!(
-                "[{}:{}] Key rotation needed: {} left, membership changed: {}",
+                "[{}/{}] Key rotation needed: {} left, membership changed: {}",
                 self.room_id,
                 self.slot_id,
                 left.len(),
@@ -667,7 +667,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             if key_age < self.config.key_rotation_grace_period_ms {
                 // Current key is still fresh, just distribute to new joiners
                 log::debug!(
-                    "[{}:{}] New joiners detected, but key is recent enough (age:{}ms < {}ms), keeping it",
+                    "[{}/{}] New joiners detected, but key is recent enough (age:{}ms < {}ms), keeping it",
                     self.room_id,
                     self.slot_id,
                     key_age,
@@ -678,7 +678,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             } else {
                 // Key is too old, rotate it
                 log::debug!(
-                    "[{}:{}] New joiners detected, but key is old (age:{}ms >= {}ms), rotating",
+                    "[{}/{}] New joiners detected, but key is old (age:{}ms >= {}ms), rotating",
                     self.room_id,
                     self.slot_id,
                     key_age,
@@ -691,7 +691,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         } else {
             // No changes, nothing to do
             log::debug!(
-                "[{}:{}] No membership changes, no distribution needed",
+                "[{}/{}] No membership changes, no distribution needed",
                 self.room_id,
                 self.slot_id
             );
@@ -722,7 +722,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             // Wait before using this key (delayBeforeUse)
             // First key is already signaled, so we only delay for subsequent keys
             log::trace!(
-                "[{}:{}] Delaying use of key index {} for {}ms",
+                "[{}/{}] Delaying use of key index {} for {}ms",
                 self.room_id,
                 self.slot_id,
                 outbound_key_to_use.key_index,
@@ -754,7 +754,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         }
 
         log::trace!(
-            "[{}:{}] Key index:{} sent to {}",
+            "[{}/{}] Key index:{} sent to {}",
             self.room_id,
             self.slot_id,
             outbound_key_to_use.key_index,
@@ -798,7 +798,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         });
 
         log::trace!(
-            "[{}:{}] Sending key index {} to member {}",
+            "[{}/{}] Sending key index {} to member {}",
             self.room_id,
             self.slot_id,
             index,
@@ -820,7 +820,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 let target_device_id = membership.origin.sender_device_id().unwrap_or("*");
 
                 log::debug!(
-                    "[{}:{}] Sending key to user={}, device={}",
+                    "[{}/{}] Sending key to user={}, device={}",
                     self.room_id,
                     self.slot_id,
                     target_user_id,
@@ -838,7 +838,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             }
             None => {
                 log::warn!(
-                    "[{}:{}] Cannot send key to member {}: no matching membership found",
+                    "[{}/{}] Cannot send key to member {}: no matching membership found",
                     self.room_id,
                     self.slot_id,
                     target_member_id
@@ -961,7 +961,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     pub async fn receive_key(&self, received: ReceivedEncryptionKey) -> Result<(), CommandError> {
         if let Err(rejection) = self.verify_origin(&received) {
             log::warn!(
-                "[{}:{}] Discarding key for member {}: {}",
+                "[{}/{}] Discarding key for member {}: {}",
                 self.room_id,
                 self.slot_id,
                 received.member_id,
@@ -976,7 +976,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         if key_bytes.len() != 32 {
             log::warn!(
-                "[{}:{}] Received key with unexpected length: {} (expected 32)",
+                "[{}/{}] Received key with unexpected length: {} (expected 32)",
                 self.room_id,
                 self.slot_id,
                 key_bytes.len()
@@ -1006,7 +1006,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             }
             None => {
                 log::debug!(
-                    "[{}:{}] No matching RTC membership for key from member {}, buffering",
+                    "[{}/{}] No matching RTC membership for key from member {}, buffering",
                     self.room_id,
                     self.slot_id,
                     received.member_id
@@ -1038,7 +1038,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     ) {
         if let Err(rejection) = Self::verify_against_membership(origin, membership) {
             log::warn!(
-                "[{}:{}] Discarding key for member {}: {}",
+                "[{}/{}] Discarding key for member {}: {}",
                 self.room_id,
                 self.slot_id,
                 key.member_id,
@@ -1054,7 +1054,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         if outdated {
             log::info!(
-                "[{}:{}] Received outdated key from member {}, index {}, dropping",
+                "[{}/{}] Received outdated key from member {}, index {}, dropping",
                 self.room_id,
                 self.slot_id,
                 key.member_id,

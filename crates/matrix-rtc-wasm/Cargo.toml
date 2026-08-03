@@ -36,6 +36,20 @@ web-sys = { version = "0.3", features = ["console"] }
 async-trait.workspace = true
 futures = "0.3"
 wasm-bindgen-futures = "0.4"
+log.workspace = true
+# Routes the workspace's `log` records to the browser console; see
+# `src/logging.rs`.
+console_log = { version = "1", features = ["color"] }
+console_error_panic_hook = "0.1"
+# `RUST_LOG`-style filter specs, so the same spec works here and over the FFI.
+# No regex: it is a large dependency to put in a wasm bundle.
+env_filter = { version = "0.1", default-features = false }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# `matrix-rtc-core` uses `rand` for key generation, which reaches getrandom 0.2.
+# That has no wasm entropy source unless its `js` feature is on, and refuses to
+# compile for wasm32-unknown-unknown without it.
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 serde_json.workspace = true

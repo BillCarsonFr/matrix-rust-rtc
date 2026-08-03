@@ -237,9 +237,20 @@ impl Call {
         let membership_id = generate_member_id();
         let own_identity = pseudonymous_identity(&user_id, &device_id, &membership_id);
 
+        log::info!(
+            "[{room_id}/{}] join: user={user_id} device={device_id} member={membership_id} \
+             identity={own_identity}",
+            options.slot_id,
+        );
+
         let livekit =
             discover_livekit_transport(&client, options.livekit_service_url_fallback.as_deref())
                 .await?;
+        log::info!(
+            "[{room_id}/{}] join: focus is {}",
+            options.slot_id,
+            livekit.livekit_service_url,
+        );
 
         // Join the RTC session, then — still holding the manager lock so no
         // sticky update can interleave — wire the encryption manager to our
@@ -263,6 +274,10 @@ impl Call {
                     pseudonymous_identity(user_id, device_id, member_id)
                 });
             if !mgr.set_encryption_signal_handler(&room_id, &options.slot_id, bridge.clone()) {
+                log::warn!(
+                    "[{room_id}/{}] join: the joined session has no encryption manager",
+                    options.slot_id,
+                );
                 return Err(CallError::Signalling(
                     "failed to register encryption signal handler".into(),
                 ));
@@ -322,12 +337,23 @@ impl Call {
             engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
         }));
 
+        log::info!(
+            "[{room_id}/{}] join: connecting own focus {}",
+            options.slot_id,
+            livekit.livekit_service_url,
+        );
         let (connection, connection_events) = match transport
             .connect_livekit(&livekit.livekit_service_url, &ctx)
             .await
         {
             Ok(connected) => connected,
             Err(error) => {
+                log::warn!(
+                    "[{room_id}/{}] join: own focus {} refused the connection ({error}); \
+                     leaving the slot again",
+                    options.slot_id,
+                    livekit.livekit_service_url,
+                );
                 // We are signalled as joined but have no media path; leave so
                 // peers don't wait on the dead man's switch to notice.
                 drop(heartbeat);
@@ -343,6 +369,8 @@ impl Call {
             }
         };
         engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
+
+        log::info!("[{room_id}/{}] join: complete", options.slot_id);
 
         // Transition-period raw stream; subscribed immediately after connect,
         // so only events racing the connect itself can be missed here.

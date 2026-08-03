@@ -301,6 +301,47 @@ Still outstanding:
    raw `Call::events`/`Call::session` accessors and delete them, and surface
    slot-close (item 1) as `CallEvent::Ended`.
 
+## Logging
+
+Every crate emits through the [`log`] facade — as do `livekit` and `libwebrtc`, so one
+`log::Log` implementation captures the SFU and WebRTC stacks too. Nothing is visible
+until a binding installs that implementation; hosts must do this first or the SDK is
+silent:
+
+| Binding | Entry point | Destination |
+|---|---|---|
+| `matrix-rtc-ffi` | `setup_logging(RtcLogConfig, Option<Arc<dyn RtcLogSink>>)` | logcat on Android (tag `matrix-rtc`), stderr elsewhere, and/or a host `RtcLogSink` |
+| `matrix-rtc-wasm` | `initLogging(level, filter)` | the JS console |
+
+Both take the same `RUST_LOG` filter syntax, e.g.
+`"matrix_rtc_core::session=trace,livekit=info,webrtc_sys=warn"`. Hosts can push their own
+lines into the stream with `log_event` / `logEvent` so app and SDK logs interleave in one
+timeline, and dump current state with `debug_snapshot()` / `debugSnapshot()`.
+
+**Conventions.**
+
+- **Targets are module paths** (the `log` default — no explicit `target:`). The filterable
+  roots are `matrix_rtc_core`, `matrix_rtc_media`, `matrix_rtc_livekit`, `matrix_rtc_ffi`,
+  plus third-party `livekit` and `webrtc_sys`.
+- **Session-scoped lines are prefixed `[{room_id}/{slot_id}]`.** `RtcSession` carries a
+  pre-formatted `log_tag` for this, set by `RtcSessionManager` from its `SessionKey` — a
+  session does not otherwise know which slot it belongs to.
+- **Levels.** `error` = broken invariant. `warn` = recoverable or protocol-deviant.
+  `info` = lifecycle milestones only (a whole call should produce a few dozen). `debug` =
+  one line per decision: sticky event ingested, membership diff, slot resolved, key
+  received, command sent. `trace` = hot paths and payloads — keep-alive ticks, per-frame
+  work, event content JSON.
+- **Never logged:** key material, LiveKit JWTs, OpenID tokens. `token.rs` logs a JWT's
+  length, never the token. Event content JSON is `trace`-only because to-device messages
+  carry keys.
+
+**The membership-projection logs are the load-bearing ones.** A member silently vanishing
+from the roster is the hardest failure to diagnose from the outside, so
+`RtcSession::join_condition` returns a `JoinCondition` reason rather than a `bool`, and
+`refresh` logs both the joined/left diff and every excluded candidate with its reason
+(`SlotClosed`, `UnencryptedInEncryptedRoom`, `SenderNotInRoom`). `debug_snapshot()`
+reports the same per-candidate verdicts as JSON.
+
 ## Non-goals in this first skeleton
 
 - No dependency on `ruma` in core.

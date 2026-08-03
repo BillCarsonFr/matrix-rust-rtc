@@ -722,6 +722,15 @@ impl Actor {
             }
         }
 
+        log::debug!(
+            "focus grouping: {}",
+            desired
+                .iter()
+                .map(|(key, (_, members))| format!("{key} -> {} member(s)", members.len()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
         let keys: Vec<String> = self.pool.keys().cloned().collect();
         for key in keys {
             let members = desired.remove(&key).map(|(_, m)| m).unwrap_or_default();
@@ -731,6 +740,7 @@ impl Actor {
             // set (re)arms one.
             entry.idle_generation += 1;
             if entry.members.is_empty() && !entry.is_own {
+                log::debug!("peer focus {key} has no members left; arming the idle timer");
                 let idle_generation = entry.idle_generation;
                 let messages = self.messages_tx.clone();
                 let key = key.clone();
@@ -750,6 +760,10 @@ impl Actor {
             if self.own_connection_key.as_deref() == Some(key.as_str()) {
                 continue;
             }
+            log::info!(
+                "connecting to peer focus {key} for {} member(s)",
+                members.len(),
+            );
             self.pool.insert(
                 key.clone(),
                 ManagedConnection {
@@ -1038,6 +1052,12 @@ impl Actor {
         self.members_snapshot = snapshot;
         self.reconcile_pool();
         self.publish_roster();
+
+        log::debug!(
+            "roster reconciled: {} participant(s), {} with a transport identity",
+            self.roster.len(),
+            self.identity_map.len(),
+        );
     }
 
     fn add_member(&mut self, member: &JoinedMembership) {
@@ -1046,6 +1066,21 @@ impl Actor {
             .transports
             .iter()
             .find_map(|backend| backend.remote_identity(member));
+
+        match &identity {
+            Some(identity) => log::debug!(
+                "member {} ({}) joined the roster as {identity}, reachable={reachable}",
+                member.member_id,
+                member.sender,
+            ),
+            // Their media arrives under an identity nothing maps back, so it
+            // will be buffered forever rather than surfacing as their stream.
+            None => log::warn!(
+                "member {} ({}) has no transport identity; their media cannot be attributed",
+                member.member_id,
+                member.sender,
+            ),
+        }
 
         self.roster.push(Participant {
             member_id: member.member_id.clone(),
@@ -1068,6 +1103,11 @@ impl Actor {
 
             // Media and keys that arrived before this membership.
             if let Some(pending) = self.pending_tracks.remove(&identity) {
+                log::debug!(
+                    "flushing {} buffered track(s) onto member {}",
+                    pending.len(),
+                    member.member_id,
+                );
                 for (kind, track) in pending {
                     self.add_stream(&member.member_id.clone(), kind, track);
                 }

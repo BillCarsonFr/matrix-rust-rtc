@@ -85,6 +85,16 @@ async fn build_media_session(
     config: MediaSessionConfig,
     token_provider: Arc<dyn OpenIdTokenProvider>,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
+    log::info!(
+        "media: connecting [{}/{}] member={} user={} device={} focus={}",
+        config.room_id,
+        config.slot_id,
+        config.member_id,
+        config.user_id,
+        config.device_id,
+        config.livekit_service_url,
+    );
+
     // Frame encryption: one shared KeyProvider feeds every SFU connection
     // (keys are indexed by pseudonymous identity, globally unique per
     // membership) and the bridge that imports keys the core signals.
@@ -101,12 +111,22 @@ async fn build_media_session(
         let memberships = mgr
             .subscribe_membership_snapshots(&config.room_id, &config.slot_id)
             .ok_or_else(|| {
+                log::warn!(
+                    "media: no session for [{}/{}] — join the slot before connecting media",
+                    config.room_id,
+                    config.slot_id,
+                );
                 MediaFfiError::NotJoined(format!(
                     "no session for {}/{} — join the slot first",
                     config.room_id, config.slot_id
                 ))
             })?;
         if !mgr.set_encryption_signal_handler(&config.room_id, &config.slot_id, bridge.clone()) {
+            log::warn!(
+                "media: session [{}/{}] has no encryption manager — join the slot first",
+                config.room_id,
+                config.slot_id,
+            );
             return Err(MediaFfiError::NotJoined(
                 "the session has no encryption manager — join the slot first".into(),
             ));
@@ -154,11 +174,19 @@ async fn build_media_session(
     let (connection, connection_events) = transport
         .connect_livekit(&config.livekit_service_url, &ctx)
         .await
-        .map_err(|error| MediaFfiError::Transport(error.to_string()))?;
+        .map_err(|error| {
+            log::warn!(
+                "media: own focus {} refused the connection: {error}",
+                config.livekit_service_url,
+            );
+            MediaFfiError::Transport(error.to_string())
+        })?;
     engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
     let events = engine.subscribe_events();
     let own_identity = pseudonymous_identity(&config.user_id, &config.device_id, &config.member_id);
+
+    log::info!("media: connected, local identity {own_identity}");
 
     Ok(Arc::new(MediaSession {
         engine,
@@ -263,11 +291,12 @@ impl MediaSession {
         &self,
         options: FfiPublishOptions,
     ) -> Result<Arc<FfiLocalTrack>, MediaFfiError> {
-        let handle = self
-            .engine
-            .publish(options.into())
-            .await
-            .map_err(|error| MediaFfiError::Transport(error.to_string()))?;
+        log::info!("media: publishing {options:?}");
+
+        let handle = self.engine.publish(options.into()).await.map_err(|error| {
+            log::warn!("media: publish failed: {error}");
+            MediaFfiError::Transport(error.to_string())
+        })?;
         Ok(Arc::new(FfiLocalTrack::new(handle)))
     }
 
@@ -279,10 +308,11 @@ impl MediaSession {
     /// Kotlin object an `AutoCloseable.close()` for handle disposal, and a
     /// suspend `close()` collides with it.)
     pub async fn disconnect(&self) -> Result<(), MediaFfiError> {
+        log::info!("media: disconnecting");
         self.engine.shutdown().await;
-        self.connection
-            .close()
-            .await
-            .map_err(|error| MediaFfiError::Transport(error.to_string()))
+        self.connection.close().await.map_err(|error| {
+            log::warn!("media: own focus did not close cleanly: {error}");
+            MediaFfiError::Transport(error.to_string())
+        })
     }
 }

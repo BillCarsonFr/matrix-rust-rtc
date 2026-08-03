@@ -162,6 +162,37 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
 
 /// Conversion from FFI join params to core join params.
 impl FfiJoinSessionParams {
+    /// One-line description for logs. Covers everything that decides whether a
+    /// join is accepted and how the member is projected — including the
+    /// transport intent, which is the field integrators most often get wrong.
+    pub(crate) fn summary(&self) -> String {
+        let transport = match &self.transport {
+            Some(transport) => format!(
+                "publish:{}{}",
+                transport.r#type,
+                transport
+                    .livekit_service_url
+                    .as_deref()
+                    .map(|url| format!("@{url}"))
+                    .unwrap_or_default(),
+            ),
+            None => format!("receive_only:{:?}", self.can_subscribe),
+        };
+
+        format!(
+            "[{}/{}] user={} device={} application={} membership_id={:?} transport={} keep_alive={:?}ms encryption={}",
+            self.room_id,
+            self.slot_id,
+            self.user_id,
+            self.device_id,
+            self.application,
+            self.membership_id,
+            transport,
+            self.keep_alive_timeout_ms,
+            self.encryption_config.is_some(),
+        )
+    }
+
     pub fn into_core(
         self,
     ) -> Result<matrix_rtc_core::JoinSessionParams, matrix_rtc_core::CommandError> {
@@ -318,6 +349,24 @@ impl FfiCommandSender {
 
 use async_trait::async_trait;
 
+/// Logs what the host callback made of an outbound command.
+///
+/// Every command leaving the SDK goes through here, so "the core decided to
+/// send X" and "the host accepted/rejected X" are always adjacent in the log —
+/// which is what separates an SDK bug from a host-integration bug.
+fn log_command<T>(what: &str, outcome: Result<T, CommandError>) -> Result<T, CommandError> {
+    match &outcome {
+        Ok(_) => log::debug!("command sent: {what}"),
+        Err(error) => log::warn!("command failed: {what}: {error}"),
+    }
+    outcome
+}
+
+/// Kept at `trace`: the content of a to-device message is key material.
+fn trace_command_content(what: &str, content_json: &str) {
+    log::trace!("command sending: {what} content={content_json}");
+}
+
 #[async_trait(?Send)]
 impl RtcCommandSender for FfiCommandSender {
     async fn send_sticky_event(
@@ -329,10 +378,16 @@ impl RtcCommandSender for FfiCommandSender {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        self.callback
-            .send_sticky_event(room_id, wire_type(event_type), content_json)
-            .map_err(CommandError::from)?;
-        Ok(())
+        let wire_event_type = wire_type(event_type);
+        let what = format!("sticky [{room_id}] type={wire_event_type}");
+        trace_command_content(&what, &content_json);
+
+        log_command(
+            &what,
+            self.callback
+                .send_sticky_event(room_id, wire_event_type, content_json)
+                .map_err(CommandError::from),
+        )
     }
 
     async fn send_delayed_event(
@@ -345,9 +400,16 @@ impl RtcCommandSender for FfiCommandSender {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        self.callback
-            .send_delayed_event(room_id, wire_type(event_type), content_json, delay_ms)
-            .map_err(CommandError::from)
+        let wire_event_type = wire_type(event_type);
+        let what = format!("delayed [{room_id}] type={wire_event_type} delay={delay_ms}ms");
+        trace_command_content(&what, &content_json);
+
+        log_command(
+            &what,
+            self.callback
+                .send_delayed_event(room_id, wire_event_type, content_json, delay_ms)
+                .map_err(CommandError::from),
+        )
     }
 
     async fn cancel_delayed_event(
@@ -355,10 +417,14 @@ impl RtcCommandSender for FfiCommandSender {
         room_id: String,
         event_id: String,
     ) -> Result<(), CommandError> {
-        self.callback
-            .cancel_delayed_event(room_id, event_id)
-            .map_err(CommandError::from)?;
-        Ok(())
+        let what = format!("cancel delayed [{room_id}] event_id={event_id}");
+
+        log_command(
+            &what,
+            self.callback
+                .cancel_delayed_event(room_id, event_id)
+                .map_err(CommandError::from),
+        )
     }
 
     async fn send_to_device_message(
@@ -371,10 +437,16 @@ impl RtcCommandSender for FfiCommandSender {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        self.callback
-            .send_to_device_message(user_id, device_id, wire_type(message_type), content_json)
-            .map_err(CommandError::from)?;
-        Ok(())
+        let wire_message_type = wire_type(message_type);
+        let what = format!("to-device {user_id}/{device_id} type={wire_message_type}");
+        trace_command_content(&what, &content_json);
+
+        log_command(
+            &what,
+            self.callback
+                .send_to_device_message(user_id, device_id, wire_message_type, content_json)
+                .map_err(CommandError::from),
+        )
     }
 
     async fn send_state_event(
@@ -387,10 +459,16 @@ impl RtcCommandSender for FfiCommandSender {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        self.callback
-            .send_state_event(room_id, wire_type(event_type), state_key, content_json)
-            .map_err(CommandError::from)?;
-        Ok(())
+        let wire_event_type = wire_type(event_type);
+        let what = format!("state [{room_id}] type={wire_event_type} state_key={state_key}");
+        trace_command_content(&what, &content_json);
+
+        log_command(
+            &what,
+            self.callback
+                .send_state_event(room_id, wire_event_type, state_key, content_json)
+                .map_err(CommandError::from),
+        )
     }
 }
 

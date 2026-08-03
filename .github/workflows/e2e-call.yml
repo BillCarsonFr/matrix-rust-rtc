@@ -71,7 +71,11 @@ jobs:
         # compose stack; run them sequentially.
         run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
         env:
-          RUST_LOG: info
+          # `debug` on our own crates: this is the only CI job that exercises a
+          # real join end to end, so its log is the reference for what a healthy
+          # sequence looks like. `livekit`/`webrtc_sys` stay at `warn` — at
+          # `debug` they are most of the output.
+          RUST_LOG: info,matrix_rtc_core=debug,matrix_rtc_media=debug,matrix_rtc_livekit=debug,livekit=warn,webrtc_sys=warn
 
       # Always, not just on failure: the auth-service (lk-jwt) logs are the
       # only visibility into the OpenID/token hop, and green runs that log
