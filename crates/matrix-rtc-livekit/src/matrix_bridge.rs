@@ -381,7 +381,13 @@ async fn slot_snapshot(room: &Room) -> Option<Vec<RawSlotEvent>> {
                 content,
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    log::debug!(
+        "[{room_id}] room state fetched: {} m.rtc.slot event(s): {:?}",
+        slots.len(),
+        slots.iter().map(|slot| &slot.slot_id).collect::<Vec<_>>(),
+    );
 
     Some(slots)
 }
@@ -441,6 +447,9 @@ pub async fn run_sticky_bridge(
     room: Room,
     manager: Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
 ) {
+    let room_id = room.room_id().to_string();
+    log::info!("[{room_id}] sticky bridge started");
+
     let mut receiver = room.subscribe_to_sticky_events();
 
     // Seed the room state that gates membership before any member event is
@@ -453,6 +462,10 @@ pub async fn run_sticky_bridge(
     for event in &initial {
         known.insert(sticky_id(event), event.clone());
     }
+    log::debug!(
+        "[{room_id}] sticky bridge seeding with {} live event(s)",
+        initial.len(),
+    );
     if let Err(error) = manager
         .lock()
         .await
@@ -489,6 +502,12 @@ pub async fn run_sticky_bridge(
             removed,
         };
 
+        log::debug!(
+            "[{room_id}] sticky tick: {} live, {} expired",
+            update.added.len(),
+            update.removed.len(),
+        );
+
         if let Err(error) = manager
             .lock()
             .await
@@ -500,4 +519,6 @@ pub async fn run_sticky_bridge(
 
         known = current_ids;
     }
+
+    log::info!("[{room_id}] sticky bridge stopped");
 }

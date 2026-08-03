@@ -27,7 +27,9 @@ use matrix_rtc_core::{
 };
 
 mod commands;
+mod logging;
 pub use commands::JsCommandSender;
+pub use logging::{init_logging, log_event};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -57,6 +59,7 @@ impl WasmRtcSessionManager {
     /// This must be called before join/leave operations.
     /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
+        log::info!("manager: command sender installed");
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());
         self.command_sender = Some(command_sender);
@@ -73,8 +76,16 @@ impl WasmRtcSessionManager {
         room_id: String,
         events: JsValue,
     ) -> Result<(), JsError> {
-        let input: Vec<WasmStickyEvent> = serde_wasm_bindgen::from_value(events)
-            .map_err(|err| JsError::new(&format!("invalid sticky snapshot payload: {err}")))?;
+        let input: Vec<WasmStickyEvent> =
+            serde_wasm_bindgen::from_value(events).map_err(|err| {
+                log::warn!("manager: [{room_id}] invalid sticky snapshot payload: {err}");
+                JsError::new(&format!("invalid sticky snapshot payload: {err}"))
+            })?;
+
+        log::debug!(
+            "manager: [{room_id}] initial sticky in, {} event(s)",
+            input.len(),
+        );
 
         let mapped: Vec<RawStickyEvent> = input.into_iter().map(Into::into).collect();
 
@@ -90,8 +101,18 @@ impl WasmRtcSessionManager {
         room_id: String,
         update: JsValue,
     ) -> Result<(), JsError> {
-        let input: WasmStickyEventsUpdate = serde_wasm_bindgen::from_value(update)
-            .map_err(|err| JsError::new(&format!("invalid sticky event payload: {err}")))?;
+        let input: WasmStickyEventsUpdate =
+            serde_wasm_bindgen::from_value(update).map_err(|err| {
+                log::warn!("manager: [{room_id}] invalid sticky event payload: {err}");
+                JsError::new(&format!("invalid sticky event payload: {err}"))
+            })?;
+
+        log::debug!(
+            "manager: [{room_id}] sticky update in, +{} ~{} -{}",
+            input.added.len(),
+            input.updated.len(),
+            input.removed.len(),
+        );
 
         let mapped = StickyEventsUpdate {
             added: input.added.into_iter().map(Into::into).collect(),
@@ -126,8 +147,15 @@ impl WasmRtcSessionManager {
         room_id: String,
         slots: JsValue,
     ) -> Result<(), JsError> {
-        let input: Vec<WasmSlotEvent> = serde_wasm_bindgen::from_value(slots)
-            .map_err(|err| JsError::new(&format!("invalid slot payload: {err}")))?;
+        let input: Vec<WasmSlotEvent> = serde_wasm_bindgen::from_value(slots).map_err(|err| {
+            log::warn!("manager: [{room_id}] invalid slot payload: {err}");
+            JsError::new(&format!("invalid slot payload: {err}"))
+        })?;
+
+        log::debug!(
+            "manager: [{room_id}] room slots in: {:?}",
+            input.iter().map(|slot| &slot.slot_id).collect::<Vec<_>>(),
+        );
 
         let mapped: Vec<RawSlotEvent> = input
             .into_iter()
@@ -147,8 +175,20 @@ impl WasmRtcSessionManager {
     /// MSC4143 only counts a member event while its sender is still joined to
     /// the room; until this is called that condition is not enforced.
     pub async fn on_room_members_received(&mut self, room_id: String, joined_user_ids: JsValue) {
-        let members: Vec<String> =
-            serde_wasm_bindgen::from_value(joined_user_ids).unwrap_or_default();
+        let members: Vec<String> = serde_wasm_bindgen::from_value(joined_user_ids)
+            .inspect_err(|err| {
+                log::warn!(
+                    "manager: [{room_id}] unreadable joined-members payload ({err}); \
+                     treating the room as empty",
+                )
+            })
+            .unwrap_or_default();
+
+        log::debug!(
+            "manager: [{room_id}] room members in: {} joined",
+            members.len(),
+        );
+
         self.inner.on_room_members_received(&room_id, members).await;
     }
 
@@ -158,9 +198,18 @@ impl WasmRtcSessionManager {
     /// elsewhere, so this changes how the room's slots resolve and whether
     /// cleartext member events count.
     pub async fn on_room_encryption_received(&mut self, room_id: String, encrypted: bool) {
+        log::info!("manager: [{room_id}] room encryption in: encrypted={encrypted}");
         self.inner
             .on_room_encryption_received(&room_id, encrypted)
             .await;
+    }
+
+    /// A JSON dump of everything the manager and its sessions currently
+    /// believe, including every candidate member and the reason it is or is not
+    /// projected as joined. For bug reports; contains no key material.
+    #[wasm_bindgen(js_name = debugSnapshot)]
+    pub fn debug_snapshot(&self) -> String {
+        self.inner.debug_snapshot().to_string()
     }
 
     /// Returns the number of active sessions currently tracked by the manager.
@@ -191,15 +240,35 @@ impl WasmRtcSessionManager {
     ///   - `transport`: Transport configuration object
     ///   - `keep_alive_timeout_ms`: Optional keep-alive timeout in milliseconds (default: 30000)
     pub async fn join(&mut self, params: JsValue) -> Result<(), JsError> {
-        let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
-            .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
+        let params: WasmJoinSessionParams =
+            serde_wasm_bindgen::from_value(params).map_err(|err| {
+                log::warn!("manager: invalid join params: {err}");
+                JsError::new(&format!("invalid join params: {err}"))
+            })?;
+
+        log::info!(
+            "manager: join requested [{}/{}] user={} device={} application={}",
+            params.room_id,
+            params.slot_id,
+            params.user_id,
+            params.device_id,
+            params.application,
+        );
 
         let core_params = params.into_core()?;
 
-        self.inner
+        let result = self
+            .inner
             .join(core_params)
             .await
-            .map_err(|err| JsError::new(&err.to_string()))
+            .map_err(|err| JsError::new(&err.to_string()));
+
+        match &result {
+            Ok(()) => log::info!("manager: join succeeded"),
+            Err(_) => log::warn!("manager: join failed"),
+        }
+
+        result
     }
 
     /// Leaves an RTC session.
@@ -224,12 +293,25 @@ impl WasmRtcSessionManager {
         let params: WasmLeaveSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid leave params: {err}")))?;
 
+        log::info!(
+            "manager: leave requested [{room_id}/{slot_id}] reason={:?}",
+            params.leave_reason,
+        );
+
         let core_params = params.into_core();
 
-        self.inner
+        let result = self
+            .inner
             .leave(room_id, slot_id, core_params)
             .await
-            .map_err(|err| JsError::new(&err.to_string()))
+            .map_err(|err| JsError::new(&err.to_string()));
+
+        match &result {
+            Ok(()) => log::info!("manager: leave succeeded"),
+            Err(_) => log::warn!("manager: leave failed"),
+        }
+
+        result
     }
 }
 

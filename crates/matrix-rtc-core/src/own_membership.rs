@@ -251,7 +251,14 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 delayed_content,
                 keep_alive_timeout_ms,
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                log::warn!(
+                    "[{room_id}] join aborted at step 1: the delayed leave could not be \
+                     scheduled ({error}). The host's homeserver may not support MSC4140 \
+                     delayed events.",
+                )
+            })?;
 
         // Store the delayed event ID for later cancellation
         {
@@ -275,7 +282,13 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         // Send the join event (Step 2 of dead man's switch)
         self.command_sender
             .send_sticky_event(room_id.clone(), "m.rtc.member".to_string(), join_content)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                log::warn!(
+                    "[{room_id}] join aborted at step 2: the join membership event was not \
+                     sent ({error}). The delayed leave stays armed and will clean up.",
+                )
+            })?;
 
         // Both steps completed successfully, transition to Joined state
         {
@@ -395,7 +408,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// should not break the application - we'll retry on the next heartbeat.
     pub async fn heartbeat(&self) {
         let room_id = self.room_id.clone();
-        log::debug!("[{}] Heartbeat: restarting keep-alive", room_id);
+        log::trace!("[{}] Heartbeat: restarting keep-alive", room_id);
 
         // First, cancel the existing delayed event if one exists
         if let Some(event_id) = self.delayed_event_id() {
@@ -405,7 +418,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 .await
             {
                 Ok(_) => {
-                    log::debug!("[{}] Previous delayed leave canceled", room_id);
+                    log::trace!("[{}] Previous delayed leave canceled", room_id);
                 }
                 Err(e) => {
                     log::warn!("[{}] Failed to cancel delayed leave: {:?}", room_id, e);
@@ -444,7 +457,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         let sticky_key = self.sticky_key.clone();
         let keep_alive_timeout_ms = self.keep_alive_timeout_ms;
 
-        log::debug!(
+        log::trace!(
             "[{}] Scheduling new delayed leave (timeout: {}ms)",
             room_id,
             keep_alive_timeout_ms
@@ -473,7 +486,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             });
         }
 
-        log::debug!("[{}] Delayed leave scheduled successfully", room_id);
+        log::trace!("[{}] Delayed leave scheduled successfully", room_id);
 
         Ok(())
     }

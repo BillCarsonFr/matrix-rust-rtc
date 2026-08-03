@@ -29,9 +29,14 @@ use matrix_rtc_core::{
     RawStickyEvent, RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
 };
 mod commands;
+mod logging;
 pub use commands::{
     CommandSenderCallback, CommandSenderError, FfiCommandSender, FfiJoinSessionParams,
     FfiLeaveSessionParams, FfiTransportConfig,
+};
+pub use logging::{
+    RtcLogConfig, RtcLogLevel, RtcLogRecord, RtcLogSink, dropped_log_record_count, log_event,
+    setup_logging,
 };
 
 /// Participants with observable frame streams, publishing, and constraints —
@@ -257,6 +262,7 @@ impl RtcSessionHandle {
         &self,
         callback: Box<dyn CommandSenderCallback>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::info!("session: command sender installed");
         let command_sender = FfiCommandSender::new(Arc::from(callback));
         let mut session = lock_mutex(&self.inner)?;
         session.set_command_sender(command_sender);
@@ -267,6 +273,13 @@ impl RtcSessionHandle {
         &self,
         events: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "session: sticky snapshot in, {} events ({})",
+            events.len(),
+            describe_events(&events),
+        );
+        trace_sticky_events("snapshot", &events);
+
         let parsed = to_core_membership_events(to_core_events(events))?;
         let mut session = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
@@ -281,6 +294,16 @@ impl RtcSessionHandle {
         updated: Vec<StickyEventUpdate>,
         removed: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "session: sticky update in, +{} ~{} -{} ({})",
+            added.len(),
+            updated.len(),
+            removed.len(),
+            describe_events(&added),
+        );
+        trace_sticky_events("added", &added);
+        trace_sticky_events("removed", &removed);
+
         let mut membership_events = to_core_membership_events(to_core_events(added))?;
 
         let updated_events = to_core_membership_events(
@@ -316,9 +339,12 @@ impl RtcSessionHandle {
     }
 
     pub fn join(&self, params: FfiJoinSessionParams) -> Result<(), MatrixRtcFfiError> {
-        let core_params = params
-            .into_core()
-            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))?;
+        log::info!("session: join requested {}", params.summary());
+
+        let core_params = params.into_core().map_err(|e| {
+            log::warn!("session: join rejected before it started: {e}");
+            MatrixRtcFfiError::InvalidInput(e.to_string())
+        })?;
 
         // Take the session out of the mutex to avoid holding the guard across await
         let mut inner = lock_mutex(&self.inner)?;
@@ -331,11 +357,15 @@ impl RtcSessionHandle {
         // For FFI, the command sender callbacks are synchronous, so the async
         // operations will complete immediately. We use a simple block_on.
         let result = futures::executor::block_on(async {
-            session
-                .join(core_params)
-                .await
-                .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+            session.join(core_params).await.map_err(|e| {
+                log::warn!("session: join failed: {e}");
+                MatrixRtcFfiError::InvalidInput(e.to_string())
+            })
         });
+
+        if result.is_ok() {
+            log::info!("session: join succeeded");
+        }
 
         // Store the session back
         let mut inner = lock_mutex(&self.inner)?;
@@ -345,6 +375,11 @@ impl RtcSessionHandle {
     }
 
     pub fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
+        log::warn!(
+            "session: leave() is not implemented on RtcSessionHandle; \
+             use RtcSessionManagerHandle::leave()"
+        );
+
         let _core_params = params.into_core();
 
         let _session = lock_mutex(&self.inner)?;
@@ -379,6 +414,7 @@ impl RtcSessionManagerHandle {
         &self,
         callback: Box<dyn CommandSenderCallback>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::info!("manager: command sender installed");
         let command_sender = FfiCommandSender::new(Arc::from(callback));
         let mut manager = lock_mutex(&self.inner)?;
         manager.set_command_sender(command_sender);
@@ -390,6 +426,13 @@ impl RtcSessionManagerHandle {
         room_id: String,
         events: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "manager: [{room_id}] initial sticky in, {} events ({})",
+            events.len(),
+            describe_events(&events),
+        );
+        trace_sticky_events("initial", &events);
+
         let mut manager = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
             manager
@@ -406,6 +449,15 @@ impl RtcSessionManagerHandle {
         updated: Vec<StickyEventUpdate>,
         removed: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "manager: [{room_id}] sticky update in, +{} ~{} -{}",
+            added.len(),
+            updated.len(),
+            removed.len(),
+        );
+        trace_sticky_events("added", &added);
+        trace_sticky_events("removed", &removed);
+
         let update = StickyEventsUpdate {
             added: to_core_events(added),
             updated: to_core_updates(updated),
@@ -425,6 +477,13 @@ impl RtcSessionManagerHandle {
         &self,
         events: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "manager: sticky snapshot in, {} events ({})",
+            events.len(),
+            describe_events(&events),
+        );
+        trace_sticky_events("snapshot", &events);
+
         let mut manager = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
             manager
@@ -440,6 +499,16 @@ impl RtcSessionManagerHandle {
         updated: Vec<StickyEventUpdate>,
         removed: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "manager: sticky update in, +{} ~{} -{} ({})",
+            added.len(),
+            updated.len(),
+            removed.len(),
+            describe_events(&added),
+        );
+        trace_sticky_events("added", &added);
+        trace_sticky_events("removed", &removed);
+
         let mut manager = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
             manager
@@ -464,10 +533,16 @@ impl RtcSessionManagerHandle {
         room_id: String,
         slots: Vec<SlotEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "manager: [{room_id}] room slots in: {:?}",
+            slots.iter().map(|slot| &slot.slot_id).collect::<Vec<_>>(),
+        );
+
         let mapped = slots
             .into_iter()
             .map(|slot| slot.into_core(&room_id))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .inspect_err(|err| log::warn!("manager: [{room_id}] rejected a slot event: {err}"))?;
 
         let mut manager = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
@@ -485,6 +560,12 @@ impl RtcSessionManagerHandle {
         room_id: String,
         joined_user_ids: Vec<String>,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "manager: [{room_id}] room members in: {} joined",
+            joined_user_ids.len(),
+        );
+        log::trace!("manager: [{room_id}] joined users: {joined_user_ids:?}");
+
         let mut manager = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
             manager
@@ -504,6 +585,8 @@ impl RtcSessionManagerHandle {
         room_id: String,
         encrypted: bool,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::info!("manager: [{room_id}] room encryption in: encrypted={encrypted}");
+
         let mut manager = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
             manager
@@ -520,14 +603,42 @@ impl RtcSessionManagerHandle {
         &self,
         key: FfiReceivedEncryptionKey,
     ) -> Result<(), MatrixRtcFfiError> {
+        // Never the key material itself — only what decides whether it is
+        // accepted. Its length is enough to spot a truncated or empty key.
+        log::debug!(
+            "manager: [{}] encryption key in: member={} index={} len={} encrypted={} sender={:?}/{:?} cross_signed={}",
+            key.room_id,
+            key.member_id,
+            key.key_index,
+            key.key_b64.len(),
+            key.was_encrypted,
+            key.sender_user_id,
+            key.sender_device_id,
+            key.sender_is_cross_signed,
+        );
+
         let received = key.into_core()?;
         let manager = lock_mutex(&self.inner)?;
         futures::executor::block_on(async {
             manager
                 .receive_encryption_key(received)
                 .await
-                .map_err(|error| MatrixRtcFfiError::InvalidInput(error.to_string()))
+                .map_err(|error| {
+                    log::warn!("manager: encryption key rejected: {error}");
+                    MatrixRtcFfiError::InvalidInput(error.to_string())
+                })
         })
+    }
+
+    /// A JSON dump of everything the manager and its sessions currently
+    /// believe: sessions, room state per room, and every candidate member with
+    /// the reason it is or is not projected as joined.
+    ///
+    /// For bug reports and for answering "what does Rust think the state is
+    /// right now?" without a debugger. Contains no key material.
+    pub fn debug_snapshot(&self) -> Result<String, MatrixRtcFfiError> {
+        let manager = lock_mutex(&self.inner)?;
+        Ok(manager.debug_snapshot().to_string())
     }
 
     pub fn session_count(&self) -> Result<u64, MatrixRtcFfiError> {
@@ -547,9 +658,12 @@ impl RtcSessionManagerHandle {
     }
 
     pub fn join(&self, params: FfiJoinSessionParams) -> Result<(), MatrixRtcFfiError> {
-        let core_params = params
-            .into_core()
-            .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))?;
+        log::info!("manager: join requested {}", params.summary());
+
+        let core_params = params.into_core().map_err(|e| {
+            log::warn!("manager: join rejected before it started: {e}");
+            MatrixRtcFfiError::InvalidInput(e.to_string())
+        })?;
 
         // Take the manager out of the mutex to avoid holding the guard across await
         let mut inner = lock_mutex(&self.inner)?;
@@ -560,11 +674,15 @@ impl RtcSessionManagerHandle {
 
         // Do the async join
         let result = futures::executor::block_on(async {
-            manager
-                .join(core_params)
-                .await
-                .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+            manager.join(core_params).await.map_err(|e| {
+                log::warn!("manager: join failed: {e}");
+                MatrixRtcFfiError::InvalidInput(e.to_string())
+            })
         });
+
+        if result.is_ok() {
+            log::info!("manager: join succeeded");
+        }
 
         // Store the manager back
         let mut inner = lock_mutex(&self.inner)?;
@@ -579,6 +697,11 @@ impl RtcSessionManagerHandle {
         slot_id: String,
         params: FfiLeaveSessionParams,
     ) -> Result<(), MatrixRtcFfiError> {
+        log::info!(
+            "manager: leave requested [{room_id}/{slot_id}] reason={:?}",
+            params.leave_reason,
+        );
+
         let core_params = params.into_core();
 
         // Take the manager out of the mutex to avoid holding the guard across await
@@ -593,8 +716,15 @@ impl RtcSessionManagerHandle {
             manager
                 .leave(room_id, slot_id, core_params)
                 .await
-                .map_err(|e| MatrixRtcFfiError::InvalidInput(e.to_string()))
+                .map_err(|e| {
+                    log::warn!("manager: leave failed: {e}");
+                    MatrixRtcFfiError::InvalidInput(e.to_string())
+                })
         });
+
+        if result.is_ok() {
+            log::info!("manager: leave succeeded");
+        }
 
         // Store the manager back
         let mut inner = lock_mutex(&self.inner)?;
@@ -739,7 +869,54 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
 }
 
 fn map_conversion_error(err: EventConversionError) -> MatrixRtcFfiError {
+    log::warn!("rejected a sticky event batch: {err}");
     MatrixRtcFfiError::InvalidInput(err.to_string())
+}
+
+/// Compact `(room, slot)` census of a sticky batch: which sessions it touched,
+/// and how many events each got.
+fn describe_events(events: &[StickyEvent]) -> String {
+    if events.is_empty() {
+        return "none".to_owned();
+    }
+
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for event in events {
+        let key = format!("{}/{}", event.room_id, event.slot_id);
+        match counts.iter_mut().find(|(seen, _)| *seen == key) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((key, 1)),
+        }
+    }
+
+    counts
+        .iter()
+        .map(|(key, count)| format!("{key} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Per-event detail for a sticky batch, for when a member is dropped for a
+/// reason the summary cannot show.
+fn trace_sticky_events(kind: &str, events: &[StickyEvent]) {
+    if !log::log_enabled!(log::Level::Trace) {
+        return;
+    }
+
+    for event in events {
+        log::trace!(
+            "sticky {kind}: [{}/{}] type={} sender={} device={:?} sticky_key={} membership={:?} encrypted={:?} transports={}",
+            event.room_id,
+            event.slot_id,
+            event.event_type,
+            event.sender,
+            event.sender_device_id,
+            event.sticky_key,
+            event.membership,
+            event.was_encrypted,
+            event.transports_json.is_some(),
+        );
+    }
 }
 
 fn lock_mutex<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, MatrixRtcFfiError> {

@@ -59,6 +59,58 @@ pub enum SlotKnowledge {
     Known(SlotState),
 }
 
+fn sticky_keys(members: &[JoinedMembership]) -> Vec<&str> {
+    members
+        .iter()
+        .map(|member| member.sticky_key.as_str())
+        .collect()
+}
+
+fn difference<'a>(from: &[&'a str], without: &[&str]) -> Vec<&'a str> {
+    from.iter()
+        .filter(|key| !without.contains(key))
+        .copied()
+        .collect()
+}
+
+fn describe_exclusions(excluded: &[(&str, JoinCondition)]) -> String {
+    excluded
+        .iter()
+        .map(|(sticky_key, condition)| format!("{sticky_key}={condition:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Log tag for a session created outside a
+/// [`RtcSessionManager`](crate::RtcSessionManager), which is the only thing
+/// that knows the `(room, slot)` a session belongs to.
+const UNATTRIBUTED_LOG_TAG: &str = "-/-";
+
+/// Why a candidate member event is, or is not, projected as joined.
+///
+/// A plain `bool` here made the most confusing failure in the whole SDK
+/// invisible: a member vanishing from the roster because of room state they
+/// have nothing to do with. Carrying the reason costs nothing and turns that
+/// into one readable log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinCondition {
+    /// Every MSC4143 condition this session can evaluate is satisfied.
+    Joined,
+    /// The slot is closed, so nobody is joined to it.
+    SlotClosed,
+    /// MSC4143 requires `m.rtc.member` to be encrypted in an encrypted room,
+    /// and one that is not "MUST be considered left".
+    UnencryptedInEncryptedRoom,
+    /// The sender is no longer joined to the room.
+    SenderNotInRoom,
+}
+
+impl JoinCondition {
+    fn is_joined(self) -> bool {
+        matches!(self, JoinCondition::Joined)
+    }
+}
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession<T: RtcCommandSender> {
     /// Member events that are join-shaped and still sticky. These are
@@ -83,6 +135,13 @@ pub struct RtcSession<T: RtcCommandSender> {
     own_membership_machine: Option<OwnMembershipMachine<T>>,
     /// Encryption manager for key distribution and management.
     encryption_manager: Option<EncryptionManager<T>>,
+    /// `room_id/slot_id`, prefixed to this session's log lines.
+    ///
+    /// A session does not otherwise know which slot it belongs to — the manager
+    /// holds that in its key — so without this every line from a multi-call
+    /// client is unattributable. Pre-formatted because it is used on paths that
+    /// run per event.
+    log_tag: String,
 }
 
 impl<T: RtcCommandSender> Clone for RtcSession<T> {
@@ -97,6 +156,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             command_sender: self.command_sender.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             encryption_manager: None,     // Don't clone the encryption manager
+            log_tag: self.log_tag.clone(),
         }
     }
 }
@@ -116,6 +176,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             command_sender: None,
             own_membership_machine: None,
             encryption_manager: None,
+            log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
     }
 
@@ -133,7 +194,16 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             command_sender: Some(command_sender),
             own_membership_machine: None,
             encryption_manager: None,
+            log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
+    }
+
+    /// Names this session in its log lines, as `room_id/slot_id`.
+    ///
+    /// Called by [`RtcSessionManager`](crate::RtcSessionManager) on creation; a
+    /// standalone [`RtcSession`] keeps the placeholder tag.
+    pub(crate) fn set_log_tag(&mut self, log_tag: String) {
+        self.log_tag = log_tag;
     }
 
     /// Sets the command sender for this session.
@@ -216,11 +286,19 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Returns `Ok(())` if the join completed successfully.
     /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
     pub async fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
-        params.validate().map_err(JoinError::MissingParameter)?;
+        params.validate().map_err(|missing| {
+            log::warn!("[{}] join rejected: missing {missing}", self.log_tag);
+            JoinError::MissingParameter(missing)
+        })?;
 
-        let command_sender = self.command_sender.as_ref().ok_or(JoinError::CommandError(
-            CommandError::from_message("no command sender configured"),
-        ))?;
+        let command_sender = self.command_sender.as_ref().ok_or_else(|| {
+            log::warn!(
+                "[{}] join rejected: no command sender configured — the host must call \
+                 set_command_sender before joining",
+                self.log_tag,
+            );
+            JoinError::CommandError(CommandError::from_message("no command sender configured"))
+        })?;
 
         let membership_id = params.membership_id();
 
@@ -230,8 +308,17 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             .as_ref()
             .is_some_and(|machine| machine.sticky_key() == membership_id)
         {
+            log::warn!("[{}] already joined as {membership_id}", self.log_tag);
             return Err(JoinError::AlreadyJoined(membership_id));
         }
+
+        log::info!(
+            "[{}] joining as {membership_id} ({}/{}, transport {:?})",
+            self.log_tag,
+            params.user_id,
+            params.device_id,
+            params.transport,
+        );
 
         let transports = match &params.transport {
             TransportIntent::Publish(transport) => MemberTransports::publishing(
@@ -283,10 +370,15 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             params.slot_id.clone(),
             get_memberships_for_encryption,
         );
+        let manage_media_keys = encryption_config.manage_media_keys;
         encryption_manager.set_config(encryption_config);
 
         // Start the encryption manager (creates first key)
         encryption_manager.join().await.map_err(|e| {
+            log::warn!(
+                "[{}] encryption manager failed to start: {e:?}",
+                self.log_tag
+            );
             JoinError::CommandError(CommandError::from_message(format!(
                 "failed to start encryption manager: {:?}",
                 e
@@ -295,6 +387,12 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
         // Store the encryption manager
         self.encryption_manager = Some(encryption_manager);
+
+        log::info!(
+            "[{}] joined as {membership_id} (media keys {})",
+            self.log_tag,
+            if manage_media_keys { "managed" } else { "off" },
+        );
 
         Ok(())
     }
@@ -313,18 +411,30 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Returns `Err(LeaveError)` if not joined, command sender is not configured, or commands fail.
     pub async fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
         // Check if we have a membership machine (i.e., we've joined)
-        let machine = self
-            .own_membership_machine
-            .take()
-            .ok_or(LeaveError::NotJoined)?;
+        let machine = self.own_membership_machine.take().ok_or_else(|| {
+            log::warn!("[{}] leave rejected: not joined", self.log_tag);
+            LeaveError::NotJoined
+        })?;
+
+        log::info!(
+            "[{}] leaving as {} (reason {:?})",
+            self.log_tag,
+            machine.sticky_key(),
+            params.leave_reason,
+        );
 
         // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
-        machine.leave(params.leave_reason.clone()).await?;
+        machine
+            .leave(params.leave_reason.clone())
+            .await
+            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag))?;
 
         // Clean up the encryption manager
         if let Some(encryption_manager) = self.encryption_manager.take() {
             encryption_manager.leave();
         }
+
+        log::info!("[{}] left", self.log_tag);
 
         Ok(())
     }
@@ -341,9 +451,11 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Returns `false` if not joined (no membership machine active).
     pub async fn heartbeat(&mut self) -> bool {
         if let Some(machine) = self.own_membership_machine.as_ref() {
+            log::trace!("[{}] heartbeat", self.log_tag);
             machine.heartbeat().await;
             true
         } else {
+            log::debug!("[{}] heartbeat ignored: not joined", self.log_tag);
             false
         }
     }
@@ -387,9 +499,33 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                 });
 
                 match existing {
-                    Some(index) if self.candidates[index] == joined => return,
-                    Some(index) => self.candidates[index] = joined,
-                    None => self.candidates.push(joined),
+                    Some(index) if self.candidates[index] == joined => {
+                        log::trace!(
+                            "[{}] member event unchanged, ignored: {}/{}",
+                            self.log_tag,
+                            joined.sender,
+                            joined.sticky_key,
+                        );
+                        return;
+                    }
+                    Some(index) => {
+                        log::debug!(
+                            "[{}] candidate updated: {}/{}",
+                            self.log_tag,
+                            joined.sender,
+                            joined.sticky_key,
+                        );
+                        self.candidates[index] = joined;
+                    }
+                    None => {
+                        log::debug!(
+                            "[{}] candidate added: {}/{}",
+                            self.log_tag,
+                            joined.sender,
+                            joined.sticky_key,
+                        );
+                        self.candidates.push(joined);
+                    }
                 }
             }
             CallMembershipEvent::Left(left) => {
@@ -399,8 +535,21 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                 });
 
                 if self.candidates.len() == before {
+                    log::trace!(
+                        "[{}] leave for an unknown candidate, ignored: {}/{}",
+                        self.log_tag,
+                        left.sender,
+                        left.sticky_key,
+                    );
                     return;
                 }
+
+                log::debug!(
+                    "[{}] candidate removed: {}/{}",
+                    self.log_tag,
+                    left.sender,
+                    left.sticky_key,
+                );
             }
         }
 
@@ -408,18 +557,18 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     }
 
     /// Whether `candidate` satisfies the MSC4143 join conditions that depend on
-    /// room state.
+    /// room state, and if not, which one it fails.
     ///
     /// The other two conditions are handled before this point: `membership =
     /// join` when the event is converted, and stickiness by the host's sticky
     /// map, whose removals arrive as leaves.
-    fn is_joined(&self, candidate: &JoinedMembership) -> bool {
+    fn join_condition(&self, candidate: &JoinedMembership) -> JoinCondition {
         match &self.slot {
             // Nothing has told us about the slot, so this condition cannot be
             // evaluated; enforcing it would drop every member.
             SlotKnowledge::Unsupplied => {}
             SlotKnowledge::Known(state) if state.is_open() => {}
-            SlotKnowledge::Known(_) => return false,
+            SlotKnowledge::Known(_) => return JoinCondition::SlotClosed,
         }
 
         // MSC4143: in an encrypted room `m.rtc.member` events MUST be
@@ -428,12 +577,12 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         if self.room_encryption == RoomEncryption::Encrypted
             && candidate.origin.was_encrypted() == Some(false)
         {
-            return false;
+            return JoinCondition::UnencryptedInEncryptedRoom;
         }
 
         match &self.room_members {
-            Some(joined) => joined.contains(&candidate.sender),
-            None => true,
+            Some(joined) if !joined.contains(&candidate.sender) => JoinCondition::SenderNotInRoom,
+            _ => JoinCondition::Joined,
         }
     }
 
@@ -444,15 +593,48 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// event does — including telling the encryption manager to stop sharing
     /// keys with whoever dropped out.
     async fn refresh(&mut self) {
-        let members: Vec<JoinedMembership> = self
-            .candidates
-            .iter()
-            .filter(|candidate| self.is_joined(candidate))
-            .cloned()
-            .collect();
+        let mut members = Vec::with_capacity(self.candidates.len());
+        let mut excluded: Vec<(&str, JoinCondition)> = Vec::new();
+
+        for candidate in &self.candidates {
+            let condition = self.join_condition(candidate);
+            if condition.is_joined() {
+                members.push(candidate.clone());
+            } else {
+                excluded.push((candidate.sticky_key.as_str(), condition));
+            }
+        }
 
         if members == self.members {
+            if !excluded.is_empty() {
+                log::debug!(
+                    "[{}] membership unchanged, {} candidate(s) still excluded: {}",
+                    self.log_tag,
+                    excluded.len(),
+                    describe_exclusions(&excluded),
+                );
+            }
             return;
+        }
+
+        let joined = sticky_keys(&members);
+        let previous = sticky_keys(&self.members);
+        log::info!(
+            "[{}] membership changed: {} -> {} joined (+{:?} -{:?}) of {} candidate(s)",
+            self.log_tag,
+            self.members.len(),
+            members.len(),
+            difference(&joined, &previous),
+            difference(&previous, &joined),
+            self.candidates.len(),
+        );
+        if !excluded.is_empty() {
+            log::debug!(
+                "[{}] {} candidate(s) excluded: {}",
+                self.log_tag,
+                excluded.len(),
+                describe_exclusions(&excluded),
+            );
         }
 
         self.members = members;
@@ -473,6 +655,12 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         if self.slot == SlotKnowledge::Known(state.clone()) {
             return;
         }
+        log::info!(
+            "[{}] slot state: {:?} -> {}",
+            self.log_tag,
+            self.slot,
+            if state.is_open() { "Open" } else { "Closed" },
+        );
         self.slot = SlotKnowledge::Known(state);
         self.refresh().await;
     }
@@ -506,6 +694,11 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         if self.room_encryption == room_encryption {
             return;
         }
+        log::info!(
+            "[{}] room encryption: {:?} -> {room_encryption:?}",
+            self.log_tag,
+            self.room_encryption,
+        );
         self.room_encryption = room_encryption;
         self.refresh().await;
     }
@@ -535,6 +728,48 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         )
     }
 
+    /// Everything this session believes, as JSON, for bug reports.
+    ///
+    /// Logs tell you what happened; this tells you where things ended up, which
+    /// is the other half of diagnosing "the roster is wrong". Deliberately
+    /// includes the *candidates* and why each is excluded — the joined set
+    /// alone cannot explain an absence.
+    pub fn debug_snapshot(&self) -> serde_json::Value {
+        let candidates: Vec<serde_json::Value> = self
+            .candidates
+            .iter()
+            .map(|candidate| {
+                serde_json::json!({
+                    "sender": candidate.sender,
+                    "sticky_key": candidate.sticky_key,
+                    "member_id": candidate.member_id,
+                    "was_encrypted": candidate.origin.was_encrypted(),
+                    "condition": format!("{:?}", self.join_condition(candidate)),
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "slot": match &self.slot {
+                SlotKnowledge::Unsupplied => "Unsupplied".to_owned(),
+                SlotKnowledge::Known(state) if state.is_open() => "Open".to_owned(),
+                SlotKnowledge::Known(_) => "Closed".to_owned(),
+            },
+            "room_encryption": format!("{:?}", self.room_encryption),
+            "room_members_known": self.room_members.as_ref().map(HashSet::len),
+            "negotiated_encryption": self.negotiated_encryption(),
+            "joined_count": self.members.len(),
+            "joined": sticky_keys(&self.members),
+            "candidates": candidates,
+            "has_command_sender": self.command_sender.is_some(),
+            "own_membership": self
+                .own_membership_machine
+                .as_ref()
+                .map(|machine| machine.sticky_key()),
+            "has_encryption_manager": self.encryption_manager.is_some(),
+        })
+    }
+
     /// The slot state this session is applying, if any has been supplied.
     pub fn slot_state(&self) -> Option<&SlotState> {
         match &self.slot {
@@ -552,6 +787,12 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         if self.room_members.as_ref() == Some(&room_members) {
             return;
         }
+        log::debug!(
+            "[{}] room members: {:?} -> {} joined",
+            self.log_tag,
+            self.room_members.as_ref().map(HashSet::len),
+            room_members.len(),
+        );
         self.room_members = Some(room_members);
         self.refresh().await;
     }

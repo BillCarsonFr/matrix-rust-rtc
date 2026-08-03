@@ -493,12 +493,21 @@ async fn translate_room_events(
             _ => None,
         };
 
-        if let Some(event) = translated
-            && tx.send(event).is_err()
-        {
+        let Some(event) = translated else { continue };
+
+        match &event {
+            // High frequency; would drown everything else at `debug`.
+            ConnectionEvent::ActiveSpeakers { .. } => log::trace!("sfu event: {event:?}"),
+            _ => log::debug!("sfu event: {event:?}"),
+        }
+
+        if tx.send(event).is_err() {
+            log::debug!("sfu event stream closed by the engine; stopping the translator");
             return;
         }
     }
+
+    log::debug!("sfu closed its event stream; stopping the translator");
 }
 
 /// Mute translation, shared by the muted/unmuted arms. Mute events fire for

@@ -118,9 +118,16 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         let command_sender = self
             .command_sender
             .as_ref()
-            .ok_or(JoinError::CommandError(
-                crate::error::CommandError::from_message("no command sender configured"),
-            ))?
+            .ok_or_else(|| {
+                log::warn!(
+                    "[{}/{}] join rejected: the manager has no command sender",
+                    params.room_id,
+                    params.slot_id,
+                );
+                JoinError::CommandError(crate::error::CommandError::from_message(
+                    "no command sender configured",
+                ))
+            })?
             .clone();
 
         let key = SessionKey::new(params.room_id.clone(), params.slot_id.clone());
@@ -156,9 +163,12 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         params: LeaveSessionParams,
     ) -> Result<(), LeaveError> {
         let key = SessionKey::new(room_id, slot_id);
-        let session = self.sessions.get_mut(&key).ok_or(LeaveError::CommandError(
-            crate::error::CommandError::from_message("session not found"),
-        ))?;
+        let session = self.sessions.get_mut(&key).ok_or_else(|| {
+            log::warn!("[{key}] leave rejected: no such session");
+            LeaveError::CommandError(crate::error::CommandError::from_message(
+                "session not found",
+            ))
+        })?;
 
         session.leave(params).await
     }
@@ -188,6 +198,12 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             let key = SessionKey::new(room_id.to_owned(), slot_id);
             batches.entry(key).or_default().push(event);
         }
+
+        log::debug!(
+            "[{room_id}] initial sticky routed to {} session(s): {}",
+            batches.len(),
+            describe_batches(&batches),
+        );
 
         for (key, batch) in batches {
             self.session_for_key(key).initial_events(batch).await;
@@ -261,6 +277,12 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             let key = SessionKey::new(room_id.to_owned(), slot_id);
             batches.entry(key).or_default().push(event);
         }
+
+        log::debug!(
+            "[{room_id}] sticky update routed to {} session(s): {}",
+            batches.len(),
+            describe_batches(&batches),
+        );
 
         for (key, batch) in batches {
             self.session_for_key(key).handle_update(batch).await;
@@ -432,13 +454,20 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         // Replace this room's slots wholesale; a slot that vanished from room
         // state is closed, not merely stale.
         self.slots.retain(|key, _| key.room_id != room_id);
+        let mut accepted = 0;
         for slot in slots {
             if slot.room_id != room_id {
+                log::warn!(
+                    "[{room_id}] ignoring a slot event for another room ({})",
+                    slot.room_id,
+                );
                 continue;
             }
             let key = SessionKey::new(room_id.to_owned(), slot.slot_id.clone());
             self.slots.insert(key, slot);
+            accepted += 1;
         }
+        log::debug!("[{room_id}] room slot state replaced with {accepted} slot(s)");
 
         self.push_slot_state(room_id).await;
     }
@@ -474,6 +503,9 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// pushes the result to every session in the room.
     async fn push_slot_state(&mut self, room_id: &str) {
         if !self.rooms_with_slot_state.contains(room_id) {
+            log::debug!(
+                "[{room_id}] no slot state supplied yet; the open-slot condition stays unenforced",
+            );
             return;
         }
 
@@ -484,6 +516,19 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             .filter(|(key, _)| key.room_id == room_id)
             .map(|(key, slot)| (key.clone(), slot.resolve(encryption)))
             .collect();
+
+        log::debug!(
+            "[{room_id}] slots resolved against encryption={encryption:?}: {}",
+            resolved
+                .iter()
+                .map(|(key, state)| format!(
+                    "{}={}",
+                    key.slot_id,
+                    if state.is_open() { "Open" } else { "Closed" },
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
 
         for (key, session) in self.sessions.iter_mut() {
             if key.room_id != room_id {
@@ -576,6 +621,38 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             .await
     }
 
+    /// Everything the manager and its sessions believe, as JSON.
+    ///
+    /// Meant to be attached to a bug report or dumped to the log when a roster
+    /// looks wrong: it answers "which sessions exist, what room state do they
+    /// have, and why is each candidate in or out" in one shot. Contains no key
+    /// material.
+    pub fn debug_snapshot(&self) -> serde_json::Value {
+        let sessions: serde_json::Map<String, serde_json::Value> = self
+            .sessions
+            .iter()
+            .map(|(key, session)| (key.to_string(), session.debug_snapshot()))
+            .collect();
+
+        serde_json::json!({
+            "has_command_sender": self.command_sender.is_some(),
+            "session_count": self.sessions.len(),
+            "rooms_with_slot_state": self.rooms_with_slot_state,
+            "known_slots": self.slots.keys().map(SessionKey::to_string).collect::<Vec<_>>(),
+            "room_encryption": self
+                .room_encryption
+                .iter()
+                .map(|(room_id, encryption)| (room_id.clone(), format!("{encryption:?}").into()))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+            "room_members": self
+                .room_members
+                .iter()
+                .map(|(room_id, members)| (room_id.clone(), members.len().into()))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+            "sessions": sessions,
+        })
+    }
+
     /// The resolved state of a slot, if its room's state has been supplied.
     pub fn slot_state(&self, room_id: &str, slot_id: &str) -> Option<SlotState> {
         if !self.rooms_with_slot_state.contains(room_id) {
@@ -606,12 +683,24 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         });
         let room_members = self.room_members.get(&key.room_id).cloned();
         let command_sender = self.command_sender.clone();
+        let log_tag = key.to_string();
 
         self.sessions.entry(key).or_insert_with(|| {
+            log::info!(
+                "session created [{log_tag}] seeded with slot={} members={:?} encryption={encryption:?}",
+                match &slot {
+                    Some(state) if state.is_open() => "Open",
+                    Some(_) => "Closed",
+                    None => "Unsupplied",
+                },
+                room_members.as_ref().map(HashSet::len),
+            );
+
             let mut session = match command_sender {
                 Some(sender) => RtcSession::with_command_sender(sender),
                 None => RtcSession::new(),
             };
+            session.set_log_tag(log_tag);
             if let Some(slot) = slot {
                 session.seed_slot_state(slot);
             }
@@ -629,8 +718,13 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ) -> Result<Option<CallMembershipEvent>, EventConversionError> {
         match event.try_into_call_membership_event() {
             Ok(event) => Ok(Some(event)),
+            // Not an RTC member event at all — the host feeds us its whole
+            // sticky map, so this is routine.
             Err(EventConversionError::UnsupportedEventType { .. }) => Ok(None),
-            Err(err) => Err(err),
+            Err(err) => {
+                log::warn!("dropping a malformed sticky member event: {err}");
+                Err(err)
+            }
         }
     }
 
@@ -641,7 +735,10 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         match event.try_into_left_membership_event() {
             Ok(event) => Ok(Some(event)),
             Err(EventConversionError::UnsupportedEventType { .. }) => Ok(None),
-            Err(err) => Err(err),
+            Err(err) => {
+                log::warn!("dropping a malformed sticky removal: {err}");
+                Err(err)
+            }
         }
     }
 }
@@ -655,5 +752,30 @@ struct SessionKey {
 impl SessionKey {
     fn new(room_id: String, slot_id: String) -> Self {
         Self { room_id, slot_id }
+    }
+}
+
+/// `slot_id xN` per session, for the one-line routing summary.
+///
+/// Which slots a room's sticky events landed in is the first thing to check
+/// when a roster looks wrong: a typo in `slot_id` silently creates a second,
+/// empty session rather than failing.
+fn describe_batches(batches: &HashMap<SessionKey, Vec<CallMembershipEvent>>) -> String {
+    if batches.is_empty() {
+        return "none".to_owned();
+    }
+
+    batches
+        .iter()
+        .map(|(key, batch)| format!("{} x{}", key.slot_id, batch.len()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `room_id/slot_id` — the correlation key every session-scoped log line is
+/// prefixed with.
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.room_id, self.slot_id)
     }
 }

@@ -34,6 +34,11 @@ uniffi.workspace = true
 async-trait.workspace = true
 futures = "0.3"
 log.workspace = true
+# `RUST_LOG`-style filter specs for `setup_logging`. No regex: message-body
+# filtering is not exposed over the FFI, and it is a large dependency to ship
+# in a mobile artifact. Held at 0.1 to match `android_logger`'s own requirement
+# so Android links one copy rather than two.
+env_filter = { version = "0.1", default-features = false }
 
 # --- `media` feature only (pulls libwebrtc; see the feature's comment) ------
 matrix-rtc-media = { path = "../matrix-rtc-media", optional = true }
@@ -47,6 +52,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # For the JNI_OnLoad libwebrtc initialisation (media feature). Android-only,
 # so it never affects other targets.
 jni = { version = "0.21", optional = true }
+# logcat writer for `setup_logging`. Used as a plain writer, not as the global
+# logger — it handles the 4 KiB logcat line split and tag nul-termination.
+# `default-features = false` drops its `regex` feature, matching our
+# `env_filter` (same crate, so the features must not diverge).
+android_logger = { version = "0.15", default-features = false }
 
 [features]
 # Media over the FFI: participants with frame streams, publishing, and

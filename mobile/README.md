@@ -33,6 +33,55 @@ Output: `mobile/android/matrixrtc/build/outputs/aar/matrixrtc-release.aar`
 
 Output: `mobile/ios/build/MatrixRtcFFI.xcframework`
 
+## Turn on logging first
+
+The SDK is silent until the host installs a logger. Do this before creating an
+`RtcSessionManagerHandle`, or you will see nothing at all — not even errors.
+
+**Android**
+
+```kotlin
+import org.matrix.rtc.RtcLogging
+import uniffi.matrix_rtc_ffi.RtcLogLevel
+
+RtcLogging.initLogcat(RtcLogLevel.DEBUG)
+// noisier, for one subsystem:
+RtcLogging.initLogcat(RtcLogLevel.INFO, "matrix_rtc_core=debug,matrix_rtc_livekit=trace")
+```
+
+```bash
+adb logcat -s matrix-rtc
+```
+
+To route into Timber, a rageshake file, or any host pipeline, use
+`RtcLogging.init(...) { record -> ... }` instead. The callback runs on a dedicated Rust
+thread and may block; records are dropped rather than queued without bound if it falls
+behind (`droppedLogRecordCount()` reports how many).
+
+**iOS**
+
+```swift
+try setupLogging(config: RtcLogConfig(level: .debug, filter: "", writeToSystem: true),
+                 sink: nil)
+```
+
+Output goes to stderr, which appears in the Xcode console.
+
+**Filter syntax** is `RUST_LOG`'s. Targets are Rust module paths matched by prefix; the
+roots are `matrix_rtc_core`, `matrix_rtc_media`, `matrix_rtc_livekit`, `matrix_rtc_ffi`,
+plus third-party `livekit` and `webrtc_sys`.
+
+**Useful extras**
+
+- `RtcLogging.log(level, message)` (or `logEvent(...)`) puts your own lines in the same
+  timeline as the SDK's, which is usually how you tell an SDK bug from an integration one.
+- `manager.debugSnapshot()` returns JSON of every session, its room state, and each
+  candidate member with the reason it is or is not joined — attach it to bug reports.
+- Key material, LiveKit JWTs and OpenID tokens are never logged at any level.
+
+See the "Logging" section of [../ARCHITECTURE.md](../ARCHITECTURE.md) for the level
+conventions the SDK follows.
+
 ## Full Documentation
 
 See [PACKAGING.md](./PACKAGING.md) for complete documentation including:

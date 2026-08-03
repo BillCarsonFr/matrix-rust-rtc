@@ -66,12 +66,20 @@ impl JsCommandSender {
 
 impl JsCommandSender {
     fn log_command(&self, description: &str) {
+        log::debug!("command sending: {description}");
+
         if let Some(callback) = &self.on_command {
             let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(description));
         }
     }
 
     fn convert_js_error(error: JsValue) -> CommandError {
+        let converted = Self::classify_js_error(error);
+        log::warn!("command failed: {converted}");
+        converted
+    }
+
+    fn classify_js_error(error: JsValue) -> CommandError {
         if error.is_undefined() || error.is_null() {
             CommandError::SendError("unknown error".to_string())
         } else if let Ok(error_obj) = error.clone().dyn_into::<js_sys::Error>() {

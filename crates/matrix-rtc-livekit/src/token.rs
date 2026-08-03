@@ -100,8 +100,10 @@ pub async fn get_token(
     openid_token: &OpenIdToken,
 ) -> Result<SfuToken, Error> {
     let endpoint = format!("{}/get_token", livekit_service_url.trim_end_matches('/'));
+    log::debug!("[{room_id}/{slot_id}] requesting an SFU token from {endpoint}");
+
     let response = http
-        .post(endpoint)
+        .post(&endpoint)
         .json(&GetTokenRequest {
             room_id,
             slot_id,
@@ -109,18 +111,27 @@ pub async fn get_token(
             member,
         })
         .send()
-        .await?;
+        .await
+        .inspect_err(|error| log::warn!("SFU token request to {endpoint} failed: {error}"))?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        log::warn!("SFU token request to {endpoint} rejected with {status}: {body}");
         return Err(Error::Service {
             status: status.as_u16(),
             body,
         });
     }
 
-    Ok(response.json::<SfuToken>().await?)
+    let token = response.json::<SfuToken>().await?;
+    // Never the JWT itself.
+    log::debug!(
+        "[{room_id}/{slot_id}] SFU token granted for {} (jwt {} chars)",
+        token.url,
+        token.jwt.len(),
+    );
+    Ok(token)
 }
 
 /// Default [`OpenIdTokenSource`] backed by a `matrix_sdk::Client`.
