@@ -68,6 +68,7 @@ media = [
     "dep:matrix-rtc-livekit",
     "dep:reqwest",
     "dep:jni",
+    "dep:webrtc-sys-build",
     "tokio/rt-multi-thread",
     "tokio/macros",
     "tokio/time",
@@ -75,6 +76,17 @@ media = [
     # integration (async_compat).
     "uniffi/tokio",
 ]
+
+[build-dependencies]
+# Re-emits libwebrtc's `Java_*` JNI link args against our cdylib — see the
+# module docs in build.rs for why `webrtc-sys` cannot do this itself. Already
+# in the build graph for any `media` build (webrtc-sys builds with it), so this
+# costs nothing there, and stays out of the slim build entirely.
+#
+# Keep this a caret requirement, NOT `=0.3.x`: it must resolve to the exact
+# same version webrtc-sys uses, or the symbol list is read by one copy of the
+# crate while `livekit` links libwebrtc through another.
+webrtc-sys-build = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }

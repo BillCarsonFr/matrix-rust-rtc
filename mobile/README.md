@@ -33,6 +33,23 @@ Output: `mobile/android/matrixrtc/build/outputs/aar/matrixrtc-release.aar`
 
 Output: `mobile/ios/build/MatrixRtcFFI.xcframework`
 
+## Load the native library first (Android)
+
+```kotlin
+import org.matrix.rtc.MatrixRtc
+
+MatrixRtc.initialize()
+```
+
+This must run before any other SDK call. The generated bindings reach the native
+library through JNA, which `dlopen`s it — and `dlopen` does not run `JNI_OnLoad`,
+only `System.loadLibrary` does. In the media build `JNI_OnLoad` is what gives
+libwebrtc its `JavaVM` and class loader, so without this call the first attempt to
+open a session aborts the process from inside libwebrtc rather than throwing.
+
+It is idempotent, and the `RtcLogging` helpers below call it themselves, so setting
+logging up as your first SDK call covers it too.
+
 ## Turn on logging first
 
 The SDK is silent until the host installs a logger. Do this before creating an

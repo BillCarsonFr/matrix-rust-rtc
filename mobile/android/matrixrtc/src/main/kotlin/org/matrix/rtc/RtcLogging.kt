@@ -35,6 +35,10 @@ import uniffi.matrix_rtc_ffi.setupLogging
  * This is a thin convenience wrapper over the generated
  * `uniffi.matrix_rtc_ffi.setupLogging`; use that directly if you need the full
  * [RtcLogConfig].
+ *
+ * Every entry point here calls [MatrixRtc.initialize] first, so setting logging
+ * up as the app's first SDK call also loads the native library. Hosts that skip
+ * logging must call [MatrixRtc.initialize] themselves.
  */
 object RtcLogging {
 
@@ -59,6 +63,7 @@ object RtcLogging {
     @JvmOverloads
     @Throws(MatrixRtcFfiException::class)
     fun initLogcat(level: RtcLogLevel = RtcLogLevel.DEBUG, filter: String = "") {
+        MatrixRtc.initialize()
         setupLogging(
             RtcLogConfig(level = level, filter = filter, writeToSystem = true),
             sink = null,
@@ -85,6 +90,7 @@ object RtcLogging {
         alsoToLogcat: Boolean = false,
         sink: (RtcLogRecord) -> Unit,
     ) {
+        MatrixRtc.initialize()
         setupLogging(
             RtcLogConfig(level = level, filter = filter, writeToSystem = alsoToLogcat),
             sink = object : RtcLogSink {
@@ -100,6 +106,7 @@ object RtcLogging {
     @JvmStatic
     @JvmOverloads
     fun log(level: RtcLogLevel, message: String, target: String = "app") {
+        MatrixRtc.initialize()
         logEvent(level, target, message)
     }
 }

@@ -123,6 +123,30 @@ cargo ndk \
   -o "$JNI_LIBS_DIR" \
   build -p matrix-rtc-ffi --release "${FEATURE_ARGS[@]}"
 
+# Assert the Java->C++ direction survived linking. matrix-rtc-ffi's build.rs
+# re-emits libwebrtc's --undefined/--version-script link args (webrtc-sys emits
+# them from an rlib, where cargo drops them), but if that ever regresses the
+# .so still builds and installs perfectly — and then aborts the host process
+# with SIGABRT the first time libwebrtc constructs its PeerConnectionFactory,
+# because DefaultVideoEncoderFactory's native methods are missing. A runtime
+# abort in someone else's app is a terrible place to discover this, so fail the
+# build here instead.
+if [ "${MEDIA:-0}" = "1" ] && [ -x "$READELF" ]; then
+    echo "Verifying libwebrtc JNI symbols are exported..."
+    while IFS= read -r so; do
+        jni_count="$("$READELF" --dyn-syms "$so" | grep -c 'Java_livekit_org_webrtc' || true)"
+        if [ "$jni_count" -eq 0 ]; then
+            echo "❌ $so exports no Java_livekit_org_webrtc* symbols."
+            echo "   libwebrtc's Java classes would have no native implementation,"
+            echo "   aborting the app on the first session. Check that"
+            echo "   crates/matrix-rtc-ffi/build.rs ran configure_jni_symbols()"
+            echo "   for this target (it is gated on the media feature)."
+            exit 1
+        fi
+        echo "  $(basename "$(dirname "$so")"): $jni_count JNI symbols"
+    done < <(find "$JNI_LIBS_DIR" -name 'libmatrix_rtc_ffi.so')
+fi
+
 # libwebrtc's Java classes: the native library up-calls into them, so the
 # media AAR must ship the jar (it is architecture-independent). Where
 # webrtc-sys leaves it depends on how it was built:
