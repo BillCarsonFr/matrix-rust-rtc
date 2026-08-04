@@ -75,7 +75,9 @@ compile errors, not silent behaviour changes.
 - **Media keys received before the media session attached were dropped.**
   Key signals with no handler installed were discarded, and nothing re-signalled
   them until a rotation — which needs a membership change. They are now replayed
-  on attach, under identities derived through the installed identity mapper.
+  on attach, under identities derived through the installed identity mapper, and
+  after the key-import listener is wired — so replayed keys surface as
+  `KeyImported` events instead of being applied invisibly.
 - **The keep-alive never ran on the FFI path.** `heartbeat()` existed and was
   driven by the native Rust facade, but nothing called it through the FFI and it
   was not exported, so a host could not even opt in.

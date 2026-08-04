@@ -142,17 +142,6 @@ async fn build_media_session(
             ));
         }
 
-        // Keys signalled between `join` and now were stored but dropped —
-        // nothing was listening. Without this, every participant whose key
-        // arrived before media attached stays undecryptable until a rotation,
-        // which only a membership change triggers.
-        //
-        // `block_on` rather than `.await`: this function is spawned, so its
-        // future must be `Send`, and awaiting here would hold the manager's
-        // `MutexGuard` across a yield point. The replay does not yield anyway —
-        // it signals with `use_after_ms: 0`, which the bridge applies inline.
-        crate::runtime::block_on(mgr.replay_encryption_keys(&config.room_id, &config.slot_id));
-
         memberships
     };
 
@@ -185,6 +174,28 @@ async fn build_media_session(
     bridge.set_key_import_listener(Box::new(move |key| {
         engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
     }));
+
+    // Keys signalled between `join` and now were stored but dropped — nothing
+    // was listening. Without this, every participant whose key arrived before
+    // media attached stays undecryptable until a rotation, which only a
+    // membership change triggers.
+    //
+    // Deliberately *after* the import listener, even though the handler has been
+    // installed since the block above: replaying earlier still fixes decryption,
+    // but silently — no `KeyImported` reaches the host for the very keys the host
+    // is most likely to be missing, so a working call is indistinguishable from
+    // the bug this replay exists to fix. Still before `connect_livekit`, so the
+    // key ring is populated before the first frame can arrive.
+    //
+    // `block_on` rather than `.await`: this function is spawned, so its future
+    // must be `Send`, and awaiting here would hold the manager's `MutexGuard`
+    // across a yield point. The replay does not yield anyway — it signals with
+    // `use_after_ms: 0`, which the bridge applies inline.
+    {
+        let mgr =
+            crate::lock_mutex(&manager.inner).map_err(|_| MediaFfiError::InternalLockPoisoned)?;
+        crate::runtime::block_on(mgr.replay_encryption_keys(&config.room_id, &config.slot_id));
+    }
 
     // Own focus connects synchronously so a broken SFU fails this call
     // instead of surfacing later as a dead session.
