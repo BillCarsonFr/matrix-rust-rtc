@@ -197,6 +197,18 @@ pub struct KeyMaterialSignal {
     /// RTC backend identity string for this participant
     /// Used by the media layer to identify the key source
     pub rtc_backend_identity: String,
+    /// How long the consumer must wait before *using* this key to encrypt,
+    /// in milliseconds (MSC4143 `delayBeforeUse`). `0` means usable at once.
+    ///
+    /// Non-zero only for our own rotated outbound key: peers need time to
+    /// receive it before we start encrypting with it. Inbound keys and the very
+    /// first outbound key are always `0` — an inbound key is only ever used to
+    /// *decrypt*, where waiting would just drop frames.
+    ///
+    /// Honouring this is the consumer's job, and it must not do so by blocking:
+    /// the core signals on its caller's task, which for the FFI is a
+    /// synchronous host call. Schedule the activation and return.
+    pub use_after_ms: u64,
 }
 
 /// Configuration for the encryption manager.

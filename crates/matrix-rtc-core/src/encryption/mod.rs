@@ -45,10 +45,17 @@
 //!
 //! # Key Usage Delay (MSC4143: delayBeforeUse)
 //!
-//! When a new key is distributed, it is NOT immediately used for encryption.
-//! Instead, we wait `delay_before_use_ms` to ensure it has been delivered to all
-//! participants. The first key is an exception - it is signaled immediately on the
-//! first `on_memberships_update()` call to ensure the transport is listening.
+//! When a new key is distributed, it is NOT immediately used for encryption:
+//! peers need `delay_before_use_ms` to receive it first. The first key is an
+//! exception — it is signaled immediately on the first `on_memberships_update()`
+//! call to ensure the transport is listening.
+//!
+//! This module does not *wait*, it only says how long to wait: the delay travels
+//! to the consumer as [`KeyMaterialSignal::use_after_ms`], and the media layer
+//! schedules activation. That keeps the core free of any timer — it holds no
+//! reactor dependency at all, which is what lets a synchronous FFI host drive it
+//! from a plain thread. Enforcing the delay is therefore a consumer obligation;
+//! `matrix-rtc-livekit`'s `MediaKeyBridge` is the reference implementation.
 //!
 //! # Outdated Key Filtering
 //!
@@ -467,7 +474,9 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 guard.clone()
             };
             if let Some(key) = key_to_signal {
-                self.signal_key_to_app(&key).await;
+                // The first key: signalled eagerly and usable at once, so the
+                // transport has a key ring before any media flows.
+                self.signal_key_to_app(&key, 0).await;
             }
         }
 
@@ -719,22 +728,25 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 *guard = Some(new_key);
             }
 
-            // Wait before using this key (delayBeforeUse)
-            // First key is already signaled, so we only delay for subsequent keys
+            // Signal the new key immediately, telling the consumer how long to
+            // wait before encrypting with it (delayBeforeUse). The wait used to
+            // happen here, as a `tokio::time::sleep` — but this runs on the
+            // caller's task, which for the FFI is a *synchronous* host call, so
+            // it blocked a host thread for the whole delay (and panicked
+            // outright when that thread had no runtime installed). Timing
+            // belongs where a scheduler already exists: the media layer.
+            //
+            // The first key carries no delay — it is signalled on the first
+            // `on_memberships_update()` so the transport is listening.
             log::trace!(
-                "[{}/{}] Delaying use of key index {} for {}ms",
+                "[{}/{}] Signalling key index {}, usable in {}ms",
                 self.room_id,
                 self.slot_id,
                 outbound_key_to_use.key_index,
                 self.config.delay_before_use_ms
             );
-            tokio::time::sleep(std::time::Duration::from_millis(
-                self.config.delay_before_use_ms,
-            ))
-            .await;
-
-            // Signal the new key to the application
-            self.signal_key_to_app(&outbound_key_to_use).await;
+            self.signal_key_to_app(&outbound_key_to_use, self.config.delay_before_use_ms)
+                .await;
         } else {
             // Reusing existing key, just update shared_with
             {
@@ -851,7 +863,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     }
 
     /// Signals a key to the application layer.
-    async fn signal_key_to_app(&self, key: &OutboundEncryptionKey) {
+    /// Signals our own outbound key to the application layer.
+    ///
+    /// `use_after_ms` is the MSC4143 `delayBeforeUse` the consumer must observe
+    /// before encrypting with it; `0` for the first key, which is signalled
+    /// eagerly so the transport is listening.
+    async fn signal_key_to_app(&self, key: &OutboundEncryptionKey, use_after_ms: u64) {
         if let Some(handler) = &self.signal_handler {
             let rtc_backend_id = match &self.identity_mapper {
                 Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
@@ -861,6 +878,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 key: key.key.clone(),
                 key_index: key.key_index,
                 rtc_backend_identity: rtc_backend_id,
+                use_after_ms,
             };
 
             // Signal to app (async, fire-and-forget)
@@ -1107,6 +1125,9 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 key: key.key.clone(),
                 key_index: key.key_index,
                 rtc_backend_identity,
+                // Inbound keys are only ever used to decrypt; delaying one would
+                // just drop the sender's frames until it elapsed.
+                use_after_ms: 0,
             };
 
             // Note: We don't use tokio::spawn here because the handler's future might not be Send
@@ -1145,6 +1166,9 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 key: outbound.key.clone(),
                 key_index: outbound.key_index,
                 rtc_backend_identity: rtc_backend_id,
+                // A snapshot of keys already held, not a new-key notification:
+                // whatever delay applied to them has long since been observed.
+                use_after_ms: 0,
             };
             result
                 .entry(self.own_member_id.clone())
@@ -1162,6 +1186,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                     key: key.key.clone(),
                     key_index: key.key_index,
                     rtc_backend_identity: member_id_clone.clone(),
+                    use_after_ms: 0,
                 };
                 result
                     .entry(member_id_clone.clone())

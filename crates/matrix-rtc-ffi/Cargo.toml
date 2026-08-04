@@ -29,7 +29,11 @@ matrix-rtc-core = { path = "../matrix-rtc-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+# `rt-multi-thread` and `time` are needed by the slim build too, not just
+# `media`: every synchronous entry point bridges to the async core through the
+# runtime in `src/runtime.rs`, and the core arms a `delayBeforeUse` timer on the
+# key-rotation path. See that module for why it has to be multi-threaded.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
 uniffi.workspace = true
 async-trait.workspace = true
 futures = "0.3"

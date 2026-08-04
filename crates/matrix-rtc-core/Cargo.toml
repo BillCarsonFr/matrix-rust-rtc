@@ -25,7 +25,12 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+# No `time`: the core deliberately arms no timers, so it needs no reactor and a
+# synchronous host can drive it from a plain thread. The MSC4143
+# `delayBeforeUse` wait is handed to the consumer as
+# `KeyMaterialSignal::use_after_ms` instead. Leaving the feature off makes that
+# a compile error to regress rather than a runtime panic on Android.
+tokio = { workspace = true }
 log.workspace = true
 async-trait.workspace = true
 rand = "0.8"

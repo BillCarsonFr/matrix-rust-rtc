@@ -84,16 +84,14 @@ pub enum MediaFfiError {
     InternalLockPoisoned,
 }
 
-/// The dedicated multithreaded runtime every media task runs on (engine
-/// actor, connection pool, SFU IO). Lazily created on first use.
+/// The multithreaded runtime every media task runs on (engine actor,
+/// connection pool, SFU IO). Lazily created on first use.
+///
+/// Shared with the synchronous FFI entry points ([`crate::runtime`]) rather
+/// than a second runtime of its own: one pool of worker threads instead of two
+/// on a mobile device, and the entry points need a multi-threaded runtime for
+/// exactly the same reason media does. Media's futures are spawned (so `Send`);
+/// the entry points only ever block on theirs, which imposes no such bound.
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
-    use std::sync::OnceLock;
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("matrix-rtc-media")
-            .build()
-            .expect("failed to build the media tokio runtime")
-    })
+    crate::runtime::runtime()
 }

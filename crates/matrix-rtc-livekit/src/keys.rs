@@ -28,9 +28,17 @@
 //! ([`msc4195_key_provider`]); one created via [`MediaKeyBridge::new`] only
 //! records them. End-to-end media decryption against Element Call is not yet
 //! validated.
+//!
+//! This bridge also owns the MSC4143 `delayBeforeUse` wait. `matrix-rtc-core`
+//! deliberately holds no timer — it only states the delay, as
+//! [`KeyMaterialSignal::use_after_ms`] — so that a synchronous FFI host can
+//! drive it from a plain thread. Enforcing it is therefore a transport-layer
+//! obligation, and for now this is the only implementation of it; a future
+//! transport-agnostic layer is the natural home.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
@@ -104,9 +112,12 @@ pub type KeyImportListener = Box<dyn Fn(&ParticipantKey) + Send + Sync>;
 /// with the core encryption manager.
 #[derive(Default)]
 pub struct MediaKeyBridge {
-    keys: Mutex<HashMap<String, ParticipantKey>>,
+    /// `Arc` so a delayed application (see [`KeyMaterialSignal::use_after_ms`])
+    /// can own a handle that outlives the signalling call — and, if it comes to
+    /// it, the bridge.
+    keys: Arc<Mutex<HashMap<String, ParticipantKey>>>,
     provider: Option<KeyProvider>,
-    listener: Mutex<Option<KeyImportListener>>,
+    listener: Arc<Mutex<Option<KeyImportListener>>>,
 }
 
 impl MediaKeyBridge {
@@ -124,9 +135,9 @@ impl MediaKeyBridge {
     /// key ring.
     pub fn with_provider(provider: KeyProvider) -> Self {
         Self {
-            keys: Mutex::new(HashMap::new()),
+            keys: Arc::new(Mutex::new(HashMap::new())),
             provider: Some(provider),
-            listener: Mutex::new(None),
+            listener: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -159,12 +170,19 @@ impl MediaKeyBridge {
     }
 }
 
-#[async_trait(?Send)]
-impl EncryptionKeySignalHandler for MediaKeyBridge {
-    async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
-        let key = ParticipantKey::from(signal);
+impl MediaKeyBridge {
+    /// Imports `key` into the provider, records it, and notifies the listener.
+    ///
+    /// Takes its state as parameters rather than `&self` so a delayed
+    /// application can call it from a spawned task holding only cloned handles.
+    fn apply(
+        provider: Option<&KeyProvider>,
+        keys: &Mutex<HashMap<String, ParticipantKey>>,
+        listener: &Mutex<Option<KeyImportListener>>,
+        key: ParticipantKey,
+    ) {
         let index = i32::from(key.key_index);
-        if let Some(provider) = &self.provider {
+        if let Some(provider) = provider {
             // Indices at or past the ring size abort the process in the native
             // frame cryptor rather than returning false, and peers control this
             // value (see NATIVE_KEY_RING_MAX). Drop (but still record) such a
@@ -190,18 +208,75 @@ impl EncryptionKeySignalHandler for MediaKeyBridge {
                 );
             }
         }
-        self.keys
-            .lock()
+        keys.lock()
             .expect("key bridge mutex poisoned")
             .insert(key.rtc_backend_identity.clone(), key.clone());
-        if let Some(listener) = self
-            .listener
+        if let Some(listener) = listener
             .lock()
             .expect("key bridge listener mutex poisoned")
             .as_ref()
         {
             listener(&key);
         }
+    }
+}
+
+#[async_trait(?Send)]
+impl EncryptionKeySignalHandler for MediaKeyBridge {
+    /// Applies a signalled key, honouring the MSC4143 `delayBeforeUse` the core
+    /// attaches as [`KeyMaterialSignal::use_after_ms`].
+    ///
+    /// A non-zero delay is scheduled, never slept through: this runs on the
+    /// caller's task, and for the FFI that caller is a *synchronous* host call,
+    /// so blocking here would stall a host thread for the whole delay. The core
+    /// used to own this wait and did exactly that.
+    ///
+    /// Everything — provider import, recording, listener — happens at activation
+    /// time rather than signalling time, so what the bridge exposes matches what
+    /// LiveKit is actually encrypting with. During the delay `key_for` keeps
+    /// reporting the previous key, which is the one still in use.
+    ///
+    /// Ordering holds without extra machinery: the delay is a constant from
+    /// `EncryptionConfig::delay_before_use_ms`, so keys signalled in index order
+    /// get deadlines in the same order.
+    async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
+        let use_after_ms = signal.use_after_ms;
+        let key = ParticipantKey::from(signal);
+
+        if use_after_ms == 0 {
+            Self::apply(self.provider.as_ref(), &self.keys, &self.listener, key);
+            return;
+        }
+
+        // `Handle::spawn` rather than `tokio::spawn` so the absence of a runtime
+        // is a branch we handle instead of a panic. Falling back to applying
+        // immediately deviates from the spec — peers may not have the key yet,
+        // so some frames go undecryptable — but that is recoverable, whereas
+        // never applying it at all breaks the session outright. Loud, because it
+        // means a consumer is driving the core without a runtime.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::warn!(
+                "no tokio runtime to schedule delayBeforeUse on: applying key index {} \
+                 immediately instead of in {use_after_ms}ms. Peers may not have it yet.",
+                key.key_index,
+            );
+            Self::apply(self.provider.as_ref(), &self.keys, &self.listener, key);
+            return;
+        };
+
+        log::trace!(
+            "scheduling key index {} for participant {} in {use_after_ms}ms",
+            key.key_index,
+            key.rtc_backend_identity,
+        );
+
+        let provider = self.provider.clone();
+        let keys = Arc::clone(&self.keys);
+        let listener = Arc::clone(&self.listener);
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(use_after_ms)).await;
+            Self::apply(provider.as_ref(), &keys, &listener, key);
+        });
     }
 }
 
@@ -217,6 +292,7 @@ mod tests {
                 key: vec![1, 2, 3, 4],
                 key_index: 7,
                 rtc_backend_identity: "participant-abc".to_owned(),
+                use_after_ms: 0,
             })
             .await;
 
@@ -231,6 +307,62 @@ mod tests {
         assert!(bridge.key_for("unknown").is_none());
     }
 
+    /// `use_after_ms` must be *scheduled*, not slept through: the signalling
+    /// call has to return at once, because for the FFI its caller is a
+    /// synchronous host call. The core used to own this wait and blocked there.
+    #[tokio::test]
+    async fn a_delayed_key_is_applied_only_after_the_delay() {
+        let bridge = MediaKeyBridge::new();
+        bridge
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![7u8; 32],
+                key_index: 4,
+                rtc_backend_identity: "p".to_owned(),
+                use_after_ms: 60,
+            })
+            .await;
+
+        assert!(
+            bridge.key_for("p").is_none(),
+            "the signalling call must return before the delay elapses, not block through it"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert_eq!(
+            bridge.key_for("p").map(|key| key.key_index),
+            Some(4),
+            "the key should have been applied once the delay elapsed"
+        );
+    }
+
+    /// Rotations keep index order: the delay is a constant, so deadlines are
+    /// ordered the same as the signalling calls that scheduled them.
+    #[tokio::test]
+    async fn delayed_keys_apply_in_index_order() {
+        let bridge = MediaKeyBridge::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        bridge.set_key_import_listener(Box::new(move |key| {
+            recorder.lock().unwrap().push(key.key_index);
+        }));
+
+        for index in [1u8, 2u8, 3u8] {
+            bridge
+                .on_new_key_material(KeyMaterialSignal {
+                    key: vec![index; 32],
+                    key_index: index,
+                    rtc_backend_identity: "p".to_owned(),
+                    use_after_ms: 60,
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3]);
+    }
+
     #[tokio::test]
     async fn latest_key_per_identity_wins() {
         let bridge = MediaKeyBridge::new();
@@ -240,6 +372,7 @@ mod tests {
                     key: vec![index],
                     key_index: index,
                     rtc_backend_identity: "p".to_owned(),
+                    use_after_ms: 0,
                 })
                 .await;
         }
@@ -276,6 +409,7 @@ mod tests {
                 key: vec![4u8; 32],
                 key_index: u8::MAX,
                 rtc_backend_identity: "participant-p2".to_owned(),
+                use_after_ms: 0,
             })
             .await;
 
@@ -292,6 +426,7 @@ mod tests {
                 key: vec![9u8; 32],
                 key_index: 3,
                 rtc_backend_identity: "participant-p1".to_owned(),
+                use_after_ms: 0,
             })
             .await;
 

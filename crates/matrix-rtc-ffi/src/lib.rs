@@ -30,6 +30,7 @@ use matrix_rtc_core::{
 };
 mod commands;
 mod logging;
+mod runtime;
 pub use commands::{
     CommandSenderCallback, CommandSenderError, FfiCommandSender, FfiJoinSessionParams,
     FfiLeaveSessionParams, FfiTransportConfig,
@@ -282,7 +283,7 @@ impl RtcSessionHandle {
 
         let parsed = to_core_membership_events(to_core_events(events))?;
         let mut session = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             session.initial_events(parsed).await;
             Ok(())
         })
@@ -318,7 +319,7 @@ impl RtcSessionHandle {
         membership_events.extend(removed_events);
 
         let mut session = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             session.handle_update(membership_events).await;
             Ok(())
         })
@@ -346,17 +347,17 @@ impl RtcSessionHandle {
             MatrixRtcFfiError::InvalidInput(e.to_string())
         })?;
 
-        // Take the session out of the mutex to avoid holding the guard across await
-        let mut inner = lock_mutex(&self.inner)?;
-        let mut session = std::mem::replace(&mut *inner, RtcSession::new());
+        // Hold the guard across the join. Not "completes immediately" as this
+        // once assumed: the core awaits a `delayBeforeUse` timer whenever it
+        // rotates a key, so the bridge supplies a runtime context (see
+        // `crate::runtime`) and this call lasts as long as that wait.
+        //
+        // The guard is deliberately *not* released for the duration — see
+        // `RtcSessionManagerHandle::join` for why swapping a placeholder in and
+        // unlocking was worse. Safe because no host callback re-enters a handle.
+        let mut session = lock_mutex(&self.inner)?;
 
-        // Drop the lock before doing async work
-        drop(inner);
-
-        // Do the async join
-        // For FFI, the command sender callbacks are synchronous, so the async
-        // operations will complete immediately. We use a simple block_on.
-        let result = futures::executor::block_on(async {
+        let result = crate::runtime::block_on(async {
             session.join(core_params).await.map_err(|e| {
                 log::warn!("session: join failed: {e}");
                 MatrixRtcFfiError::InvalidInput(e.to_string())
@@ -366,10 +367,6 @@ impl RtcSessionHandle {
         if result.is_ok() {
             log::info!("session: join succeeded");
         }
-
-        // Store the session back
-        let mut inner = lock_mutex(&self.inner)?;
-        *inner = session;
 
         result
     }
@@ -434,7 +431,7 @@ impl RtcSessionManagerHandle {
         trace_sticky_events("initial", &events);
 
         let mut manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager
                 .initial_sticky_for_room(&room_id, to_core_events(events))
                 .await
@@ -465,7 +462,7 @@ impl RtcSessionManagerHandle {
         };
 
         let mut manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager
                 .sticky_update_for_room(&room_id, update)
                 .await
@@ -485,7 +482,7 @@ impl RtcSessionManagerHandle {
         trace_sticky_events("snapshot", &events);
 
         let mut manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager
                 .on_sticky_events_snapshot_received(to_core_events(events))
                 .await
@@ -510,7 +507,7 @@ impl RtcSessionManagerHandle {
         trace_sticky_events("removed", &removed);
 
         let mut manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager
                 .on_sticky_events_update_received(StickyEventsUpdate {
                     added: to_core_events(added),
@@ -545,7 +542,7 @@ impl RtcSessionManagerHandle {
             .inspect_err(|err| log::warn!("manager: [{room_id}] rejected a slot event: {err}"))?;
 
         let mut manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager.on_room_slots_received(&room_id, mapped).await;
             Ok(())
         })
@@ -567,7 +564,7 @@ impl RtcSessionManagerHandle {
         log::trace!("manager: [{room_id}] joined users: {joined_user_ids:?}");
 
         let mut manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager
                 .on_room_members_received(&room_id, joined_user_ids)
                 .await;
@@ -588,7 +585,7 @@ impl RtcSessionManagerHandle {
         log::info!("manager: [{room_id}] room encryption in: encrypted={encrypted}");
 
         let mut manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager
                 .on_room_encryption_received(&room_id, encrypted)
                 .await;
@@ -619,7 +616,7 @@ impl RtcSessionManagerHandle {
 
         let received = key.into_core()?;
         let manager = lock_mutex(&self.inner)?;
-        futures::executor::block_on(async {
+        crate::runtime::block_on(async {
             manager
                 .receive_encryption_key(received)
                 .await
@@ -665,15 +662,21 @@ impl RtcSessionManagerHandle {
             MatrixRtcFfiError::InvalidInput(e.to_string())
         })?;
 
-        // Take the manager out of the mutex to avoid holding the guard across await
-        let mut inner = lock_mutex(&self.inner)?;
-        let mut manager = std::mem::replace(&mut *inner, RtcSessionManager::new());
+        // Hold the guard across the join, rather than swapping a placeholder
+        // `RtcSessionManager::new()` in and unlocking for the duration. That
+        // pattern had two failure modes: any call landing during the join —
+        // `member_count`, or a sticky snapshot — operated on the *placeholder*,
+        // so events arriving in that window were applied to it and then thrown
+        // away when the real manager was restored; and a panic mid-join dropped
+        // the real manager during unwind, silently leaving the empty one behind
+        // with no poison flag to signal it.
+        //
+        // Serialising instead is safe because no host callback re-enters a
+        // handle: the command sender only sends events outward. If that ever
+        // changes, this becomes a deadlock rather than lost state.
+        let mut manager = lock_mutex(&self.inner)?;
 
-        // Drop the lock before doing async work
-        drop(inner);
-
-        // Do the async join
-        let result = futures::executor::block_on(async {
+        let result = crate::runtime::block_on(async {
             manager.join(core_params).await.map_err(|e| {
                 log::warn!("manager: join failed: {e}");
                 MatrixRtcFfiError::InvalidInput(e.to_string())
@@ -683,10 +686,6 @@ impl RtcSessionManagerHandle {
         if result.is_ok() {
             log::info!("manager: join succeeded");
         }
-
-        // Store the manager back
-        let mut inner = lock_mutex(&self.inner)?;
-        *inner = manager;
 
         result
     }
@@ -704,15 +703,13 @@ impl RtcSessionManagerHandle {
 
         let core_params = params.into_core();
 
-        // Take the manager out of the mutex to avoid holding the guard across await
-        let mut inner = lock_mutex(&self.inner)?;
-        let mut manager = std::mem::replace(&mut *inner, RtcSessionManager::new());
+        // Held across the leave, for the reasons in `join` above. It matters
+        // most here: losing the manager to a placeholder mid-leave would drop
+        // the very state needed to depart, leaving the membership live until the
+        // dead man's switch expired.
+        let mut manager = lock_mutex(&self.inner)?;
 
-        // Drop the lock before doing async work
-        drop(inner);
-
-        // Do the async leave
-        let result = futures::executor::block_on(async {
+        let result = crate::runtime::block_on(async {
             manager
                 .leave(room_id, slot_id, core_params)
                 .await
@@ -725,10 +722,6 @@ impl RtcSessionManagerHandle {
         if result.is_ok() {
             log::info!("manager: leave succeeded");
         }
-
-        // Store the manager back
-        let mut inner = lock_mutex(&self.inner)?;
-        *inner = manager;
 
         result
     }
@@ -919,10 +912,34 @@ fn trace_sticky_events(kind: &str, events: &[StickyEvent]) {
     }
 }
 
+/// Locks `mutex`, recovering from poisoning rather than propagating it.
+///
+/// A panic anywhere inside a handle method used to poison the handle for the
+/// rest of the process: every later call — `member_count`, and critically
+/// `leave` — returned [`MatrixRtcFfiError::InternalLockPoisoned`] forever, so
+/// the host could not even depart the session and its membership stayed live
+/// until the dead man's switch expired. One panic permanently disabling the
+/// manager, including the ability to leave it, is worse than the panic.
+///
+/// So we take the guard anyway and clear the flag. The state behind it may have
+/// been mid-mutation when the panic unwound, which is why this logs at error
+/// level: it is a bug worth reporting, not a condition to handle silently.
+///
+/// Still returns `Result` — the signature is what ~20 call sites and the
+/// `media` module expect, and it keeps room for a future fallible lock — but
+/// the error path is now unreachable.
 fn lock_mutex<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, MatrixRtcFfiError> {
-    mutex
-        .lock()
-        .map_err(|_| MatrixRtcFfiError::InternalLockPoisoned)
+    match mutex.lock() {
+        Ok(guard) => Ok(guard),
+        Err(poisoned) => {
+            log::error!(
+                "recovering a poisoned lock: an earlier call panicked and its state may be \
+                 inconsistent. Please report this with the panic that preceded it."
+            );
+            mutex.clear_poison();
+            Ok(poisoned.into_inner())
+        }
+    }
 }
 
 uniffi::setup_scaffolding!();
@@ -997,5 +1014,32 @@ mod tests {
 
         let no_update = subscription.next_snapshot().unwrap();
         assert_eq!(no_update, None);
+    }
+
+    /// A panic inside one handle method must not disable the handle forever.
+    /// It used to: the poisoned mutex made every later call — `leave` included —
+    /// return `InternalLockPoisoned`, so the host could not depart the session
+    /// and its membership stayed live until the dead man's switch expired.
+    #[test]
+    fn a_poisoned_lock_is_recovered_rather_than_propagated() {
+        let mutex = Mutex::new(0_u32);
+
+        let panicked = std::panic::catch_unwind(|| {
+            let mut guard = mutex.lock().unwrap();
+            *guard = 1;
+            panic!("simulates a panic while the guard is held");
+        });
+        assert!(panicked.is_err());
+        assert!(mutex.is_poisoned(), "the mutex should now be poisoned");
+
+        // The value the panicking call had written is still there, and the lock
+        // is usable again.
+        let guard = lock_mutex(&mutex).expect("a poisoned lock must still be usable");
+        assert_eq!(*guard, 1);
+        drop(guard);
+        assert!(
+            !mutex.is_poisoned(),
+            "the poison flag should have been cleared"
+        );
     }
 }
