@@ -57,7 +57,8 @@ impl WasmRtcSessionManager {
     /// Sets up the command sender for this manager with a Matrix client.
     ///
     /// This must be called before join/leave operations.
-    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
+    /// sendDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         log::info!("manager: command sender installed");
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
@@ -239,6 +240,8 @@ impl WasmRtcSessionManager {
     ///   - `application`: Application type (e.g., "m.call")
     ///   - `transport`: Transport configuration object
     ///   - `keep_alive_timeout_ms`: Optional keep-alive timeout in milliseconds (default: 30000)
+    ///   - `sticky_duration_ms`: Optional sticky-map lifetime for our membership in
+    ///     milliseconds (default: 3600000); the SDK re-sends the membership at half this
     pub async fn join(&mut self, params: JsValue) -> Result<(), JsError> {
         let params: WasmJoinSessionParams =
             serde_wasm_bindgen::from_value(params).map_err(|err| {
@@ -341,6 +344,7 @@ pub struct WasmJoinSessionParams {
     pub can_subscribe: Vec<String>,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
+    pub sticky_duration_ms: Option<u64>,
     #[serde(default)]
     pub encryption_config: Option<WasmEncryptionConfig>,
 }
@@ -402,6 +406,7 @@ impl WasmJoinSessionParams {
                 },
             },
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
+            sticky_duration_ms: self.sticky_duration_ms,
             encryption_config,
         })
     }
@@ -506,7 +511,8 @@ impl WasmRtcSession {
     /// Sets up the command sender for this session with a Matrix client.
     ///
     /// This must be called before join/leave operations.
-    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
+    /// sendDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());

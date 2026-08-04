@@ -21,7 +21,10 @@
 //! them into core DTOs so `matrix-rtc-core` stays decoupled from FFI-specific
 //! types and binding-tooling concerns.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::HashMap;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 use tokio::sync::watch;
 
 use matrix_rtc_core::{
@@ -229,7 +232,84 @@ pub struct RtcSessionHandle {
 
 #[derive(uniffi::Object)]
 pub struct RtcSessionManagerHandle {
-    inner: Mutex<RtcSessionManager<FfiCommandSender>>,
+    /// `Arc` so a heartbeat driver can hold a `Weak` to it without keeping the
+    /// manager alive past the handle.
+    inner: Arc<Mutex<RtcSessionManager<FfiCommandSender>>>,
+    /// One driver per joined session, keyed by `(room_id, slot_id)`. Dropping
+    /// the entry stops its thread.
+    heartbeats: Mutex<HashMap<(String, String), HeartbeatDriver>>,
+}
+
+/// How often the keep-alive is driven.
+///
+/// Three ticks inside the 30 s default delayed-leave timeout, so a skipped tick
+/// (the manager was busy) or one slow round trip cannot let the switch fire.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Owns the thread that drives one session's keep-alive.
+///
+/// A plain thread rather than a `tokio::spawn`: the beat needs `&mut` on the
+/// manager across an await, so its future holds a `std::sync::MutexGuard` and is
+/// therefore `!Send`. Blocking on it from a dedicated thread sidesteps that,
+/// and sleeping on the channel means a stop takes effect immediately instead of
+/// at the end of the current interval.
+struct HeartbeatDriver {
+    /// Dropped to ask the thread to stop; it observes the disconnect.
+    _stop: mpsc::Sender<()>,
+}
+
+/// Runs one session's keep-alive until the session ends or the handle goes away.
+fn run_heartbeat(
+    manager: Weak<Mutex<RtcSessionManager<FfiCommandSender>>>,
+    room_id: String,
+    slot_id: String,
+    stop: mpsc::Receiver<()>,
+) {
+    loop {
+        match stop.recv_timeout(HEARTBEAT_INTERVAL) {
+            // The driver was dropped (leave, rejoin, or the handle died).
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        let Some(manager) = manager.upgrade() else {
+            log::debug!("[{room_id}/{slot_id}] heartbeat: manager gone, stopping");
+            break;
+        };
+
+        // Holding the guard across the await is the point: `heartbeat` needs
+        // `&mut` on the manager for its whole duration, and the manager is
+        // behind a `std::sync::Mutex` because the sync FFI entry points share
+        // it — an async mutex is not an option. Safe because this future is
+        // driven by `block_on` on this dedicated thread and never spawned, so
+        // it is never required to be `Send`.
+        #[allow(clippy::await_holding_lock)]
+        let still_joined = crate::runtime::block_on(async {
+            let mut guard = match manager.try_lock() {
+                Ok(guard) => guard,
+                // An FFI call holds the manager. Skip rather than queue behind
+                // it: the next tick is 10 s away and the switch has 30 s.
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    log::debug!("[{room_id}/{slot_id}] heartbeat: manager busy, skipping a tick");
+                    return true;
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    log::error!("[{room_id}/{slot_id}] heartbeat: recovering a poisoned manager");
+                    manager.clear_poison();
+                    poisoned.into_inner()
+                }
+            };
+            guard.heartbeat(&room_id, &slot_id).await
+        });
+
+        // `false` means the session is gone or has left — `leave` takes the
+        // membership machine, so a beat racing a leave is a no-op and lands
+        // here. Nothing left to keep alive.
+        if !still_joined {
+            log::debug!("[{room_id}/{slot_id}] heartbeat: no longer joined, stopping");
+            break;
+        }
+    }
 }
 
 struct SubscriptionState {
@@ -395,7 +475,8 @@ impl RtcSessionManagerHandle {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(RtcSessionManager::new()),
+            inner: Arc::new(Mutex::new(RtcSessionManager::new())),
+            heartbeats: Mutex::new(HashMap::new()),
         })
     }
 
@@ -657,6 +738,10 @@ impl RtcSessionManagerHandle {
     pub fn join(&self, params: FfiJoinSessionParams) -> Result<(), MatrixRtcFfiError> {
         log::info!("manager: join requested {}", params.summary());
 
+        // Kept for the keep-alive driver, which outlives `params`.
+        let room_id = params.room_id.clone();
+        let slot_id = params.slot_id.clone();
+
         let core_params = params.into_core().map_err(|e| {
             log::warn!("manager: join rejected before it started: {e}");
             MatrixRtcFfiError::InvalidInput(e.to_string())
@@ -685,9 +770,81 @@ impl RtcSessionManagerHandle {
 
         if result.is_ok() {
             log::info!("manager: join succeeded");
+            // Drop the manager lock before starting the driver: its first act
+            // is to try_lock, and holding it here would make that first tick a
+            // guaranteed skip.
+            drop(manager);
+            self.start_heartbeat(room_id, slot_id);
         }
 
         result
+    }
+
+    /// Restarts the keep-alive for one session: reschedules the delayed leave,
+    /// and re-sends the membership if its sticky entry is halfway to expiring.
+    ///
+    /// **Hosts do not need to call this** — [`Self::join`] starts a driver that
+    /// does it every 10 seconds, and [`Self::leave`] stops it. It is exported
+    /// for hosts that would rather drive the keep-alive from their own scheduler
+    /// (a foreground service, a workmanager job), and for tests.
+    ///
+    /// Returns `false` if there is no joined session for `(room_id, slot_id)`,
+    /// which means there is nothing to keep alive.
+    pub fn heartbeat(&self, room_id: String, slot_id: String) -> Result<bool, MatrixRtcFfiError> {
+        let mut manager = lock_mutex(&self.inner)?;
+        Ok(crate::runtime::block_on(async {
+            manager.heartbeat(&room_id, &slot_id).await
+        }))
+    }
+
+    /// Starts (or replaces) the keep-alive driver for one session.
+    fn start_heartbeat(&self, room_id: String, slot_id: String) {
+        let (stop, stop_rx) = mpsc::channel();
+        let manager = Arc::downgrade(&self.inner);
+        let key = (room_id.clone(), slot_id.clone());
+
+        let thread = std::thread::Builder::new()
+            .name(format!("matrix-rtc-heartbeat-{room_id}"))
+            .spawn(move || run_heartbeat(manager, room_id, slot_id, stop_rx));
+
+        match thread {
+            Ok(_) => {
+                log::info!(
+                    "manager: keep-alive driver started for [{}/{}] every {}s",
+                    key.0,
+                    key.1,
+                    HEARTBEAT_INTERVAL.as_secs(),
+                );
+                // Replaces any previous driver for this session; dropping the
+                // old sender stops its thread.
+                match lock_mutex(&self.heartbeats) {
+                    Ok(mut drivers) => {
+                        drivers.insert(key, HeartbeatDriver { _stop: stop });
+                    }
+                    Err(error) => log::error!("manager: could not register keep-alive: {error}"),
+                }
+            }
+            Err(error) => log::error!(
+                "manager: could not start the keep-alive driver for [{}/{}]: {error}. The \
+                 membership will be cleaned up by the delayed leave unless the host drives \
+                 `heartbeat()` itself.",
+                key.0,
+                key.1,
+            ),
+        }
+    }
+
+    /// Stops the keep-alive driver for one session, if any.
+    fn stop_heartbeat(&self, room_id: &str, slot_id: &str) {
+        let key = (room_id.to_owned(), slot_id.to_owned());
+        match lock_mutex(&self.heartbeats) {
+            Ok(mut drivers) => {
+                if drivers.remove(&key).is_some() {
+                    log::debug!("manager: keep-alive driver stopped for [{room_id}/{slot_id}]");
+                }
+            }
+            Err(error) => log::error!("manager: could not stop the keep-alive: {error}"),
+        }
     }
 
     pub fn leave(
@@ -702,6 +859,12 @@ impl RtcSessionManagerHandle {
         );
 
         let core_params = params.into_core();
+
+        // Stop the keep-alive first, so it cannot re-arm a delayed leave after
+        // the leave below cancels it. A beat already in flight is harmless: it
+        // holds the manager lock we are about to take, and once `leave` has
+        // taken the membership machine any later beat is a no-op.
+        self.stop_heartbeat(&room_id, &slot_id);
 
         // Held across the leave, for the reasons in `join` above. It matters
         // most here: losing the manager to a placeholder mid-leave would drop
@@ -947,6 +1110,28 @@ uniffi::setup_scaffolding!();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manual entry point exists and reports honestly when there is nothing
+    /// to keep alive, rather than pretending it beat something.
+    #[test]
+    fn heartbeat_reports_no_session_when_not_joined() {
+        let manager = RtcSessionManagerHandle::new();
+        assert!(
+            !manager
+                .heartbeat("!room:example.org".to_owned(), "m.call#ROOM".to_owned())
+                .expect("the call itself should succeed"),
+        );
+    }
+
+    /// A driver is only registered by a successful join, and `leave` must clear
+    /// it even for a session that was never joined — otherwise a failed join
+    /// would leave a thread beating forever.
+    #[test]
+    fn stopping_an_unknown_heartbeat_is_harmless() {
+        let manager = RtcSessionManagerHandle::new();
+        manager.stop_heartbeat("!room:example.org", "m.call#ROOM");
+        assert!(lock_mutex(&manager.heartbeats).unwrap().is_empty());
+    }
 
     fn join_event() -> StickyEvent {
         StickyEvent {

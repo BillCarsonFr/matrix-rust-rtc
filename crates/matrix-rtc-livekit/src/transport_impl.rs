@@ -363,12 +363,25 @@ impl TransportConnection for LiveKitTransportConnection {
         Ok(())
     }
 
+    /// Idempotent: closing a connection that is already closed succeeds.
+    ///
+    /// LiveKit answers `RoomError::AlreadyClosed` both for a second `close()`
+    /// and for a room the SFU already tore down — the latter being the normal
+    /// case when the server disconnected us before the user hung up. Either way
+    /// the postcondition callers want ("this connection is not open") already
+    /// holds, so reporting a failure only makes a clean hangup look broken.
     async fn close(&self) -> Result<(), TransportError> {
-        self.session
-            .room()
-            .close()
-            .await
-            .map_err(|error| TransportError::Closed(error.to_string()))
+        match self.session.room().close().await {
+            Ok(()) => Ok(()),
+            Err(livekit::RoomError::AlreadyClosed) => {
+                log::debug!(
+                    "connection {} was already closed; treating as success",
+                    self.connection_key,
+                );
+                Ok(())
+            }
+            Err(error) => Err(TransportError::Closed(error.to_string())),
+        }
     }
 }
 

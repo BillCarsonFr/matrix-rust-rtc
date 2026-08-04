@@ -234,6 +234,21 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
     }
 
+    /// Re-signals every key already held to the installed signal handler.
+    ///
+    /// Call after both the handler and the identity mapper are in place; see
+    /// [`EncryptionManager::replay_keys_to_handler`]. Returns `false` if the
+    /// session has no encryption manager.
+    pub async fn replay_encryption_keys(&self) -> bool {
+        match &self.encryption_manager {
+            Some(manager) => {
+                manager.replay_keys_to_handler().await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Installs the identity mapper used to derive the RTC-backend participant
     /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
     ///
@@ -337,6 +352,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             membership_id.clone(),
             params.application.clone(),
             params.keep_alive_timeout_ms(),
+            params.sticky_duration_ms(),
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)

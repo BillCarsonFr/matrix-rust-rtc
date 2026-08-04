@@ -57,14 +57,14 @@ use matrix_rtc_core::{
     StickyEventsUpdate,
 };
 
-/// Sticky duration for `m.rtc.member` events, clamped to one hour by the SDK.
-///
-/// The join event lives for this long; liveness while joined relies on the dead
-/// man's switch (a delayed leave restarted by heartbeats), and a graceful leave
-/// sends an explicit disconnect sticky. NOTE: the delayed leave is currently a
-/// plain (non-sticky) delayed event, so crash cleanup relies on this TTL
-/// expiring; making the delayed leave itself sticky is a follow-up.
-const STICKY_DURATION_MS: u32 = 60 * 60 * 1000;
+// The sticky duration for `m.rtc.member` now comes from the core
+// (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
+// half that interval to stay in the map. It used to be a constant here, which
+// meant nothing knew when the entry would lapse.
+//
+// NOTE: the delayed leave is currently a plain (non-sticky) delayed event, so
+// crash cleanup relies on this TTL expiring; making the delayed leave itself
+// sticky is a follow-up.
 
 fn command_error(error: impl std::fmt::Display) -> CommandError {
     CommandError::from_message(error.to_string())
@@ -124,11 +124,19 @@ impl RtcCommandSender for SdkCommandSender {
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError> {
         let room = self.room(&room_id)?;
         let event_type = wire_event_type(event_type).to_string();
+        // The core's value, not a constant of ours: it schedules the refresh
+        // against exactly this lifetime, so substituting one here would break
+        // the refresh. The core clamps to `MAX_STICKY_DURATION_MS` for the same
+        // reason the SDK does — anything longer comes back as an hour, and a
+        // refresh scheduled against the longer figure would fire after the entry
+        // had already lapsed.
+        let duration_ms = u32::try_from(duration_ms).unwrap_or(u32::MAX);
         room.send_raw(&event_type, &content)
-            .with_sticky_duration_ms(STICKY_DURATION_MS)
+            .with_sticky_duration_ms(duration_ms)
             .with_request_config(rtc_request_config())
             .await
             .map_err(command_error)?;

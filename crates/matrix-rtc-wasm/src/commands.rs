@@ -30,7 +30,8 @@ use wasm_bindgen::prelude::*;
 /// WASM implementation of the RtcCommandSender trait.
 ///
 /// This sender delegates to a JavaScript object that provides the actual Matrix SDK integration.
-/// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+/// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
+/// sendDelayedEvent, cancelDelayedEvent.
 #[wasm_bindgen]
 pub struct JsCommandSender {
     /// The JavaScript Matrix client that handles the actual event sending
@@ -46,7 +47,7 @@ impl JsCommandSender {
     /// Creates a new JsCommandSender with the given Matrix client.
     ///
     /// The client must implement the following methods:
-    /// - sendStickyEvent(roomId, eventType, content, callback)
+    /// - sendStickyEvent(roomId, eventType, content, durationMs, callback)
     /// - sendDelayedEvent(roomId, eventType, content, delayMs, callback)
     /// - cancelDelayedEvent(roomId, eventId, callback)
     /// - sendToDeviceMessage(userId, deviceId, messageType, content, callback)
@@ -139,13 +140,14 @@ impl RtcCommandSender for JsCommandSender {
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError> {
         // The JS host puts this string on the wire verbatim, so translate the
         // core's stable id to the one peers actually match on.
         let event_type = wire_event_type(&event_type);
         self.log_command(&format!(
-            "send_sticky_event: room={}, type={}",
-            room_id, event_type
+            "send_sticky_event: room={}, type={}, duration={}ms",
+            room_id, event_type, duration_ms
         ));
 
         // Convert Rust Value to JsValue
@@ -160,6 +162,9 @@ impl RtcCommandSender for JsCommandSender {
                     JsValue::from_str(&room_id),
                     JsValue::from_str(event_type),
                     js_content,
+                    // The core refreshes the entry against this lifetime; the
+                    // host must pass it through, not choose its own.
+                    JsValue::from_f64(duration_ms as f64),
                 ],
             )
             .map_err(JsCommandSender::convert_js_error)?;

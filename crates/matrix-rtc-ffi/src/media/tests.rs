@@ -39,6 +39,7 @@ impl CommandSenderCallback for NoopCommands {
         _room_id: String,
         _event_type: String,
         _content_json: String,
+        _duration_ms: u64,
     ) -> Result<(), CommandSenderError> {
         Ok(())
     }
@@ -144,6 +145,7 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
             }),
             can_subscribe: Vec::new(),
             keep_alive_timeout_ms: None,
+            sticky_duration_ms: None,
             encryption_config: None,
         })
         .unwrap();

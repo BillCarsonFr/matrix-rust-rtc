@@ -121,6 +121,16 @@ async fn build_media_session(
                     config.room_id, config.slot_id
                 ))
             })?;
+        // Mapper before handler: the replay below derives MSC4195 identities
+        // through it, and installing it second would replay peer keys under the
+        // raw `member_id` fallback — an identity the SFU never uses, which is
+        // indistinguishable from importing nothing.
+        let identity_mapper: RtcIdentityMapper =
+            Arc::new(|user_id: &str, device_id: &str, member_id: &str| {
+                pseudonymous_identity(user_id, device_id, member_id)
+            });
+        mgr.set_encryption_identity_mapper(&config.room_id, &config.slot_id, identity_mapper);
+
         if !mgr.set_encryption_signal_handler(&config.room_id, &config.slot_id, bridge.clone()) {
             log::warn!(
                 "media: session [{}/{}] has no encryption manager — join the slot first",
@@ -131,11 +141,18 @@ async fn build_media_session(
                 "the session has no encryption manager — join the slot first".into(),
             ));
         }
-        let identity_mapper: RtcIdentityMapper =
-            Arc::new(|user_id: &str, device_id: &str, member_id: &str| {
-                pseudonymous_identity(user_id, device_id, member_id)
-            });
-        mgr.set_encryption_identity_mapper(&config.room_id, &config.slot_id, identity_mapper);
+
+        // Keys signalled between `join` and now were stored but dropped —
+        // nothing was listening. Without this, every participant whose key
+        // arrived before media attached stays undecryptable until a rotation,
+        // which only a membership change triggers.
+        //
+        // `block_on` rather than `.await`: this function is spawned, so its
+        // future must be `Send`, and awaiting here would hold the manager's
+        // `MutexGuard` across a yield point. The replay does not yield anyway —
+        // it signals with `use_after_ms: 0`, which the bridge applies inline.
+        crate::runtime::block_on(mgr.replay_encryption_keys(&config.room_id, &config.slot_id));
+
         memberships
     };
 

@@ -53,11 +53,16 @@ pub trait RtcCommandSender: Send + Sync {
     /// * `room_id` - The room ID where the event should be sent
     /// * `event_type` - The event type (e.g., "m.rtc.member")
     /// * `content` - The event content as a JSON value
+    /// * `duration_ms` - How long the server should keep this entry in the
+    ///   sticky map. Implementations MUST pass this through rather than
+    ///   choosing their own: the caller re-sends the event before this elapses,
+    ///   so a different lifetime here silently breaks that refresh.
     async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError>;
 
     /// Send a delayed event to a Matrix room.
@@ -159,6 +164,7 @@ impl RtcCommandSender for NoopCommandSender {
         _room_id: String,
         _event_type: String,
         _content: Value,
+        _duration_ms: u64,
     ) -> Result<(), CommandError> {
         Ok(())
     }
@@ -208,7 +214,7 @@ impl RtcCommandSender for NoopCommandSender {
 #[cfg(test)]
 #[derive(Default)]
 pub struct MockCommandSender {
-    pub sticky_events: std::sync::Mutex<Vec<(String, String, Value)>>,
+    pub sticky_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
     pub delayed_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
     pub cancelled_events: std::sync::Mutex<Vec<(String, String)>>,
     pub to_device_messages: std::sync::Mutex<Vec<(String, String, String, Value)>>,
@@ -222,7 +228,7 @@ impl MockCommandSender {
     }
 
     #[allow(dead_code)]
-    pub fn last_sticky_event(&self) -> Option<(String, String, Value)> {
+    pub fn last_sticky_event(&self) -> Option<(String, String, Value, u64)> {
         self.sticky_events.lock().unwrap().last().cloned()
     }
 
@@ -256,11 +262,12 @@ impl RtcCommandSender for MockCommandSender {
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError> {
         self.sticky_events
             .lock()
             .unwrap()
-            .push((room_id, event_type, content));
+            .push((room_id, event_type, content, duration_ms));
         Ok(())
     }
 

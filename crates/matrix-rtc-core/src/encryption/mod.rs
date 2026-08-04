@@ -89,7 +89,7 @@
 //!
 //! #[async_trait(?Send)]
 //! impl RtcCommandSender for MyCommandSender {
-//!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value) -> Result<(), CommandError> {
+//!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _duration_ms: u64) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }
 //!     async fn send_delayed_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
@@ -320,8 +320,94 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     }
 
     /// Sets the handler for key material signals.
+    ///
+    /// Keys that arrived before this was installed were stored but not
+    /// signalled — see [`Self::replay_keys_to_handler`], which the consumer
+    /// should call once the identity mapper is in place too.
     pub fn set_signal_handler(&mut self, handler: Arc<dyn EncryptionKeySignalHandler>) {
         self.signal_handler = Some(handler);
+    }
+
+    /// Re-signals every key we already hold to the current handler.
+    ///
+    /// Signals are dropped when no handler is installed, and a key is otherwise
+    /// only re-signalled by a rotation — which needs a membership change. So a
+    /// handler attached after keys arrived (the normal case: media connects some
+    /// time after the slot is joined) would never hear about them, and the
+    /// transport would fail to decrypt those participants for the rest of the
+    /// call.
+    ///
+    /// Install the identity mapper **before** calling this. Identities are
+    /// derived here exactly as the live signal paths derive them, so replaying
+    /// without the mapper imports keys under fallback identities the transport
+    /// never sees — which looks identical to not replaying at all.
+    pub async fn replay_keys_to_handler(&self) {
+        let Some(handler) = self.signal_handler.clone() else {
+            log::debug!("no signal handler to replay keys to");
+            return;
+        };
+
+        let mut signals: Vec<KeyMaterialSignal> = Vec::new();
+
+        // Our own outbound key, under the same identity `signal_key_to_app`
+        // would use.
+        if let Some(outbound) = self.get_outbound_key() {
+            let rtc_backend_identity = match &self.identity_mapper {
+                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
+                None => self.get_own_rtc_backend_identity(),
+            };
+            signals.push(KeyMaterialSignal {
+                key: outbound.key.clone(),
+                key_index: outbound.key_index,
+                rtc_backend_identity,
+                // Already-held keys: whatever `delayBeforeUse` applied to them
+                // elapsed long ago, so delaying again would only stall media.
+                use_after_ms: 0,
+            });
+        }
+
+        // Peer keys, under the identity derived from their membership — the
+        // same derivation `add_key_to_participant` performs.
+        let memberships = {
+            let guard = self.get_memberships.lock().unwrap();
+            guard()
+        };
+        for (member_id, keys) in self.get_all_inbound_keys() {
+            let Some(membership) = memberships
+                .iter()
+                .find(|membership| membership.member_id == member_id)
+            else {
+                // No membership means no identity to derive; the key stays
+                // stored and will be signalled if their membership shows up.
+                log::debug!("not replaying keys for {member_id}: no known membership");
+                continue;
+            };
+            let rtc_backend_identity = match &self.identity_mapper {
+                Some(mapper) => mapper(
+                    &membership.sender,
+                    membership.origin.sender_device_id().unwrap_or(""),
+                    &membership.member_id,
+                ),
+                None => membership.member_id.clone(),
+            };
+            for key in keys {
+                signals.push(KeyMaterialSignal {
+                    key: key.key.clone(),
+                    key_index: key.key_index,
+                    rtc_backend_identity: rtc_backend_identity.clone(),
+                    use_after_ms: 0,
+                });
+            }
+        }
+
+        if signals.is_empty() {
+            return;
+        }
+
+        log::info!("replaying {} held key(s) to the new handler", signals.len());
+        for signal in signals {
+            handler.on_new_key_material(signal).await;
+        }
     }
 
     /// Sets the identity mapper used to derive the RTC-backend participant
@@ -1276,6 +1362,133 @@ mod tests {
         participants: Vec<JoinedMembership>,
     ) -> impl Fn() -> Vec<JoinedMembership> + Send + Sync + 'static {
         move || participants.clone()
+    }
+
+    /// Records what the media layer would have been told.
+    #[derive(Default)]
+    struct RecordingHandler {
+        signals: Mutex<Vec<KeyMaterialSignal>>,
+    }
+
+    impl RecordingHandler {
+        fn identities(&self) -> Vec<String> {
+            self.signals
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|signal| signal.rtc_backend_identity.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl EncryptionKeySignalHandler for RecordingHandler {
+        async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
+            self.signals.lock().unwrap().push(signal);
+        }
+    }
+
+    /// Media attaches after the slot is joined, so keys routinely arrive with no
+    /// handler installed. They must not be lost: nothing re-signals them until a
+    /// rotation, which needs a membership change.
+    #[tokio::test]
+    async fn keys_held_before_a_handler_exists_are_replayed_on_attach() {
+        let mock_sender = Arc::new(NoopCommandSender);
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            mock_sender,
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+
+        // Join and receive a peer key with nothing listening.
+        manager.join().await.expect("join should succeed");
+        manager
+            .receive_key(bob_key(vec![7u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        assert!(
+            handler.signals.lock().unwrap().is_empty(),
+            "installing a handler must not itself signal"
+        );
+
+        manager.replay_keys_to_handler().await;
+
+        let signals = handler.signals.lock().unwrap();
+        assert_eq!(signals.len(), 2, "our own key and bob's");
+        // Replayed keys are already in use by peers; delaying them again would
+        // only stall media that could be decrypted now.
+        assert!(signals.iter().all(|signal| signal.use_after_ms == 0));
+        assert!(signals.iter().any(|signal| signal.key == vec![7u8; 32]));
+    }
+
+    /// The identity is the whole point of the replay: importing a key under one
+    /// the transport never uses is indistinguishable from not importing it.
+    #[tokio::test]
+    async fn replayed_keys_use_the_installed_identity_mapper() {
+        let mock_sender = Arc::new(NoopCommandSender);
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            mock_sender,
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        manager.join().await.expect("join should succeed");
+        manager
+            .receive_key(bob_key(vec![7u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.set_identity_mapper(Arc::new(
+            |user_id: &str, device_id: &str, member_id: &str| {
+                format!("mapped:{user_id}/{device_id}/{member_id}")
+            },
+        ));
+
+        manager.replay_keys_to_handler().await;
+
+        let identities = handler.identities();
+        assert!(
+            identities.contains(&format!("mapped:{USER_ID}/{DEVICE_ID}/{MEMBER_ID}")),
+            "our own key must replay under the mapped identity, got {identities:?}"
+        );
+        assert!(
+            identities
+                .contains(&"mapped:@bob:example.org/device456/bob-device456-uuid".to_string()),
+            "bob's key must replay under his mapped identity, not his member_id, got {identities:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_without_a_handler_is_a_no_op() {
+        let mock_sender = Arc::new(NoopCommandSender);
+        let get_memberships = create_mock_get_memberships(vec![]);
+        let manager = EncryptionManager::new(
+            mock_sender,
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        manager.join().await.expect("join should succeed");
+
+        // Must not panic on the missing handler.
+        manager.replay_keys_to_handler().await;
     }
 
     #[tokio::test]

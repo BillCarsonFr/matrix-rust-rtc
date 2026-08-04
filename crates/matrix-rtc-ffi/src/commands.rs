@@ -104,8 +104,17 @@ pub struct FfiJoinSessionParams {
     /// Transport types this member can receive on. Only read when `transport`
     /// is `None`; a publishing member advertises its own transport's type.
     pub can_subscribe: Vec<String>,
-    /// Optional keep-alive timeout in milliseconds (default: 30000)
+    /// Optional keep-alive timeout in milliseconds (default: 30000).
+    ///
+    /// Arms the delayed leave (the dead man's switch for a client that dies).
     pub keep_alive_timeout_ms: Option<u64>,
+    /// Optional sticky-map lifetime for our membership, in milliseconds
+    /// (default: 3600000).
+    ///
+    /// A different clock from `keep_alive_timeout_ms`: this is how long the
+    /// homeserver keeps the membership at all. The SDK re-sends the membership
+    /// at half this interval, so shortening it buys nothing but traffic.
+    pub sticky_duration_ms: Option<u64>,
     /// Optional encryption configuration
     pub encryption_config: Option<FfiEncryptionConfig>,
 }
@@ -212,6 +221,7 @@ impl FfiJoinSessionParams {
             application: self.application,
             transport,
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
+            sticky_duration_ms: self.sticky_duration_ms,
             encryption_config,
         })
     }
@@ -243,6 +253,12 @@ pub trait CommandSenderCallback: Send + Sync {
     /// * `event_type` - The wire event type (e.g., "org.matrix.msc4143.rtc.member");
     ///   send it verbatim, it is already translated for you
     /// * `content_json` - The event content as a JSON string
+    /// * `duration_ms` - How long the homeserver should keep this entry in the
+    ///   sticky map. Pass it through verbatim (matrix-rust-sdk:
+    ///   `.with_sticky_duration_ms(durationMs)`); do NOT substitute a value of
+    ///   your own. The SDK re-sends the membership before this elapses to stay
+    ///   in the call, so a shorter lifetime here silently drops the membership
+    ///   mid-call and a longer one leaves a ghost behind.
     ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
@@ -251,6 +267,7 @@ pub trait CommandSenderCallback: Send + Sync {
         room_id: String,
         event_type: String,
         content_json: String,
+        duration_ms: u64,
     ) -> Result<(), CommandSenderError>;
 
     /// Called when a delayed event needs to be scheduled.
@@ -374,6 +391,7 @@ impl RtcCommandSender for FfiCommandSender {
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError> {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
@@ -385,7 +403,7 @@ impl RtcCommandSender for FfiCommandSender {
         log_command(
             &what,
             self.callback
-                .send_sticky_event(room_id, wire_event_type, content_json)
+                .send_sticky_event(room_id, wire_event_type, content_json, duration_ms)
                 .map_err(CommandError::from),
         )
     }
@@ -482,6 +500,7 @@ mod tests {
     #[derive(Default)]
     struct MockCommandSenderCallback {
         sent_types: Mutex<Vec<String>>,
+        sticky_duration_ms: Mutex<Option<u64>>,
     }
 
     impl MockCommandSenderCallback {
@@ -500,8 +519,10 @@ mod tests {
             _room_id: String,
             event_type: String,
             _content_json: String,
+            duration_ms: u64,
         ) -> Result<(), CommandSenderError> {
             self.record(&event_type);
+            *self.sticky_duration_ms.lock().unwrap() = Some(duration_ms);
             Ok(())
         }
 
@@ -565,12 +586,16 @@ mod tests {
                     "slot_id": "m.call#ROOM",
                     "sticky_key": "alice-device-a"
                 }),
+                90_000,
             )
             .await;
 
         assert!(result.is_ok());
         // The host must see the unstable id: peers do not match on `m.rtc.member`.
         assert_eq!(mock.sent_types(), ["org.matrix.msc4143.rtc.member"]);
+        // The sticky lifetime must reach the host unchanged: the core schedules
+        // its refresh against exactly this number.
+        assert_eq!(*mock.sticky_duration_ms.lock().unwrap(), Some(90_000));
     }
 
     #[tokio::test]

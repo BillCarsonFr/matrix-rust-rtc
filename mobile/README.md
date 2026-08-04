@@ -99,6 +99,33 @@ plus third-party `livekit` and `webrtc_sys`.
 See the "Logging" section of [../ARCHITECTURE.md](../ARCHITECTURE.md) for the level
 conventions the SDK follows.
 
+## Staying in the call (keep-alive)
+
+Two independent clocks expire your membership, and the SDK now tends both for
+you. `join()` starts a keep-alive driver and `leave()` stops it — **there is
+nothing to call.**
+
+| Clock | Default | What the SDK does |
+| --- | --- | --- |
+| Delayed leave (dead man's switch) | 30 s | Cancels and reschedules it every 10 s |
+| Sticky-map entry for your membership | 1 h | Re-sends the membership once it is halfway to expiry |
+
+Both are configurable per join via `keepAliveTimeoutMs` and `stickyDurationMs`.
+Shortening `stickyDurationMs` buys nothing but extra traffic — the refresh
+interval is derived from it. Values above one hour are clamped, because servers
+clamp them too and the refresh has to stay ahead of the real expiry.
+
+Your `CommandSenderCallback.sendStickyEvent` now receives a `durationMs`
+argument. **Pass it through verbatim** — with matrix-rust-sdk that is
+`.with_sticky_duration_ms(durationMs)`. Substituting your own value breaks the
+refresh: shorter and the membership vanishes mid-call, longer and a ghost
+membership outlives a crash.
+
+If you would rather drive the keep-alive from your own scheduler (a foreground
+service, say), call `manager.heartbeat(roomId, slotId)` on your own cadence; it
+returns `false` when there is no joined session. The built-in driver runs
+regardless, so only reach for this if you need a different cadence.
+
 ## Diagnosing "the call connects but I see/hear nothing"
 
 Frames are produced at a fixed cadence whether or not RTP is arriving — an audio
