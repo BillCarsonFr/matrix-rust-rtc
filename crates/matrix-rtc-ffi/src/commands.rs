@@ -354,7 +354,9 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Arguments
     /// * `user_id` - The target user ID
-    /// * `device_id` - The target device ID (use "*" for all devices of the user)
+    /// * `device_id` - The target device ID. Always one device — send to exactly
+    ///   that device and do not widen it to the user's other devices; the SDK
+    ///   never asks for a fan-out.
     /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
     /// * `content_json` - The message content as a JSON string
     ///

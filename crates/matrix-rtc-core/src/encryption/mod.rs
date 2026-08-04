@@ -681,12 +681,25 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     async fn rollout_outbound_key(&self) -> Result<(), CommandError> {
         let current_memberships = (self.get_memberships.lock().unwrap())();
 
-        // Build list of current participants (excluding ourselves)
+        // Build the list of recipients: every membership but this device's.
+        //
+        // Matching on `member_id` alone is not enough. It is fresh on every join
+        // (MSC4143), so a stale membership of *our own* device — we died without
+        // leaving and rejoined inside its sticky lifetime — reads as a peer, and
+        // we would send our own key to ourselves. Olm has no session with the
+        // sending device, so that send fails; and because a repeat of our own
+        // user+device under a new `member_id` also trips `any_membership_changed`
+        // below, the ghost forces a rotation *and* breaks it, for as long as it
+        // stays visible.
+        //
+        // Other devices of our own user are ordinary recipients and stay.
         let current_participants: Vec<ParticipantDeviceInfo> = current_memberships
             .iter()
             .filter(|m| {
-                // Exclude ourselves - we don't send keys to ourselves
-                m.member_id != self.own_member_id
+                let is_this_join = m.member_id == self.own_member_id;
+                let is_this_device = m.sender == self.own_user_id
+                    && m.origin.sender_device_id() == Some(self.own_device_id.as_str());
+                !is_this_join && !is_this_device
             })
             .map(|m| ParticipantDeviceInfo {
                 user_id: m.sender.clone(),
@@ -799,13 +812,33 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // Send keys via to-device messages
         let key_b64 = general_purpose::STANDARD.encode(&outbound_key_to_use.key);
 
+        // One unreachable recipient must not abort the rollout. This loop used to
+        // `?`, which meant every later recipient got nothing *and* the block
+        // below never ran — so the new key was neither stored nor signalled and
+        // the rotation was silently abandoned while we kept using the old key.
+        //
+        // TODO: recipients are recorded in `shared_with` below whether or not
+        // their send succeeded, so a failure is never retried and that member
+        // cannot decrypt us for the rest of the call. Track delivery per
+        // recipient and re-attempt the failures on the next membership update.
         for participant in &to_distribute_to {
-            self.send_key_to_participant(
-                &key_b64,
-                outbound_key_to_use.key_index,
-                &participant.member_id,
-            )
-            .await?;
+            if let Err(error) = self
+                .send_key_to_participant(
+                    &key_b64,
+                    outbound_key_to_use.key_index,
+                    &participant.member_id,
+                )
+                .await
+            {
+                log::error!(
+                    "[{}/{}] Could not send key index {} to member {}: {error}. They will not be \
+                     able to decrypt our media.",
+                    self.room_id,
+                    self.slot_id,
+                    outbound_key_to_use.key_index,
+                    participant.member_id,
+                );
+            }
         }
 
         // Update or store the outbound key
@@ -912,13 +945,25 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         match target {
             Some(membership) => {
-                // Send to the specific user and device
-                let target_user_id = &membership.sender;
                 // MSC4143: key material goes to the device that encrypted the
-                // member event. Falling back to "*" (every device of that user)
-                // keeps cleartext-room sessions working; Olm still encrypts
-                // per-device, so this widens delivery, not readership.
-                let target_device_id = membership.origin.sender_device_id().unwrap_or("*");
+                // member event. There is deliberately no "*" fallback — sending
+                // to every device of that user hands the key to devices that are
+                // not in the call, and for our own user it includes this device,
+                // which Olm cannot encrypt to. A membership with no sending
+                // device is unreachable; say so and move on.
+                let target_user_id = &membership.sender;
+                let Some(target_device_id) = membership.origin.sender_device_id() else {
+                    log::warn!(
+                        "[{}/{}] Cannot send key to member {}: its member event names no sending \
+                         device, and we will not broadcast the key to every device of {}. Their \
+                         media will not decrypt for us.",
+                        self.room_id,
+                        self.slot_id,
+                        target_member_id,
+                        target_user_id,
+                    );
+                    return Ok(());
+                };
 
                 log::debug!(
                     "[{}/{}] Sending key to user={}, device={}",
@@ -1365,6 +1410,17 @@ mod tests {
         participants: Vec<JoinedMembership>,
     ) -> impl Fn() -> Vec<JoinedMembership> + Send + Sync + 'static {
         move || participants.clone()
+    }
+
+    /// Who a rollout actually addressed, in order.
+    fn to_device_recipients(sender: &MockCommandSender) -> Vec<(String, String)> {
+        sender
+            .to_device_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(user_id, device_id, _, _)| (user_id.clone(), device_id.clone()))
+            .collect()
     }
 
     /// Records what the media layer would have been told.
@@ -1928,5 +1984,232 @@ mod tests {
         // Verify state is cleaned up
         assert!(manager.get_outbound_key().is_none());
         assert!(manager.get_all_inbound_keys().is_empty());
+    }
+
+    /// A membership of our own device under a *different* `member_id` — the
+    /// ghost we leave behind by dying without leaving and rejoining inside its
+    /// sticky lifetime. It must not be treated as a recipient: Olm has no
+    /// session with the sending device, so the send fails, and the same
+    /// user+device under a new id also forces a rotation — which the failure
+    /// would then abandon.
+    #[tokio::test]
+    async fn our_own_stale_membership_is_never_a_key_recipient() {
+        let ghost = JoinedMembership {
+            member_id: "alice-device123-previous-join".to_string(),
+            sticky_key: "alice-device123-previous-join".to_string(),
+            sender: USER_ID.to_string(),
+            origin: EventOrigin::encrypted(Some(DEVICE_ID.to_string())),
+            ..bob_membership()
+        };
+        let mock_sender = Arc::new(MockCommandSender::new());
+        let get_memberships = create_mock_get_memberships(vec![ghost, bob_membership()]);
+        let manager = EncryptionManager::new(
+            mock_sender.clone(),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("distribution should succeed");
+
+        assert!(
+            to_device_recipients(&mock_sender)
+                .iter()
+                .all(|(user_id, device_id)| !(user_id == USER_ID && device_id == DEVICE_ID)),
+            "we must never send our own media key to our own device, got {:?}",
+            to_device_recipients(&mock_sender),
+        );
+        assert_eq!(
+            to_device_recipients(&mock_sender),
+            vec![("@bob:example.org".to_string(), "device456".to_string())],
+            "bob is the only real recipient",
+        );
+    }
+
+    /// Another device of our own user is an ordinary recipient — only *this*
+    /// device is excluded.
+    #[tokio::test]
+    async fn another_device_of_our_own_user_still_receives_the_key() {
+        let other_device = JoinedMembership {
+            member_id: "alice-tablet-uuid".to_string(),
+            sticky_key: "alice-tablet-uuid".to_string(),
+            sender: USER_ID.to_string(),
+            origin: EventOrigin::encrypted(Some("TABLET".to_string())),
+            ..bob_membership()
+        };
+        let mock_sender = Arc::new(MockCommandSender::new());
+        let get_memberships = create_mock_get_memberships(vec![other_device]);
+        let manager = EncryptionManager::new(
+            mock_sender.clone(),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("distribution should succeed");
+
+        assert_eq!(
+            to_device_recipients(&mock_sender),
+            vec![(USER_ID.to_string(), "TABLET".to_string())],
+        );
+    }
+
+    /// No `"*"` fallback: a membership that names no sending device is
+    /// unreachable, and broadcasting the key to every device of that user would
+    /// hand it to devices that are not in the call.
+    #[tokio::test]
+    async fn a_membership_with_no_sending_device_is_skipped_not_broadcast() {
+        let deviceless = JoinedMembership {
+            origin: EventOrigin::encrypted(None),
+            ..bob_membership()
+        };
+        let mock_sender = Arc::new(MockCommandSender::new());
+        let get_memberships = create_mock_get_memberships(vec![deviceless]);
+        let manager = EncryptionManager::new(
+            mock_sender.clone(),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("distribution should succeed");
+
+        assert!(
+            to_device_recipients(&mock_sender).is_empty(),
+            "expected no send at all, got {:?}",
+            to_device_recipients(&mock_sender),
+        );
+    }
+
+    /// One unreachable recipient must not cost the others their key, and must
+    /// not abandon the rotation: the key still has to be stored and signalled.
+    #[tokio::test]
+    async fn a_failed_recipient_does_not_abort_the_rollout() {
+        struct FailsFirstRecipient {
+            attempted: Mutex<Vec<String>>,
+        }
+
+        #[async_trait(?Send)]
+        impl RtcCommandSender for FailsFirstRecipient {
+            async fn send_sticky_event(
+                &self,
+                _room_id: String,
+                _event_type: String,
+                _content: serde_json::Value,
+                _duration_ms: u64,
+            ) -> Result<(), CommandError> {
+                Ok(())
+            }
+            async fn send_delayed_event(
+                &self,
+                _room_id: String,
+                _event_type: String,
+                _content: serde_json::Value,
+                _delay_ms: u64,
+            ) -> Result<String, CommandError> {
+                Ok("$delay".to_string())
+            }
+            async fn restart_delayed_event(
+                &self,
+                _room_id: String,
+                _event_id: String,
+            ) -> Result<(), CommandError> {
+                Ok(())
+            }
+            async fn cancel_delayed_event(
+                &self,
+                _room_id: String,
+                _event_id: String,
+            ) -> Result<(), CommandError> {
+                Ok(())
+            }
+            async fn send_to_device_message(
+                &self,
+                user_id: String,
+                _device_id: String,
+                _message_type: String,
+                _content: serde_json::Value,
+            ) -> Result<(), CommandError> {
+                self.attempted.lock().unwrap().push(user_id.clone());
+                if user_id == "@bob:example.org" {
+                    Err(CommandError::from_message("no olm session"))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn send_state_event(
+                &self,
+                _room_id: String,
+                _event_type: String,
+                _state_key: String,
+                _content: serde_json::Value,
+            ) -> Result<(), CommandError> {
+                Ok(())
+            }
+        }
+
+        let carol = JoinedMembership {
+            member_id: "carol-device789-uuid".to_string(),
+            sticky_key: "carol-device789-uuid".to_string(),
+            sender: "@carol:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("device789".to_string())),
+            ..bob_membership()
+        };
+        let sender = Arc::new(FailsFirstRecipient {
+            attempted: Mutex::new(Vec::new()),
+        });
+        let handler = Arc::new(RecordingHandler::default());
+        let get_memberships = create_mock_get_memberships(vec![bob_membership(), carol]);
+        let mut manager = EncryptionManager::new(
+            sender.clone(),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        manager.set_signal_handler(handler.clone());
+
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("a failed recipient must not fail the rollout");
+
+        assert_eq!(
+            *sender.attempted.lock().unwrap(),
+            vec!["@bob:example.org", "@carol:example.org"],
+            "carol must still be attempted after bob failed",
+        );
+        assert!(
+            manager.get_outbound_key().is_some(),
+            "the key must still be stored, or we rotate again next update and never converge",
+        );
+        assert!(
+            !handler.signals.lock().unwrap().is_empty(),
+            "the key must still reach the media layer, or we encrypt with nothing",
+        );
     }
 }

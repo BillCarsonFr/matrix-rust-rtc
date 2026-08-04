@@ -256,8 +256,10 @@ impl RtcCommandSender for SdkCommandSender {
         let user = UserId::parse(&user_id).map_err(command_error)?;
         let encryption = self.client.encryption();
 
-        // Resolve the recipient devices. `"*"` (used by the core to target every
-        // device of a user) fans out to all of the user's known devices.
+        // Resolve the recipient devices. The core always names a single device —
+        // it no longer falls back to `"*"`, which would have handed media keys to
+        // devices outside the call — so this fan-out survives only for other
+        // callers of the trait.
         let devices: Vec<Device> = if device_id == "*" {
             encryption
                 .get_user_devices(&user)

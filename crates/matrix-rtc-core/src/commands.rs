@@ -134,7 +134,11 @@ pub trait RtcCommandSender: Send + Sync {
     /// # Arguments
     ///
     /// * `user_id` - The target user ID
-    /// * `device_id` - The target device ID (use "*" for all devices of the user)
+    /// * `device_id` - The target device ID. Always a single device: media keys
+    ///   go to the device that published the membership, and the SDK never asks
+    ///   for a fan-out to every device of a user (that would hand the key to
+    ///   devices outside the call, and for our own user to this very device,
+    ///   which Olm cannot encrypt to).
     /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
     /// * `content` - The message content as a JSON value
     ///

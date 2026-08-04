@@ -100,6 +100,25 @@ compile errors, not silent behaviour changes.
   and because MSC4354 resolves sticky conflicts by *last to expire*, that leave
   out-expires the live membership and shows the user as having left a call they
   are still in.
+- **We could try to send our own media key to our own device.** The recipient
+  filter excluded us by `member.id`, which is fresh per join — so a stale
+  membership of our own device (crash without leaving, rejoin inside its sticky
+  lifetime) read as a peer. Olm has no session with the sending device, so that
+  send failed; and since our own user+device under a new `member.id` also forces
+  a key rotation, the ghost forced rotations and broke them for as long as it
+  stayed visible. The filter now matches on user + device. Other devices of our
+  own user remain ordinary recipients.
+- **Media keys are no longer broadcast to every device of a user.** A membership
+  that named no sending device fell back to `"*"`, which hands the key to devices
+  that are not in the call — and, for our own user, to this device. Such a
+  membership is now logged and skipped.
+- **One unreachable recipient no longer abandons a key rotation.** Distribution
+  stopped at the first failing send, so later recipients got nothing *and* the
+  new key was never stored or signalled: we kept encrypting with the old key and
+  the rotation vanished silently. Failures are now logged per recipient and the
+  rollout continues. (Recipients are still recorded as shared with regardless of
+  outcome, so a failed send is not retried — see the `TODO` in
+  `encryption/mod.rs`.)
 - **`leave()` failed when the delayed leave had already fired.** The 404 from
   cancelling an expired delay aborted the leave after the leave event had
   already been sent, leaving the state machine stuck in `Leaving`. Cancellation
