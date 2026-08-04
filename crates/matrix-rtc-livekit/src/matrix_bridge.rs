@@ -34,7 +34,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, update_delayed_event,
@@ -252,50 +251,31 @@ impl RtcCommandSender for SdkCommandSender {
         content: Value,
     ) -> Result<(), CommandError> {
         // MSC4143 encryption-key distribution: send the media key as an
-        // Olm-encrypted to-device message to the target device(s).
+        // Olm-encrypted to-device message to exactly one device — the one that
+        // published the membership. There is deliberately no `"*"` fan-out: media
+        // keys must not reach devices that are not in the call, and for our own
+        // user a fan-out would include this device, which Olm cannot encrypt to.
         let user = UserId::parse(&user_id).map_err(command_error)?;
         let encryption = self.client.encryption();
 
-        // Resolve the recipient devices. The core always names a single device —
-        // it no longer falls back to `"*"`, which would have handed media keys to
-        // devices outside the call — so this fan-out survives only for other
-        // callers of the trait.
-        let devices: Vec<Device> = if device_id == "*" {
-            encryption
-                .get_user_devices(&user)
-                .await
-                .map_err(command_error)?
-                .devices()
-                .collect()
-        } else {
-            let dev_id = <&DeviceId>::from(device_id.as_str());
-            match encryption
-                .get_device(&user, dev_id)
-                .await
-                .map_err(command_error)?
-            {
-                Some(device) => vec![device],
-                None => {
-                    log::warn!(
-                        "no known device {device_id} for {user_id}; dropping to-device \
-                         {message_type}"
-                    );
-                    return Ok(());
-                }
-            }
-        };
-        if devices.is_empty() {
-            log::warn!("no devices to send to-device {message_type} to {user_id}");
+        let dev_id = <&DeviceId>::from(device_id.as_str());
+        let Some(device) = encryption
+            .get_device(&user, dev_id)
+            .await
+            .map_err(command_error)?
+        else {
+            log::warn!(
+                "no known device {device_id} for {user_id}; dropping to-device {message_type}"
+            );
             return Ok(());
-        }
-        let recipients: Vec<&Device> = devices.iter().collect();
+        };
 
         let raw: Raw<AnyToDeviceEventContent> =
             Raw::new(&content).map_err(command_error)?.cast_unchecked();
 
         let failures = encryption
             .encrypt_and_send_raw_to_device(
-                recipients,
+                vec![&device],
                 &message_type,
                 raw,
                 // `AllDevices` sends to every device regardless of verification/cross-

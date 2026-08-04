@@ -111,7 +111,9 @@ compile errors, not silent behaviour changes.
 - **Media keys are no longer broadcast to every device of a user.** A membership
   that named no sending device fell back to `"*"`, which hands the key to devices
   that are not in the call — and, for our own user, to this device. Such a
-  membership is now logged and skipped.
+  membership is now logged and skipped, and the matrix-rust-sdk bridge no longer
+  implements a `"*"` fan-out at all: `sendToDeviceMessage` always names exactly
+  one device, and a host implementation must not widen it.
 - **One unreachable recipient no longer abandons a key rotation.** Distribution
   stopped at the first failing send, so later recipients got nothing *and* the
   new key was never stored or signalled: we kept encrypting with the old key and

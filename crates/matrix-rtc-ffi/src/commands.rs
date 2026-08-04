@@ -692,7 +692,7 @@ mod tests {
         command_sender
             .send_to_device_message(
                 "@bob:example.org".to_string(),
-                "*".to_string(),
+                "device456".to_string(),
                 matrix_rtc_core::KEY_MESSAGE_TYPE.to_string(),
                 serde_json::json!({ "key": "…" }),
             )
