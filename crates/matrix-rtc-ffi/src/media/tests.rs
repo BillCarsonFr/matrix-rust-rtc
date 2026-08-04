@@ -114,7 +114,6 @@ fn config() -> MediaSessionConfig {
     MediaSessionConfig {
         room_id: "!room:example.org".to_owned(),
         slot_id: "m.call#ROOM".to_owned(),
-        member_id: "member-1".to_owned(),
         user_id: "@alice:example.org".to_owned(),
         device_id: "DEVICE".to_owned(),
         livekit_service_url: DEAD_SFU_URL.to_owned(),
@@ -143,7 +142,6 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
         .join(FfiJoinSessionParams {
             user_id: "@alice:example.org".to_owned(),
             device_id: "DEVICE".to_owned(),
-            membership_id: Some("member-1".to_owned()),
             room_id: "!room:example.org".to_owned(),
             slot_id: "m.call#ROOM".to_owned(),
             application: "m.call".to_owned(),

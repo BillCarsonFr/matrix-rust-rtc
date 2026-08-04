@@ -30,6 +30,9 @@
 //!    bridge into the core, starts the transport-agnostic `CallEngine`
 //!    (which opens connections to every peer's focus — MSC4195 multi-SFU),
 //!    and connects the own-focus SFU with per-participant frame encryption.
+//!    It reads the `member.id` from that join rather than taking one from the
+//!    host — our MSC4195 participant identity is derived from it, so the two
+//!    must not be able to disagree.
 //! 3. The host consumes [`MediaSession`]: the unified event stream
 //!    (`next_event`, bridged to Kotlin `Flow` / Swift `AsyncStream`), the
 //!    participant roster, per-stream constraints, frame streams

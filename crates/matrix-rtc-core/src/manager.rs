@@ -402,6 +402,19 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             .is_some_and(|session| session.set_encryption_signal_handler(handler))
     }
 
+    /// Our `member.id` in one `(room_id, slot_id)` session, or `None` if there
+    /// is no such session or it has not joined.
+    ///
+    /// See [`RtcSession::own_member_id`]: it changes on every join, so read it
+    /// rather than cache it.
+    pub fn own_member_id(&self, room_id: &str, slot_id: &str) -> Option<String> {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get(&key)
+            .and_then(|session| session.own_member_id())
+            .map(str::to_owned)
+    }
+
     /// Re-signals every key one session already holds to its signal handler.
     ///
     /// Call after installing both the handler and the identity mapper: keys

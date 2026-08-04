@@ -47,9 +47,6 @@ use crate::RtcSessionManagerHandle;
 pub struct MediaSessionConfig {
     pub room_id: String,
     pub slot_id: String,
-    /// The `member.id` this device joined the slot with — the same value
-    /// passed as `membership_id` in the join params.
-    pub member_id: String,
     pub user_id: String,
     pub device_id: String,
     /// The MSC4195 authorisation-service URL of the focus we publish on —
@@ -63,8 +60,8 @@ pub struct MediaSessionConfig {
 /// own-focus SFU with per-participant frame E2EE.
 ///
 /// Preconditions: the manager has a command sender, the host feeds it sticky
-/// events/room state, and `join` succeeded for this room/slot with
-/// `membership_id = config.member_id`.
+/// events/room state, and `join` succeeded for this room/slot. The `member.id`
+/// comes from that join — the host neither chooses nor passes it.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn connect_media_session(
     manager: Arc<RtcSessionManagerHandle>,
@@ -86,10 +83,9 @@ async fn build_media_session(
     token_provider: Arc<dyn OpenIdTokenProvider>,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
     log::info!(
-        "media: connecting [{}/{}] member={} user={} device={} focus={}",
+        "media: connecting [{}/{}] user={} device={} focus={}",
         config.room_id,
         config.slot_id,
-        config.member_id,
         config.user_id,
         config.device_id,
         config.livekit_service_url,
@@ -105,9 +101,26 @@ async fn build_media_session(
     // identity derivation, and take the membership snapshot channel the
     // engine consumes. All sync — the manager mutex is never held across an
     // await.
-    let memberships = {
+    let (memberships, member_id) = {
         let mut mgr =
             crate::lock_mutex(&manager.inner).map_err(|_| MediaFfiError::InternalLockPoisoned)?;
+        // Read the `member.id` from the join rather than taking one from the
+        // host: it is what our MSC4195 participant identity is derived from, so
+        // a value that disagrees with the published membership would put our
+        // media on an identity no peer holds a key for.
+        let member_id = mgr
+            .own_member_id(&config.room_id, &config.slot_id)
+            .ok_or_else(|| {
+                log::warn!(
+                    "media: [{}/{}] has not joined — join the slot before connecting media",
+                    config.room_id,
+                    config.slot_id,
+                );
+                MediaFfiError::NotJoined(format!(
+                    "{}/{} has not joined — join the slot first",
+                    config.room_id, config.slot_id
+                ))
+            })?;
         let memberships = mgr
             .subscribe_membership_snapshots(&config.room_id, &config.slot_id)
             .ok_or_else(|| {
@@ -142,7 +155,7 @@ async fn build_media_session(
             ));
         }
 
-        memberships
+        (memberships, member_id)
     };
 
     let transport = Arc::new(LiveKitMediaTransport::new(
@@ -154,7 +167,7 @@ async fn build_media_session(
         room_id: config.room_id.clone(),
         slot_id: config.slot_id.clone(),
         member: OwnMemberClaims {
-            member_id: config.member_id.clone(),
+            member_id: member_id.clone(),
             user_id: config.user_id.clone(),
             device_id: config.device_id.clone(),
         },
@@ -162,7 +175,7 @@ async fn build_media_session(
     let engine = CallEngine::new(
         EngineConfig {
             transports: vec![transport.clone()],
-            own_member_id: config.member_id.clone(),
+            own_member_id: member_id.clone(),
             ctx: ctx.clone(),
             own_connection_key: Some(config.livekit_service_url.clone()),
         },
@@ -212,9 +225,9 @@ async fn build_media_session(
     engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
     let events = engine.subscribe_events();
-    let own_identity = pseudonymous_identity(&config.user_id, &config.device_id, &config.member_id);
+    let own_identity = pseudonymous_identity(&config.user_id, &config.device_id, &member_id);
 
-    log::info!("media: connected, local identity {own_identity}");
+    log::info!("media: connected as member {member_id}, local identity {own_identity}");
 
     Ok(Arc::new(MediaSession {
         engine,

@@ -419,13 +419,19 @@ impl RtcSessionHandle {
         }))
     }
 
-    pub fn join(&self, params: FfiJoinSessionParams) -> Result<(), MatrixRtcFfiError> {
+    /// Joins the session, returning the `member.id` it joined as.
+    ///
+    /// See [`RtcSessionManagerHandle::join`] for why the SDK generates this
+    /// rather than accepting one.
+    pub fn join(&self, params: FfiJoinSessionParams) -> Result<String, MatrixRtcFfiError> {
         log::info!("session: join requested {}", params.summary());
 
-        let core_params = params.into_core().map_err(|e| {
+        let mut core_params = params.into_core().map_err(|e| {
             log::warn!("session: join rejected before it started: {e}");
             MatrixRtcFfiError::InvalidInput(e.to_string())
         })?;
+        let member_id = matrix_rtc_core::generate_member_id();
+        core_params.membership_id = Some(member_id.clone());
 
         // Hold the guard across the join. Not "completes immediately" as this
         // once assumed: the core awaits a `delayBeforeUse` timer whenever it
@@ -445,10 +451,16 @@ impl RtcSessionHandle {
         });
 
         if result.is_ok() {
-            log::info!("session: join succeeded");
+            log::info!("session: join succeeded as {member_id}");
         }
 
-        result
+        result.map(|()| member_id)
+    }
+
+    /// Our `member.id` for the current join, or `None` while not joined.
+    pub fn own_member_id(&self) -> Result<Option<String>, MatrixRtcFfiError> {
+        let session = lock_mutex(&self.inner)?;
+        Ok(session.own_member_id().map(str::to_owned))
     }
 
     pub fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
@@ -735,17 +747,32 @@ impl RtcSessionManagerHandle {
             .map(|count| count as u64))
     }
 
-    pub fn join(&self, params: FfiJoinSessionParams) -> Result<(), MatrixRtcFfiError> {
+    /// Joins a session, returning the `member.id` it joined as.
+    ///
+    /// The SDK generates that id; hosts do not supply one. MSC4143 requires a
+    /// fresh `member.id` on every join, and reusing one is silently destructive:
+    /// the MSC4195 participant identity is derived from it, so a repeat join
+    /// keeps the identity peers already hold a key for while our key index
+    /// restarts at 0 — every peer then decrypts our media with the previous
+    /// call's key and never recovers.
+    ///
+    /// Hosts that need the id later (nothing in this API does — see
+    /// [`connect_media_session`](crate::media::connect_media_session)) can read
+    /// it back with [`Self::own_member_id`] instead of storing it, which cannot
+    /// go stale across a rejoin.
+    pub fn join(&self, params: FfiJoinSessionParams) -> Result<String, MatrixRtcFfiError> {
         log::info!("manager: join requested {}", params.summary());
 
         // Kept for the keep-alive driver, which outlives `params`.
         let room_id = params.room_id.clone();
         let slot_id = params.slot_id.clone();
 
-        let core_params = params.into_core().map_err(|e| {
+        let mut core_params = params.into_core().map_err(|e| {
             log::warn!("manager: join rejected before it started: {e}");
             MatrixRtcFfiError::InvalidInput(e.to_string())
         })?;
+        let member_id = matrix_rtc_core::generate_member_id();
+        core_params.membership_id = Some(member_id.clone());
 
         // Hold the guard across the join, rather than swapping a placeholder
         // `RtcSessionManager::new()` in and unlocking for the duration. That
@@ -769,7 +796,7 @@ impl RtcSessionManagerHandle {
         });
 
         if result.is_ok() {
-            log::info!("manager: join succeeded");
+            log::info!("manager: join succeeded as {member_id}");
             // Drop the manager lock before starting the driver: its first act
             // is to try_lock, and holding it here would make that first tick a
             // guaranteed skip.
@@ -777,7 +804,21 @@ impl RtcSessionManagerHandle {
             self.start_heartbeat(room_id, slot_id);
         }
 
-        result
+        result.map(|()| member_id)
+    }
+
+    /// Our `member.id` in one session, or `None` if there is no such session or
+    /// it has not joined.
+    ///
+    /// Changes on every join (MSC4143), so read it when needed rather than
+    /// caching what [`Self::join`] returned.
+    pub fn own_member_id(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<Option<String>, MatrixRtcFfiError> {
+        let manager = lock_mutex(&self.inner)?;
+        Ok(manager.own_member_id(&room_id, &slot_id))
     }
 
     /// Restarts the keep-alive for one session: reschedules the delayed leave,

@@ -481,6 +481,19 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         self.members.len()
     }
 
+    /// Our `member.id` for the current join, or `None` while not joined.
+    ///
+    /// MSC4143 requires a fresh one on every join, so this changes across a
+    /// leave/rejoin and must not be cached by the caller. Consumers that need
+    /// it — the media layer derives its MSC4195 participant identity from it —
+    /// should read it here rather than supply one, so it cannot drift from the
+    /// value the membership was actually published under.
+    pub fn own_member_id(&self) -> Option<&str> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| machine.sticky_key())
+    }
+
     /// Subscribes to full membership snapshots for this session as a watch receiver.
     ///
     /// This is used by bindings that implement their own polling/callback model.

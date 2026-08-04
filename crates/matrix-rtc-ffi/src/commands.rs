@@ -90,8 +90,6 @@ pub struct FfiJoinSessionParams {
     pub user_id: String,
     /// Device ID
     pub device_id: String,
-    /// Optional sticky key, defaults to "{user_id}-{device_id}"
-    pub membership_id: Option<String>,
     /// Room ID
     pub room_id: String,
     /// Slot ID (e.g., "m.call#ROOM")
@@ -189,13 +187,12 @@ impl FfiJoinSessionParams {
         };
 
         format!(
-            "[{}/{}] user={} device={} application={} membership_id={:?} transport={} keep_alive={:?}ms encryption={}",
+            "[{}/{}] user={} device={} application={} transport={} keep_alive={:?}ms encryption={}",
             self.room_id,
             self.slot_id,
             self.user_id,
             self.device_id,
             self.application,
-            self.membership_id,
             transport,
             self.keep_alive_timeout_ms,
             self.encryption_config.is_some(),
@@ -215,7 +212,12 @@ impl FfiJoinSessionParams {
         Ok(matrix_rtc_core::JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
-            membership_id: self.membership_id,
+            // Filled in by the join entry points, which generate a fresh id per
+            // join and return it: a host-chosen `member.id` reused across joins
+            // keeps the MSC4195 participant identity stable while the key index
+            // restarts at 0, so peers decrypt new media with a stale key and
+            // never recover. The SDK owns it so that is not expressible.
+            membership_id: None,
             room_id: self.room_id,
             slot_id: self.slot_id,
             application: self.application,
@@ -710,6 +712,63 @@ mod tests {
         assert_eq!(
             wire_type("com.example.custom".to_owned()),
             "com.example.custom"
+        );
+    }
+
+    fn join_params() -> FfiJoinSessionParams {
+        FfiJoinSessionParams {
+            user_id: "@alice:example.org".to_owned(),
+            device_id: "DEVICE".to_owned(),
+            room_id: "!room:example.org".to_owned(),
+            slot_id: "m.call#ROOM".to_owned(),
+            application: "m.call".to_owned(),
+            transport: Some(FfiTransportConfig {
+                r#type: "livekit".to_owned(),
+                livekit_service_url: Some("https://sfu.example.org".to_owned()),
+            }),
+            can_subscribe: Vec::new(),
+            keep_alive_timeout_ms: None,
+            sticky_duration_ms: None,
+            encryption_config: None,
+        }
+    }
+
+    /// The SDK owns the `member.id`, and a rejoin must not reuse the previous
+    /// one. Reuse keeps the MSC4195 participant identity stable while our key
+    /// index restarts at 0, so every peer decrypts the new call's media with the
+    /// old call's key and never recovers — which is why hosts cannot supply one.
+    #[test]
+    fn every_join_gets_a_fresh_member_id() {
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Box::new(MockCommandSenderCallback::default()))
+            .expect("the mock sender should be accepted");
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+
+        let first = manager.join(join_params()).expect("first join");
+        assert_eq!(
+            manager
+                .own_member_id(room_id.clone(), slot_id.clone())
+                .expect("the call itself should succeed"),
+            Some(first.clone()),
+            "the id returned by join must be the one the membership was published under",
+        );
+
+        manager
+            .leave(
+                room_id.clone(),
+                slot_id.clone(),
+                FfiLeaveSessionParams { leave_reason: None },
+            )
+            .expect("leave");
+        let second = manager.join(join_params()).expect("rejoin");
+
+        assert_ne!(first, second, "a rejoin must not reuse the member id");
+        assert_eq!(
+            manager
+                .own_member_id(room_id, slot_id)
+                .expect("the call itself should succeed"),
+            Some(second),
         );
     }
 }

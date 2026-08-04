@@ -23,6 +23,15 @@ compile errors, not silent behaviour changes.
   Implement it as `update_delayed_event` with `UpdateAction.Restart` (MSC4140's
   "heartbeat ping"). Do *not* implement it as cancel-then-reschedule; see
   Fixed below for why.
+- **The SDK now owns the `member.id`.** `FfiJoinSessionParams.membershipId` and
+  `MediaSessionConfig.memberId` are gone; `join` returns the id it generated, and
+  `connect_media_session` reads it from the join. Drop both fields and use the
+  return value (or `ownMemberId(roomId, slotId)`, which cannot go stale).
+  A host-chosen id was silently destructive when reused across joins: the
+  MSC4195 participant identity is derived from it, so a rejoin kept the identity
+  peers already held a key for while our key index restarted at 0 — every peer
+  then decrypted our media with the previous call's key and never recovered.
+  MSC4143 requires a fresh id per join, and nothing validated that.
 - **`FfiCallEvent` gained a `FrameEncryptionState` variant.** uniffi generates
   the enum as a sealed class, so exhaustive `when` blocks without an `else` need
   a new arm.
@@ -30,6 +39,8 @@ compile errors, not silent behaviour changes.
   default.
 - WASM hosts: the JS client must implement `restartDelayedEvent(roomId,
   eventId)` and accept the new `durationMs` argument on `sendStickyEvent`.
+  `join` no longer accepts `membership_id` and now resolves to the generated
+  `member.id`; `ownMemberId(...)` reads it back.
 - Android media builds must call `MatrixRtc.initialize()` before touching any
   FFI object. Required only for the media AAR (the slim signalling-only build
   loads fine through JNA); harmless to call either way.
@@ -53,6 +64,8 @@ compile errors, not silent behaviour changes.
 - `MatrixRtc.initialize()` on Android owns native library loading, so
   libwebrtc's `JNI_OnLoad` runs.
 - `Call::receive_stats` for parity on the native Rust facade.
+- `ownMemberId` on the manager and session handles (FFI and WASM), and
+  `RtcSession::own_member_id` / `RtcSessionManager::own_member_id` in the core.
 - `scripts/build-android-aar.sh` now fails the build if a produced `.so`
   exports no `Java_livekit_org_webrtc*` symbols.
 
