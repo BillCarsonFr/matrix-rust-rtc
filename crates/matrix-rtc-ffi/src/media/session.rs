@@ -36,8 +36,8 @@ use matrix_rtc_media::{
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
-    FfiCallEvent, FfiMediaConstraints, FfiParticipant, FfiPublishOptions, FfiStreamKind,
-    OpenIdTokenProvider, TokenProviderAdapter,
+    FfiCallEvent, FfiMediaConstraints, FfiParticipant, FfiPublishOptions, FfiReceiveStats,
+    FfiStreamKind, OpenIdTokenProvider, TokenProviderAdapter,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcSessionManagerHandle;
@@ -283,6 +283,24 @@ impl MediaSession {
     ) -> Option<Arc<VideoFrameStream>> {
         let track = self.engine.remote_track(&member_id, kind.into())?;
         Some(Arc::new(VideoFrameStream::new(track.video_frames()?)))
+    }
+
+    /// Cumulative receive-side RTP counters for a participant's stream.
+    ///
+    /// `null` while that stream is not subscribed, or before the first RTCP
+    /// report has arrived. This is the only way to tell "no RTP arriving" from
+    /// "RTP arriving that does not decode": the receive path fabricates frames
+    /// at a fixed cadence either way. See [`FfiReceiveStats`] for how to read
+    /// the counters — they are totals, so sample twice and compare.
+    pub async fn receive_stats(
+        &self,
+        member_id: String,
+        kind: FfiStreamKind,
+    ) -> Option<FfiReceiveStats> {
+        self.engine
+            .receive_stats(&member_id, kind.into())
+            .await
+            .map(Into::into)
     }
 
     /// Publish a local track on our focus; push captured frames into the

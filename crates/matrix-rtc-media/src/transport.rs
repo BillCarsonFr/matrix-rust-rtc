@@ -40,9 +40,11 @@ use matrix_rtc_core::{JoinedMembership, RtcTransport};
 use tokio::sync::mpsc;
 
 use crate::constraints::ResolvedConstraints;
+use crate::event::FrameEncryptionState;
 use crate::frame::{AudioFrame, VideoFrame};
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::MediaStreamKind;
+use crate::stats::ReceiveStats;
 
 /// Errors produced by media transports.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +82,7 @@ pub struct ConnectionContext {
 ///
 /// Handles are cheap `Arc`s; a stream borrows nothing — dropping it stops
 /// frame delivery for that consumer only.
+#[async_trait]
 pub trait RemoteTrackHandle: Send + Sync {
     fn kind(&self) -> MediaStreamKind;
 
@@ -91,6 +94,16 @@ pub trait RemoteTrackHandle: Send + Sync {
     /// A stream of decoded video frames, for video tracks. Delivery is
     /// latest-frame-wins: slow consumers drop frames instead of buffering.
     fn video_frames(&self) -> Option<BoxStream<'static, VideoFrame>> {
+        None
+    }
+
+    /// Cumulative receive-side RTP counters for this track.
+    ///
+    /// `None` from a transport whose RTP layer exposes no counters; the
+    /// default. Because frames are produced whether or not RTP arrives, this
+    /// is the only way a caller can tell a dead network path from a decrypt
+    /// failure — see [`ReceiveStats`].
+    async fn receive_stats(&self) -> Option<ReceiveStats> {
         None
     }
 }
@@ -127,6 +140,11 @@ pub enum ConnectionEvent {
     },
     ActiveSpeakers {
         identities: Vec<String>,
+    },
+    /// The frame cryptor's verdict on this participant's media changed.
+    EncryptionStateChanged {
+        identity: String,
+        state: FrameEncryptionState,
     },
     /// The connection lost its transport link and is re-establishing it.
     Reconnecting,
@@ -171,6 +189,11 @@ impl fmt::Debug for ConnectionEvent {
             Self::ActiveSpeakers { identities } => f
                 .debug_struct("ActiveSpeakers")
                 .field("identities", identities)
+                .finish(),
+            Self::EncryptionStateChanged { identity, state } => f
+                .debug_struct("EncryptionStateChanged")
+                .field("identity", identity)
+                .field("state", state)
                 .finish(),
             Self::Reconnecting => f.write_str("Reconnecting"),
             Self::Reconnected => f.write_str("Reconnected"),

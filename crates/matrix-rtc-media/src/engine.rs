@@ -60,6 +60,7 @@ use crate::constraints::MediaConstraints;
 use crate::event::{CallEvent, EndedReason};
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
+use crate::stats::ReceiveStats;
 use crate::transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
     TransportError,
@@ -357,6 +358,24 @@ impl CallEngine {
             .expect("track map mutex poisoned")
             .get(&(member_id.to_owned(), kind))
             .cloned()
+    }
+
+    /// Receive-side RTP counters for a participant's stream.
+    ///
+    /// `None` while no such stream is subscribed, or when the transport
+    /// reports no counters. Because the receive path emits frames whether or
+    /// not RTP arrives, this is how a caller distinguishes "nothing is
+    /// arriving" from "arriving but not decoding" — sample twice and compare,
+    /// the fields are cumulative totals. See [`ReceiveStats`].
+    pub async fn receive_stats(
+        &self,
+        member_id: &str,
+        kind: MediaStreamKind,
+    ) -> Option<ReceiveStats> {
+        // `remote_track` hands back an owned `Arc`, so the track-map lock is
+        // released before the transport's (potentially slow) stats round trip.
+        let track = self.remote_track(member_id, kind)?;
+        track.receive_stats().await
     }
 
     /// Emit [`CallEvent::Ended`] and close every pooled peer-focus connection.
@@ -1005,6 +1024,23 @@ impl Actor {
                     .collect();
                 self.emit(CallEvent::ActiveSpeakers { member_ids });
             }
+            ConnectionEvent::EncryptionStateChanged { identity, state } => {
+                match self.identity_map.get(&identity).cloned() {
+                    Some(member_id) => {
+                        if state.is_failure() {
+                            log::warn!("frame encryption for {member_id} is {state:?}");
+                        }
+                        self.emit(CallEvent::FrameEncryptionState { member_id, state });
+                    }
+                    None => {
+                        // No membership to attribute it to; `UnknownParticipant`
+                        // already covers that case on its own.
+                        log::debug!(
+                            "encryption state {state:?} for unmapped identity {identity} on {connection_key}"
+                        );
+                    }
+                }
+            }
             ConnectionEvent::Reconnecting => self.mark_degraded(connection_key),
             ConnectionEvent::Reconnected => {
                 self.clear_degraded(connection_key);
@@ -1304,6 +1340,8 @@ mod tests {
     use futures_core::stream::BoxStream;
     use futures_util::StreamExt;
     use matrix_rtc_core::{EventOrigin, LiveKitTransport, RtcTransport};
+
+    use crate::event::FrameEncryptionState;
     use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
@@ -1438,8 +1476,18 @@ mod tests {
 
     struct FakeTrack {
         kind: MediaStreamKind,
+        /// What `receive_stats` reports; `None` models a transport with no
+        /// counters (the trait default).
+        stats: Option<ReceiveStats>,
     }
 
+    impl FakeTrack {
+        fn new(kind: MediaStreamKind) -> Self {
+            Self { kind, stats: None }
+        }
+    }
+
+    #[async_trait::async_trait]
     impl RemoteTrackHandle for FakeTrack {
         fn kind(&self) -> MediaStreamKind {
             self.kind
@@ -1453,6 +1501,10 @@ mod tests {
                 samples_per_channel: 2,
             };
             Some(futures_util::stream::iter([frame]).boxed())
+        }
+
+        async fn receive_stats(&self) -> Option<ReceiveStats> {
+            self.stats.clone()
         }
     }
 
@@ -1636,9 +1688,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Microphone,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Microphone,
-                }),
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
             .unwrap();
 
@@ -1702,9 +1752,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Camera,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Camera,
-                }),
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
             })
             .unwrap();
         fx.engine.notify_key_imported("id-bob", 3);
@@ -1737,6 +1785,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_decryption_failure_is_surfaced_against_the_membership() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+
+        // The host learns which *member* is undecryptable, not which opaque
+        // transport identity.
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::FrameEncryptionState {
+                member_id: "bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_encryption_state_for_an_unmapped_identity_is_dropped() {
+        let mut fx = fixture();
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-nobody".to_owned(),
+                state: FrameEncryptionState::DecryptionFailed,
+            })
+            .unwrap();
+        // Followed by something we can wait for, to prove the first produced
+        // no event rather than merely being slower.
+        connection
+            .send(ConnectionEvent::ActiveSpeakers {
+                identities: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ActiveSpeakers {
+                member_ids: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_stats_come_from_the_subscribed_track() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+
+        // RTP arriving, nothing decoding: the exact case that is invisible at
+        // the frame level, because frames are produced either way.
+        let reported = ReceiveStats {
+            packets_received: 900,
+            bytes_received: 120_000,
+            frames_decoded: 0,
+            concealed_samples: 48_000,
+            total_samples_received: 48_000,
+            ..ReceiveStats::default()
+        };
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Microphone,
+                track: Arc::new(FakeTrack {
+                    kind: MediaStreamKind::Microphone,
+                    stats: Some(reported.clone()),
+                }),
+            })
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // StreamStarted
+
+        assert_eq!(
+            fx.engine
+                .receive_stats("bob", MediaStreamKind::Microphone)
+                .await,
+            Some(reported)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_receive_stats_future_is_send() {
+        // uniffi's async exports require `Future + Send`. A `!Send` future
+        // here would only break the FFI crate, which cannot be built without
+        // libwebrtc — so assert it in the crate that can.
+        fn assert_send<T: Send>(_: T) {}
+        let fx = fixture();
+        assert_send(fx.engine.receive_stats("bob", MediaStreamKind::Microphone));
+    }
+
+    #[tokio::test]
+    async fn receive_stats_are_none_without_a_subscribed_stream() {
+        let fx = fixture();
+        assert_eq!(
+            fx.engine
+                .receive_stats("bob", MediaStreamKind::Microphone)
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_stats_are_none_when_the_transport_reports_nothing() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Microphone,
+                // `FakeTrack::new` leaves the trait default in place.
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
+            })
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+
+        assert_eq!(
+            fx.engine
+                .receive_stats("bob", MediaStreamKind::Microphone)
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn departure_cleans_up_roster_and_tracks() {
         let mut fx = fixture();
         fx.memberships
@@ -1749,9 +1937,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Microphone,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Microphone,
-                }),
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
             .unwrap();
         let _ = next_event(&mut fx.events).await; // StreamStarted
@@ -1833,9 +2019,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Microphone,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Microphone,
-                }),
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
             .unwrap();
         assert_eq!(
@@ -1876,9 +2060,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Microphone,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Microphone,
-                }),
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
             .unwrap();
         let _ = next_event(&mut fx.events).await; // StreamStarted
@@ -2050,9 +2232,7 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Camera,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Camera,
-                }),
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
             })
             .unwrap();
         wait_until(|| fx.state.applied.lock().unwrap().len() == 2).await;

@@ -99,6 +99,43 @@ plus third-party `livekit` and `webrtc_sys`.
 See the "Logging" section of [../ARCHITECTURE.md](../ARCHITECTURE.md) for the level
 conventions the SDK follows.
 
+## Diagnosing "the call connects but I see/hear nothing"
+
+Frames are produced at a fixed cadence whether or not RTP is arriving — an audio
+stream with no incoming packets still yields 10 ms buffers of jitter-buffer
+concealment (silence), and a video stream holds its last picture. So a silent call
+and a silent-because-nothing-is-arriving call look identical at the frame level.
+Two APIs separate them, without reading logcat.
+
+**`MediaSession.receiveStats(memberId, kind)`** returns cumulative RTP counters, or
+`null` if that stream isn't subscribed or no RTCP report has landed yet. Every field
+is a running total, so sample twice and compare:
+
+| Between two samples | Diagnosis |
+| --- | --- |
+| `packetsReceived` flat | Nothing is arriving: network, subscription, or SFU |
+| `packetsReceived` up, `framesDecoded` flat | Arriving but not decoding (video) |
+| `concealedSamples` up in step with `totalSamplesReceived` | The "audio" is entirely fabricated |
+| both up, `packetsLost`/`jitter` rising | Arriving and decoding, but lossy |
+
+**`FfiCallEvent.FrameEncryptionState`** on the event stream names the cause when it is
+a key problem. `MissingKey` means frames carry a key index we hold nothing for (their
+key never reached us, or arrived under a different identity); `DecryptionFailed` means
+we have a key for that index and it doesn't work. It is reported per participant, not
+per stream — the frame cryptor is keyed by participant identity.
+
+```kotlin
+when (val event = session.nextEvent()) {
+    is FfiCallEvent.FrameEncryptionState ->
+        if (event.state != FfiFrameEncryptionState.OK) {
+            val stats = session.receiveStats(event.memberId, FfiStreamKind.MICROPHONE)
+            // packetsReceived > 0 here means the media path is fine and the key is not
+            Timber.w("no media from ${event.memberId}: ${event.state}, stats=$stats")
+        }
+    else -> { /* ... */ }
+}
+```
+
 ## Full Documentation
 
 See [PACKAGING.md](./PACKAGING.md) for complete documentation including:

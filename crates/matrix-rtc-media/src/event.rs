@@ -28,6 +28,35 @@
 
 use crate::participant::MediaStreamKind;
 
+/// Whether a participant's frames are encrypting and decrypting cleanly.
+///
+/// Reported per participant rather than per stream: the transport's frame
+/// cryptor is keyed by participant identity, so a failure does not say which
+/// of their tracks it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameEncryptionState {
+    /// Frames are being encrypted and decrypted normally.
+    Ok,
+    /// Frames are arriving with a key index we hold no key for — their media
+    /// key has not reached us (or reached us under the wrong identity).
+    MissingKey,
+    /// We hold a key for the index the frames carry, but it does not decrypt
+    /// them. The two sides disagree about the key material itself.
+    DecryptionFailed,
+    /// Our *outgoing* frames failed to encrypt, so peers receive nothing
+    /// usable from us.
+    EncryptionFailed,
+    /// The transport's cryptor failed internally.
+    InternalError,
+}
+
+impl FrameEncryptionState {
+    /// Whether this state means media is not flowing usably.
+    pub fn is_failure(&self) -> bool {
+        !matches!(self, Self::Ok)
+    }
+}
+
 /// Why the call ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EndedReason {
@@ -74,6 +103,18 @@ pub enum CallEvent {
     /// A media decryption key for this participant was imported; their frames
     /// are decryptable from here on.
     KeyImported { member_id: String, key_index: u8 },
+    /// Frame encryption state for a participant's media changed.
+    ///
+    /// Anything but [`FrameEncryptionState::Ok`] means their frames are not
+    /// decoding — note that the RTP itself may be arriving perfectly well, so
+    /// the receive path keeps producing frames (silence, or a frozen picture).
+    /// Pair with
+    /// [`CallEngine::receive_stats`](crate::engine::CallEngine::receive_stats)
+    /// to tell a key failure from an empty network path.
+    FrameEncryptionState {
+        member_id: String,
+        state: FrameEncryptionState,
+    },
     /// A transport-level participant appeared that maps to no signalled
     /// membership. It gets no subscription (and could not be decrypted
     /// anyway); surfaced for diagnostics.

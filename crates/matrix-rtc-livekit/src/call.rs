@@ -67,7 +67,7 @@ use matrix_rtc_core::{
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
-    MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, RemoteTrackHandle,
+    MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,
 };
 
 use crate::identity::pseudonymous_identity;
@@ -424,6 +424,20 @@ impl Call {
         kind: MediaStreamKind,
     ) -> Option<Arc<dyn RemoteTrackHandle>> {
         self.engine.remote_track(member_id, kind)
+    }
+
+    /// Cumulative receive-side RTP counters for a participant's stream, or
+    /// `None` while it is not subscribed / before the first RTCP report.
+    ///
+    /// The only way to distinguish "no RTP arriving" from "RTP arriving that
+    /// does not decode": the receive path produces frames at a fixed cadence
+    /// either way. See [`ReceiveStats`].
+    pub async fn receive_stats(
+        &self,
+        member_id: &str,
+        kind: MediaStreamKind,
+    ) -> Option<ReceiveStats> {
+        self.engine.receive_stats(member_id, kind).await
     }
 
     /// Publish a local track (microphone, camera, screenshare) on our focus;
