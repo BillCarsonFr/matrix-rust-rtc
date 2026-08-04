@@ -58,7 +58,7 @@ impl WasmRtcSessionManager {
     ///
     /// This must be called before join/leave operations.
     /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
-    /// sendDelayedEvent, cancelDelayedEvent.
+    /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         log::info!("manager: command sender installed");
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
@@ -512,7 +512,7 @@ impl WasmRtcSession {
     ///
     /// This must be called before join/leave operations.
     /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
-    /// sendDelayedEvent, cancelDelayedEvent.
+    /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());

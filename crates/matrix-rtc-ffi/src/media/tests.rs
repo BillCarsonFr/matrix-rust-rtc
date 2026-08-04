@@ -64,6 +64,14 @@ impl CommandSenderCallback for NoopCommands {
         Ok(())
     }
 
+    fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+    ) -> Result<(), CommandSenderError> {
+        Ok(())
+    }
+
     fn cancel_delayed_event(
         &self,
         _room_id: String,

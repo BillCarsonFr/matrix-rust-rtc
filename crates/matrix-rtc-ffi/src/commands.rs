@@ -309,6 +309,31 @@ pub trait CommandSenderCallback: Send + Sync {
         content_json: String,
     ) -> Result<(), CommandSenderError>;
 
+    /// Called periodically to restart a scheduled delayed event's timer.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID where the delayed event was scheduled
+    /// * `event_id` - The delay ID returned by send_delayed_event
+    ///
+    /// # Implementation
+    /// matrix-rust-sdk: `update_delayed_event` with `UpdateAction::Restart`.
+    /// This is MSC4140's "heartbeat ping" — it resets the delay's timer to now
+    /// plus its original delay, without changing its ID.
+    ///
+    /// Do NOT emulate it by cancelling and re-scheduling. That leaves the call
+    /// unprotected in between, burns the server's `max_scheduled` quota, and a
+    /// failed cancel leaks a delay which then fires — and because the sticky map
+    /// resolves conflicts by *last to expire*, that leave out-expires the live
+    /// membership and shows the user as having left a call they are still in.
+    ///
+    /// # Returns
+    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandSenderError>;
+
     /// Called when a previously scheduled delayed event needs to be canceled.
     ///
     /// # Arguments
@@ -430,6 +455,20 @@ impl RtcCommandSender for FfiCommandSender {
         )
     }
 
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        let what = format!("restart delayed [{room_id}] id={event_id}");
+        log_command(
+            &what,
+            self.callback
+                .restart_delayed_event(room_id, event_id)
+                .map_err(CommandError::from),
+        )
+    }
+
     async fn cancel_delayed_event(
         &self,
         room_id: String,
@@ -545,6 +584,15 @@ mod tests {
             _content_json: String,
         ) -> Result<(), CommandSenderError> {
             self.record(&event_type);
+            Ok(())
+        }
+
+        fn restart_delayed_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+        ) -> Result<(), CommandSenderError> {
+            self.record("restart_delayed_event");
             Ok(())
         }
 

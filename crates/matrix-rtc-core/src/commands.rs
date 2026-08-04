@@ -87,6 +87,29 @@ pub trait RtcCommandSender: Send + Sync {
         delay_ms: u64,
     ) -> Result<String, CommandError>;
 
+    /// Restart a previously scheduled delayed event's timer (MSC4140's
+    /// `restart` action — "heartbeat ping").
+    ///
+    /// Resets the scheduled send time to now plus the *original* delay, leaving
+    /// the delay id and everything else about the event untouched. This is the
+    /// keep-alive primitive: one request, and no moment at which no delayed
+    /// leave is armed.
+    ///
+    /// Do NOT emulate this with cancel-then-reschedule. That leaves a window
+    /// with nothing armed, burns the server's `max_scheduled` quota, and a
+    /// failed cancel leaks a delay that will fire and mark us as departed while
+    /// we are still in the call.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID where the delayed event was scheduled
+    /// * `event_id` - The delay id returned by `send_delayed_event`
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError>;
+
     /// Cancel a previously scheduled delayed event.
     ///
     /// This prevents the delayed event from being sent if it hasn't already been
@@ -179,6 +202,14 @@ impl RtcCommandSender for NoopCommandSender {
         Ok("mock-event-id".to_string())
     }
 
+    async fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+    ) -> Result<(), CommandError> {
+        Ok(())
+    }
+
     async fn cancel_delayed_event(
         &self,
         _room_id: String,
@@ -216,6 +247,7 @@ impl RtcCommandSender for NoopCommandSender {
 pub struct MockCommandSender {
     pub sticky_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
     pub delayed_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
+    pub restarted_events: std::sync::Mutex<Vec<(String, String)>>,
     pub cancelled_events: std::sync::Mutex<Vec<(String, String)>>,
     pub to_device_messages: std::sync::Mutex<Vec<(String, String, String, Value)>>,
     pub state_events: std::sync::Mutex<Vec<(String, String, String, Value)>>,
@@ -285,6 +317,18 @@ impl RtcCommandSender for MockCommandSender {
             delay_ms,
         ));
         Ok(format!("delayed-{}-{}", room_id, event_type))
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        self.restarted_events
+            .lock()
+            .unwrap()
+            .push((room_id, event_id));
+        Ok(())
     }
 
     async fn cancel_delayed_event(

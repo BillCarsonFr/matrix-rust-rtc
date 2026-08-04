@@ -62,9 +62,29 @@ use matrix_rtc_core::{
 // half that interval to stay in the map. It used to be a constant here, which
 // meant nothing knew when the entry would lapse.
 //
-// NOTE: the delayed leave is currently a plain (non-sticky) delayed event, so
-// crash cleanup relies on this TTL expiring; making the delayed leave itself
-// sticky is a follow-up.
+// NOTE: the delayed leave is a plain (non-sticky) delayed event, so it clears
+// nothing from the sticky map when it fires — crash cleanup relies entirely on
+// the membership's own sticky TTL expiring. That makes the dead man's switch
+// ceremonial today, and it is why a crashed client lingers as a ghost for up to
+// `sticky_duration_ms` rather than `keep_alive_timeout_ms`.
+//
+// It is *not* an HTTP-level limitation. MSC4140 has no endpoint of its own: both
+// `org.matrix.msc4140.delay` and `org.matrix.msc4354.sticky_duration_ms` are
+// query parameters on the ordinary
+// `PUT /_matrix/client/v3/rooms/{room}/send/{type}/{txn}`, so a sticky delayed
+// event is just both at once. The blocker is ruma's types —
+// `delayed_message_event::Request` has no sticky field and
+// `send_message_event::Request` has no delay field, so neither can express both.
+//
+// Two things to settle upstream before relying on it:
+//   * Neither MSC states that the two compose (MSC4354 only hints: they "may be
+//     combined ... to provide heartbeat semantics (e.g required for MatrixRTC)").
+//   * `origin_server_ts` for a delayed event must be the *fire* time, not the
+//     scheduling time. MSC4354 resolves sticky conflicts by highest
+//     `origin_server_ts + duration` ("last to expire wins"), so a leave stamped
+//     at scheduling time would expire *before* the join it is meant to replace
+//     and would never take effect. MSC4140 only implies fire time, in a footnote
+//     about event IDs.
 
 fn command_error(error: impl std::fmt::Display) -> CommandError {
     CommandError::from_message(error.to_string())
@@ -169,6 +189,24 @@ impl RtcCommandSender for SdkCommandSender {
             .map_err(command_error)?;
         // The trait's "event_id" is the delay_id used to restart/cancel it.
         Ok(response.delay_id)
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        // MSC4140's "heartbeat ping": resets the timer to now + the original
+        // delay, keeping the same delay id. One request, and never a moment
+        // with no delayed leave armed.
+        let request =
+            update_delayed_event::unstable_v1::Request::new(event_id, UpdateAction::Restart);
+        self.client
+            .send(request)
+            .with_request_config(rtc_request_config())
+            .await
+            .map_err(command_error)?;
+        Ok(())
     }
 
     async fn cancel_delayed_event(

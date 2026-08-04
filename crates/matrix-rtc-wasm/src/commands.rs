@@ -31,7 +31,7 @@ use wasm_bindgen::prelude::*;
 ///
 /// This sender delegates to a JavaScript object that provides the actual Matrix SDK integration.
 /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
-/// sendDelayedEvent, cancelDelayedEvent.
+/// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
 #[wasm_bindgen]
 pub struct JsCommandSender {
     /// The JavaScript Matrix client that handles the actual event sending
@@ -49,6 +49,7 @@ impl JsCommandSender {
     /// The client must implement the following methods:
     /// - sendStickyEvent(roomId, eventType, content, durationMs, callback)
     /// - sendDelayedEvent(roomId, eventType, content, delayMs, callback)
+    /// - restartDelayedEvent(roomId, eventId, callback)
     /// - cancelDelayedEvent(roomId, eventId, callback)
     /// - sendToDeviceMessage(userId, deviceId, messageType, content, callback)
     #[wasm_bindgen(constructor)]
@@ -254,6 +255,32 @@ impl RtcCommandSender for JsCommandSender {
         })?;
 
         Ok(event_id)
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        self.log_command(&format!(
+            "restart_delayed_event: room={}, event_id={}",
+            room_id, event_id
+        ));
+
+        // MSC4140's `restart` action, not cancel-then-reschedule: one request,
+        // and never a moment with no delayed leave armed.
+        let promise = self
+            .call_js_promise_method(
+                "restartDelayedEvent",
+                vec![JsValue::from_str(&room_id), JsValue::from_str(&event_id)],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        Ok(())
     }
 
     async fn cancel_delayed_event(

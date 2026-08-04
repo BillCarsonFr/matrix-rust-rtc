@@ -101,30 +101,44 @@ conventions the SDK follows.
 
 ## Staying in the call (keep-alive)
 
-Two independent clocks expire your membership, and the SDK now tends both for
-you. `join()` starts a keep-alive driver and `leave()` stops it — **there is
-nothing to call.**
+Two independent clocks expire your membership, and the SDK tends both for you.
+`join()` starts a keep-alive driver and `leave()` stops it — **there is nothing
+to call.**
 
-| Clock | Default | What the SDK does |
+| Clock | Default | Kept alive by |
 | --- | --- | --- |
-| Delayed leave (dead man's switch) | 30 s | Cancels and reschedules it every 10 s |
-| Sticky-map entry for your membership | 1 h | Re-sends the membership once it is halfway to expiry |
+| Delayed leave (dead man's switch) | 30 s | Restarting its timer every 10 s |
+| Sticky-map entry for your membership | 1 h | Re-sending the membership once it is halfway to expiry |
 
 Both are configurable per join via `keepAliveTimeoutMs` and `stickyDurationMs`.
 Shortening `stickyDurationMs` buys nothing but extra traffic — the refresh
 interval is derived from it. Values above one hour are clamped, because servers
 clamp them too and the refresh has to stay ahead of the real expiry.
 
-Your `CommandSenderCallback.sendStickyEvent` now receives a `durationMs`
-argument. **Pass it through verbatim** — with matrix-rust-sdk that is
-`.with_sticky_duration_ms(durationMs)`. Substituting your own value breaks the
-refresh: shorter and the membership vanishes mid-call, longer and a ghost
-membership outlives a crash.
+Two `CommandSenderCallback` methods are load-bearing here, and both are easy to
+implement in a way that looks right and silently breaks the call:
 
-If you would rather drive the keep-alive from your own scheduler (a foreground
-service, say), call `manager.heartbeat(roomId, slotId)` on your own cadence; it
-returns `false` when there is no joined session. The built-in driver runs
+- **`sendStickyEvent(..., durationMs)`** — pass `durationMs` through verbatim;
+  with matrix-rust-sdk that is `.with_sticky_duration_ms(durationMs)`.
+  Substituting a value of your own breaks the refresh: shorter and the
+  membership disappears mid-call, longer and a ghost membership outlives a
+  crash.
+- **`restartDelayedEvent(roomId, eventId)`** — implement as
+  `update_delayed_event` with `UpdateAction.Restart` (MSC4140's "heartbeat
+  ping"). Do **not** implement it as cancel-then-reschedule: that leaves the
+  call unprotected in between, burns the server's `max_scheduled` quota, and a
+  failed cancel leaks a delay that later fires — and because the sticky map
+  resolves conflicts by *last to expire*, that leave out-expires your live
+  membership and shows you as having left a call you are still in.
+
+To drive the keep-alive from your own scheduler instead (a foreground service, a
+workmanager job), call `manager.heartbeat(roomId, slotId)` on your own cadence;
+it returns `false` when there is no joined session. The built-in driver runs
 regardless, so only reach for this if you need a different cadence.
+
+A client that dies without leaving stays visible to peers for up to
+`stickyDurationMs`, not `keepAliveTimeoutMs` — see Known limitations in
+[../CHANGELOG.md](../CHANGELOG.md).
 
 ## Diagnosing "the call connects but I see/hear nothing"
 

@@ -95,6 +95,9 @@
 //!     async fn send_delayed_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
 //!         Ok(String::new())
 //!     }
+//!     async fn restart_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
+//!         Ok(())
+//!     }
 //!     async fn cancel_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }
