@@ -30,6 +30,27 @@ use crate::transport::RtcTransport;
 /// This is the delay before the cleanup event would fire if not restarted.
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
 
+/// Default sticky-map lifetime for our membership event, in milliseconds
+/// (1 hour).
+///
+/// Distinct from [`DEFAULT_KEEP_ALIVE_TIMEOUT_MS`]: that one arms the delayed
+/// leave (the dead man's switch for a client that dies), while this one is how
+/// long the homeserver keeps our membership in the sticky map at all. Both are
+/// refreshed by [`heartbeat`], the sticky one only once it is halfway to
+/// expiry.
+///
+/// [`heartbeat`]: crate::OwnMembershipMachine::heartbeat
+pub const DEFAULT_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
+
+/// The longest sticky lifetime that is actually honoured (1 hour).
+///
+/// Homeservers (and matrix-rust-sdk) clamp longer requests down to an hour.
+/// That clamp is invisible in the response, so asking for more would have us
+/// schedule the refresh against a lifetime the entry does not have — and the
+/// membership would lapse before we ever re-sent it. Requests are therefore
+/// clamped here, where the refresh interval is derived from the same number.
+pub const MAX_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
+
 /// Generates a fresh `member.id` for a join.
 ///
 /// MSC4143 requires the id to be unique per join and suggests it be
@@ -108,6 +129,15 @@ pub struct JoinSessionParams {
     /// Defaults to `DEFAULT_KEEP_ALIVE_TIMEOUT_MS` if not specified.
     pub keep_alive_timeout_ms: Option<u64>,
 
+    /// How long the homeserver should keep our membership in the sticky map,
+    /// in milliseconds.
+    ///
+    /// Defaults to `DEFAULT_STICKY_DURATION_MS` if not specified. The
+    /// heartbeat re-sends the membership before this elapses, so a host that
+    /// shortens it is choosing a higher signalling rate, not a shorter
+    /// presence.
+    pub sticky_duration_ms: Option<u64>,
+
     /// Configuration for encryption key management.
     ///
     /// If not provided, defaults to `EncryptionConfig::default()`.
@@ -135,6 +165,7 @@ impl JoinSessionParams {
             application,
             transport: TransportIntent::Publish(transport),
             keep_alive_timeout_ms: None,
+            sticky_duration_ms: None,
             encryption_config: None,
         }
     }
@@ -157,6 +188,7 @@ impl JoinSessionParams {
             application,
             transport,
             keep_alive_timeout_ms: None,
+            sticky_duration_ms: None,
             encryption_config: None,
         }
     }
@@ -178,6 +210,23 @@ impl JoinSessionParams {
     pub fn keep_alive_timeout_ms(&self) -> u64 {
         self.keep_alive_timeout_ms
             .unwrap_or(DEFAULT_KEEP_ALIVE_TIMEOUT_MS)
+    }
+
+    /// Gets the sticky-map lifetime to use.
+    ///
+    /// Returns the configured duration or the default.
+    pub fn sticky_duration_ms(&self) -> u64 {
+        let requested = self
+            .sticky_duration_ms
+            .unwrap_or(DEFAULT_STICKY_DURATION_MS);
+        if requested > MAX_STICKY_DURATION_MS {
+            log::warn!(
+                "sticky_duration_ms {requested} exceeds the {MAX_STICKY_DURATION_MS} the server \
+                 will honour; using the maximum so the refresh stays ahead of expiry",
+            );
+            return MAX_STICKY_DURATION_MS;
+        }
+        requested
     }
 
     /// Gets the encryption configuration to use.

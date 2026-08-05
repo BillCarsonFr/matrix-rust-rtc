@@ -39,6 +39,7 @@ impl CommandSenderCallback for NoopCommands {
         _room_id: String,
         _event_type: String,
         _content_json: String,
+        _duration_ms: u64,
     ) -> Result<(), CommandSenderError> {
         Ok(())
     }
@@ -59,6 +60,14 @@ impl CommandSenderCallback for NoopCommands {
         _event_type: String,
         _state_key: String,
         _content_json: String,
+    ) -> Result<(), CommandSenderError> {
+        Ok(())
+    }
+
+    fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
     ) -> Result<(), CommandSenderError> {
         Ok(())
     }
@@ -105,7 +114,6 @@ fn config() -> MediaSessionConfig {
     MediaSessionConfig {
         room_id: "!room:example.org".to_owned(),
         slot_id: "m.call#ROOM".to_owned(),
-        member_id: "member-1".to_owned(),
         user_id: "@alice:example.org".to_owned(),
         device_id: "DEVICE".to_owned(),
         livekit_service_url: DEAD_SFU_URL.to_owned(),
@@ -134,7 +142,6 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
         .join(FfiJoinSessionParams {
             user_id: "@alice:example.org".to_owned(),
             device_id: "DEVICE".to_owned(),
-            membership_id: Some("member-1".to_owned()),
             room_id: "!room:example.org".to_owned(),
             slot_id: "m.call#ROOM".to_owned(),
             application: "m.call".to_owned(),
@@ -144,6 +151,7 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
             }),
             can_subscribe: Vec::new(),
             keep_alive_timeout_ms: None,
+            sticky_duration_ms: None,
             encryption_config: None,
         })
         .unwrap();

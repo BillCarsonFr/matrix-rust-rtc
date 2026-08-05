@@ -234,6 +234,21 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
     }
 
+    /// Re-signals every key already held to the installed signal handler.
+    ///
+    /// Call after both the handler and the identity mapper are in place; see
+    /// [`EncryptionManager::replay_keys_to_handler`]. Returns `false` if the
+    /// session has no encryption manager.
+    pub async fn replay_encryption_keys(&self) -> bool {
+        match &self.encryption_manager {
+            Some(manager) => {
+                manager.replay_keys_to_handler().await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Installs the identity mapper used to derive the RTC-backend participant
     /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
     ///
@@ -337,6 +352,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             membership_id.clone(),
             params.application.clone(),
             params.keep_alive_timeout_ms(),
+            params.sticky_duration_ms(),
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
@@ -463,6 +479,19 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Returns the number of currently tracked joined members.
     pub fn member_count(&self) -> usize {
         self.members.len()
+    }
+
+    /// Our `member.id` for the current join, or `None` while not joined.
+    ///
+    /// MSC4143 requires a fresh one on every join, so this changes across a
+    /// leave/rejoin and must not be cached by the caller. Consumers that need
+    /// it — the media layer derives its MSC4195 participant identity from it —
+    /// should read it here rather than supply one, so it cannot drift from the
+    /// value the membership was actually published under.
+    pub fn own_member_id(&self) -> Option<&str> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| machine.sticky_key())
     }
 
     /// Subscribes to full membership snapshots for this session as a watch receiver.

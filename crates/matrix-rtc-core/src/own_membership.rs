@@ -29,9 +29,28 @@
 //!
 //! This ensures that if the client crashes or loses connection, the delayed leave will
 //! automatically clean up after the timeout period, preventing ghost memberships.
+//!
+//! # Two clocks, one heartbeat
+//!
+//! Our membership expires in two independent ways, and
+//! [`OwnMembershipMachine::heartbeat`] has to tend both:
+//!
+//! - The **delayed leave** (`keep_alive_timeout_ms`, seconds) is the dead man's
+//!   switch above. Its timer is pushed back out on every heartbeat via MSC4140's
+//!   `restart` action — never cancel-and-recreate, which leaves a window with
+//!   nothing armed and can leak a delay that then marks us departed mid-call.
+//! - The **sticky-map entry** (`sticky_duration_ms`, an hour by default) is how
+//!   long the homeserver keeps the membership at all. Re-sent once it is
+//!   halfway to expiry.
+//!
+//! Tending only the first produces a membership that vanishes mid-call with a
+//! perfectly healthy heartbeat; tending only the second leaves a ghost
+//! membership behind when the client dies. A host that never calls `heartbeat`
+//! gets both failures.
 
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
@@ -41,6 +60,19 @@ use crate::transport::{MemberTransports, RtcTransport};
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
+
+/// Wall-clock milliseconds since the Unix epoch.
+///
+/// `SystemTime` rather than a tokio timer on purpose: the core arms no timers,
+/// so the sticky refresh is decided by comparing timestamps when the host
+/// happens to call [`OwnMembershipMachine::heartbeat`], not by a task waking
+/// itself up.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Converts an RtcTransport to a JSON value for event content.
 pub fn transport_to_json(transport: &RtcTransport) -> Value {
@@ -81,11 +113,16 @@ pub enum OwnMembershipState {
 /// Information about the active keep-alive delayed event.
 #[derive(Debug, Clone)]
 pub struct KeepAliveInfo {
-    /// The event ID of the delayed cleanup event.
+    /// The delay id of the delayed cleanup event.
     pub delayed_event_id: String,
-    /// The timeout in milliseconds before the event fires.
-    #[allow(dead_code)]
+    /// The timeout in milliseconds before the event fires, measured from the
+    /// last successful restart.
     pub timeout_ms: u64,
+    /// Unix ms of the last successful arm or restart.
+    ///
+    /// Used to decide whether a delay whose restarts keep failing must by now
+    /// have fired — the only way to re-arm without risking a leak.
+    pub last_restart_ms: u64,
 }
 
 /// The OwnMembershipMachine manages the lifecycle of our own membership in an RTC session.
@@ -120,6 +157,20 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     keep_alive_info: Arc<Mutex<Option<KeepAliveInfo>>>,
     /// The keep-alive timeout in milliseconds.
     keep_alive_timeout_ms: u64,
+    /// How long the homeserver keeps our sticky-map entry.
+    sticky_duration_ms: u64,
+    /// The join content and when we last sent it, so the heartbeat can re-send
+    /// it before the sticky entry expires. `None` until we join.
+    last_sticky: Arc<Mutex<Option<SentSticky>>>,
+}
+
+/// The membership event we last put in the sticky map, and when.
+#[derive(Debug, Clone)]
+struct SentSticky {
+    /// The join content, re-sent verbatim to refresh the entry.
+    content: Value,
+    /// Unix ms at which it was accepted by the server.
+    sent_at_ms: u64,
 }
 
 impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
@@ -140,6 +191,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         sticky_key: String,
         application_type: String,
         keep_alive_timeout_ms: u64,
+        sticky_duration_ms: u64,
     ) -> Self {
         Self {
             command_sender,
@@ -150,6 +202,8 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             state: Arc::new(Mutex::new(OwnMembershipState::NotJoined)),
             keep_alive_info: Arc::new(Mutex::new(None)),
             keep_alive_timeout_ms,
+            sticky_duration_ms,
+            last_sticky: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -168,6 +222,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             sticky_key,
             application_type,
             DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
+            crate::join::DEFAULT_STICKY_DURATION_MS,
         )
     }
 
@@ -266,6 +321,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             *info_guard = Some(KeepAliveInfo {
                 delayed_event_id,
                 timeout_ms: keep_alive_timeout_ms,
+                last_restart_ms: now_ms(),
             });
         }
 
@@ -281,7 +337,12 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
         // Send the join event (Step 2 of dead man's switch)
         self.command_sender
-            .send_sticky_event(room_id.clone(), "m.rtc.member".to_string(), join_content)
+            .send_sticky_event(
+                room_id.clone(),
+                "m.rtc.member".to_string(),
+                join_content.clone(),
+                self.sticky_duration_ms,
+            )
             .await
             .inspect_err(|error| {
                 log::warn!(
@@ -289,6 +350,17 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                      sent ({error}). The delayed leave stays armed and will clean up.",
                 )
             })?;
+
+        // Remember it so the heartbeat can refresh the sticky entry before the
+        // server expires it. Recorded only on success: a failed send left
+        // nothing in the map, so there is nothing to refresh.
+        {
+            let mut guard = self.last_sticky.lock().unwrap();
+            *guard = Some(SentSticky {
+                content: join_content,
+                sent_at_ms: now_ms(),
+            });
+        }
 
         // Both steps completed successfully, transition to Joined state
         {
@@ -370,22 +442,47 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
         // Send leave event
         self.command_sender
-            .send_sticky_event(room_id.clone(), "m.rtc.member".to_string(), leave_content)
+            .send_sticky_event(
+                room_id.clone(),
+                "m.rtc.member".to_string(),
+                leave_content,
+                self.sticky_duration_ms,
+            )
             .await?;
+
+        // We are gone from the call; stop refreshing the sticky entry.
+        {
+            let mut guard = self.last_sticky.lock().unwrap();
+            *guard = None;
+        }
 
         // Cancel the delayed leave event if one exists
         if let Some(event_id) = self.delayed_event_id() {
             log::debug!("[{}] Canceling delayed leave event: {}", room_id, event_id);
-            self.command_sender
+            // Deliberately not propagated. The leave event above already went
+            // through, so we *have* left; the cancellation is only tidying up a
+            // safety net that is now redundant. The common failure is a 404
+            // because the delay already fired — which is the outcome we wanted
+            // anyway. Failing the whole leave here would leave the machine
+            // stuck in `Leaving` after a successful leave.
+            match self
+                .command_sender
                 .cancel_delayed_event(room_id.clone(), event_id.clone())
-                .await?;
+                .await
+            {
+                Ok(()) => log::debug!("[{}] Delayed leave event canceled", room_id),
+                Err(error) => log::debug!(
+                    "[{room_id}] Delayed leave {event_id} could not be canceled ({error:?}); \
+                     it has most likely already fired, which leaves us departed either way.",
+                ),
+            }
 
-            // Clear the stored event ID
+            // Clear the stored event ID regardless: either it is canceled, or
+            // it fired and no longer exists.
             {
                 let mut info_guard = self.keep_alive_info.lock().unwrap();
                 *info_guard = None;
             }
-            log::debug!("[{}] Delayed leave event canceled", room_id);
         }
 
         // Transition to Left state
@@ -399,10 +496,18 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         Ok(())
     }
 
-    /// Restarts the keep-alive by canceling the current delayed leave and scheduling a new one.
+    /// Restarts the keep-alive: pushes the delayed leave's timer back out, and
+    /// re-sends the membership if its sticky entry is nearing expiry.
     ///
     /// This is called periodically (heartbeat) to keep our membership active.
-    /// The strategy is to always have a delayed leave scheduled, and restart it periodically.
+    ///
+    /// Uses MSC4140's `restart` action rather than cancel-then-reschedule. That
+    /// matters for three reasons: it is one request instead of two; there is
+    /// never a moment with no delayed leave armed; and it cannot leak a delay.
+    /// A leaked delay is not benign — nobody restarts it, so it fires, and
+    /// because the sticky map resolves conflicts by *last to expire* (MSC4354),
+    /// its leave out-expires our live membership and marks us departed while we
+    /// are still in the call.
     ///
     /// This method is fire-and-forget (doesn't return Result) because heartbeat failures
     /// should not break the application - we'll retry on the next heartbeat.
@@ -410,36 +515,138 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         let room_id = self.room_id.clone();
         log::trace!("[{}] Heartbeat: restarting keep-alive", room_id);
 
-        // First, cancel the existing delayed event if one exists
-        if let Some(event_id) = self.delayed_event_id() {
-            match self
-                .command_sender
-                .cancel_delayed_event(room_id.clone(), event_id.clone())
-                .await
+        // Two independent clocks expire our membership, and the heartbeat tends
+        // both: the sticky-map entry here, and the delayed leave below.
+        self.refresh_sticky_if_due().await;
+
+        let Some(event_id) = self.delayed_event_id() else {
+            // Nothing armed (not joined, or a previous re-arm failed). Arming
+            // one is the safe move: without it a crash leaves a ghost behind.
+            if self.state() == OwnMembershipState::Joined
+                && let Err(error) = self.schedule_delayed_leave().await
             {
-                Ok(_) => {
-                    log::trace!("[{}] Previous delayed leave canceled", room_id);
-                }
-                Err(e) => {
-                    log::warn!("[{}] Failed to cancel delayed leave: {:?}", room_id, e);
-                    // Continue anyway - we'll try to schedule a new one
+                log::warn!("[{room_id}] Failed to arm a delayed leave: {error:?}");
+            }
+            return;
+        };
+
+        match self
+            .command_sender
+            .restart_delayed_event(room_id.clone(), event_id.clone())
+            .await
+        {
+            Ok(()) => {
+                let mut guard = self.keep_alive_info.lock().unwrap();
+                if let Some(info) = guard.as_mut()
+                    && info.delayed_event_id == event_id
+                {
+                    info.last_restart_ms = now_ms();
                 }
             }
-
-            // Clear the stored event ID after attempting cancellation
-            {
-                let mut info_guard = self.keep_alive_info.lock().unwrap();
-                *info_guard = None;
+            Err(error) => {
+                // Retry on the next beat rather than replacing it: a restart can
+                // fail transiently while the delay is still perfectly armed, and
+                // scheduling a second one would leak the first.
+                log::warn!(
+                    "[{room_id}] Failed to restart delayed leave {event_id}: {error:?}. \
+                     Retrying on the next heartbeat.",
+                );
+                self.rearm_if_certainly_fired().await;
             }
         }
+    }
 
-        // Then schedule a new delayed leave
-        if let Err(e) = self.schedule_delayed_leave().await {
-            log::warn!(
-                "[{}] Failed to schedule new delayed leave: {:?}",
-                room_id,
-                e
-            );
+    /// Arms a fresh delayed leave, but only once the old one *must* be gone.
+    ///
+    /// A restart can keep failing for two very different reasons: the delay
+    /// vanished (it fired, or the server forgot it), in which case we are
+    /// unprotected and must re-arm; or the request keeps failing while the delay
+    /// sits there armed, in which case arming a second one leaks the first and
+    /// gets us marked as departed when it fires.
+    ///
+    /// The two are told apart by the clock rather than by the error: a delay
+    /// cannot still be pending once its full delay period has elapsed since the
+    /// last successful restart. Waiting for that moment makes the re-arm
+    /// leak-free without needing to interpret the server's error.
+    async fn rearm_if_certainly_fired(&self) {
+        let Some(info) = self.keep_alive_info.lock().unwrap().clone() else {
+            return;
+        };
+        if now_ms().saturating_sub(info.last_restart_ms) <= info.timeout_ms {
+            // It may well still be armed; leave it alone and retry the restart.
+            return;
+        }
+
+        let room_id = self.room_id.clone();
+        log::warn!(
+            "[{room_id}] Delayed leave {} has not been restarted for longer than its {}ms \
+             delay, so it has already fired; arming a replacement.",
+            info.delayed_event_id,
+            info.timeout_ms,
+        );
+        {
+            let mut guard = self.keep_alive_info.lock().unwrap();
+            *guard = None;
+        }
+        if let Err(error) = self.schedule_delayed_leave().await {
+            log::warn!("[{room_id}] Failed to arm a replacement delayed leave: {error:?}");
+        }
+    }
+
+    /// Re-sends our membership event once the sticky entry is halfway to
+    /// expiring, keeping us in the map for another full duration.
+    ///
+    /// Halfway rather than at the brink so a single failed refresh (or a
+    /// missed heartbeat) is survivable: there is a whole half-duration of
+    /// further attempts before the entry actually lapses. Content is re-sent
+    /// verbatim, so peers see an update identical to what they already hold.
+    ///
+    /// Fire-and-forget like the rest of the heartbeat — the next tick retries.
+    async fn refresh_sticky_if_due(&self) {
+        let Some(sticky) = self.last_sticky.lock().unwrap().clone() else {
+            // Not joined (or the join's sticky send failed): nothing to refresh.
+            return;
+        };
+
+        let elapsed = now_ms().saturating_sub(sticky.sent_at_ms);
+        if elapsed < self.sticky_duration_ms / 2 {
+            return;
+        }
+
+        let room_id = self.room_id.clone();
+        log::debug!(
+            "[{room_id}] Refreshing sticky membership ({elapsed}ms of {}ms elapsed)",
+            self.sticky_duration_ms,
+        );
+
+        match self
+            .command_sender
+            .send_sticky_event(
+                room_id.clone(),
+                "m.rtc.member".to_string(),
+                sticky.content.clone(),
+                self.sticky_duration_ms,
+            )
+            .await
+        {
+            Ok(()) => {
+                let mut guard = self.last_sticky.lock().unwrap();
+                // Only advance the clock if we are still tracking the same
+                // content: a concurrent join/leave may have replaced it while
+                // this send was in flight, and stamping our timestamp onto
+                // theirs would delay their refresh.
+                if let Some(current) = guard.as_mut()
+                    && current.content == sticky.content
+                {
+                    current.sent_at_ms = now_ms();
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "[{room_id}] Failed to refresh sticky membership: {error:?}. \
+                     Retrying on the next heartbeat.",
+                );
+            }
         }
     }
 
@@ -483,6 +690,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             *info_guard = Some(KeepAliveInfo {
                 delayed_event_id,
                 timeout_ms: keep_alive_timeout_ms,
+                last_restart_ms: now_ms(),
             });
         }
 
@@ -495,6 +703,8 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::commands::{MockCommandSender, NoopCommandSender};
     use crate::transport::RawRtcTransport;
 
@@ -616,7 +826,7 @@ mod tests {
         assert_eq!(sticky_events.len(), 1);
 
         // The sticky event should be the join
-        let (room_id, event_type, content) = &sticky_events[0];
+        let (room_id, event_type, content, _) = &sticky_events[0];
         assert_eq!(room_id, "!room:example.org");
         assert_eq!(event_type, "m.rtc.member");
         assert_eq!(
@@ -654,7 +864,7 @@ mod tests {
 
         // Publishing a transport also declares we can subscribe to its type, so
         // peers can pick one every member can receive.
-        let (_, _, content) = &sticky_events[0];
+        let (_, _, content, _) = &sticky_events[0];
         assert_eq!(
             content
                 .pointer("/transports/published/0/type")
@@ -692,7 +902,7 @@ mod tests {
         let sticky_events = mock_sender.sticky_events.lock().unwrap();
         assert_eq!(sticky_events.len(), 1);
 
-        let (room_id, event_type, content) = &sticky_events[0];
+        let (room_id, event_type, content, _) = &sticky_events[0];
         assert_eq!(room_id, "!room:example.org");
         assert_eq!(event_type, "m.rtc.member");
 
@@ -727,23 +937,91 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        // Get initial delayed event count
-        let initial_count = {
-            let delayed_events = mock_sender.delayed_events.lock().unwrap();
-            delayed_events.len()
-        };
+        let delay_id = machine
+            .delayed_event_id()
+            .expect("join arms a delayed leave");
 
-        // Heartbeat should cancel and reschedule
         machine.heartbeat().await;
 
-        // Check that another delayed event was scheduled
-        let new_count = {
-            let delayed_events = mock_sender.delayed_events.lock().unwrap();
-            delayed_events.len()
-        };
+        // The beat restarts the existing delay in place: one request, the same
+        // delay id, and no second delay scheduled. Scheduling a replacement
+        // instead would leak the original, which then fires and (last-to-expire
+        // wins) marks us departed while we are still here.
+        assert_eq!(
+            *mock_sender.restarted_events.lock().unwrap(),
+            vec![("!room:example.org".to_string(), delay_id.clone())],
+        );
+        assert_eq!(
+            mock_sender.delayed_events.lock().unwrap().len(),
+            1,
+            "the heartbeat must not schedule a second delayed leave"
+        );
+        assert!(
+            mock_sender.cancelled_events.lock().unwrap().is_empty(),
+            "the heartbeat must not cancel anything"
+        );
+        assert_eq!(machine.delayed_event_id(), Some(delay_id));
+    }
 
-        // Should have scheduled at least one more (the cancel may or may not have been processed)
-        assert!(new_count > initial_count);
+    /// A restart that fails while the delay is still armed must not be
+    /// "recovered" by arming a second one — that is exactly the leak that gets
+    /// us marked as departed mid-call.
+    #[tokio::test]
+    async fn a_failed_restart_does_not_immediately_arm_a_replacement() {
+        let sender = Arc::new(CancelFailsSender::default());
+        let machine = OwnMembershipMachine::with_default_timeout(
+            sender.clone(),
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            APPLICATION_TYPE.to_string(),
+        );
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+        let delay_id = machine.delayed_event_id().expect("armed by join");
+
+        // The mock fails every restart. The delay was armed moments ago, so it
+        // cannot have fired yet: keep it and retry next beat.
+        machine.heartbeat().await;
+
+        assert_eq!(*sender.scheduled.lock().unwrap(), 1, "no replacement armed");
+        assert_eq!(machine.delayed_event_id(), Some(delay_id));
+    }
+
+    /// Once a full delay period has passed with no successful restart, the old
+    /// delay must have fired, so arming a replacement is leak-free — and
+    /// necessary, or we are left with no dead man's switch at all.
+    #[tokio::test]
+    async fn a_delay_that_must_have_fired_is_replaced() {
+        let sender = Arc::new(CancelFailsSender::default());
+        // A zero-length delay has always "already fired".
+        let machine = OwnMembershipMachine::new(
+            sender.clone(),
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            APPLICATION_TYPE.to_string(),
+            0,
+            crate::join::DEFAULT_STICKY_DURATION_MS,
+        );
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        // Let real time pass the (zero) delay, so the check has unambiguously
+        // elapsed rather than sitting exactly on the boundary.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        machine.heartbeat().await;
+
+        assert_eq!(
+            *sender.scheduled.lock().unwrap(),
+            2,
+            "the fired delay should have been replaced"
+        );
+        assert!(machine.delayed_event_id().is_some());
     }
 
     fn test_machine(
@@ -758,6 +1036,232 @@ mod tests {
         )
     }
 
+    /// A machine whose sticky entry lives `sticky_duration_ms`, so a test can
+    /// make the refresh due (or not) without waiting on a clock.
+    fn test_machine_with_sticky_duration(
+        mock_sender: Arc<MockCommandSender>,
+        sticky_duration_ms: u64,
+    ) -> OwnMembershipMachine<MockCommandSender> {
+        OwnMembershipMachine::new(
+            mock_sender,
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            APPLICATION_TYPE.to_string(),
+            DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
+            sticky_duration_ms,
+        )
+    }
+
+    /// Sends everything successfully except `cancel_delayed_event`, which fails
+    /// the way a homeserver fails it once the delay has already fired.
+    #[derive(Default)]
+    struct CancelFailsSender {
+        sticky_events: std::sync::Mutex<Vec<Value>>,
+        /// How many delayed events have been scheduled, to catch leaks.
+        scheduled: std::sync::Mutex<u32>,
+        fail_sticky: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RtcCommandSender for CancelFailsSender {
+        async fn send_sticky_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            content: Value,
+            _duration_ms: u64,
+        ) -> Result<(), CommandError> {
+            if self.fail_sticky {
+                return Err(CommandError::from_message("sticky send rejected"));
+            }
+            self.sticky_events.lock().unwrap().push(content);
+            Ok(())
+        }
+
+        async fn send_delayed_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            _content: Value,
+            _delay_ms: u64,
+        ) -> Result<String, CommandError> {
+            let mut scheduled = self.scheduled.lock().unwrap();
+            *scheduled += 1;
+            Ok(format!("delay-{scheduled}"))
+        }
+
+        async fn restart_delayed_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+        ) -> Result<(), CommandError> {
+            Err(CommandError::from_message(
+                "M_NOT_FOUND: Unknown delay_id (it already fired)",
+            ))
+        }
+
+        async fn cancel_delayed_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+        ) -> Result<(), CommandError> {
+            Err(CommandError::from_message(
+                "M_NOT_FOUND: Unknown delay_id (it already fired)",
+            ))
+        }
+
+        async fn send_to_device_message(
+            &self,
+            _user_id: String,
+            _device_id: String,
+            _message_type: String,
+            _content: Value,
+        ) -> Result<(), CommandError> {
+            Ok(())
+        }
+
+        async fn send_state_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            _state_key: String,
+            _content: Value,
+        ) -> Result<(), CommandError> {
+            Ok(())
+        }
+    }
+
+    /// The sticky entry expires independently of the delayed leave, so a call
+    /// running past its lifetime must re-announce the membership.
+    #[tokio::test]
+    async fn heartbeat_refreshes_the_sticky_membership_once_half_expired() {
+        let mock_sender = Arc::new(MockCommandSender::new());
+        // A zero lifetime is always at least half expired.
+        let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine.heartbeat().await;
+
+        let sticky = mock_sender.sticky_events.lock().unwrap();
+        assert_eq!(sticky.len(), 2, "the heartbeat should re-send the join");
+        // Re-sent verbatim: peers must not see a different membership.
+        assert_eq!(sticky[0].2, sticky[1].2);
+        // And with the lifetime the machine was configured with.
+        assert_eq!(sticky[1].3, 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_leaves_a_fresh_sticky_membership_alone() {
+        let mock_sender = Arc::new(MockCommandSender::new());
+        let machine = test_machine_with_sticky_duration(mock_sender.clone(), 60 * 60 * 1000);
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine.heartbeat().await;
+
+        assert_eq!(
+            mock_sender.sticky_events.lock().unwrap().len(),
+            1,
+            "an hour-long entry needs no refresh seconds after joining"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_refreshes_nothing_before_a_join() {
+        let mock_sender = Arc::new(MockCommandSender::new());
+        let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
+
+        machine.heartbeat().await;
+
+        assert!(
+            mock_sender.sticky_events.lock().unwrap().is_empty(),
+            "there is no membership to refresh yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stops_refreshing_the_sticky_after_leaving() {
+        let mock_sender = Arc::new(MockCommandSender::new());
+        let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+        machine.leave(None).await.expect("leave should succeed");
+
+        let after_leave = mock_sender.sticky_events.lock().unwrap().len();
+        machine.heartbeat().await;
+
+        assert_eq!(
+            mock_sender.sticky_events.lock().unwrap().len(),
+            after_leave,
+            "refreshing after a leave would resurrect the membership"
+        );
+    }
+
+    /// The delayed leave firing is the outcome a leave wants anyway; failing to
+    /// cancel it must not turn a successful leave into an error.
+    #[tokio::test]
+    async fn leave_succeeds_when_the_delayed_event_already_fired() {
+        let sender = Arc::new(CancelFailsSender::default());
+        let machine = OwnMembershipMachine::with_default_timeout(
+            sender.clone(),
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            APPLICATION_TYPE.to_string(),
+        );
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine
+            .leave(None)
+            .await
+            .expect("a 404 on cancel must not fail the leave");
+
+        assert_eq!(machine.state(), OwnMembershipState::Left);
+        assert_eq!(
+            machine.delayed_event_id(),
+            None,
+            "the stale delay id must be cleared either way"
+        );
+        assert_eq!(
+            sender.sticky_events.lock().unwrap().len(),
+            2,
+            "join then leave"
+        );
+    }
+
+    /// The tolerance above must not extend to the leave event itself.
+    #[tokio::test]
+    async fn leave_still_fails_when_the_leave_event_cannot_be_sent() {
+        let sender = Arc::new(CancelFailsSender {
+            fail_sticky: true,
+            ..Default::default()
+        });
+        let machine = OwnMembershipMachine::with_default_timeout(
+            sender,
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            APPLICATION_TYPE.to_string(),
+        );
+
+        machine
+            .leave(None)
+            .await
+            .expect_err("a rejected leave event is a real failure");
+        assert_ne!(machine.state(), OwnMembershipState::Left);
+    }
+
     // Regression: every write path must emit the MSC4354 unstable id `msc4354_sticky_key`,
     // never the bare `sticky_key`. The join, delayed-leave and leave content are all built
     // from the single shared `RawStickyEventContent`, so the rename is applied everywhere.
@@ -770,7 +1274,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        let (_, _, join_content) = &mock_sender.sticky_events.lock().unwrap()[0];
+        let (_, _, join_content, _) = &mock_sender.sticky_events.lock().unwrap()[0];
         assert_eq!(
             join_content
                 .get("msc4354_sticky_key")
@@ -810,7 +1314,7 @@ mod tests {
             .await
             .expect("leave should succeed");
 
-        let (_, _, leave_content) = &mock_sender.sticky_events.lock().unwrap()[0];
+        let (_, _, leave_content, _) = &mock_sender.sticky_events.lock().unwrap()[0];
         assert_eq!(
             leave_content
                 .get("msc4354_sticky_key")

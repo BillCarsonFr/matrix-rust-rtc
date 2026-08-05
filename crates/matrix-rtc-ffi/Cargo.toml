@@ -29,7 +29,11 @@ matrix-rtc-core = { path = "../matrix-rtc-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+# `rt-multi-thread` and `time` are needed by the slim build too, not just
+# `media`: every synchronous entry point bridges to the async core through the
+# runtime in `src/runtime.rs`, and the core arms a `delayBeforeUse` timer on the
+# key-rotation path. See that module for why it has to be multi-threaded.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
 uniffi.workspace = true
 async-trait.workspace = true
 futures = "0.3"
@@ -68,6 +72,7 @@ media = [
     "dep:matrix-rtc-livekit",
     "dep:reqwest",
     "dep:jni",
+    "dep:webrtc-sys-build",
     "tokio/rt-multi-thread",
     "tokio/macros",
     "tokio/time",
@@ -75,6 +80,17 @@ media = [
     # integration (async_compat).
     "uniffi/tokio",
 ]
+
+[build-dependencies]
+# Re-emits libwebrtc's `Java_*` JNI link args against our cdylib — see the
+# module docs in build.rs for why `webrtc-sys` cannot do this itself. Already
+# in the build graph for any `media` build (webrtc-sys builds with it), so this
+# costs nothing there, and stays out of the slim build entirely.
+#
+# Keep this a caret requirement, NOT `=0.3.x`: it must resolve to the exact
+# same version webrtc-sys uses, or the symbol list is read by one copy of the
+# crate while `livekit` links libwebrtc through another.
+webrtc-sys-build = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }

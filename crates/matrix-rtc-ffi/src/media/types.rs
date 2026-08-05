@@ -107,6 +107,105 @@ pub enum FfiEndedReason {
     ConnectionClosed { message: String },
 }
 
+/// Whether a participant's frames are encrypting and decrypting cleanly
+/// (mirrors `matrix_rtc_media::FrameEncryptionState`).
+///
+/// Reported per participant, not per stream: the frame cryptor is keyed by
+/// participant identity, so a failure does not say which of their tracks it
+/// came from.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum FfiFrameEncryptionState {
+    /// Frames are being encrypted and decrypted normally.
+    Ok,
+    /// Frames carry a key index we hold no key for — their media key has not
+    /// reached us, or reached us under a different identity.
+    MissingKey,
+    /// We hold a key for that index but it does not decrypt their frames.
+    DecryptionFailed,
+    /// Our *own* outgoing frames failed to encrypt; peers get nothing usable
+    /// from us.
+    EncryptionFailed,
+    /// The cryptor failed internally.
+    InternalError,
+}
+
+impl From<matrix_rtc_media::FrameEncryptionState> for FfiFrameEncryptionState {
+    fn from(state: matrix_rtc_media::FrameEncryptionState) -> Self {
+        use matrix_rtc_media::FrameEncryptionState as State;
+        match state {
+            State::Ok => Self::Ok,
+            State::MissingKey => Self::MissingKey,
+            State::DecryptionFailed => Self::DecryptionFailed,
+            State::EncryptionFailed => Self::EncryptionFailed,
+            State::InternalError => Self::InternalError,
+        }
+    }
+}
+
+/// Cumulative receive-side RTP counters for one subscribed stream (mirrors
+/// `matrix_rtc_media::ReceiveStats`). Obtain via
+/// [`MediaSession::receive_stats`](super::MediaSession::receive_stats).
+///
+/// These exist because the receive path emits frames at a fixed cadence
+/// whether or not RTP is arriving — an audio stream with no incoming packets
+/// still produces 10 ms buffers of jitter-buffer concealment (silence). So
+/// "silent" and "silent because nothing is arriving" are indistinguishable at
+/// the frame level. Every field is a monotonic total since subscription, so
+/// sample twice and compare:
+///
+/// - **Nothing arriving**: `packetsReceived` flat between samples.
+/// - **Arriving but not decoding**: `packetsReceived` climbing while
+///   `framesDecoded` stays flat (video), or `concealedSamples` climbing in
+///   step with `totalSamplesReceived` (audio). Corroborate with
+///   [`FfiCallEvent::FrameEncryptionState`].
+/// - **Arriving and decoding, but lossy**: both climbing, with `packetsLost`
+///   or `jitter` rising.
+///
+/// Fields that don't apply to the stream's media kind stay `0`.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiReceiveStats {
+    /// RTP packets received since subscribing.
+    pub packets_received: u64,
+    /// Packets expected and never received; may go briefly negative on
+    /// reordering.
+    pub packets_lost: i64,
+    /// Payload bytes received.
+    pub bytes_received: u64,
+    /// Packet-arrival jitter in seconds.
+    pub jitter: f64,
+    /// Video frames the decoder produced.
+    pub frames_decoded: u64,
+    /// Video frames dropped before rendering.
+    pub frames_dropped: u64,
+    /// Audio samples handed to the output, real or concealed.
+    pub total_samples_received: u64,
+    /// Audio samples invented by the jitter buffer because the real ones never
+    /// arrived.
+    pub concealed_samples: u64,
+    /// The subset of `concealedSamples` emitted as pure silence.
+    pub silent_concealed_samples: u64,
+    /// How many separate times concealment kicked in — a better gap counter
+    /// than the sample totals, which one long outage inflates.
+    pub concealment_events: u64,
+}
+
+impl From<matrix_rtc_media::ReceiveStats> for FfiReceiveStats {
+    fn from(stats: matrix_rtc_media::ReceiveStats) -> Self {
+        Self {
+            packets_received: stats.packets_received,
+            packets_lost: stats.packets_lost,
+            bytes_received: stats.bytes_received,
+            jitter: stats.jitter,
+            frames_decoded: stats.frames_decoded,
+            frames_dropped: stats.frames_dropped,
+            total_samples_received: stats.total_samples_received,
+            concealed_samples: stats.concealed_samples,
+            silent_concealed_samples: stats.silent_concealed_samples,
+            concealment_events: stats.concealment_events,
+        }
+    }
+}
+
 /// An event on the unified call stream (mirrors
 /// `matrix_rtc_media::CallEvent`). Consume via
 /// [`MediaSession::next_event`](super::MediaSession::next_event).
@@ -144,6 +243,17 @@ pub enum FfiCallEvent {
     KeyImported {
         member_id: String,
         key_index: u8,
+    },
+    /// Frame encryption state for a participant's media changed.
+    ///
+    /// Anything but `Ok` means their frames are not decoding. The RTP may
+    /// still be arriving perfectly well, so the receive path keeps producing
+    /// frames — silence, or a frozen picture. Pair with
+    /// [`MediaSession::receive_stats`](super::MediaSession::receive_stats) to
+    /// tell a key failure from an empty network path.
+    FrameEncryptionState {
+        member_id: String,
+        state: FfiFrameEncryptionState,
     },
     /// A transport-level participant with no signalled membership; it gets
     /// no subscription. Diagnostics only.
@@ -191,6 +301,10 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
             } => Self::KeyImported {
                 member_id,
                 key_index,
+            },
+            Event::FrameEncryptionState { member_id, state } => Self::FrameEncryptionState {
+                member_id,
+                state: state.into(),
             },
             Event::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
             Event::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },

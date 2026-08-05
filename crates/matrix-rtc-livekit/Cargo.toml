@@ -43,7 +43,34 @@ base64 = "0.22"
 # select the rustls TLS backend for the SFU WebSocket/HTTP connections. This
 # pulls in libwebrtc (native C++) via webrtc-sys, so building this crate needs a
 # C++ toolchain — CI jobs that lack one must not build this crate.
-livekit = { version = "0.7", features = ["rustls-tls-native-roots"] }
+#
+# BOTH root stores, deliberately. `rustls-tls-native-roots` alone breaks the
+# signal WebSocket on every Android device: `rustls-native-certs` probes the
+# filesystem (/etc/ssl/certs, SSL_CERT_FILE, ...) and Android keeps its trust
+# store in the Java KeyStore instead, so it returns zero certificates and
+# tokio-tungstenite fails the connection with "no native root CA certificates
+# found (errors: [])". Nothing failed to parse — there was nothing to read.
+#
+# tokio-tungstenite is written for the two to coexist (src/tls.rs): an empty
+# native store is fatal *only* when `rustls-tls-webpki-roots` is off, and the
+# webpki roots are then unioned into the same store. So Android falls back to
+# the bundled roots while desktop keeps the system store, including any
+# enterprise CA an admin added there.
+#
+# Not a swap, for two reasons. Desktop would lose user/enterprise-added CAs.
+# And livekit-api gates its WSS-over-HTTP-proxy path on
+# `rustls-tls-native-roots` (signal_client/signal_stream.rs) — without it, any
+# wss:// through a proxy becomes a hard "requires rustls-tls-native-roots".
+#
+# This does NOT give Android enterprise/internal CAs: nothing here can read the
+# Java KeyStore. That needs a platform verifier
+# (`rustls-platform-verifier`) plumbed through livekit-api, which calls
+# `connect_async` without a connector and so cannot accept one today — an
+# upstream change, not a local knob.
+livekit = { version = "0.7", features = [
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+] }
 # Stream combinators for draining the LiveKit audio stream in the media helpers.
 futures-util = "0.3"
 # The experimental branch carries MSC4354 sticky-event support that the crates.io

@@ -44,7 +44,9 @@ use livekit::track::VideoQuality as LkVideoQuality;
 use livekit::webrtc::audio_source::AudioSourceOptions;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
+use livekit::webrtc::native::frame_cryptor::EncryptionState as LkEncryptionState;
 use livekit::webrtc::prelude::AudioFrame as LkAudioFrame;
+use livekit::webrtc::stats::RtcStats;
 use livekit::webrtc::video_frame::{
     I420Buffer as LkI420Buffer, VideoBuffer, VideoFrame as LkVideoFrame,
     VideoRotation as LkVideoRotation,
@@ -56,9 +58,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use matrix_rtc_core::{JoinedMembership, RtcTransport};
 use matrix_rtc_media::{
-    AudioFrame, ConnectionContext, ConnectionEvent, I420Buffer, LocalTrackHandle, MediaStreamKind,
-    MediaTransport, PublishOptions, QualityLimit, RemoteTrackHandle, ResolvedConstraints,
-    StreamDemand, TransportConnection, TransportError, VideoDetail, VideoFrame, VideoRotation,
+    AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
+    LocalTrackHandle, MediaStreamKind, MediaTransport, PublishOptions, QualityLimit, ReceiveStats,
+    RemoteTrackHandle, ResolvedConstraints, StreamDemand, TransportConnection, TransportError,
+    VideoDetail, VideoFrame, VideoRotation,
 };
 
 use crate::identity::pseudonymous_identity;
@@ -360,12 +363,25 @@ impl TransportConnection for LiveKitTransportConnection {
         Ok(())
     }
 
+    /// Idempotent: closing a connection that is already closed succeeds.
+    ///
+    /// LiveKit answers `RoomError::AlreadyClosed` both for a second `close()`
+    /// and for a room the SFU already tore down — the latter being the normal
+    /// case when the server disconnected us before the user hung up. Either way
+    /// the postcondition callers want ("this connection is not open") already
+    /// holds, so reporting a failure only makes a clean hangup look broken.
     async fn close(&self) -> Result<(), TransportError> {
-        self.session
-            .room()
-            .close()
-            .await
-            .map_err(|error| TransportError::Closed(error.to_string()))
+        match self.session.room().close().await {
+            Ok(()) => Ok(()),
+            Err(livekit::RoomError::AlreadyClosed) => {
+                log::debug!(
+                    "connection {} was already closed; treating as success",
+                    self.connection_key,
+                );
+                Ok(())
+            }
+            Err(error) => Err(TransportError::Closed(error.to_string())),
+        }
     }
 }
 
@@ -482,11 +498,12 @@ async fn translate_room_events(
                 // Media that is subscribed but never decodes is invisible
                 // without this (MissingKey / DecryptionFailed = the key
                 // exchange or identity mapping went wrong for that stream).
-                log::warn!(
-                    "frame e2ee state changed for {}: {state:?}",
-                    participant.identity()
-                );
-                None
+                // Forwarded rather than merely logged: a host cannot build
+                // diagnostics on our log output.
+                encryption_state(state).map(|state| ConnectionEvent::EncryptionStateChanged {
+                    identity: participant.identity().to_string(),
+                    state,
+                })
             }
             // Everything else (data, transcriptions, metadata, local echoes
             // of our own publications, ...) stays LiveKit-internal for now.
@@ -554,12 +571,34 @@ fn stream_kind(source: TrackSource, kind: TrackKind) -> MediaStreamKind {
     }
 }
 
+/// Map the frame cryptor's state onto the transport-neutral vocabulary.
+///
+/// `None` for the two states that carry no diagnostic value: `New` is the
+/// cryptor's initial state (fired before anything has been attempted), and
+/// `KeyRatcheted` cannot occur with the MSC4195 per-participant key provider,
+/// which never ratchets.
+fn encryption_state(state: LkEncryptionState) -> Option<FrameEncryptionState> {
+    match state {
+        LkEncryptionState::Ok => Some(FrameEncryptionState::Ok),
+        LkEncryptionState::MissingKey => Some(FrameEncryptionState::MissingKey),
+        LkEncryptionState::DecryptionFailed => Some(FrameEncryptionState::DecryptionFailed),
+        LkEncryptionState::EncryptionFailed => Some(FrameEncryptionState::EncryptionFailed),
+        LkEncryptionState::InternalError => Some(FrameEncryptionState::InternalError),
+        LkEncryptionState::New => None,
+        LkEncryptionState::KeyRatcheted => {
+            log::warn!("frame cryptor reported a key ratchet, which MSC4195 never asks for");
+            None
+        }
+    }
+}
+
 /// A subscribed LiveKit track behind the transport-neutral handle.
 struct LiveKitRemoteTrack {
     kind: MediaStreamKind,
     track: RemoteTrack,
 }
 
+#[async_trait]
 impl RemoteTrackHandle for LiveKitRemoteTrack {
     fn kind(&self) -> MediaStreamKind {
         self.kind
@@ -590,6 +629,59 @@ impl RemoteTrackHandle for LiveKitRemoteTrack {
         // slow consumer drops frames instead of buffering.
         let stream = NativeVideoStream::new(track.rtc_track());
         Some(stream.map(to_media_video_frame).boxed())
+    }
+
+    async fn receive_stats(&self) -> Option<ReceiveStats> {
+        let stats = match self.track.get_stats().await {
+            Ok(stats) => stats,
+            Err(error) => {
+                log::debug!("could not read receive stats: {error}");
+                return None;
+            }
+        };
+        // One RTCP report per SSRC; the RTX and FEC streams get their own
+        // `InboundRtp` entries, so sum rather than taking the first.
+        let inbound: Vec<_> = stats
+            .iter()
+            .filter_map(|entry| match entry {
+                RtcStats::InboundRtp(inbound) => Some(inbound),
+                _ => None,
+            })
+            .collect();
+        if inbound.is_empty() {
+            // Before the first RTCP report there is nothing to report; a
+            // caller polling early gets `None` rather than a misleading zero.
+            return None;
+        }
+        Some(ReceiveStats {
+            packets_received: inbound.iter().map(|s| s.received.packets_received).sum(),
+            packets_lost: inbound.iter().map(|s| s.received.packets_lost).sum(),
+            bytes_received: inbound.iter().map(|s| s.inbound.bytes_received).sum(),
+            // Jitter is a per-stream measurement, not a total: report the
+            // worst of them.
+            jitter: inbound
+                .iter()
+                .map(|s| s.received.jitter)
+                .fold(0.0_f64, f64::max),
+            frames_decoded: inbound
+                .iter()
+                .map(|s| u64::from(s.inbound.frames_decoded))
+                .sum(),
+            frames_dropped: inbound
+                .iter()
+                .map(|s| u64::from(s.inbound.frames_dropped))
+                .sum(),
+            total_samples_received: inbound
+                .iter()
+                .map(|s| s.inbound.total_samples_received)
+                .sum(),
+            concealed_samples: inbound.iter().map(|s| s.inbound.concealed_samples).sum(),
+            silent_concealed_samples: inbound
+                .iter()
+                .map(|s| s.inbound.silent_concealed_samples)
+                .sum(),
+            concealment_events: inbound.iter().map(|s| s.inbound.concealment_events).sum(),
+        })
     }
 }
 

@@ -214,7 +214,9 @@ uniffi-bindgen warns about a missing `ktlint` (formatting only).
   peers' foci too).
 - Feed decrypted `m.rtc.encryption_key` to-device messages to
   `manager.receiveEncryptionKey(...)`; outbound keys already flow through
-  your `CommandSenderCallback`.
+  your `CommandSenderCallback`. Keys that arrive before
+  `connectMediaSession` are replayed into the transport on attach, so the
+  order of "join, receive keys, connect media" does not matter.
 - Include `transports_json` on the sticky events you feed in — without it
   peers project as media-unreachable.
 - Render frames from `videoStream(...).next()`: either the safe `data(plane)`

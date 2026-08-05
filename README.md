@@ -151,7 +151,10 @@ make build-ios-media
 See [mobile/PACKAGING.md](mobile/PACKAGING.md) for detailed documentation —
 including what changes with the media variant (binary sizes, `libwebrtc.jar`
 on Android, the required `-ObjC` linker flag on iOS), integration guides, and
-CI/CD setup.
+CI/CD setup. [mobile/README.md](mobile/README.md) covers what a host app has to
+do (native loading, logging, keep-alive, diagnosing dead media), and
+[CHANGELOG.md](CHANGELOG.md) tracks what changed for integrators — read its
+Breaking section before bumping the SDK.
 
 ## Quick Web Builds
 
@@ -240,6 +243,11 @@ cd web && npm test
 change touches the media feature.)
 
 If a required platform/toolchain is not available locally, document the skip reason in the PR description and ensure the corresponding CI job passes before merge.
+
+Finally, record anything a host integrator would notice in
+[CHANGELOG.md](./CHANGELOG.md) — new or changed API, behaviour changes, and
+especially breaking changes to the command-sender callbacks, which surface as
+compile errors in the host app.
 
 ## License
 

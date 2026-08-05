@@ -57,7 +57,8 @@ impl WasmRtcSessionManager {
     /// Sets up the command sender for this manager with a Matrix client.
     ///
     /// This must be called before join/leave operations.
-    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
+    /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         log::info!("manager: command sender installed");
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
@@ -233,13 +234,19 @@ impl WasmRtcSessionManager {
     /// * `params` - JSON object containing join parameters:
     ///   - `user_id`: Matrix user ID (e.g., "@alice:example.org")
     ///   - `device_id`: Device ID
-    ///   - `membership_id`: Optional sticky key, defaults to "{user_id}-{device_id}"
     ///   - `room_id`: Room ID
     ///   - `slot_id`: Slot ID (e.g., "m.call#ROOM")
     ///   - `application`: Application type (e.g., "m.call")
     ///   - `transport`: Transport configuration object
     ///   - `keep_alive_timeout_ms`: Optional keep-alive timeout in milliseconds (default: 30000)
-    pub async fn join(&mut self, params: JsValue) -> Result<(), JsError> {
+    ///   - `sticky_duration_ms`: Optional sticky-map lifetime for our membership in
+    ///     milliseconds (default: 3600000); the SDK re-sends the membership at half this
+    ///
+    /// Resolves to the `member.id` this join used. The SDK generates it: MSC4143
+    /// requires a fresh one per join, and reusing one keeps the media-plane
+    /// participant identity stable while the key index restarts at 0, so peers
+    /// would decrypt new media with the previous call's key.
+    pub async fn join(&mut self, params: JsValue) -> Result<String, JsError> {
         let params: WasmJoinSessionParams =
             serde_wasm_bindgen::from_value(params).map_err(|err| {
                 log::warn!("manager: invalid join params: {err}");
@@ -255,7 +262,9 @@ impl WasmRtcSessionManager {
             params.application,
         );
 
-        let core_params = params.into_core()?;
+        let mut core_params = params.into_core()?;
+        let member_id = matrix_rtc_core::generate_member_id();
+        core_params.membership_id = Some(member_id.clone());
 
         let result = self
             .inner
@@ -264,11 +273,19 @@ impl WasmRtcSessionManager {
             .map_err(|err| JsError::new(&err.to_string()));
 
         match &result {
-            Ok(()) => log::info!("manager: join succeeded"),
+            Ok(()) => log::info!("manager: join succeeded as {member_id}"),
             Err(_) => log::warn!("manager: join failed"),
         }
 
-        result
+        result.map(|()| member_id)
+    }
+
+    /// Our `member.id` in one session, or `undefined` if there is no such
+    /// session or it has not joined. Changes on every join, so read it when
+    /// needed rather than caching what `join` returned.
+    #[wasm_bindgen(js_name = ownMemberId)]
+    pub fn own_member_id(&self, room_id: String, slot_id: String) -> Option<String> {
+        self.inner.own_member_id(&room_id, &slot_id)
     }
 
     /// Leaves an RTC session.
@@ -326,8 +343,6 @@ impl Default for WasmRtcSessionManager {
 pub struct WasmJoinSessionParams {
     pub user_id: String,
     pub device_id: String,
-    #[serde(default)]
-    pub membership_id: Option<String>,
     pub room_id: String,
     pub slot_id: String,
     pub application: String,
@@ -341,6 +356,7 @@ pub struct WasmJoinSessionParams {
     pub can_subscribe: Vec<String>,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
+    pub sticky_duration_ms: Option<u64>,
     #[serde(default)]
     pub encryption_config: Option<WasmEncryptionConfig>,
 }
@@ -391,7 +407,12 @@ impl WasmJoinSessionParams {
         Ok(JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
-            membership_id: self.membership_id,
+            // Filled in by the join entry points, which generate a fresh id per
+            // join and return it. A caller-chosen `member.id` reused across
+            // joins would keep the MSC4195 participant identity stable while our
+            // key index restarts at 0, so peers decrypt new media with the
+            // previous call's key.
+            membership_id: None,
             room_id: self.room_id,
             slot_id: self.slot_id,
             application: self.application,
@@ -402,6 +423,7 @@ impl WasmJoinSessionParams {
                 },
             },
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
+            sticky_duration_ms: self.sticky_duration_ms,
             encryption_config,
         })
     }
@@ -506,7 +528,8 @@ impl WasmRtcSession {
     /// Sets up the command sender for this session with a Matrix client.
     ///
     /// This must be called before join/leave operations.
-    /// The client must implement methods: sendStickyEvent, sendDelayedEvent, cancelDelayedEvent.
+    /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
+    /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());
@@ -595,16 +618,27 @@ impl WasmRtcSession {
     /// # Arguments
     ///
     /// * `params` - JSON object containing join parameters (same as WasmRtcSessionManager::join)
-    pub async fn join(&mut self, params: JsValue) -> Result<(), JsError> {
+    ///
+    /// Resolves to the SDK-generated `member.id` this join used.
+    pub async fn join(&mut self, params: JsValue) -> Result<String, JsError> {
         let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
 
-        let core_params = params.into_core()?;
+        let mut core_params = params.into_core()?;
+        let member_id = matrix_rtc_core::generate_member_id();
+        core_params.membership_id = Some(member_id.clone());
 
         self.inner
             .join(core_params)
             .await
+            .map(|()| member_id)
             .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Our `member.id` for the current join, or `undefined` while not joined.
+    #[wasm_bindgen(js_name = ownMemberId)]
+    pub fn own_member_id(&self) -> Option<String> {
+        self.inner.own_member_id().map(str::to_owned)
     }
 
     /// Leaves this RTC session.

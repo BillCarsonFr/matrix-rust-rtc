@@ -34,7 +34,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, update_delayed_event,
@@ -57,14 +56,34 @@ use matrix_rtc_core::{
     StickyEventsUpdate,
 };
 
-/// Sticky duration for `m.rtc.member` events, clamped to one hour by the SDK.
-///
-/// The join event lives for this long; liveness while joined relies on the dead
-/// man's switch (a delayed leave restarted by heartbeats), and a graceful leave
-/// sends an explicit disconnect sticky. NOTE: the delayed leave is currently a
-/// plain (non-sticky) delayed event, so crash cleanup relies on this TTL
-/// expiring; making the delayed leave itself sticky is a follow-up.
-const STICKY_DURATION_MS: u32 = 60 * 60 * 1000;
+// The sticky duration for `m.rtc.member` now comes from the core
+// (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
+// half that interval to stay in the map. It used to be a constant here, which
+// meant nothing knew when the entry would lapse.
+//
+// NOTE: the delayed leave is a plain (non-sticky) delayed event, so it clears
+// nothing from the sticky map when it fires — crash cleanup relies entirely on
+// the membership's own sticky TTL expiring. That makes the dead man's switch
+// ceremonial today, and it is why a crashed client lingers as a ghost for up to
+// `sticky_duration_ms` rather than `keep_alive_timeout_ms`.
+//
+// It is *not* an HTTP-level limitation. MSC4140 has no endpoint of its own: both
+// `org.matrix.msc4140.delay` and `org.matrix.msc4354.sticky_duration_ms` are
+// query parameters on the ordinary
+// `PUT /_matrix/client/v3/rooms/{room}/send/{type}/{txn}`, so a sticky delayed
+// event is just both at once. The blocker is ruma's types —
+// `delayed_message_event::Request` has no sticky field and
+// `send_message_event::Request` has no delay field, so neither can express both.
+//
+// Two things to settle upstream before relying on it:
+//   * Neither MSC states that the two compose (MSC4354 only hints: they "may be
+//     combined ... to provide heartbeat semantics (e.g required for MatrixRTC)").
+//   * `origin_server_ts` for a delayed event must be the *fire* time, not the
+//     scheduling time. MSC4354 resolves sticky conflicts by highest
+//     `origin_server_ts + duration` ("last to expire wins"), so a leave stamped
+//     at scheduling time would expire *before* the join it is meant to replace
+//     and would never take effect. MSC4140 only implies fire time, in a footnote
+//     about event IDs.
 
 fn command_error(error: impl std::fmt::Display) -> CommandError {
     CommandError::from_message(error.to_string())
@@ -124,11 +143,19 @@ impl RtcCommandSender for SdkCommandSender {
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError> {
         let room = self.room(&room_id)?;
         let event_type = wire_event_type(event_type).to_string();
+        // The core's value, not a constant of ours: it schedules the refresh
+        // against exactly this lifetime, so substituting one here would break
+        // the refresh. The core clamps to `MAX_STICKY_DURATION_MS` for the same
+        // reason the SDK does — anything longer comes back as an hour, and a
+        // refresh scheduled against the longer figure would fire after the entry
+        // had already lapsed.
+        let duration_ms = u32::try_from(duration_ms).unwrap_or(u32::MAX);
         room.send_raw(&event_type, &content)
-            .with_sticky_duration_ms(STICKY_DURATION_MS)
+            .with_sticky_duration_ms(duration_ms)
             .with_request_config(rtc_request_config())
             .await
             .map_err(command_error)?;
@@ -161,6 +188,24 @@ impl RtcCommandSender for SdkCommandSender {
             .map_err(command_error)?;
         // The trait's "event_id" is the delay_id used to restart/cancel it.
         Ok(response.delay_id)
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        // MSC4140's "heartbeat ping": resets the timer to now + the original
+        // delay, keeping the same delay id. One request, and never a moment
+        // with no delayed leave armed.
+        let request =
+            update_delayed_event::unstable_v1::Request::new(event_id, UpdateAction::Restart);
+        self.client
+            .send(request)
+            .with_request_config(rtc_request_config())
+            .await
+            .map_err(command_error)?;
+        Ok(())
     }
 
     async fn cancel_delayed_event(
@@ -206,48 +251,31 @@ impl RtcCommandSender for SdkCommandSender {
         content: Value,
     ) -> Result<(), CommandError> {
         // MSC4143 encryption-key distribution: send the media key as an
-        // Olm-encrypted to-device message to the target device(s).
+        // Olm-encrypted to-device message to exactly one device — the one that
+        // published the membership. There is deliberately no `"*"` fan-out: media
+        // keys must not reach devices that are not in the call, and for our own
+        // user a fan-out would include this device, which Olm cannot encrypt to.
         let user = UserId::parse(&user_id).map_err(command_error)?;
         let encryption = self.client.encryption();
 
-        // Resolve the recipient devices. `"*"` (used by the core to target every
-        // device of a user) fans out to all of the user's known devices.
-        let devices: Vec<Device> = if device_id == "*" {
-            encryption
-                .get_user_devices(&user)
-                .await
-                .map_err(command_error)?
-                .devices()
-                .collect()
-        } else {
-            let dev_id = <&DeviceId>::from(device_id.as_str());
-            match encryption
-                .get_device(&user, dev_id)
-                .await
-                .map_err(command_error)?
-            {
-                Some(device) => vec![device],
-                None => {
-                    log::warn!(
-                        "no known device {device_id} for {user_id}; dropping to-device \
-                         {message_type}"
-                    );
-                    return Ok(());
-                }
-            }
-        };
-        if devices.is_empty() {
-            log::warn!("no devices to send to-device {message_type} to {user_id}");
+        let dev_id = <&DeviceId>::from(device_id.as_str());
+        let Some(device) = encryption
+            .get_device(&user, dev_id)
+            .await
+            .map_err(command_error)?
+        else {
+            log::warn!(
+                "no known device {device_id} for {user_id}; dropping to-device {message_type}"
+            );
             return Ok(());
-        }
-        let recipients: Vec<&Device> = devices.iter().collect();
+        };
 
         let raw: Raw<AnyToDeviceEventContent> =
             Raw::new(&content).map_err(command_error)?.cast_unchecked();
 
         let failures = encryption
             .encrypt_and_send_raw_to_device(
-                recipients,
+                vec![&device],
                 &message_type,
                 raw,
                 // `AllDevices` sends to every device regardless of verification/cross-

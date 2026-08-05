@@ -90,8 +90,6 @@ pub struct FfiJoinSessionParams {
     pub user_id: String,
     /// Device ID
     pub device_id: String,
-    /// Optional sticky key, defaults to "{user_id}-{device_id}"
-    pub membership_id: Option<String>,
     /// Room ID
     pub room_id: String,
     /// Slot ID (e.g., "m.call#ROOM")
@@ -104,8 +102,17 @@ pub struct FfiJoinSessionParams {
     /// Transport types this member can receive on. Only read when `transport`
     /// is `None`; a publishing member advertises its own transport's type.
     pub can_subscribe: Vec<String>,
-    /// Optional keep-alive timeout in milliseconds (default: 30000)
+    /// Optional keep-alive timeout in milliseconds (default: 30000).
+    ///
+    /// Arms the delayed leave (the dead man's switch for a client that dies).
     pub keep_alive_timeout_ms: Option<u64>,
+    /// Optional sticky-map lifetime for our membership, in milliseconds
+    /// (default: 3600000).
+    ///
+    /// A different clock from `keep_alive_timeout_ms`: this is how long the
+    /// homeserver keeps the membership at all. The SDK re-sends the membership
+    /// at half this interval, so shortening it buys nothing but traffic.
+    pub sticky_duration_ms: Option<u64>,
     /// Optional encryption configuration
     pub encryption_config: Option<FfiEncryptionConfig>,
 }
@@ -180,13 +187,12 @@ impl FfiJoinSessionParams {
         };
 
         format!(
-            "[{}/{}] user={} device={} application={} membership_id={:?} transport={} keep_alive={:?}ms encryption={}",
+            "[{}/{}] user={} device={} application={} transport={} keep_alive={:?}ms encryption={}",
             self.room_id,
             self.slot_id,
             self.user_id,
             self.device_id,
             self.application,
-            self.membership_id,
             transport,
             self.keep_alive_timeout_ms,
             self.encryption_config.is_some(),
@@ -206,12 +212,18 @@ impl FfiJoinSessionParams {
         Ok(matrix_rtc_core::JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
-            membership_id: self.membership_id,
+            // Filled in by the join entry points, which generate a fresh id per
+            // join and return it: a host-chosen `member.id` reused across joins
+            // keeps the MSC4195 participant identity stable while the key index
+            // restarts at 0, so peers decrypt new media with a stale key and
+            // never recover. The SDK owns it so that is not expressible.
+            membership_id: None,
             room_id: self.room_id,
             slot_id: self.slot_id,
             application: self.application,
             transport,
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
+            sticky_duration_ms: self.sticky_duration_ms,
             encryption_config,
         })
     }
@@ -243,6 +255,12 @@ pub trait CommandSenderCallback: Send + Sync {
     /// * `event_type` - The wire event type (e.g., "org.matrix.msc4143.rtc.member");
     ///   send it verbatim, it is already translated for you
     /// * `content_json` - The event content as a JSON string
+    /// * `duration_ms` - How long the homeserver should keep this entry in the
+    ///   sticky map. Pass it through verbatim (matrix-rust-sdk:
+    ///   `.with_sticky_duration_ms(durationMs)`); do NOT substitute a value of
+    ///   your own. The SDK re-sends the membership before this elapses to stay
+    ///   in the call, so a shorter lifetime here silently drops the membership
+    ///   mid-call and a longer one leaves a ghost behind.
     ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
@@ -251,6 +269,7 @@ pub trait CommandSenderCallback: Send + Sync {
         room_id: String,
         event_type: String,
         content_json: String,
+        duration_ms: u64,
     ) -> Result<(), CommandSenderError>;
 
     /// Called when a delayed event needs to be scheduled.
@@ -292,6 +311,31 @@ pub trait CommandSenderCallback: Send + Sync {
         content_json: String,
     ) -> Result<(), CommandSenderError>;
 
+    /// Called periodically to restart a scheduled delayed event's timer.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID where the delayed event was scheduled
+    /// * `event_id` - The delay ID returned by send_delayed_event
+    ///
+    /// # Implementation
+    /// matrix-rust-sdk: `update_delayed_event` with `UpdateAction::Restart`.
+    /// This is MSC4140's "heartbeat ping" — it resets the delay's timer to now
+    /// plus its original delay, without changing its ID.
+    ///
+    /// Do NOT emulate it by cancelling and re-scheduling. That leaves the call
+    /// unprotected in between, burns the server's `max_scheduled` quota, and a
+    /// failed cancel leaks a delay which then fires — and because the sticky map
+    /// resolves conflicts by *last to expire*, that leave out-expires the live
+    /// membership and shows the user as having left a call they are still in.
+    ///
+    /// # Returns
+    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandSenderError>;
+
     /// Called when a previously scheduled delayed event needs to be canceled.
     ///
     /// # Arguments
@@ -310,7 +354,9 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Arguments
     /// * `user_id` - The target user ID
-    /// * `device_id` - The target device ID (use "*" for all devices of the user)
+    /// * `device_id` - The target device ID. Always one device — send to exactly
+    ///   that device and do not widen it to the user's other devices; the SDK
+    ///   never asks for a fan-out.
     /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
     /// * `content_json` - The message content as a JSON string
     ///
@@ -374,6 +420,7 @@ impl RtcCommandSender for FfiCommandSender {
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError> {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
@@ -385,7 +432,7 @@ impl RtcCommandSender for FfiCommandSender {
         log_command(
             &what,
             self.callback
-                .send_sticky_event(room_id, wire_event_type, content_json)
+                .send_sticky_event(room_id, wire_event_type, content_json, duration_ms)
                 .map_err(CommandError::from),
         )
     }
@@ -408,6 +455,20 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .send_delayed_event(room_id, wire_event_type, content_json, delay_ms)
+                .map_err(CommandError::from),
+        )
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        let what = format!("restart delayed [{room_id}] id={event_id}");
+        log_command(
+            &what,
+            self.callback
+                .restart_delayed_event(room_id, event_id)
                 .map_err(CommandError::from),
         )
     }
@@ -482,6 +543,7 @@ mod tests {
     #[derive(Default)]
     struct MockCommandSenderCallback {
         sent_types: Mutex<Vec<String>>,
+        sticky_duration_ms: Mutex<Option<u64>>,
     }
 
     impl MockCommandSenderCallback {
@@ -500,8 +562,10 @@ mod tests {
             _room_id: String,
             event_type: String,
             _content_json: String,
+            duration_ms: u64,
         ) -> Result<(), CommandSenderError> {
             self.record(&event_type);
+            *self.sticky_duration_ms.lock().unwrap() = Some(duration_ms);
             Ok(())
         }
 
@@ -524,6 +588,15 @@ mod tests {
             _content_json: String,
         ) -> Result<(), CommandSenderError> {
             self.record(&event_type);
+            Ok(())
+        }
+
+        fn restart_delayed_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+        ) -> Result<(), CommandSenderError> {
+            self.record("restart_delayed_event");
             Ok(())
         }
 
@@ -565,12 +638,16 @@ mod tests {
                     "slot_id": "m.call#ROOM",
                     "sticky_key": "alice-device-a"
                 }),
+                90_000,
             )
             .await;
 
         assert!(result.is_ok());
         // The host must see the unstable id: peers do not match on `m.rtc.member`.
         assert_eq!(mock.sent_types(), ["org.matrix.msc4143.rtc.member"]);
+        // The sticky lifetime must reach the host unchanged: the core schedules
+        // its refresh against exactly this number.
+        assert_eq!(*mock.sticky_duration_ms.lock().unwrap(), Some(90_000));
     }
 
     #[tokio::test]
@@ -615,7 +692,7 @@ mod tests {
         command_sender
             .send_to_device_message(
                 "@bob:example.org".to_string(),
-                "*".to_string(),
+                "device456".to_string(),
                 matrix_rtc_core::KEY_MESSAGE_TYPE.to_string(),
                 serde_json::json!({ "key": "…" }),
             )
@@ -637,6 +714,63 @@ mod tests {
         assert_eq!(
             wire_type("com.example.custom".to_owned()),
             "com.example.custom"
+        );
+    }
+
+    fn join_params() -> FfiJoinSessionParams {
+        FfiJoinSessionParams {
+            user_id: "@alice:example.org".to_owned(),
+            device_id: "DEVICE".to_owned(),
+            room_id: "!room:example.org".to_owned(),
+            slot_id: "m.call#ROOM".to_owned(),
+            application: "m.call".to_owned(),
+            transport: Some(FfiTransportConfig {
+                r#type: "livekit".to_owned(),
+                livekit_service_url: Some("https://sfu.example.org".to_owned()),
+            }),
+            can_subscribe: Vec::new(),
+            keep_alive_timeout_ms: None,
+            sticky_duration_ms: None,
+            encryption_config: None,
+        }
+    }
+
+    /// The SDK owns the `member.id`, and a rejoin must not reuse the previous
+    /// one. Reuse keeps the MSC4195 participant identity stable while our key
+    /// index restarts at 0, so every peer decrypts the new call's media with the
+    /// old call's key and never recovers — which is why hosts cannot supply one.
+    #[test]
+    fn every_join_gets_a_fresh_member_id() {
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Box::new(MockCommandSenderCallback::default()))
+            .expect("the mock sender should be accepted");
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+
+        let first = manager.join(join_params()).expect("first join");
+        assert_eq!(
+            manager
+                .own_member_id(room_id.clone(), slot_id.clone())
+                .expect("the call itself should succeed"),
+            Some(first.clone()),
+            "the id returned by join must be the one the membership was published under",
+        );
+
+        manager
+            .leave(
+                room_id.clone(),
+                slot_id.clone(),
+                FfiLeaveSessionParams { leave_reason: None },
+            )
+            .expect("leave");
+        let second = manager.join(join_params()).expect("rejoin");
+
+        assert_ne!(first, second, "a rejoin must not reuse the member id");
+        assert_eq!(
+            manager
+                .own_member_id(room_id, slot_id)
+                .expect("the call itself should succeed"),
+            Some(second),
         );
     }
 }

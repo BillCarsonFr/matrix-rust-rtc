@@ -30,6 +30,9 @@
 //!    bridge into the core, starts the transport-agnostic `CallEngine`
 //!    (which opens connections to every peer's focus — MSC4195 multi-SFU),
 //!    and connects the own-focus SFU with per-participant frame encryption.
+//!    It reads the `member.id` from that join rather than taking one from the
+//!    host — our MSC4195 participant identity is derived from it, so the two
+//!    must not be able to disagree.
 //! 3. The host consumes [`MediaSession`]: the unified event stream
 //!    (`next_event`, bridged to Kotlin `Flow` / Swift `AsyncStream`), the
 //!    participant roster, per-stream constraints, frame streams
@@ -60,9 +63,10 @@ pub use frames::{
 };
 pub use session::{MediaSession, MediaSessionConfig, connect_media_session};
 pub use types::{
-    FfiAudioSourceConfig, FfiCallEvent, FfiEndedReason, FfiMediaConstraints, FfiOpenIdToken,
-    FfiParticipant, FfiPublishOptions, FfiQualityLimit, FfiStreamKind, FfiStreamState,
-    FfiVideoDetail, FfiVideoSourceConfig, OpenIdTokenProvider,
+    FfiAudioSourceConfig, FfiCallEvent, FfiEndedReason, FfiFrameEncryptionState,
+    FfiMediaConstraints, FfiOpenIdToken, FfiParticipant, FfiPublishOptions, FfiQualityLimit,
+    FfiReceiveStats, FfiStreamKind, FfiStreamState, FfiVideoDetail, FfiVideoSourceConfig,
+    OpenIdTokenProvider,
 };
 
 /// Errors produced by the media layer of the FFI.
@@ -84,16 +88,14 @@ pub enum MediaFfiError {
     InternalLockPoisoned,
 }
 
-/// The dedicated multithreaded runtime every media task runs on (engine
-/// actor, connection pool, SFU IO). Lazily created on first use.
+/// The multithreaded runtime every media task runs on (engine actor,
+/// connection pool, SFU IO). Lazily created on first use.
+///
+/// Shared with the synchronous FFI entry points ([`crate::runtime`]) rather
+/// than a second runtime of its own: one pool of worker threads instead of two
+/// on a mobile device, and the entry points need a multi-threaded runtime for
+/// exactly the same reason media does. Media's futures are spawned (so `Send`);
+/// the entry points only ever block on theirs, which imposes no such bound.
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
-    use std::sync::OnceLock;
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("matrix-rtc-media")
-            .build()
-            .expect("failed to build the media tokio runtime")
-    })
+    crate::runtime::runtime()
 }

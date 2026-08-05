@@ -572,7 +572,7 @@ mod tests {
         manager.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
-        let (_, _, content) = sticky.first().expect("a join should have been sent");
+        let (_, _, content, _) = sticky.first().expect("a join should have been sent");
 
         // Nothing published, but peers are still told what it can receive on,
         // so they pick a transport it can actually hear.
@@ -611,7 +611,7 @@ mod tests {
         manager.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
-        let (_, _, content) = sticky.first().expect("a join should have been sent");
+        let (_, _, content, _) = sticky.first().expect("a join should have been sent");
         assert!(content.get("transports").is_none());
     }
 
@@ -635,7 +635,7 @@ mod tests {
         manager.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
-        let (_, _, content) = sticky.first().expect("a join should have been sent");
+        let (_, _, content, _) = sticky.first().expect("a join should have been sent");
         assert_eq!(
             content
                 .pointer("/transports/published/0/livekit_service_url")

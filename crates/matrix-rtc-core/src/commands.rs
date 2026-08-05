@@ -53,11 +53,16 @@ pub trait RtcCommandSender: Send + Sync {
     /// * `room_id` - The room ID where the event should be sent
     /// * `event_type` - The event type (e.g., "m.rtc.member")
     /// * `content` - The event content as a JSON value
+    /// * `duration_ms` - How long the server should keep this entry in the
+    ///   sticky map. Implementations MUST pass this through rather than
+    ///   choosing their own: the caller re-sends the event before this elapses,
+    ///   so a different lifetime here silently breaks that refresh.
     async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError>;
 
     /// Send a delayed event to a Matrix room.
@@ -81,6 +86,29 @@ pub trait RtcCommandSender: Send + Sync {
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError>;
+
+    /// Restart a previously scheduled delayed event's timer (MSC4140's
+    /// `restart` action — "heartbeat ping").
+    ///
+    /// Resets the scheduled send time to now plus the *original* delay, leaving
+    /// the delay id and everything else about the event untouched. This is the
+    /// keep-alive primitive: one request, and no moment at which no delayed
+    /// leave is armed.
+    ///
+    /// Do NOT emulate this with cancel-then-reschedule. That leaves a window
+    /// with nothing armed, burns the server's `max_scheduled` quota, and a
+    /// failed cancel leaks a delay that will fire and mark us as departed while
+    /// we are still in the call.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID where the delayed event was scheduled
+    /// * `event_id` - The delay id returned by `send_delayed_event`
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError>;
 
     /// Cancel a previously scheduled delayed event.
     ///
@@ -106,7 +134,11 @@ pub trait RtcCommandSender: Send + Sync {
     /// # Arguments
     ///
     /// * `user_id` - The target user ID
-    /// * `device_id` - The target device ID (use "*" for all devices of the user)
+    /// * `device_id` - The target device ID. Always a single device: media keys
+    ///   go to the device that published the membership, and the SDK never asks
+    ///   for a fan-out to every device of a user (that would hand the key to
+    ///   devices outside the call, and for our own user to this very device,
+    ///   which Olm cannot encrypt to).
     /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
     /// * `content` - The message content as a JSON value
     ///
@@ -159,6 +191,7 @@ impl RtcCommandSender for NoopCommandSender {
         _room_id: String,
         _event_type: String,
         _content: Value,
+        _duration_ms: u64,
     ) -> Result<(), CommandError> {
         Ok(())
     }
@@ -171,6 +204,14 @@ impl RtcCommandSender for NoopCommandSender {
         _delay_ms: u64,
     ) -> Result<String, CommandError> {
         Ok("mock-event-id".to_string())
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+    ) -> Result<(), CommandError> {
+        Ok(())
     }
 
     async fn cancel_delayed_event(
@@ -208,8 +249,9 @@ impl RtcCommandSender for NoopCommandSender {
 #[cfg(test)]
 #[derive(Default)]
 pub struct MockCommandSender {
-    pub sticky_events: std::sync::Mutex<Vec<(String, String, Value)>>,
+    pub sticky_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
     pub delayed_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
+    pub restarted_events: std::sync::Mutex<Vec<(String, String)>>,
     pub cancelled_events: std::sync::Mutex<Vec<(String, String)>>,
     pub to_device_messages: std::sync::Mutex<Vec<(String, String, String, Value)>>,
     pub state_events: std::sync::Mutex<Vec<(String, String, String, Value)>>,
@@ -222,7 +264,7 @@ impl MockCommandSender {
     }
 
     #[allow(dead_code)]
-    pub fn last_sticky_event(&self) -> Option<(String, String, Value)> {
+    pub fn last_sticky_event(&self) -> Option<(String, String, Value, u64)> {
         self.sticky_events.lock().unwrap().last().cloned()
     }
 
@@ -256,11 +298,12 @@ impl RtcCommandSender for MockCommandSender {
         room_id: String,
         event_type: String,
         content: Value,
+        duration_ms: u64,
     ) -> Result<(), CommandError> {
         self.sticky_events
             .lock()
             .unwrap()
-            .push((room_id, event_type, content));
+            .push((room_id, event_type, content, duration_ms));
         Ok(())
     }
 
@@ -278,6 +321,18 @@ impl RtcCommandSender for MockCommandSender {
             delay_ms,
         ));
         Ok(format!("delayed-{}-{}", room_id, event_type))
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), CommandError> {
+        self.restarted_events
+            .lock()
+            .unwrap()
+            .push((room_id, event_id));
+        Ok(())
     }
 
     async fn cancel_delayed_event(
