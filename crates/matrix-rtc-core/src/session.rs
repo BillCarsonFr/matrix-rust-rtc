@@ -103,12 +103,29 @@ pub(crate) enum JoinCondition {
     UnencryptedInEncryptedRoom,
     /// The sender is no longer joined to the room.
     SenderNotInRoom,
+    /// A previous participation of *this* device, still sticky under an older
+    /// `member_id`. MSC4143 mints a fresh `member.id` per join, so this is us one
+    /// call ago, not a peer.
+    SupersededOwnParticipation,
 }
 
 impl JoinCondition {
     fn is_joined(self) -> bool {
         matches!(self, JoinCondition::Joined)
     }
+}
+
+/// Who we are in the session's current join, for as long as we are joined.
+///
+/// Kept next to the membership machine so the join conditions can recognise our
+/// own superseded participations. The `member_id` alone is not enough: telling a
+/// stale participation of *this* device apart from another device of the same
+/// user needs the device too.
+#[derive(Clone, Debug)]
+struct OwnParticipation {
+    user_id: String,
+    device_id: String,
+    member_id: String,
 }
 
 /// Per-session MatrixRTC state machine and membership store.
@@ -133,6 +150,8 @@ pub struct RtcSession<T: RtcCommandSender> {
     command_sender: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
     own_membership_machine: Option<OwnMembershipMachine<T>>,
+    /// Identity of the current join, or `None` while not joined.
+    own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
     encryption_manager: Option<EncryptionManager<T>>,
     /// `room_id/slot_id`, prefixed to this session's log lines.
@@ -156,6 +175,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             command_sender: self.command_sender.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             encryption_manager: None,     // Don't clone the encryption manager
+            own_participation: None,      // A clone holds no machine, so it is not joined
             log_tag: self.log_tag.clone(),
         }
     }
@@ -176,6 +196,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             command_sender: None,
             own_membership_machine: None,
             encryption_manager: None,
+            own_participation: None,
             log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
     }
@@ -194,6 +215,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             command_sender: Some(command_sender),
             own_membership_machine: None,
             encryption_manager: None,
+            own_participation: None,
             log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
     }
@@ -360,6 +382,11 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
         // Store the machine
         self.own_membership_machine = Some(machine);
+        self.own_participation = Some(OwnParticipation {
+            user_id: params.user_id.clone(),
+            device_id: params.device_id.clone(),
+            member_id: membership_id.clone(),
+        });
 
         // Create the encryption manager
         // We need a closure that can access self.members
@@ -403,6 +430,35 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
         // Store the encryption manager
         self.encryption_manager = Some(encryption_manager);
+
+        // Re-evaluate the roster: we now have an `own_participation`, so any
+        // still-sticky participation of this device from a previous call stops
+        // counting as a member. This also publishes the roster the media layer's
+        // engine will boot from.
+        self.refresh().await;
+
+        // Drive the first distribution from the join itself, unconditionally.
+        //
+        // `on_memberships_update` is otherwise only reachable through
+        // `refresh()`, which returns early when the roster is unchanged — and a
+        // session outlives a `leave()`, so a second join in the same process
+        // starts with the previous call's roster already in place and has no
+        // change to ride on. Without this, the first call in a process
+        // distributes its key (the peer's arrival moved the roster) and every
+        // later one silently distributes nothing, leaving peers at
+        // `MISSING_KEY` for the whole call.
+        //
+        // A failure here is logged rather than propagated: an unreachable peer
+        // must not fail the join, exactly as it does not fail a rollout
+        // triggered by a membership change.
+        if let Some(encryption_manager) = self.encryption_manager.as_ref()
+            && let Err(error) = encryption_manager.on_memberships_update().await
+        {
+            log::warn!(
+                "[{}] the join's first key distribution failed: {error:?}",
+                self.log_tag,
+            );
+        }
 
         log::info!(
             "[{}] joined as {membership_id} (media keys {})",
@@ -449,6 +505,14 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         if let Some(encryption_manager) = self.encryption_manager.take() {
             encryption_manager.leave();
         }
+        self.own_participation = None;
+
+        // Republish the roster now that we are no longer part of it, rather than
+        // waiting for the host's next sticky delta. Room state and peer
+        // candidates are deliberately kept: they are room truth a host feeding
+        // deltas will never re-deliver, and a host that has hung up may still
+        // want to see who is left in the call.
+        self.refresh().await;
 
         log::info!("[{}] left", self.log_tag);
 
@@ -607,6 +671,27 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             && candidate.origin.was_encrypted() == Some(false)
         {
             return JoinCondition::UnencryptedInEncryptedRoom;
+        }
+
+        // A previous participation of this very device is us, one call ago —
+        // MSC4143 mints a fresh `member.id` per join, and the old one stays
+        // sticky until the homeserver expires it. Left in, it becomes a phantom
+        // member: the media layer opens a receive stream for it and waits for a
+        // key that will never come, and it forces a key rotation whose only
+        // recipient is unreachable (a device cannot send itself a to-device
+        // message). The encryption manager already filters it out of its
+        // recipients; this is the same rule applied one level up, where the
+        // published roster is decided.
+        //
+        // The device must match, not just the user: other devices of our own
+        // user are ordinary peers. A candidate whose sending device the host did
+        // not report therefore cannot be judged, and stays.
+        if let Some(own) = &self.own_participation
+            && candidate.sender == own.user_id
+            && candidate.origin.sender_device_id() == Some(own.device_id.as_str())
+            && candidate.member_id != own.member_id
+        {
+            return JoinCondition::SupersededOwnParticipation;
         }
 
         match &self.room_members {

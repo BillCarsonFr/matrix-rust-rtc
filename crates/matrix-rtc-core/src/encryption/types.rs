@@ -271,6 +271,20 @@ impl Default for EncryptionConfig {
 /// From MSC4143: "It is possible that keys arrive in the wrong order. For example,
 /// after a quick join/leave/join, there will be 2 keys of index 0 distributed, and
 /// if they are received in the wrong order, the stream won't be decryptable."
+///
+/// # What this can actually detect
+///
+/// MSC4143 puts no creation timestamp on the wire, so the only timestamp
+/// available is the moment *we* received the key. Receive order is therefore the
+/// whole of our ordering information, and "the latest key" can only mean "the
+/// last one received" — this filter cannot recognise a genuinely stale key that
+/// merely arrived late, which is the case the MSC is describing. It is kept
+/// because it is the right shape for the day a sender timestamp exists, and
+/// because it still bounds one real case: two deliveries stamped identically.
+///
+/// Deduplicating *identical* re-deliveries is a separate job, done on the key
+/// material itself where a re-send of the same key is recognisable without any
+/// timestamp at all.
 #[derive(Clone, Debug)]
 pub struct OutdatedKeyFilter {
     /// Buffer tracking the latest timestamp per (member_id, key_index)
@@ -308,13 +322,22 @@ impl OutdatedKeyFilter {
     /// * `candidate_ts` - The timestamp of the candidate key
     ///
     /// # Logic
-    /// If we already have a key from this member at the same index with a timestamp
-    /// >= the candidate's timestamp, the candidate is outdated and should be dropped.
+    /// If we already have a key from this member at the same index with a
+    /// timestamp strictly newer than the candidate's, the candidate is outdated
+    /// and should be dropped.
+    ///
+    /// Equal timestamps let the candidate through, deliberately. Timestamps are
+    /// stamped on receipt (see the type docs), so two keys at one index in the
+    /// same millisecond are a rekey we saw twice in quick succession, not
+    /// evidence of staleness — and the later one is the one the sender is now
+    /// encrypting with. Treating equal as outdated silently discarded it and left
+    /// the stream undecryptable, which is the failure this filter exists to
+    /// prevent.
     pub fn is_outdated(&self, member_id: &str, key_index: u8, candidate_ts: u64) -> bool {
         let key = format!("{}:{}", member_id, key_index);
         if let Some(&existing_ts) = self.buffer.get(&key) {
-            // If existing key has same or newer timestamp, candidate is outdated
-            if existing_ts >= candidate_ts {
+            // Only a strictly newer key already in hand makes this one outdated.
+            if existing_ts > candidate_ts {
                 return true;
             }
         }

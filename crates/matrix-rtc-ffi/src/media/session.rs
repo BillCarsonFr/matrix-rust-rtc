@@ -202,8 +202,10 @@ async fn build_media_session(
     //
     // `block_on` rather than `.await`: this function is spawned, so its future
     // must be `Send`, and awaiting here would hold the manager's `MutexGuard`
-    // across a yield point. The replay does not yield anyway — it signals with
-    // `use_after_ms: 0`, which the bridge applies inline.
+    // across a yield point. The replay does not yield either way — a key already
+    // in use is signalled with `use_after_ms: 0` and applied inline, and a
+    // rotation still inside its `delayBeforeUse` is signalled with whatever
+    // remains of it, which the bridge *schedules* without blocking.
     {
         let mgr =
             crate::lock_mutex(&manager.inner).map_err(|_| MediaFfiError::InternalLockPoisoned)?;

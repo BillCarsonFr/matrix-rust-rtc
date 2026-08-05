@@ -540,10 +540,22 @@ mod tests {
 
     /// Mock callback that records the event type each send was given, so tests
     /// can assert on what a native host would actually put on the wire.
+    ///
+    /// To-device sends are recorded in full — recipient and content — because
+    /// "which member was handed which key index" is the question most key
+    /// distribution bugs turn on, and the event type alone cannot answer it.
     #[derive(Default)]
     struct MockCommandSenderCallback {
         sent_types: Mutex<Vec<String>>,
         sticky_duration_ms: Mutex<Option<u64>>,
+        to_device: Mutex<Vec<ToDeviceSend>>,
+    }
+
+    #[derive(Clone)]
+    struct ToDeviceSend {
+        user_id: String,
+        device_id: String,
+        content: serde_json::Value,
     }
 
     impl MockCommandSenderCallback {
@@ -553,6 +565,20 @@ mod tests {
 
         fn sent_types(&self) -> Vec<String> {
             self.sent_types.lock().unwrap().clone()
+        }
+
+        fn to_device_for(&self, user_id: &str, device_id: &str) -> Vec<serde_json::Value> {
+            self.to_device
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|send| send.user_id == user_id && send.device_id == device_id)
+                .map(|send| send.content.clone())
+                .collect()
+        }
+
+        fn clear_to_device(&self) {
+            self.to_device.lock().unwrap().clear();
         }
     }
 
@@ -610,13 +636,78 @@ mod tests {
 
         fn send_to_device_message(
             &self,
-            _user_id: String,
-            _device_id: String,
+            user_id: String,
+            device_id: String,
             message_type: String,
-            _content_json: String,
+            content_json: String,
         ) -> Result<(), CommandSenderError> {
             self.record(&message_type);
+            self.to_device.lock().unwrap().push(ToDeviceSend {
+                user_id,
+                device_id,
+                content: serde_json::from_str(&content_json).unwrap_or(serde_json::Value::Null),
+            });
             Ok(())
+        }
+    }
+
+    /// Lets a test keep hold of the mock after handing it to
+    /// `set_command_sender`, which takes ownership of a `Box`.
+    impl CommandSenderCallback for Arc<MockCommandSenderCallback> {
+        fn send_sticky_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            content_json: String,
+            duration_ms: u64,
+        ) -> Result<(), CommandSenderError> {
+            (**self).send_sticky_event(room_id, event_type, content_json, duration_ms)
+        }
+
+        fn send_delayed_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            content_json: String,
+            delay_ms: u64,
+        ) -> Result<String, CommandSenderError> {
+            (**self).send_delayed_event(room_id, event_type, content_json, delay_ms)
+        }
+
+        fn send_state_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            state_key: String,
+            content_json: String,
+        ) -> Result<(), CommandSenderError> {
+            (**self).send_state_event(room_id, event_type, state_key, content_json)
+        }
+
+        fn restart_delayed_event(
+            &self,
+            room_id: String,
+            event_id: String,
+        ) -> Result<(), CommandSenderError> {
+            (**self).restart_delayed_event(room_id, event_id)
+        }
+
+        fn cancel_delayed_event(
+            &self,
+            room_id: String,
+            event_id: String,
+        ) -> Result<(), CommandSenderError> {
+            (**self).cancel_delayed_event(room_id, event_id)
+        }
+
+        fn send_to_device_message(
+            &self,
+            user_id: String,
+            device_id: String,
+            message_type: String,
+            content_json: String,
+        ) -> Result<(), CommandSenderError> {
+            (**self).send_to_device_message(user_id, device_id, message_type, content_json)
         }
     }
 
@@ -771,6 +862,92 @@ mod tests {
                 .own_member_id(room_id, slot_id)
                 .expect("the call itself should succeed"),
             Some(second),
+        );
+    }
+
+    fn joined_sticky(user_id: &str, device_id: &str, member_id: &str) -> crate::StickyEvent {
+        crate::StickyEvent {
+            room_id: "!room:example.org".to_owned(),
+            sender: user_id.to_owned(),
+            sender_device_id: Some(device_id.to_owned()),
+            was_encrypted: Some(true),
+            event_type: "m.rtc.member".to_owned(),
+            slot_id: "m.call#ROOM".to_owned(),
+            sticky_key: member_id.to_owned(),
+            application_type: Some("m.call".to_owned()),
+            member_id: Some(member_id.to_owned()),
+            membership: Some("join".to_owned()),
+            leave_reason: None,
+            transports_json: None,
+        }
+    }
+
+    /// The same second-call regression as
+    /// `matrix_rtc_core::tests::a_rejoin_in_the_same_process_distributes_a_key_to_the_incumbent`,
+    /// but driven through the handle an FFI host actually holds — the path where
+    /// an Android integration hit it. Kept at this layer too because the host
+    /// reaches key distribution only via `join`/`leave` on the manager handle,
+    /// and a fix that works in the core but not through the handle is no fix.
+    #[test]
+    fn a_rejoin_distributes_keys_without_new_sticky_events() {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Box::new(mock.clone()))
+            .expect("the mock sender should be accepted");
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+
+        manager
+            .on_room_encryption_received(room_id.clone(), true)
+            .expect("room encryption");
+        manager
+            .on_room_slots_received(
+                room_id.clone(),
+                vec![crate::SlotEvent {
+                    slot_id: slot_id.clone(),
+                    content_json: r#"{ "status": "open",
+                                       "application": { "type": "m.call" },
+                                       "encryption": { "type": "m.per_member" } }"#
+                        .to_owned(),
+                }],
+            )
+            .expect("room slots");
+
+        // First call: bob arrives after we joined, so there is a roster change.
+        manager.join(join_params()).expect("first join");
+        manager
+            .on_sticky_events_update_received(
+                vec![joined_sticky("@bob:example.org", "BOBDEV", "bob-a")],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("bob's membership");
+        assert!(
+            !mock.to_device_for("@bob:example.org", "BOBDEV").is_empty(),
+            "first call should have distributed a key to the incumbent"
+        );
+
+        manager
+            .leave(
+                room_id.clone(),
+                slot_id.clone(),
+                FfiLeaveSessionParams { leave_reason: None },
+            )
+            .expect("leave");
+        mock.clear_to_device();
+
+        // Second call: no new sticky events at all. Bob has not moved.
+        let second = manager.join(join_params()).expect("rejoin");
+
+        let sent = mock.to_device_for("@bob:example.org", "BOBDEV");
+        assert!(
+            !sent.is_empty(),
+            "the second call distributed no key to the incumbent"
+        );
+        assert_eq!(
+            sent[0].pointer("/member_id").and_then(|v| v.as_str()),
+            Some(second.as_str()),
+            "the key must be advertised under the member id this join published",
         );
     }
 }

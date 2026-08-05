@@ -112,7 +112,13 @@ pub struct RawStickyEventContent {
     /// MatrixRTC slot identifier.
     pub slot_id: String,
     /// Sticky-map key associated with this membership; equal to `member.id`.
-    #[serde(rename = "msc4354_sticky_key")]
+    ///
+    /// Sent under the unstable MSC4354 name, and accepted under either. The
+    /// stable spelling is what MSC4354 lands as, and matrix-rust-sdk already
+    /// reads both — being stricter than the SDK here means a peer that has moved
+    /// to `sticky_key` fails to deserialize, and the member event is then dropped
+    /// whole: that participant simply never appears in the call.
+    #[serde(rename = "msc4354_sticky_key", alias = "sticky_key")]
     pub sticky_key: String,
     /// Member info from `content.member` (MSC4143).
     #[serde(default, skip_serializing_if = "MemberInfo::is_empty")]

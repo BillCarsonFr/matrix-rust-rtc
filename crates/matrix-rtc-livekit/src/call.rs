@@ -273,6 +273,13 @@ impl Call {
                 Arc::new(|user_id: &str, device_id: &str, member_id: &str| {
                     pseudonymous_identity(user_id, device_id, member_id)
                 });
+            // The mapper goes in *before* the signal handler. Identities are
+            // derived at signal time, so a key signalled in between would be
+            // imported under the fallback `user:device` identity — one the SFU
+            // never uses, which looks exactly like the key never arriving. The
+            // join itself now drives the first distribution, so that window is no
+            // longer theoretical.
+            mgr.set_encryption_identity_mapper(&room_id, &options.slot_id, identity_mapper);
             if !mgr.set_encryption_signal_handler(&room_id, &options.slot_id, bridge.clone()) {
                 log::warn!(
                     "[{room_id}/{}] join: the joined session has no encryption manager",
@@ -282,7 +289,6 @@ impl Call {
                     "failed to register encryption signal handler".into(),
                 ));
             }
-            mgr.set_encryption_identity_mapper(&room_id, &options.slot_id, identity_mapper);
             mgr.subscribe_membership_snapshots(&room_id, &options.slot_id)
                 .ok_or_else(|| {
                     CallError::Signalling("joined session is not tracked by the manager".into())
@@ -336,6 +342,31 @@ impl Call {
         bridge.set_key_import_listener(Box::new(move |key| {
             engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
         }));
+
+        // Re-signal every key held so far, now that the listener above exists.
+        //
+        // Two things arrive before this point: our own first key, which `join`
+        // distributes and signals, and any peer key the sticky bridge has already
+        // pumped in. Both were applied to the key provider, but with no listener
+        // installed neither produced a `KeyImported` — so the one path a host
+        // cannot otherwise observe was also the one it most needed to see. The
+        // replay is idempotent at the provider and honours whatever remains of a
+        // rotation's `delayBeforeUse`.
+        //
+        // It runs before `connect_livekit` so the key ring is populated before the
+        // first frame can arrive.
+        if !manager
+            .lock()
+            .await
+            .replay_encryption_keys(&room_id, &options.slot_id)
+            .await
+        {
+            log::warn!(
+                "[{room_id}/{}] join: could not replay held keys; peers may stay undecryptable \
+                 until the next rotation",
+                options.slot_id,
+            );
+        }
 
         log::info!(
             "[{room_id}/{}] join: connecting own focus {}",

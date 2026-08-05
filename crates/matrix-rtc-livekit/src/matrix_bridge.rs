@@ -324,7 +324,29 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
             if event_type != "m.rtc.member" && event_type != "org.matrix.msc4143.rtc.member" {
                 return None;
             }
-            let content: RawStickyEventContent = entry.raw().get_field("content").ok().flatten()?;
+            // A member event we cannot parse is a member who never appears in
+            // the call, so say so — silently dropping it here is indistinguishable
+            // from the peer never having joined, and that ambiguity has cost real
+            // debugging time.
+            let content: RawStickyEventContent = match entry.raw().get_field("content") {
+                Ok(Some(content)) => content,
+                Ok(None) => {
+                    log::warn!(
+                        "[{room_id}] ignoring an {event_type} sticky with no content object \
+                         (sticky key {})",
+                        entry.key.sticky_key.as_deref().unwrap_or("<none>"),
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[{room_id}] ignoring an unparseable {event_type} sticky (sticky key \
+                         {}): {error}. That member will not appear in the call.",
+                        entry.key.sticky_key.as_deref().unwrap_or("<none>"),
+                    );
+                    return None;
+                }
+            };
             // The sticky map only files plaintext and successfully decrypted
             // events, so the presence of decryption metadata is exactly whether
             // this arrived encrypted — never "we don't know".

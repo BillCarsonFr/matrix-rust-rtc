@@ -133,6 +133,26 @@ enum RunMode {
     /// Media is verified through the transport-agnostic media API
     /// (`participants` / `remote_track` / frame streams), in both directions.
     TwoFoci,
+    /// Single focus, but bob hangs up and calls again while alice stays: the
+    /// tone must be audible on bob's *second* call.
+    ///
+    /// What this exercises is the **incumbent** side of a redial. Alice never
+    /// leaves, so her `RtcSessionManager` is the long-lived one and has to carry
+    /// the whole transition: retire the key bob's first participation held, then
+    /// hand his *new* participation — a fresh `member_id`, holding nothing, on a
+    /// brand-new frame cryptor — a key it can decrypt the very next frame with.
+    /// The unit tests cover the key bookkeeping; only a real SFU shows whether
+    /// media actually resumes.
+    ///
+    /// It deliberately does **not** claim to cover the joiner half.
+    /// [`Call::join`] builds a fresh `RtcSessionManager` per call, so bob starts
+    /// from pristine state here and cannot reproduce a bug that needs a manager
+    /// carried across calls. That path belongs to hosts holding one
+    /// `RtcSessionManagerHandle` for the whole Matrix session, and is covered
+    /// in-process by `a_rejoin_in_the_same_process_distributes_a_key_to_the_incumbent`
+    /// (matrix-rtc-core) and `a_rejoin_distributes_keys_without_new_sticky_events`
+    /// (matrix-rtc-ffi).
+    RejoinSameProcess,
 }
 
 /// Use `ALICE`/`BOB` (+`_PW`) when supplied (long-lived stacks with closed
@@ -237,11 +257,23 @@ async fn join_call(
     livekit_service_url: &str,
 ) -> Result<Participant, Box<dyn Error>> {
     let SyncedClient { client: _, sync } = synced;
+    let call = open_call(cfg, &room, user, livekit_service_url).await?;
+    Ok(Participant { call, _sync: sync })
+}
+
+/// The `Call::join` half of [`join_call`], reusable on its own so a participant
+/// can redial on a client that is already logged in and syncing.
+async fn open_call(
+    cfg: &Config,
+    room: &matrix_sdk::Room,
+    user: &str,
+    livekit_service_url: &str,
+) -> Result<Call, Box<dyn Error>> {
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(cfg.insecure_tls)
         .build()?;
     let call = Call::join(
-        &room,
+        room,
         CallOptions {
             slot_id: cfg.slot_id.clone(),
             livekit_service_url_fallback: Some(livekit_service_url.to_owned()),
@@ -256,7 +288,7 @@ async fn join_call(
         call.membership_id()
     );
 
-    Ok(Participant { call, _sync: sync })
+    Ok(call)
 }
 
 /// Poll until the room is known to the client, or time out.
@@ -322,6 +354,12 @@ fn e2e_call_two_clients_audio() {
 #[ignore = "requires the demo/backend docker stack (make backend-up)"]
 fn e2e_call_two_clients_two_foci() {
     harness(RunMode::TwoFoci);
+}
+
+#[test]
+#[ignore = "requires the demo/backend docker stack (make backend-up)"]
+fn e2e_call_rejoin_in_the_same_process() {
+    harness(RunMode::RejoinSameProcess);
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.
@@ -403,10 +441,12 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     //    publishes on their own SFU; the engines then cross-connect to the
     //    peer's focus for subscribing (MSC4195 multi-SFU).
     let bob_url = match mode {
-        RunMode::SingleFocus => cfg.livekit_service_url.clone(),
+        RunMode::SingleFocus | RunMode::RejoinSameProcess => cfg.livekit_service_url.clone(),
         RunMode::TwoFoci => cfg.livekit_service_url_2.clone(),
     };
     let alice_url = cfg.livekit_service_url.clone();
+    // Kept so bob can redial on the same room handle after hanging up.
+    let bob_room_again = bob_room.clone();
     let alice = join_call(&cfg, alice, alice_room, &alice_creds.user, &alice_url).await?;
     let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &bob_url).await?;
 
@@ -429,7 +469,7 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     let mut _bob_tone = None;
     let mut _alice_video = None;
     let (tone_ok, reverse_tone_ok, video_ok, constraints_ok) = match mode {
-        RunMode::SingleFocus => (
+        RunMode::SingleFocus | RunMode::RejoinSameProcess => (
             record_and_verify_tone(&mut bob.call).await?,
             true,
             true,
@@ -465,6 +505,35 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     let alice_key_seen_by_bob = bob.call.imported_key_for(alice.call.local_identity());
     println!("[bob] imported alice's per-participant media key: {alice_key_seen_by_bob}");
 
+    // Hang up and call again, with alice staying put and still publishing. Her
+    // core is the long-lived one across this transition: it retires the key bob's
+    // first participation held and must hand his new one a key it can decrypt the
+    // next frame with, on a frame cryptor that starts empty.
+    let (rejoin_tone_ok, rejoin_key_ok) = if mode == RunMode::RejoinSameProcess {
+        let Participant {
+            call: first_call,
+            _sync,
+        } = bob;
+        println!("[bob] leaving, then redialling in the same process");
+        first_call.leave().await?;
+
+        let mut second = Participant {
+            call: open_call(&cfg, &bob_room_again, &bob_creds.user, &bob_url).await?,
+            _sync,
+        };
+        if !wait_for_members(&second.call, 2, "bob-redial").await {
+            println!("[bob] WARNING: the second call never saw alice's membership");
+        }
+
+        let tone_ok = record_and_verify_tone(&mut second.call).await?;
+        let key_ok = second.call.imported_key_for(alice.call.local_identity());
+        println!("[bob] second call imported alice's media key: {key_ok}");
+        bob = second;
+        (tone_ok, key_ok)
+    } else {
+        (true, true)
+    };
+
     // Tear down both peers cleanly and symmetrically: `Call::leave` stops the
     // heartbeat, sends the leave event (cancelling the delayed leave), shuts
     // the media engine down (closing peer-focus connections), and closes the
@@ -498,6 +567,10 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
         println!("video pattern alice->bob verified:      {video_ok}");
         println!("constraints pause/resume verified:      {constraints_ok}");
     }
+    if mode == RunMode::RejoinSameProcess {
+        println!("alice's key received on bob's redial:   {rejoin_key_ok}");
+        println!("tone alice->bob on bob's redial:        {rejoin_tone_ok}");
+    }
     println!("clean teardown (leave both sides):      {teardown_ok}");
 
     if alice_sees
@@ -507,6 +580,8 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
         && reverse_tone_ok
         && video_ok
         && constraints_ok
+        && rejoin_tone_ok
+        && rejoin_key_ok
         && teardown_ok
     {
         println!("END-TO-END TEST PASSED (with per-participant frame E2EE)");

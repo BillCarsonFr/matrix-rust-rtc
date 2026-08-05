@@ -446,8 +446,14 @@ struct Actor {
     constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
     /// Media that arrived before its membership, flushed when it lands.
     pending_tracks: PendingTracks,
-    /// Imported keys awaiting their membership (latest index per identity).
-    pending_keys: HashMap<String, u8>,
+    /// Imported key indices awaiting their membership, in arrival order.
+    ///
+    /// A `Vec`, not a single index: at join a member can be handed more than one
+    /// index before their sticky membership lands (their first key plus a
+    /// rotation, say), and keeping only the latest silently dropped the others —
+    /// so the host saw one `KeyImported` where the core had imported several, and
+    /// could not tell which index the transport actually held.
+    pending_keys: HashMap<String, Vec<u8>>,
     pool: HashMap<String, ManagedConnection>,
     connection_generation: u64,
     /// Connections currently impaired (reconnecting or failing to connect);
@@ -577,7 +583,10 @@ impl Actor {
                 }
                 None => {
                     // To-device keys regularly beat sticky memberships.
-                    self.pending_keys.insert(identity, key_index);
+                    let pending = self.pending_keys.entry(identity).or_default();
+                    if !pending.contains(&key_index) {
+                        pending.push(key_index);
+                    }
                 }
             },
             ActorMessage::Publish { options, respond } => {
@@ -1148,7 +1157,7 @@ impl Actor {
                     self.add_stream(&member.member_id.clone(), kind, track);
                 }
             }
-            if let Some(key_index) = self.pending_keys.remove(&identity) {
+            for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
                 self.emit(CallEvent::KeyImported {
                     member_id: member.member_id.clone(),
                     key_index,
@@ -1160,8 +1169,17 @@ impl Actor {
     fn remove_member(&mut self, member_id: &str) {
         self.roster
             .retain(|participant| participant.member_id != member_id);
+        // Read the identity out before dropping the mappings, so the
+        // identity-keyed buffers can be cleared too. They used to be left behind
+        // on every departure: a stale index could then resurface against a later
+        // member that happened to reuse the identity, and in a long-lived process
+        // the maps only ever grew.
+        let identity = self.member_identities.remove(member_id);
+        if let Some(identity) = &identity {
+            self.pending_keys.remove(identity);
+            self.pending_tracks.remove(identity);
+        }
         self.identity_map.retain(|_, mapped| mapped != member_id);
-        self.member_identities.remove(member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
         self.constraints
@@ -1782,6 +1800,88 @@ mod tests {
             member_id: "bob".to_owned(),
             key_index: 3,
         }));
+    }
+
+    /// More than one key can be imported before a membership lands — a first key
+    /// plus a rotation, which is exactly what a rejoin produces. Keeping only the
+    /// latest index left the host believing the transport held one key when it
+    /// held several, and unable to tell which.
+    #[tokio::test]
+    async fn every_early_key_surfaces_once_the_membership_lands() {
+        let mut fx = fixture();
+
+        fx.engine.notify_key_imported("id-bob", 0);
+        fx.engine.notify_key_imported("id-bob", 1);
+        // A repeat of an index already buffered is still just one import.
+        fx.engine.notify_key_imported("id-bob", 1);
+
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "bob".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyImported {
+                member_id: "bob".to_owned(),
+                key_index: 0,
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyImported {
+                member_id: "bob".to_owned(),
+                key_index: 1,
+            }
+        );
+    }
+
+    /// A departure must take its identity-keyed buffers with it, or a key
+    /// imported for the member who left resurfaces against whoever next occupies
+    /// that identity.
+    #[tokio::test]
+    async fn a_departure_forgets_the_keys_buffered_against_its_identity() {
+        let mut fx = fixture();
+
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "bob".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+            }
+        );
+
+        // Bob leaves, and a key for his identity lands late.
+        fx.memberships.send(Vec::new()).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantLeft {
+                member_id: "bob".to_owned(),
+            }
+        );
+        fx.engine.notify_key_imported("id-bob", 7);
+
+        // Bob rejoins under a fresh member id, as MSC4143 requires. The stale
+        // index must not be attributed to the new participation.
+        fx.memberships
+            .send(vec![member("bob-2", "@bob:example.org")])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "bob-2".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]
