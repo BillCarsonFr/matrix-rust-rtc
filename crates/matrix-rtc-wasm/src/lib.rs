@@ -808,10 +808,10 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn next_snapshot_returns_current_snapshot_on_first_poll() {
+    async fn next_snapshot_returns_current_snapshot_on_first_poll() {
         let mut session = WasmRtcSession::new();
         let events = serde_wasm_bindgen::to_value(&vec![joined_event()]).unwrap();
-        session.set_current_sticky_state(events).unwrap();
+        session.set_current_sticky_state(events).await.unwrap();
 
         let mut subscription = session.subscribe_membership_snapshots();
         let first = subscription.next_snapshot().unwrap();
