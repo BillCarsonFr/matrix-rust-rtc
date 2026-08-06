@@ -28,15 +28,15 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use matrix_rtc_core::{
-    CallMembershipEvent, EventConversionError, JoinedMembership as CoreJoinedMembership,
-    RawStickyEvent, RawStickyEventUpdate, RtcSession, RtcSessionManager, StickyEventsUpdate,
+    EventConversionError, JoinedMembership as CoreJoinedMembership, RawStickyEvent,
+    RtcSessionManager,
 };
 mod commands;
 mod logging;
 mod runtime;
 pub use commands::{
     CommandSenderCallback, CommandSenderError, FfiCommandSender, FfiJoinSessionParams,
-    FfiLeaveSessionParams, FfiTransportConfig,
+    FfiLeaveSessionParams, FfiToDeviceDelivery, FfiToDeviceRecipient, FfiTransportConfig,
 };
 pub use logging::{
     RtcLogConfig, RtcLogLevel, RtcLogRecord, RtcLogSink, dropped_log_record_count, log_event,
@@ -125,12 +125,6 @@ impl SlotEvent {
             content,
         })
     }
-}
-
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct StickyEventUpdate {
-    pub current: StickyEvent,
-    pub previous: StickyEvent,
 }
 
 /// A decrypted `m.rtc.encryption_key` to-device message, fed into the core so
@@ -224,12 +218,6 @@ pub struct JoinedMembership {
     /// Transport types this member can subscribe to (MSC4143).
     pub can_subscribe: Vec<String>,
 }
-
-#[derive(uniffi::Object)]
-pub struct RtcSessionHandle {
-    inner: Mutex<RtcSession<FfiCommandSender>>,
-}
-
 #[derive(uniffi::Object)]
 pub struct RtcSessionManagerHandle {
     /// `Arc` so a heartbeat driver can hold a `Weak` to it without keeping the
@@ -323,166 +311,6 @@ pub struct MembershipSnapshotSubscription {
 }
 
 #[uniffi::export]
-impl RtcSessionHandle {
-    #[uniffi::constructor]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(RtcSession::new()),
-        })
-    }
-
-    /// Sets the command sender for this session.
-    ///
-    /// This must be called before join/leave operations to enable sending events
-    /// back to the Matrix room. The callback will be invoked by the core to send
-    /// membership events (join, leave, keep-alive).
-    ///
-    /// # Arguments
-    /// * `callback` - Native implementation of CommandSenderCallback
-    pub fn set_command_sender(
-        &self,
-        callback: Box<dyn CommandSenderCallback>,
-    ) -> Result<(), MatrixRtcFfiError> {
-        log::info!("session: command sender installed");
-        let command_sender = FfiCommandSender::new(Arc::from(callback));
-        let mut session = lock_mutex(&self.inner)?;
-        session.set_command_sender(command_sender);
-        Ok(())
-    }
-
-    pub fn on_sticky_events_snapshot_received(
-        &self,
-        events: Vec<StickyEvent>,
-    ) -> Result<(), MatrixRtcFfiError> {
-        log::debug!(
-            "session: sticky snapshot in, {} events ({})",
-            events.len(),
-            describe_events(&events),
-        );
-        trace_sticky_events("snapshot", &events);
-
-        let parsed = to_core_membership_events(to_core_events(events))?;
-        let mut session = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            session.initial_events(parsed).await;
-            Ok(())
-        })
-    }
-
-    pub fn on_sticky_events_update_received(
-        &self,
-        added: Vec<StickyEvent>,
-        updated: Vec<StickyEventUpdate>,
-        removed: Vec<StickyEvent>,
-    ) -> Result<(), MatrixRtcFfiError> {
-        log::debug!(
-            "session: sticky update in, +{} ~{} -{} ({})",
-            added.len(),
-            updated.len(),
-            removed.len(),
-            describe_events(&added),
-        );
-        trace_sticky_events("added", &added);
-        trace_sticky_events("removed", &removed);
-
-        let mut membership_events = to_core_membership_events(to_core_events(added))?;
-
-        let updated_events = to_core_membership_events(
-            to_core_updates(updated)
-                .into_iter()
-                .map(|update| update.current)
-                .collect(),
-        )?;
-        membership_events.extend(updated_events);
-
-        let removed_events = to_core_left_membership_events(to_core_events(removed))?;
-        membership_events.extend(removed_events);
-
-        let mut session = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            session.handle_update(membership_events).await;
-            Ok(())
-        })
-    }
-
-    pub fn subscribe_membership_snapshots(
-        &self,
-    ) -> Result<Arc<MembershipSnapshotSubscription>, MatrixRtcFfiError> {
-        let session = lock_mutex(&self.inner)?;
-        let receiver = session.subscribe_membership_snapshots();
-
-        Ok(Arc::new(MembershipSnapshotSubscription {
-            state: Mutex::new(SubscriptionState {
-                receiver,
-                initial_pending: true,
-            }),
-        }))
-    }
-
-    /// Joins the session, returning the `member.id` it joined as.
-    ///
-    /// See [`RtcSessionManagerHandle::join`] for why the SDK generates this
-    /// rather than accepting one.
-    pub fn join(&self, params: FfiJoinSessionParams) -> Result<String, MatrixRtcFfiError> {
-        log::info!("session: join requested {}", params.summary());
-
-        let mut core_params = params.into_core().map_err(|e| {
-            log::warn!("session: join rejected before it started: {e}");
-            MatrixRtcFfiError::InvalidInput(e.to_string())
-        })?;
-        let member_id = matrix_rtc_core::generate_member_id();
-        core_params.membership_id = Some(member_id.clone());
-
-        // Hold the guard across the join. Not "completes immediately" as this
-        // once assumed: the core awaits a `delayBeforeUse` timer whenever it
-        // rotates a key, so the bridge supplies a runtime context (see
-        // `crate::runtime`) and this call lasts as long as that wait.
-        //
-        // The guard is deliberately *not* released for the duration — see
-        // `RtcSessionManagerHandle::join` for why swapping a placeholder in and
-        // unlocking was worse. Safe because no host callback re-enters a handle.
-        let mut session = lock_mutex(&self.inner)?;
-
-        let result = crate::runtime::block_on(async {
-            session.join(core_params).await.map_err(|e| {
-                log::warn!("session: join failed: {e}");
-                MatrixRtcFfiError::InvalidInput(e.to_string())
-            })
-        });
-
-        if result.is_ok() {
-            log::info!("session: join succeeded as {member_id}");
-        }
-
-        result.map(|()| member_id)
-    }
-
-    /// Our `member.id` for the current join, or `None` while not joined.
-    pub fn own_member_id(&self) -> Result<Option<String>, MatrixRtcFfiError> {
-        let session = lock_mutex(&self.inner)?;
-        Ok(session.own_member_id().map(str::to_owned))
-    }
-
-    pub fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
-        log::warn!(
-            "session: leave() is not implemented on RtcSessionHandle; \
-             use RtcSessionManagerHandle::leave()"
-        );
-
-        let _core_params = params.into_core();
-
-        let _session = lock_mutex(&self.inner)?;
-
-        // Note: This requires room_id and slot_id to be tracked in the session
-        // For now, we need to handle this properly
-        // This is a limitation that the session needs to track its room/slot
-        Err(MatrixRtcFfiError::InvalidInput(
-            "leave() on single session requires room_id and slot_id to be tracked by the session itself. Use RtcSessionManagerHandle::leave() instead.".to_string(),
-        ))
-    }
-}
-
-#[uniffi::export]
 impl RtcSessionManagerHandle {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
@@ -511,102 +339,37 @@ impl RtcSessionManagerHandle {
         Ok(())
     }
 
-    pub fn initial_sticky_for_room(
+    /// Apply the **complete** current sticky state for one room.
+    ///
+    /// Replaces, rather than merges: a member absent from `events` is gone, and
+    /// an empty list clears the room.
+    ///
+    /// That is what makes expiry work. A member does not only leave by sending a
+    /// leave event — an MSC4354 sticky entry lapses when its owner stops
+    /// refreshing it, which is exactly what a crashed client does, and the lapse
+    /// produces no event to feed in. A merging call would keep that member in
+    /// the call for good and leave every host to diff snapshots itself.
+    ///
+    /// The usual flow is this call once with the SDK's current sticky map for
+    /// the room, and again whenever it changes. It is the only way membership
+    /// reaches the core, and safe to call as often as you like — re-asserting
+    /// the full state is also how you resynchronise after a reconnect.
+    pub fn set_current_sticky_state(
         &self,
         room_id: String,
         events: Vec<StickyEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
         log::debug!(
-            "manager: [{room_id}] initial sticky in, {} events ({})",
+            "manager: [{room_id}] current sticky state in, {} events ({})",
             events.len(),
             describe_events(&events),
         );
-        trace_sticky_events("initial", &events);
+        trace_sticky_events("current", &events);
 
         let mut manager = lock_mutex(&self.inner)?;
         crate::runtime::block_on(async {
             manager
-                .initial_sticky_for_room(&room_id, to_core_events(events))
-                .await
-                .map_err(map_conversion_error)
-        })
-    }
-
-    pub fn sticky_update_for_room(
-        &self,
-        room_id: String,
-        added: Vec<StickyEvent>,
-        updated: Vec<StickyEventUpdate>,
-        removed: Vec<StickyEvent>,
-    ) -> Result<(), MatrixRtcFfiError> {
-        log::debug!(
-            "manager: [{room_id}] sticky update in, +{} ~{} -{}",
-            added.len(),
-            updated.len(),
-            removed.len(),
-        );
-        trace_sticky_events("added", &added);
-        trace_sticky_events("removed", &removed);
-
-        let update = StickyEventsUpdate {
-            added: to_core_events(added),
-            updated: to_core_updates(updated),
-            removed: to_core_events(removed),
-        };
-
-        let mut manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager
-                .sticky_update_for_room(&room_id, update)
-                .await
-                .map_err(map_conversion_error)
-        })
-    }
-
-    pub fn on_sticky_events_snapshot_received(
-        &self,
-        events: Vec<StickyEvent>,
-    ) -> Result<(), MatrixRtcFfiError> {
-        log::debug!(
-            "manager: sticky snapshot in, {} events ({})",
-            events.len(),
-            describe_events(&events),
-        );
-        trace_sticky_events("snapshot", &events);
-
-        let mut manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager
-                .on_sticky_events_snapshot_received(to_core_events(events))
-                .await
-                .map_err(map_conversion_error)
-        })
-    }
-
-    pub fn on_sticky_events_update_received(
-        &self,
-        added: Vec<StickyEvent>,
-        updated: Vec<StickyEventUpdate>,
-        removed: Vec<StickyEvent>,
-    ) -> Result<(), MatrixRtcFfiError> {
-        log::debug!(
-            "manager: sticky update in, +{} ~{} -{} ({})",
-            added.len(),
-            updated.len(),
-            removed.len(),
-            describe_events(&added),
-        );
-        trace_sticky_events("added", &added);
-        trace_sticky_events("removed", &removed);
-
-        let mut manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager
-                .on_sticky_events_update_received(StickyEventsUpdate {
-                    added: to_core_events(added),
-                    updated: to_core_updates(updated),
-                    removed: to_core_events(removed),
-                })
+                .set_current_sticky_state(&room_id, to_core_events(events))
                 .await
                 .map_err(map_conversion_error)
         })
@@ -745,6 +508,39 @@ impl RtcSessionManagerHandle {
         Ok(manager
             .member_count(&room_id, &slot_id)
             .map(|count| count as u64))
+    }
+
+    /// Observe the joined roster of one session.
+    ///
+    /// Returns `None` if no session exists for `(room_id, slot_id)` — a session
+    /// appears when the first member event for that slot is fed in, or when this
+    /// manager joins it.
+    ///
+    /// This is the roster the media layer works from, and the counterpart to
+    /// [`Self::member_count`], which answers only "how many". Polling the count
+    /// once a second was the previous way to notice a change: the wrong shape for
+    /// a value that moves a handful of times per call, and useless for learning
+    /// *who* moved. A host that wants to be told a call has started watches this.
+    ///
+    /// The subscription yields the current roster on its first
+    /// `nextSnapshot()` and then only on change, so a host can attach at any
+    /// point without missing the state it attached to.
+    pub fn subscribe_membership_snapshots(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<Option<Arc<MembershipSnapshotSubscription>>, MatrixRtcFfiError> {
+        let manager = lock_mutex(&self.inner)?;
+        Ok(manager
+            .subscribe_membership_snapshots(&room_id, &slot_id)
+            .map(|receiver| {
+                Arc::new(MembershipSnapshotSubscription {
+                    state: Mutex::new(SubscriptionState {
+                        receiver,
+                        initial_pending: true,
+                    }),
+                })
+            }))
     }
 
     /// Joins a session, returning the `member.id` it joined as.
@@ -1011,46 +807,6 @@ fn to_core_events(events: Vec<StickyEvent>) -> Vec<RawStickyEvent> {
     events.into_iter().map(to_core_event).collect()
 }
 
-fn to_core_updates(updates: Vec<StickyEventUpdate>) -> Vec<RawStickyEventUpdate> {
-    updates
-        .into_iter()
-        .map(|update| RawStickyEventUpdate {
-            current: to_core_event(update.current),
-            previous: to_core_event(update.previous),
-        })
-        .collect()
-}
-
-fn to_core_membership_events(
-    events: Vec<RawStickyEvent>,
-) -> Result<Vec<CallMembershipEvent>, MatrixRtcFfiError> {
-    events.into_iter().try_fold(Vec::new(), |mut acc, event| {
-        match event.try_into_call_membership_event() {
-            Ok(event) => {
-                acc.push(event);
-                Ok(acc)
-            }
-            Err(EventConversionError::UnsupportedEventType { .. }) => Ok(acc),
-            Err(err) => Err(map_conversion_error(err)),
-        }
-    })
-}
-
-fn to_core_left_membership_events(
-    events: Vec<RawStickyEvent>,
-) -> Result<Vec<CallMembershipEvent>, MatrixRtcFfiError> {
-    events.into_iter().try_fold(Vec::new(), |mut acc, event| {
-        match event.try_into_left_membership_event() {
-            Ok(event) => {
-                acc.push(event);
-                Ok(acc)
-            }
-            Err(EventConversionError::UnsupportedEventType { .. }) => Ok(acc),
-            Err(err) => Err(map_conversion_error(err)),
-        }
-    })
-}
-
 fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
     JoinedMembership {
         room_id: member.room_id,
@@ -1195,23 +951,28 @@ mod tests {
     }
 
     #[test]
-    fn ffi_session_snapshot_entrypoint_accepts_join_event() {
-        let session = RtcSessionHandle::new();
+    fn ffi_snapshot_entrypoint_accepts_join_event() {
+        let manager = RtcSessionManagerHandle::new();
 
-        let result = session.on_sticky_events_snapshot_received(vec![join_event()]);
+        let result =
+            manager.set_current_sticky_state("!room:example.org".to_owned(), vec![join_event()]);
 
         assert!(result.is_ok());
     }
 
     #[test]
     fn transports_round_trip_through_the_ffi() {
-        let session = RtcSessionHandle::new();
-        let subscription = session.subscribe_membership_snapshots().unwrap();
-        let _ = subscription.next_snapshot();
-
-        session
-            .on_sticky_events_snapshot_received(vec![join_event()])
+        let manager = RtcSessionManagerHandle::new();
+        manager
+            .set_current_sticky_state("!room:example.org".to_owned(), vec![join_event()])
             .unwrap();
+        let subscription = manager
+            .subscribe_membership_snapshots(
+                "!room:example.org".to_owned(),
+                "m.call#ROOM".to_owned(),
+            )
+            .unwrap()
+            .expect("the member event should have created the session");
 
         let joined = subscription.next_snapshot().unwrap().unwrap();
         assert_eq!(
@@ -1223,23 +984,46 @@ mod tests {
         assert_eq!(joined[0].can_subscribe, vec!["livekit".to_owned()]);
     }
 
+    /// The roster is observable from the *manager* handle, which is the one a
+    /// host drives and the one the media layer needs. Previously it existed only
+    /// on `RtcSessionHandle`, so a host running the manager could see
+    /// `memberCount` but never who was in the call — and polling a count once a
+    /// second was the only way to notice a change.
     #[test]
-    fn ffi_session_subscription_emits_initial_then_join_snapshot() {
-        let session = RtcSessionHandle::new();
-        let subscription = session.subscribe_membership_snapshots().unwrap();
+    fn the_manager_publishes_the_roster_of_a_session() {
+        let manager = RtcSessionManagerHandle::new();
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
 
-        let initial = subscription.next_snapshot().unwrap();
-        assert_eq!(initial, Some(Vec::new()));
+        assert!(
+            manager
+                .subscribe_membership_snapshots(room_id.clone(), slot_id.clone())
+                .unwrap()
+                .is_none(),
+            "no session for that slot yet, so nothing to observe"
+        );
 
-        let snapshot_result = session.on_sticky_events_snapshot_received(vec![join_event()]);
-        assert!(snapshot_result.is_ok());
+        manager
+            .set_current_sticky_state(room_id.clone(), vec![join_event()])
+            .expect("the current state should be accepted");
 
-        let joined = subscription.next_snapshot().unwrap().unwrap();
-        assert_eq!(joined.len(), 1);
-        assert_eq!(joined[0].sender, "@alice:example.org");
+        let subscription = manager
+            .subscribe_membership_snapshots(room_id, slot_id)
+            .unwrap()
+            .expect("the member event should have created the session");
 
-        let no_update = subscription.next_snapshot().unwrap();
-        assert_eq!(no_update, None);
+        // Attaching late still yields the state attached to, not silence.
+        let initial = subscription
+            .next_snapshot()
+            .unwrap()
+            .expect("the first call reports the current roster");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].sender, "@alice:example.org");
+
+        assert_eq!(
+            subscription.next_snapshot().unwrap(),
+            None,
+            "and then only on change"
+        );
     }
 
     /// A panic inside one handle method must not disable the handle forever.

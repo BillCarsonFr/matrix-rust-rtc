@@ -55,12 +55,12 @@ pub use constraints::{
     Dimensions, MediaConstraints, QualityLimit, ResolvedConstraints, StreamDemand, VideoDetail,
 };
 pub use engine::{CallEngine, EngineConfig, EngineHandle};
-pub use event::{CallEvent, EndedReason, FrameEncryptionState};
+pub use event::{CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState};
 pub use frame::{AudioFrame, I420Buffer, VideoFrame, VideoRotation};
 pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSourceConfig};
 pub use participant::{MediaStreamKind, Participant, StreamState};
 pub use stats::ReceiveStats;
 pub use transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, OwnMemberClaims, RemoteTrackHandle,
-    TransportConnection, TransportError,
+    SpeakingParticipant, TransportConnection, TransportError,
 };

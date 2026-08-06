@@ -188,6 +188,14 @@ async fn build_media_session(
         engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
     }));
 
+    // Refused keys surface as `FfiCallEvent::KeyDiscarded`. Without this the
+    // reason a key was rejected never leaves the core, and the host sees only a
+    // `MissingKey` it cannot distinguish from a key that never arrived.
+    let engine_handle = engine.handle();
+    bridge.set_key_discard_listener(Box::new(move |discarded| {
+        engine_handle.notify_key_discarded(discarded);
+    }));
+
     // Keys signalled between `join` and now were stored but dropped — nothing
     // was listening. Without this, every participant whose key arrived before
     // media attached stays undecryptable until a rotation, which only a
@@ -202,8 +210,10 @@ async fn build_media_session(
     //
     // `block_on` rather than `.await`: this function is spawned, so its future
     // must be `Send`, and awaiting here would hold the manager's `MutexGuard`
-    // across a yield point. The replay does not yield anyway — it signals with
-    // `use_after_ms: 0`, which the bridge applies inline.
+    // across a yield point. The replay does not yield either way — a key already
+    // in use is signalled with `use_after_ms: 0` and applied inline, and a
+    // rotation still inside its `delayBeforeUse` is signalled with whatever
+    // remains of it, which the bridge *schedules* without blocking.
     {
         let mgr =
             crate::lock_mutex(&manager.inner).map_err(|_| MediaFfiError::InternalLockPoisoned)?;
@@ -226,6 +236,22 @@ async fn build_media_session(
 
     let events = engine.subscribe_events();
     let own_identity = pseudonymous_identity(&config.user_id, &config.device_id, &member_id);
+
+    // Move our sender onto each key we rotate to. Importing a key only fills the
+    // provider's ring; the index our frames actually carry lives on the frame
+    // cryptor. Without this we advertise a rotation to peers and carry on
+    // encrypting with the previous key, so anyone joining after it decrypts
+    // nothing — and the forward secrecy the rotation exists for is not delivered.
+    let connection_for_keys = connection.clone();
+    bridge.set_local_sender(
+        own_identity.clone(),
+        Box::new(move |key_index| connection_for_keys.set_local_key_index(key_index)),
+    );
+    // Adopt the index we are already on rather than assuming 0, and record it for
+    // tracks published later.
+    if let Some(own_key) = bridge.key_for(&own_identity) {
+        connection.set_local_key_index(own_key.key_index);
+    }
 
     log::info!("media: connected as member {member_id}, local identity {own_identity}");
 
@@ -357,6 +383,32 @@ impl MediaSession {
             MediaFfiError::Transport(error.to_string())
         })?;
         Ok(Arc::new(FfiLocalTrack::new(handle)))
+    }
+
+    /// Mute or unmute one of our own publications.
+    ///
+    /// Peers are told, so their UI can show it — muting is not the same as
+    /// simply not pushing frames, which looks to a peer like a stalled sender.
+    /// Our own roster entry and the event stream are updated too
+    /// (`StreamMuted`/`StreamUnmuted` against our `member_id`), so a host can
+    /// render its own state from the same source it renders everyone else's
+    /// instead of keeping a parallel copy.
+    ///
+    /// Errors if nothing of that kind is currently published.
+    pub async fn set_local_muted(
+        &self,
+        kind: FfiStreamKind,
+        muted: bool,
+    ) -> Result<(), MediaFfiError> {
+        log::info!("media: setting our own {kind:?} muted={muted}");
+
+        self.engine
+            .set_local_muted(kind.into(), muted)
+            .await
+            .map_err(|error| {
+                log::warn!("media: local mute failed: {error}");
+                MediaFfiError::Transport(error.to_string())
+            })
     }
 
     /// End the media session: emits `Ended { Left }`, closes every

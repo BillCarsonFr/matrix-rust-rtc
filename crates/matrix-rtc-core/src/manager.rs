@@ -29,9 +29,7 @@ use crate::commands::RtcCommandSender;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::event::{
-    EventConversionError, RawStickyEvent, RawStickyEventUpdate, StickyEventsUpdate,
-};
+use crate::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::session::{CallMembershipEvent, JoinedMembership, RtcSession};
 use crate::slot::{
@@ -146,6 +144,12 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// This will find the appropriate session for the given room_id and slot_id,
     /// and then call leave on that session.
     ///
+    /// The session is **kept**, not removed: it is keyed by `(room_id, slot_id)`
+    /// and stays usable for a later join in the same process. See
+    /// [`RtcSession::leave`] for why, and for what it does and does not clear —
+    /// a rejoin therefore starts with the previous call's roster in place, which
+    /// [`RtcSession::join`] accounts for.
+    ///
     /// # Arguments
     ///
     /// * `room_id` - The room ID of the session to leave
@@ -173,8 +177,28 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         session.leave(params).await
     }
 
-    /// Applies an initial sticky snapshot for one room, typically from SDK `getStickyEvents`.
-    pub async fn initial_sticky_for_room(
+    /// Applies the **complete** current sticky state for one room.
+    ///
+    /// Replaces, rather than merges: a member absent from `events` is gone.
+    ///
+    /// That is what lets a host hand over what it has without doing any
+    /// resolution of its own. An MSC4354 sticky entry lapses when its owner
+    /// stops refreshing it — a crashed client — and the entry then simply
+    /// disappears from the map. A host that only ever sees the current state
+    /// (which is what matrix-sdk-ffi delivers: it collapses the SDK's delta to a
+    /// snapshot before it crosses the boundary) has no way to say "this one
+    /// expired" beyond its absence. Diffing here means every host does not have
+    /// to.
+    ///
+    /// This is the only way membership reaches the core; there is deliberately
+    /// no delta entry point. A delta carried nothing extra — the core flattens
+    /// every removal to a plain leave, and an explicit leave arrives inside the
+    /// current state anyway, as a leave-shaped sticky replacing the join under
+    /// the same key.
+    ///
+    /// Safe to call repeatedly: re-assert the full state whenever the host's
+    /// sticky map changes. Passing an empty list clears the room.
+    pub async fn set_current_sticky_state(
         &mut self,
         room_id: &str,
         events: impl IntoIterator<Item = RawStickyEvent>,
@@ -199,152 +223,28 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             batches.entry(key).or_default().push(event);
         }
 
+        // Every slot we already track in this room, not just the ones named in
+        // `events`: a slot whose last member expired disappears from the payload
+        // entirely, and leaving it untouched is precisely the ghost this call
+        // exists to prevent. Such a slot gets an empty set, which clears it.
+        let known_slots: Vec<SessionKey> = self
+            .sessions
+            .keys()
+            .filter(|key| key.room_id == room_id)
+            .cloned()
+            .collect();
+        for key in known_slots {
+            batches.entry(key).or_default();
+        }
+
         log::debug!(
-            "[{room_id}] initial sticky routed to {} session(s): {}",
+            "[{room_id}] current sticky state routed to {} session(s): {}",
             batches.len(),
             describe_batches(&batches),
         );
 
         for (key, batch) in batches {
-            self.session_for_key(key).initial_events(batch).await;
-        }
-
-        Ok(())
-    }
-
-    /// Applies a sticky diff batch for one room.
-    pub async fn sticky_update_for_room(
-        &mut self,
-        room_id: &str,
-        update: StickyEventsUpdate,
-    ) -> Result<(), EventConversionError> {
-        let mut batches: HashMap<SessionKey, Vec<CallMembershipEvent>> = HashMap::new();
-
-        for event in update.added {
-            if event.room_id != room_id {
-                continue;
-            }
-
-            let Some(event) = self.try_convert_membership_event(event)? else {
-                continue;
-            };
-
-            let slot_id = match &event {
-                CallMembershipEvent::Joined(joined) => joined.slot_id.clone(),
-                CallMembershipEvent::Left(left) => left.slot_id.clone(),
-            };
-
-            let key = SessionKey::new(room_id.to_owned(), slot_id);
-            batches.entry(key).or_default().push(event);
-        }
-
-        for changed in update.updated {
-            let RawStickyEventUpdate { current, previous } = changed;
-
-            if current.room_id != room_id {
-                continue;
-            }
-
-            let Some(event) = self.try_convert_membership_event(current)? else {
-                continue;
-            };
-
-            let slot_id = match &event {
-                CallMembershipEvent::Joined(joined) => joined.slot_id.clone(),
-                CallMembershipEvent::Left(left) => left.slot_id.clone(),
-            };
-
-            let key = SessionKey::new(room_id.to_owned(), slot_id);
-            batches.entry(key).or_default().push(event);
-
-            let _ = previous;
-        }
-
-        for event in update.removed {
-            if event.room_id != room_id {
-                continue;
-            }
-
-            let Some(event) = self.try_convert_removed_membership_event(event)? else {
-                continue;
-            };
-
-            let slot_id = match &event {
-                CallMembershipEvent::Joined(joined) => joined.slot_id.clone(),
-                CallMembershipEvent::Left(left) => left.slot_id.clone(),
-            };
-
-            let key = SessionKey::new(room_id.to_owned(), slot_id);
-            batches.entry(key).or_default().push(event);
-        }
-
-        log::debug!(
-            "[{room_id}] sticky update routed to {} session(s): {}",
-            batches.len(),
-            describe_batches(&batches),
-        );
-
-        for (key, batch) in batches {
-            self.session_for_key(key).handle_update(batch).await;
-        }
-
-        Ok(())
-    }
-
-    /// Applies an initial sticky snapshot, grouped by room and slot.
-    pub async fn on_sticky_events_snapshot_received(
-        &mut self,
-        events: impl IntoIterator<Item = RawStickyEvent>,
-    ) -> Result<(), EventConversionError> {
-        let mut by_room: HashMap<String, Vec<RawStickyEvent>> = HashMap::new();
-
-        for event in events {
-            by_room
-                .entry(event.room_id.clone())
-                .or_default()
-                .push(event);
-        }
-
-        for (room_id, batch) in by_room {
-            self.initial_sticky_for_room(&room_id, batch).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Applies one incremental sticky diff batch, grouped by room and slot.
-    pub async fn on_sticky_events_update_received(
-        &mut self,
-        update: StickyEventsUpdate,
-    ) -> Result<(), EventConversionError> {
-        let mut by_room: HashMap<String, StickyEventsUpdate> = HashMap::new();
-
-        for event in update.added {
-            by_room
-                .entry(event.room_id.clone())
-                .or_default()
-                .added
-                .push(event);
-        }
-
-        for changed in update.updated {
-            by_room
-                .entry(changed.current.room_id.clone())
-                .or_default()
-                .updated
-                .push(changed);
-        }
-
-        for event in update.removed {
-            by_room
-                .entry(event.room_id.clone())
-                .or_default()
-                .removed
-                .push(event);
-        }
-
-        for (room_id, batch) in by_room {
-            self.sticky_update_for_room(&room_id, batch).await?;
+            self.session_for_key(key).set_current_state(batch).await;
         }
 
         Ok(())
@@ -749,20 +649,6 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             Err(EventConversionError::UnsupportedEventType { .. }) => Ok(None),
             Err(err) => {
                 log::warn!("dropping a malformed sticky member event: {err}");
-                Err(err)
-            }
-        }
-    }
-
-    fn try_convert_removed_membership_event(
-        &self,
-        event: RawStickyEvent,
-    ) -> Result<Option<CallMembershipEvent>, EventConversionError> {
-        match event.try_into_left_membership_event() {
-            Ok(event) => Ok(Some(event)),
-            Err(EventConversionError::UnsupportedEventType { .. }) => Ok(None),
-            Err(err) => {
-                log::warn!("dropping a malformed sticky removal: {err}");
                 Err(err)
             }
         }

@@ -79,7 +79,7 @@
 //! # Example Usage
 //!
 //! ```no_run
-//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, RtcCommandSender};
+//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient};
 //! use async_trait::async_trait;
 //! use std::sync::Arc;
 //! use base64::{Engine as _, engine::general_purpose};
@@ -101,8 +101,8 @@
 //!     async fn cancel_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }
-//!     async fn send_to_device_message(&self, _user_id: String, _device_id: String, _message_type: String, _content: serde_json::Value) -> Result<(), CommandError> {
-//!         Ok(())
+//!     async fn send_to_device_message(&self, recipients: Vec<ToDeviceRecipient>, _message_type: String, _content: serde_json::Value) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+//!         Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
 //!     }
 //!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<(), CommandError> {
 //!         Ok(())
@@ -149,8 +149,10 @@
 //!     key_index: 0,
 //! }).await.unwrap();
 //!
-//! // Get current keys for application layer
-//! let keys = manager.get_encryption_keys();
+//! // Keys reach the media layer through the signal handler installed above.
+//! // A handler attached after keys arrived (the normal case — media connects
+//! // some time after the slot is joined) calls `replay_keys_to_handler()` to
+//! // receive the ones it missed.
 //! # });
 //! ```
 
@@ -168,7 +170,7 @@ use types::*;
 /// Closure type for getting current memberships, wrapped for thread-safety.
 type GetMembershipsFn = Arc<Mutex<Box<dyn Fn() -> Vec<JoinedMembership> + Send>>>;
 
-use crate::commands::RtcCommandSender;
+use crate::commands::{RtcCommandSender, ToDeviceRecipient};
 use crate::error::CommandError;
 use crate::event::EventOrigin;
 use crate::session::JoinedMembership;
@@ -195,6 +197,59 @@ pub trait EncryptionKeySignalHandler: Send + Sync {
     /// # Arguments
     /// * `signal` - Contains the raw key bytes, key index, and RTC backend identity
     async fn on_new_key_material(&self, signal: KeyMaterialSignal);
+
+    /// Called when a key was received but refused, with the reason.
+    ///
+    /// The media layer can only report *that* a participant's frames will not
+    /// decrypt; the reason is visible here and nowhere else, because this is the
+    /// only layer that sees the to-device message and its provenance. A refused
+    /// key and a key that never arrived look identical downstream, yet one is a
+    /// trust or configuration problem and the other a delivery one.
+    ///
+    /// Defaulted to a no-op so existing handlers need not change.
+    async fn on_key_discarded(&self, discarded: DiscardedKey) {
+        let _ = discarded;
+    }
+}
+
+/// A media key that was received and refused, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscardedKey {
+    /// The member the key claimed to be for.
+    pub member_id: String,
+    /// The key's index, when the message got far enough for it to be meaningful.
+    pub key_index: Option<u8>,
+    /// The user the message was attributed to, if it was attributable at all.
+    pub sender_user_id: Option<String>,
+    /// The device it was attributed to, if known.
+    pub sender_device_id: Option<String>,
+    /// Why it was refused.
+    pub reason: KeyRejection,
+}
+
+impl DiscardedKey {
+    fn new(
+        member_id: &str,
+        key_index: Option<u8>,
+        origin: &KeyOrigin,
+        reason: KeyRejection,
+    ) -> Self {
+        let (sender_user_id, sender_device_id) = match origin {
+            KeyOrigin::Encrypted {
+                sender_user_id,
+                sender_device_id,
+                ..
+            } => (Some(sender_user_id.clone()), sender_device_id.clone()),
+            KeyOrigin::Cleartext => (None, None),
+        };
+        Self {
+            member_id: member_id.to_owned(),
+            key_index,
+            sender_user_id,
+            sender_device_id,
+            reason,
+        }
+    }
 }
 
 /// Maps a `(user_id, device_id, member_id)` triple to the RTC-backend
@@ -273,6 +328,31 @@ pub struct EncryptionManager<T: RtcCommandSender> {
 
     /// Keys that arrived before their membership was known (waiting for RTC membership)
     keys_without_membership: Arc<Mutex<Vec<PendingInboundKey>>>,
+
+    /// Our outbound key as last signalled to the app, so the same rotation is
+    /// not installed twice and a replay can honour the remaining
+    /// `delayBeforeUse`.
+    ///
+    /// The eager first-key signal used to be gated on `shared_with.is_empty()`,
+    /// which is also the state a rollout leaves behind when there was nobody to
+    /// distribute to — so in a solo call every membership update re-signalled the
+    /// same index, and each one reached the transport as a fresh key import.
+    signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+}
+
+/// What we last told the app about our own key, and when.
+///
+/// The timestamp is what makes a replay honest: a rotation signalled with a
+/// `delayBeforeUse` has an install pending in the media layer, so replaying it at
+/// `0` would install that index a second time *and* start encrypting with it
+/// before peers have had their delay.
+#[derive(Clone, Copy, Debug)]
+struct SignalledKey {
+    key_index: u8,
+    /// When it was signalled, in epoch milliseconds.
+    at_ms: u64,
+    /// The `delayBeforeUse` it was signalled with.
+    use_after_ms: u64,
 }
 
 impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
@@ -314,6 +394,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             next_key_index: Arc::new(Mutex::new(0)),
             key_buffer: Arc::new(Mutex::new(OutdatedKeyFilter::default())),
             keys_without_membership: Arc::new(Mutex::new(Vec::new())),
+            signalled_key: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -359,13 +440,33 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
                 None => self.get_own_rtc_backend_identity(),
             };
+            // Replay with whatever is *left* of this key's `delayBeforeUse`,
+            // which is almost always nothing:
+            //
+            // - Never signalled (the join key, or a rotation made before any
+            //   handler existed): this replay is its first signal, and it must be
+            //   usable at once or we cannot encrypt at all.
+            // - Signalled and its delay elapsed: in use, so delaying again would
+            //   only stall media that could flow now.
+            // - Signalled and its delay still running: a rotation with an install
+            //   already pending in the media layer. Replaying at `0` would
+            //   install that index a second time *and* bypass MSC4143's
+            //   `delayBeforeUse`, so we would start encrypting with a key peers
+            //   have not installed yet.
+            let use_after_ms = self
+                .signalled_key
+                .lock()
+                .unwrap()
+                .filter(|signalled| signalled.key_index == outbound.key_index)
+                .map_or(0, |signalled| {
+                    let elapsed = self.timestamp_ms().saturating_sub(signalled.at_ms);
+                    signalled.use_after_ms.saturating_sub(elapsed)
+                });
             signals.push(KeyMaterialSignal {
                 key: outbound.key.clone(),
                 key_index: outbound.key_index,
                 rtc_backend_identity,
-                // Already-held keys: whatever `delayBeforeUse` applied to them
-                // elapsed long ago, so delaying again would only stall media.
-                use_after_ms: 0,
+                use_after_ms,
             });
         }
 
@@ -516,6 +617,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         *self.outbound_key.write().unwrap() = None;
         *self.inbound_keys.write().unwrap() = HashMap::new();
         *self.next_key_index.lock().unwrap() = 0;
+        *self.signalled_key.lock().unwrap() = None;
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -549,11 +651,23 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             }
         }
 
-        // Signal the first key immediately on first membership update
-        // (as per JS SDK test: "Set up my key asap even if no key distribution is needed")
+        // Signal our current key as soon as we have one, so the transport has a
+        // key ring before any media flows — even when there is nobody to
+        // distribute to yet.
+        //
+        // Gated on the index we last signalled, not on `shared_with.is_empty()`:
+        // a rollout with no recipients also leaves `shared_with` empty, so the
+        // old gate re-signalled the same index on every membership update. The
+        // key material is identical, but each signal reaches the transport as a
+        // fresh import of that index — which is the duplicate
+        // `key index N imported` an Android integration observed.
         let should_signal = {
-            let guard = self.outbound_key.read().unwrap();
-            guard.as_ref().is_some_and(|key| key.shared_with.is_empty())
+            let key = self.outbound_key.read().unwrap();
+            let signalled = self.signalled_key.lock().unwrap();
+            match key.as_ref() {
+                Some(key) => signalled.map(|signalled| signalled.key_index) != Some(key.key_index),
+                None => false,
+            }
         };
 
         if should_signal {
@@ -615,7 +729,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             return Ok(());
         }
 
-        let in_progress = {
+        {
             let mut guard = self.key_distribution_in_progress.lock().unwrap();
             if *guard {
                 // Mark that we need a new distribution after current completes
@@ -628,46 +742,34 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 return Ok(());
             }
             *guard = true;
-            true
-        };
-
-        if !in_progress {
-            return Ok(());
         }
 
-        let result = self.rollout_outbound_key().await;
-
-        // Check if we need another distribution
-        let needs_followup = {
-            let mut need_new = self.need_new_distribution.lock().unwrap();
-            if *need_new {
-                *need_new = false;
-                true
-            } else {
-                false
+        // Loop rather than recurse. The recursive version called itself *before*
+        // clearing `key_distribution_in_progress`, so the follow-up took the
+        // "already in progress" branch above, re-set `need_new_distribution` and
+        // returned without rolling anything out — the coalesced distribution was
+        // dropped every time, and the flag stayed latched.
+        loop {
+            if let Err(error) = self.rollout_outbound_key().await {
+                log::error!(
+                    "[{}/{}] Failed to rollout key: {error:?}",
+                    self.room_id,
+                    self.slot_id,
+                );
             }
-        };
 
-        if needs_followup {
+            let needs_followup = std::mem::take(&mut *self.need_new_distribution.lock().unwrap());
+            if !needs_followup {
+                break;
+            }
             log::debug!(
                 "[{}/{}] Starting follow-up distribution",
                 self.room_id,
                 self.slot_id
             );
-            // Recursively call ensure_key_distribution using Box::pin
-            let _ = Box::pin(self.ensure_key_distribution()).await;
         }
 
         *self.key_distribution_in_progress.lock().unwrap() = false;
-
-        if let Err(e) = result {
-            log::error!(
-                "[{}/{}] Failed to rollout key: {:?}",
-                self.room_id,
-                self.slot_id,
-                e
-            );
-        }
 
         Ok(())
     }
@@ -754,6 +856,24 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             })
         });
 
+        // Does anyone actually still holding the outgoing key stand to be
+        // disrupted by us switching away from it?
+        //
+        // `delayBeforeUse` buys the *recipients of a new key* time to install it
+        // while we keep encrypting with the previous one, so members already in
+        // the call never see a gap. That trade only pays when someone present can
+        // decrypt what we are currently stamping. When nobody can — the call sat
+        // empty and the key we hold was distributed to nobody, or every member who
+        // had it has left — holding on protects no one and costs the arriving
+        // member the entire delay, during which they have no key that works at
+        // all. Switching at once then leaves only the unavoidable wait for their
+        // own to-device delivery.
+        let outgoing_key_is_live = current_participants.iter().any(|participant| {
+            already_shared_with
+                .iter()
+                .any(|holder| holder.member_id == participant.member_id)
+        });
+
         let to_distribute_to: Vec<ParticipantDeviceInfo>;
         let mut use_new_key = false;
         let outbound_key_to_use: OutboundEncryptionKey;
@@ -809,36 +929,52 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             return Ok(());
         }
 
-        // Send keys via to-device messages
-        let key_b64 = general_purpose::STANDARD.encode(&outbound_key_to_use.key);
-
-        // One unreachable recipient must not abort the rollout. This loop used to
-        // `?`, which meant every later recipient got nothing *and* the block
-        // below never ran — so the new key was neither stored nor signalled and
-        // the rotation was silently abandoned while we kept using the old key.
+        // Send the key to every recipient in one call, and record only the
+        // recipients it actually reached.
         //
-        // TODO: recipients are recorded in `shared_with` below whether or not
-        // their send succeeded, so a failure is never retried and that member
-        // cannot decrypt us for the rest of the call. Track delivery per
-        // recipient and re-attempt the failures on the next membership update.
-        for participant in &to_distribute_to {
-            if let Err(error) = self
-                .send_key_to_participant(
-                    &key_b64,
-                    outbound_key_to_use.key_index,
-                    &participant.member_id,
-                )
-                .await
-            {
-                log::error!(
-                    "[{}/{}] Could not send key index {} to member {}: {error}. They will not be \
-                     able to decrypt our media.",
-                    self.room_id,
-                    self.slot_id,
-                    outbound_key_to_use.key_index,
-                    participant.member_id,
-                );
-            }
+        // This used to be a loop of single-recipient sends whose failures were
+        // logged and then forgotten: `shared_with` was set to the full list
+        // regardless, so a member the send never reached was treated as holding
+        // the key and never re-sent to — they could not decrypt us for the rest
+        // of the call. Recording only the served recipients makes the next
+        // rollout see the rest as newly joined and try again.
+        let key_b64 = general_purpose::STANDARD.encode(&outbound_key_to_use.key);
+        let served = self
+            .send_key_to_participants(&key_b64, outbound_key_to_use.key_index, &to_distribute_to)
+            .await;
+
+        let unreached: Vec<&str> = to_distribute_to
+            .iter()
+            .map(|participant| participant.member_id.as_str())
+            .filter(|member_id| {
+                !served
+                    .iter()
+                    .any(|participant| participant.member_id == *member_id)
+            })
+            .collect();
+
+        // One line per rollout saying how it went as a whole: per-recipient
+        // errors are easy to miss in a busy log, and "distributed to 1 of 3" is
+        // the shape of the problem.
+        if unreached.is_empty() {
+            log::info!(
+                "[{}/{}] distributed key index {} to {} member(s)",
+                self.room_id,
+                self.slot_id,
+                outbound_key_to_use.key_index,
+                to_distribute_to.len(),
+            );
+        } else {
+            log::warn!(
+                "[{}/{}] distributed key index {} to {} of {} member(s); not delivered to {:?}, \
+                 who cannot decrypt our media until the next rollout retries them",
+                self.room_id,
+                self.slot_id,
+                outbound_key_to_use.key_index,
+                served.len(),
+                to_distribute_to.len(),
+                unreached,
+            );
         }
 
         // Update or store the outbound key
@@ -846,7 +982,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             {
                 let mut guard = self.outbound_key.write().unwrap();
                 let mut new_key = outbound_key_to_use.clone();
-                new_key.shared_with = to_distribute_to.clone();
+                new_key.shared_with = served.clone();
                 *guard = Some(new_key);
             }
 
@@ -858,23 +994,39 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             // outright when that thread had no runtime installed). Timing
             // belongs where a scheduler already exists: the media layer.
             //
-            // The first key carries no delay — it is signalled on the first
+            // The delay is skipped when the key we are leaving behind is not live
+            // for anyone present (see `outgoing_key_is_live`): there is no
+            // continuity to protect, and waiting would only extend how long the
+            // arriving member has nothing it can decrypt.
+            //
+            // The first key carries no delay either — it is signalled on the first
             // `on_memberships_update()` so the transport is listening.
-            log::trace!(
-                "[{}/{}] Signalling key index {}, usable in {}ms",
+            let use_after_ms = if outgoing_key_is_live {
+                self.config.delay_before_use_ms
+            } else {
+                0
+            };
+            log::debug!(
+                "[{}/{}] Signalling key index {}, usable in {}ms ({})",
                 self.room_id,
                 self.slot_id,
                 outbound_key_to_use.key_index,
-                self.config.delay_before_use_ms
+                use_after_ms,
+                if outgoing_key_is_live {
+                    "a member present still holds the key we are replacing"
+                } else {
+                    "nobody present holds the key we are replacing"
+                },
             );
-            self.signal_key_to_app(&outbound_key_to_use, self.config.delay_before_use_ms)
+            self.signal_key_to_app(&outbound_key_to_use, use_after_ms)
                 .await;
         } else {
-            // Reusing existing key, just update shared_with
+            // Reusing the existing key: record only the recipients we reached,
+            // so the rest are retried on the next rollout.
             {
                 let mut guard = self.outbound_key.write().unwrap();
                 if let Some(ref mut key) = *guard {
-                    for recipient in &to_distribute_to {
+                    for recipient in &served {
                         if !key
                             .shared_with
                             .iter()
@@ -912,14 +1064,26 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         }
     }
 
-    /// Sends a key to a specific participant via to-device message (MSC4143 format).
-    async fn send_key_to_participant(
+    /// Sends the key to every reachable participant, returning those the send
+    /// actually reached.
+    ///
+    /// Recipients whose membership names no sending device are unreachable and
+    /// are dropped before the call — MSC4143 puts key material on the device that
+    /// encrypted the member event, and there is deliberately no `*` fallback
+    /// (that hands the key to devices outside the call, and for our own user to
+    /// this very device, which Olm cannot encrypt to).
+    async fn send_key_to_participants(
         &self,
         key_b64: &str,
         index: u8,
-        target_member_id: &str,
-    ) -> Result<(), CommandError> {
-        // Build the to-device message content (MSC4143 format)
+        targets: &[ParticipantDeviceInfo],
+    ) -> Vec<ParticipantDeviceInfo> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+
+        // The same content for every recipient: it names *our* member id and key,
+        // not theirs.
         let content = json!({
             "room_id": self.room_id,
             "member_id": self.own_member_id,
@@ -931,72 +1095,127 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             "format": 0
         });
 
-        log::trace!(
-            "[{}/{}] Sending key index {} to member {}",
-            self.room_id,
-            self.slot_id,
-            index,
-            target_member_id
-        );
-
-        // Find the target participant in our membership list
         let memberships = (self.get_memberships.lock().unwrap())();
-        let target = memberships.iter().find(|m| m.member_id == target_member_id);
+        let mut recipients = Vec::with_capacity(targets.len());
+        let mut addressed = Vec::with_capacity(targets.len());
 
-        match target {
-            Some(membership) => {
-                // MSC4143: key material goes to the device that encrypted the
-                // member event. There is deliberately no "*" fallback — sending
-                // to every device of that user hands the key to devices that are
-                // not in the call, and for our own user it includes this device,
-                // which Olm cannot encrypt to. A membership with no sending
-                // device is unreachable; say so and move on.
-                let target_user_id = &membership.sender;
-                let Some(target_device_id) = membership.origin.sender_device_id() else {
-                    log::warn!(
-                        "[{}/{}] Cannot send key to member {}: its member event names no sending \
-                         device, and we will not broadcast the key to every device of {}. Their \
-                         media will not decrypt for us.",
-                        self.room_id,
-                        self.slot_id,
-                        target_member_id,
-                        target_user_id,
-                    );
-                    return Ok(());
-                };
-
-                log::debug!(
-                    "[{}/{}] Sending key to user={}, device={}",
-                    self.room_id,
-                    self.slot_id,
-                    target_user_id,
-                    target_device_id
-                );
-
-                self.command_sender
-                    .send_to_device_message(
-                        target_user_id.clone(),
-                        target_device_id.to_string(),
-                        KEY_MESSAGE_TYPE.to_string(),
-                        content,
-                    )
-                    .await
-            }
-            None => {
+        for target in targets {
+            let Some(membership) = memberships.iter().find(|m| m.member_id == target.member_id)
+            else {
                 log::warn!(
-                    "[{}/{}] Cannot send key to member {}: no matching membership found",
+                    "[{}/{}] cannot send key to member {}: no matching membership found",
                     self.room_id,
                     self.slot_id,
-                    target_member_id
+                    target.member_id,
                 );
-                // Buffer the key for when membership arrives
-                // For now, just return Ok - the key will be sent when membership is known
-                Ok(())
-            }
+                continue;
+            };
+            let user_id = &membership.sender;
+            let Some(device_id) = membership.origin.sender_device_id() else {
+                log::warn!(
+                    "[{}/{}] cannot send key to member {}: its member event names no sending \
+                     device, and we will not broadcast the key to every device of {user_id}. \
+                     Their media will not decrypt for us.",
+                    self.room_id,
+                    self.slot_id,
+                    target.member_id,
+                );
+                continue;
+            };
+
+            // Recipient *and* index, on one line: an Android integration had to
+            // add exactly this to discover that the core was addressing a key to
+            // the device it was running on. Whether a member was addressed at
+            // all, and with which index, is not answerable from any other line.
+            log::debug!(
+                "[{}/{}] sending key index {index} for member {} to {user_id}/{device_id}{}",
+                self.room_id,
+                self.slot_id,
+                target.member_id,
+                if user_id == &self.own_user_id && device_id == self.own_device_id {
+                    " (ourselves — a homeserver will drop this)"
+                } else {
+                    ""
+                },
+            );
+
+            recipients.push(ToDeviceRecipient::new(user_id.clone(), device_id));
+            addressed.push(target.clone());
         }
+
+        if recipients.is_empty() {
+            return Vec::new();
+        }
+
+        let deliveries = match self
+            .command_sender
+            .send_to_device_message(recipients, KEY_MESSAGE_TYPE.to_string(), content)
+            .await
+        {
+            Ok(deliveries) => deliveries,
+            Err(error) => {
+                // The batch never left; nobody was served, so nobody is recorded
+                // as holding the key and the next rollout retries all of them.
+                log::error!(
+                    "[{}/{}] could not send key index {index} to any of {} recipient(s): {error}",
+                    self.room_id,
+                    self.slot_id,
+                    addressed.len(),
+                );
+                return Vec::new();
+            }
+        };
+
+        // Match results back by recipient rather than by position: an
+        // implementation is free to reorder or to answer for only some of them,
+        // and treating an unanswered recipient as served is the failure this
+        // whole shape exists to prevent.
+        addressed
+            .into_iter()
+            .filter(|target| {
+                let delivered = deliveries.iter().find(|delivery| {
+                    delivery.recipient.user_id == target.user_id
+                        && delivery.recipient.device_id == target.device_id
+                });
+                match delivered {
+                    Some(delivery) if delivery.is_sent() => true,
+                    Some(delivery) => {
+                        log::error!(
+                            "[{}/{}] key index {index} was not delivered to member {} ({}/{}): {}",
+                            self.room_id,
+                            self.slot_id,
+                            target.member_id,
+                            target.user_id,
+                            target.device_id,
+                            delivery.error.as_deref().unwrap_or("no reason given"),
+                        );
+                        false
+                    }
+                    None => {
+                        log::error!(
+                            "[{}/{}] the host reported no outcome for member {} ({}/{}); treating \
+                             key index {index} as undelivered so it is retried",
+                            self.room_id,
+                            self.slot_id,
+                            target.member_id,
+                            target.user_id,
+                            target.device_id,
+                        );
+                        false
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Signals a key to the application layer.
+    /// Reports a refused key to the handler, so the reason leaves the core.
+    async fn signal_discarded_key(&self, discarded: DiscardedKey) {
+        if let Some(handler) = &self.signal_handler {
+            handler.clone().on_key_discarded(discarded).await;
+        }
+    }
+
     /// Signals our own outbound key to the application layer.
     ///
     /// `use_after_ms` is the MSC4143 `delayBeforeUse` the consumer must observe
@@ -1019,6 +1238,11 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             // Note: We don't use tokio::spawn here because the handler's future might not be Send
             let handler_clone = handler.clone();
             let _ = handler_clone.on_new_key_material(signal).await;
+            *self.signalled_key.lock().unwrap() = Some(SignalledKey {
+                key_index: key.key_index,
+                at_ms: self.timestamp_ms(),
+                use_after_ms,
+            });
         }
     }
 
@@ -1111,14 +1335,47 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// they can be checked once it does — a key is never signalled to the
     /// application before it has been verified.
     pub async fn receive_key(&self, received: ReceivedEncryptionKey) -> Result<(), CommandError> {
-        if let Err(rejection) = self.verify_origin(&received) {
-            log::warn!(
-                "[{}/{}] Discarding key for member {}: {}",
+        // What the host claimed, logged before we decide anything about it, so a
+        // discard can be read against the message that caused it.
+        match &received.origin {
+            KeyOrigin::Encrypted {
+                sender_user_id,
+                sender_device_id,
+                sender_is_cross_signed,
+            } => log::debug!(
+                "[{}/{}] key index {} for member {} from {sender_user_id}/{} \
+                 cross_signed={sender_is_cross_signed}",
                 self.room_id,
                 self.slot_id,
+                received.key_index,
+                received.member_id,
+                sender_device_id.as_deref().unwrap_or("<unknown>"),
+            ),
+            KeyOrigin::Cleartext => log::debug!(
+                "[{}/{}] key index {} for member {} arrived in cleartext",
+                self.room_id,
+                self.slot_id,
+                received.key_index,
+                received.member_id,
+            ),
+        }
+
+        if let Err(rejection) = self.verify_origin(&received) {
+            log::warn!(
+                "[{}/{}] Discarding key index {} for member {}: {}",
+                self.room_id,
+                self.slot_id,
+                received.key_index,
                 received.member_id,
                 rejection
             );
+            self.signal_discarded_key(DiscardedKey::new(
+                &received.member_id,
+                Some(received.key_index),
+                &received.origin,
+                rejection,
+            ))
+            .await;
             return Ok(());
         }
 
@@ -1190,17 +1447,30 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     ) {
         if let Err(rejection) = Self::verify_against_membership(origin, membership) {
             log::warn!(
-                "[{}/{}] Discarding key for member {}: {}",
+                "[{}/{}] Discarding key index {} for member {}: {}",
                 self.room_id,
                 self.slot_id,
+                key.key_index,
                 key.member_id,
                 rejection
             );
+            self.signal_discarded_key(DiscardedKey::new(
+                &key.member_id,
+                Some(key.key_index),
+                origin,
+                rejection,
+            ))
+            .await;
             return;
         }
 
         let outdated = {
             let mut guard = self.key_buffer.lock().unwrap();
+            // Entries older than the filter's TTL can no longer make anything
+            // look outdated, so drop them here rather than keeping one per
+            // (member, index) for the life of the session. This is the only place
+            // keys are added, so it is the only place the buffer can grow.
+            guard.cleanup(key.creation_ts);
             guard.check_and_add(key.member_id.clone(), key.key_index, key.creation_ts)
         };
 
@@ -1237,11 +1507,53 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             None => membership.member_id.clone(),
         };
 
-        // Store the key
+        // Store the key: at most one entry per index, holding the newest material
+        // we have seen for it.
+        //
+        // Both halves matter. A re-delivered *identical* key — the sender
+        // re-distributing after a membership change, or two sticky updates racing
+        // — must not be stored or signalled again: `OutdatedKeyFilter` cannot
+        // catch it, because with no sender timestamp on the wire `creation_ts` is
+        // stamped at receive time and a re-delivery never looks stale. Appending
+        // instead grew a duplicate per delivery, signalled each as a fresh
+        // import, and made every later replay re-signal all the copies.
+        //
+        // A *different* key at an index we already hold is a rekey, and the newer
+        // material is what the sender is encrypting with, so it replaces the old
+        // one rather than joining it. Keeping both would leave the replay order
+        // deciding which one the transport ends up installed with — and replaying
+        // the older one last silently downgrades us to a key the sender has
+        // stopped using.
         let map_key = key.member_id.clone();
         {
             let mut guard = self.inbound_keys.write().unwrap();
-            guard.entry(map_key).or_default().push(key.clone());
+            let held = guard.entry(map_key).or_default();
+            match held
+                .iter_mut()
+                .find(|existing| existing.key_index == key.key_index)
+            {
+                Some(existing) if existing.key == key.key => {
+                    log::trace!(
+                        "[{}/{}] key index {} for member {} is already held; not re-importing it",
+                        self.room_id,
+                        self.slot_id,
+                        key.key_index,
+                        key.member_id,
+                    );
+                    return;
+                }
+                Some(existing) => {
+                    log::debug!(
+                        "[{}/{}] member {} rekeyed index {}; replacing the key we held",
+                        self.room_id,
+                        self.slot_id,
+                        key.member_id,
+                        key.key_index,
+                    );
+                    *existing = key.clone();
+                }
+                None => held.push(key.clone()),
+            }
         }
 
         // Signal to application
@@ -1285,52 +1597,6 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     pub fn get_all_inbound_keys(&self) -> HashMap<String, Vec<InboundEncryptionKey>> {
         self.inbound_keys.read().unwrap().clone()
     }
-
-    /// Gets encryption keys for the application layer.
-    ///
-    /// Returns a map of member_id to their key rings (multiple keys per participant
-    /// for rotation support).
-    pub fn get_encryption_keys(&self) -> HashMap<String, Vec<KeyMaterialSignal>> {
-        let mut result: HashMap<String, Vec<KeyMaterialSignal>> = HashMap::new();
-
-        // Add outbound key
-        if let Some(outbound) = self.get_outbound_key() {
-            let rtc_backend_id = self.get_own_rtc_backend_identity();
-            let signal = KeyMaterialSignal {
-                key: outbound.key.clone(),
-                key_index: outbound.key_index,
-                rtc_backend_identity: rtc_backend_id,
-                // A snapshot of keys already held, not a new-key notification:
-                // whatever delay applied to them has long since been observed.
-                use_after_ms: 0,
-            };
-            result
-                .entry(self.own_member_id.clone())
-                .or_default()
-                .push(signal);
-        }
-
-        // Add inbound keys
-        for (member_id, keys) in self.get_all_inbound_keys() {
-            let member_id_clone = member_id.clone();
-            for key in keys {
-                // We need to compute the backend identity
-                // For simplicity, use the member_id as identity
-                let signal = KeyMaterialSignal {
-                    key: key.key.clone(),
-                    key_index: key.key_index,
-                    rtc_backend_identity: member_id_clone.clone(),
-                    use_after_ms: 0,
-                };
-                result
-                    .entry(member_id_clone.clone())
-                    .or_default()
-                    .push(signal);
-            }
-        }
-
-        result
-    }
 }
 
 impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
@@ -1353,6 +1619,7 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
             next_key_index: self.next_key_index.clone(),
             key_buffer: self.key_buffer.clone(),
             keys_without_membership: self.keys_without_membership.clone(),
+            signalled_key: self.signalled_key.clone(),
         }
     }
 }
@@ -1367,7 +1634,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{MockCommandSender, NoopCommandSender};
+    use crate::commands::{MockCommandSender, NoopCommandSender, ToDeviceDelivery};
     use crate::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
@@ -1427,6 +1694,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingHandler {
         signals: Mutex<Vec<KeyMaterialSignal>>,
+        discarded: Mutex<Vec<DiscardedKey>>,
     }
 
     impl RecordingHandler {
@@ -1444,6 +1712,10 @@ mod tests {
     impl EncryptionKeySignalHandler for RecordingHandler {
         async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
             self.signals.lock().unwrap().push(signal);
+        }
+
+        async fn on_key_discarded(&self, discarded: DiscardedKey) {
+            self.discarded.lock().unwrap().push(discarded);
         }
     }
 
@@ -1486,6 +1758,297 @@ mod tests {
         // only stall media that could be decrypted now.
         assert!(signals.iter().all(|signal| signal.use_after_ms == 0));
         assert!(signals.iter().any(|signal| signal.key == vec![7u8; 32]));
+    }
+
+    /// Builds a manager whose memberships come from a list a test can mutate,
+    /// so a departure or arrival can be staged between rollouts.
+    fn manager_over(
+        sender: Arc<MockCommandSender>,
+        memberships: Arc<Mutex<Vec<JoinedMembership>>>,
+    ) -> EncryptionManager<MockCommandSender> {
+        EncryptionManager::new(
+            sender,
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            move || memberships.lock().unwrap().clone(),
+        )
+    }
+
+    /// One membership update per arriving peer, but only ever one signal per key
+    /// index. Each signal reaches the transport as a key *import*, so a repeat is
+    /// a duplicate `set_key` on the frame cryptor for material it already has.
+    #[tokio::test]
+    async fn a_key_index_is_signalled_once_however_often_memberships_update() {
+        let memberships = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = manager_over(Arc::new(MockCommandSender::new()), memberships.clone());
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.join().await.expect("join should succeed");
+
+        // Alone in the call: a rollout with no recipients leaves `shared_with`
+        // empty, which used to be read as "not signalled yet".
+        for _ in 0..3 {
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        let signals = handler.signals.lock().unwrap();
+        assert_eq!(
+            signals.len(),
+            1,
+            "the same key index was signalled {} times: {:?}",
+            signals.len(),
+            signals.iter().map(|s| s.key_index).collect::<Vec<_>>(),
+        );
+        assert_eq!(signals[0].key_index, 0);
+        assert_eq!(
+            signals[0].use_after_ms, 0,
+            "the first key must be usable at once, or nothing can be encrypted"
+        );
+    }
+
+    /// A departure rotates the key even with nobody left to send it to, and that
+    /// eagerness is the point: the next arrival is then handed a key that is
+    /// already the one we are stamping frames with, so they decrypt immediately.
+    ///
+    /// Deferring the rotation until someone arrives looks tidier — no index burnt
+    /// on a key no peer will hold — but it is worse. The arrival would be handed a
+    /// freshly rotated key while we keep stamping the *previous* one for the whole
+    /// of its `delayBeforeUse`, and they hold nothing that decrypts it. Rotating
+    /// on departure instead lets the grace-period reuse path below hand them the
+    /// live key.
+    ///
+    /// Forward secrecy still holds: the departed member's key is retired at once,
+    /// and the key the newcomer receives only ever encrypted media from after the
+    /// call emptied.
+    #[tokio::test]
+    async fn a_departure_rotates_so_the_next_arrival_gets_the_live_key() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.join().await.expect("join should succeed");
+
+        // Bob is in the call and gets index 0.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        let index_bob_got = sender
+            .last_to_device_message()
+            .expect("bob should have been sent a key")
+            .3
+            .pointer("/media_key/index")
+            .and_then(|index| index.as_u64())
+            .expect("the key message carries an index");
+
+        // Bob leaves. Nobody is left.
+        memberships.lock().unwrap().clear();
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_ne!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(index_bob_got as u8),
+            "the departed member's key must be retired, or media sent after they \
+             left stays readable to them"
+        );
+
+        // Carol arrives while that key is still inside its grace period, so it is
+        // reused rather than rotated again — and it is exactly what we encrypt
+        // with, so she decrypts from her first frame.
+        let carol = JoinedMembership {
+            sender: "@carol:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_string())),
+            sticky_key: "carol-a".to_string(),
+            member_id: "carol-a".to_string(),
+            ..bob_membership()
+        };
+        *memberships.lock().unwrap() = vec![carol];
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        let sent_to_carol = sender
+            .to_device_messages_for("@carol:example.org", "CAROLDEV")
+            .into_iter()
+            .filter_map(|(_, content)| {
+                content
+                    .pointer("/media_key/index")
+                    .and_then(|index| index.as_u64())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent_to_carol.len(),
+            1,
+            "carol should be handed exactly one key index, got {sent_to_carol:?}"
+        );
+        assert_ne!(
+            sent_to_carol[0], index_bob_got,
+            "the key bob held must not be reused for carol"
+        );
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(sent_to_carol[0] as u8),
+            "we must encrypt with exactly the index carol was handed"
+        );
+    }
+
+    /// `delayBeforeUse` is there to keep members who hold the outgoing key
+    /// decrypting while its replacement propagates. When the call has sat empty,
+    /// the key we hold went to nobody, so there is no continuity to protect — and
+    /// waiting would leave the arriving member, who holds nothing at all, blind
+    /// for the whole delay instead of just for their own key's delivery.
+    #[tokio::test]
+    async fn a_rotation_nobody_can_decrypt_is_usable_at_once() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        // No grace period, so an arrival always rotates rather than reusing.
+        manager.set_config(EncryptionConfig {
+            key_rotation_grace_period_ms: 0,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+
+        // Bob is here and holds our key.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        // Carol joins alongside him. Bob can decrypt what we are stamping, so the
+        // rotation must wait for her to install it before we switch.
+        let carol = JoinedMembership {
+            sender: "@carol:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_string())),
+            sticky_key: "carol-a".to_string(),
+            member_id: "carol-a".to_string(),
+            ..bob_membership()
+        };
+        memberships.lock().unwrap().push(carol.clone());
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            handler
+                .signals
+                .lock()
+                .unwrap()
+                .last()
+                .expect("the rotation should have been signalled")
+                .use_after_ms,
+            EncryptionConfig::default().delay_before_use_ms,
+            "bob still holds the outgoing key, so switching away from it early \
+             would cut him off"
+        );
+
+        // Now everyone leaves and, later, carol arrives alone. The key we hold
+        // reached nobody who is present, so there is nothing to keep alive.
+        memberships.lock().unwrap().clear();
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        *memberships.lock().unwrap() = vec![carol];
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            handler
+                .signals
+                .lock()
+                .unwrap()
+                .last()
+                .expect("the rotation should have been signalled")
+                .use_after_ms,
+            0,
+            "nobody present holds the outgoing key, so waiting only keeps the \
+             arriving member undecryptable for longer"
+        );
+    }
+
+    /// MSC4143 sends the same key to a member whenever their membership event
+    /// changes, so a receiver sees repeats. Storing each one grows the key list
+    /// without bound and re-imports identical material; `OutdatedKeyFilter`
+    /// cannot catch it, because with no sender timestamp on the wire a
+    /// re-delivery always looks newer than what we hold.
+    #[tokio::test]
+    async fn an_identical_key_redelivery_is_not_reimported() {
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+
+        manager
+            .receive_key(bob_key(vec![7u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+        manager
+            .receive_key(bob_key(vec![7u8; 32], 0))
+            .await
+            .expect("the redelivery should be accepted too");
+
+        assert_eq!(
+            handler.signals.lock().unwrap().len(),
+            1,
+            "an identical key was imported twice"
+        );
+        assert_eq!(
+            manager.get_inbound_keys("bob-device456-uuid").len(),
+            1,
+            "an identical key was stored twice"
+        );
+    }
+
+    /// A *different* key at the same index is a real rotation and must still get
+    /// through — the dedupe keys on the material, not the index alone.
+    #[tokio::test]
+    async fn a_different_key_at_the_same_index_is_still_imported() {
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+
+        manager
+            .receive_key(bob_key(vec![7u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+        manager
+            .receive_key(bob_key(vec![9u8; 32], 0))
+            .await
+            .expect("bob's replacement key should be accepted");
+
+        assert_eq!(handler.signals.lock().unwrap().len(), 2);
     }
 
     /// The identity is the whole point of the replay: importing a key under one
@@ -1656,8 +2219,17 @@ mod tests {
         assert_eq!(keys[0].key, vec![1u8; 32]);
     }
 
+    /// A peer rekeying an index we already hold must win: their newer key is what
+    /// they are encrypting with, so keeping the first one guarantees their media
+    /// never decrypts.
+    ///
+    /// This used to assert the opposite — that the second key was "outdated" and
+    /// dropped — which only held because both receives landed in the same
+    /// millisecond. MSC4143 puts no creation timestamp on the wire, so
+    /// `OutdatedKeyFilter` stamps receive time and cannot tell a stale key from a
+    /// fresh one; treating an equal timestamp as stale threw away the good key.
     #[tokio::test]
-    async fn test_receive_outdated_key_is_dropped() {
+    async fn a_rekey_at_the_same_index_replaces_the_key_we_held() {
         let mock_sender = Arc::new(NoopCommandSender);
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
 
@@ -1675,18 +2247,17 @@ mod tests {
             .receive_key(bob_key(vec![1u8; 32], 1))
             .await
             .expect("receive_key should succeed");
-
-        // A second key at the same index, no newer than the first, is outdated.
         manager
             .receive_key(bob_key(vec![2u8; 32], 1))
             .await
             .expect("receive_key should succeed");
 
-        // Only the first key should be stored
+        // One entry per index, holding the newest material — so a later replay
+        // cannot reinstall the superseded key.
         let keys = manager.get_inbound_keys("bob-device456-uuid");
-        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.len(), 1, "an index should not accumulate keys");
         assert_eq!(keys[0].key_index, 1);
-        assert_eq!(keys[0].key, vec![1u8; 32]);
+        assert_eq!(keys[0].key, vec![2u8; 32], "the rekey should have won");
     }
 
     /// Helper: a manager with Bob joined, using the default (strict) config.
@@ -1715,6 +2286,99 @@ mod tests {
             manager.get_inbound_keys(&member_id).is_empty(),
             "key should have been discarded"
         );
+    }
+
+    /// A discarded key must reach the host with its reason attached. Downstream,
+    /// a refused key and one that never arrived both surface as `MISSING_KEY`, so
+    /// without this the host cannot tell a trust problem from a delivery one —
+    /// the reason was warn-logged inside the core and went nowhere.
+    #[tokio::test]
+    async fn a_refused_key_is_reported_with_its_reason() {
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+
+        // MSC4153: bob's device is not cross-signed, so his key is refused.
+        let mut key = bob_key(vec![1u8; 32], 3);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@bob:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
+            sender_is_cross_signed: false,
+        };
+        manager
+            .receive_key(key)
+            .await
+            .expect("a discarded key is not an error");
+
+        let discarded = handler.discarded.lock().unwrap();
+        assert_eq!(
+            *discarded,
+            vec![DiscardedKey {
+                member_id: "bob-device456-uuid".to_string(),
+                key_index: Some(3),
+                sender_user_id: Some("@bob:example.org".to_string()),
+                sender_device_id: Some("device456".to_string()),
+                reason: KeyRejection::NotCrossSigned,
+            }],
+        );
+        assert!(
+            handler.signals.lock().unwrap().is_empty(),
+            "a refused key must not also be signalled as usable"
+        );
+    }
+
+    /// The other rejection stage — the key passed the origin checks but does not
+    /// match the member event it claims — must report too, and say who sent it.
+    #[tokio::test]
+    async fn a_key_from_the_wrong_device_is_reported_with_its_reason() {
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@bob:example.org".to_string(),
+            sender_device_id: Some("SOMEOTHERDEV".to_string()),
+            sender_is_cross_signed: true,
+        };
+        manager
+            .receive_key(key)
+            .await
+            .expect("a discarded key is not an error");
+
+        let discarded = handler.discarded.lock().unwrap();
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the rejection should have been reported"
+        );
+        assert_eq!(
+            discarded[0].sender_device_id.as_deref(),
+            Some("SOMEOTHERDEV"),
+            "the host needs the device that actually sent it, to act on this",
+        );
+        assert!(matches!(
+            discarded[0].reason,
+            KeyRejection::DeviceMismatch { .. }
+        ));
     }
 
     /// MSC4143: "clients SHOULD discard any m.rtc.encryption_key events that
@@ -2102,8 +2766,10 @@ mod tests {
         );
     }
 
-    /// One unreachable recipient must not cost the others their key, and must
-    /// not abandon the rotation: the key still has to be stored and signalled.
+    /// One unreachable recipient must not cost the others their key, must not
+    /// abandon the rotation (the key still has to be stored and signalled) —
+    /// and must not be recorded as holding the key, or it is never retried and
+    /// that member cannot decrypt us for the rest of the call.
     #[tokio::test]
     async fn a_failed_recipient_does_not_abort_the_rollout() {
         struct FailsFirstRecipient {
@@ -2133,30 +2799,35 @@ mod tests {
             async fn restart_delayed_event(
                 &self,
                 _room_id: String,
-                _event_id: String,
+                _delay_id: String,
             ) -> Result<(), CommandError> {
                 Ok(())
             }
             async fn cancel_delayed_event(
                 &self,
                 _room_id: String,
-                _event_id: String,
+                _delay_id: String,
             ) -> Result<(), CommandError> {
                 Ok(())
             }
             async fn send_to_device_message(
                 &self,
-                user_id: String,
-                _device_id: String,
+                recipients: Vec<ToDeviceRecipient>,
                 _message_type: String,
                 _content: serde_json::Value,
-            ) -> Result<(), CommandError> {
-                self.attempted.lock().unwrap().push(user_id.clone());
-                if user_id == "@bob:example.org" {
-                    Err(CommandError::from_message("no olm session"))
-                } else {
-                    Ok(())
-                }
+            ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+                let mut attempted = self.attempted.lock().unwrap();
+                Ok(recipients
+                    .into_iter()
+                    .map(|recipient| {
+                        attempted.push(recipient.user_id.clone());
+                        if recipient.user_id == "@bob:example.org" {
+                            ToDeviceDelivery::failed(recipient, "no olm session")
+                        } else {
+                            ToDeviceDelivery::sent(recipient)
+                        }
+                    })
+                    .collect())
             }
             async fn send_state_event(
                 &self,
@@ -2210,6 +2881,33 @@ mod tests {
         assert!(
             !handler.signals.lock().unwrap().is_empty(),
             "the key must still reach the media layer, or we encrypt with nothing",
+        );
+
+        let shared_with: Vec<String> = manager
+            .get_outbound_key()
+            .expect("the key is stored")
+            .shared_with
+            .into_iter()
+            .map(|participant| participant.user_id)
+            .collect();
+        assert_eq!(
+            shared_with,
+            vec!["@carol:example.org"],
+            "only the recipient the send actually reached may be recorded as holding \
+             the key; recording bob would mean never retrying him",
+        );
+
+        // Next rollout: bob is not in `shared_with`, so he counts as newly
+        // joined and is addressed again.
+        sender.attempted.lock().unwrap().clear();
+        manager
+            .on_memberships_update()
+            .await
+            .expect("the retry rollout should succeed");
+        assert_eq!(
+            *sender.attempted.lock().unwrap(),
+            vec!["@bob:example.org"],
+            "the unreached recipient should be retried, and the served one left alone",
         );
     }
 }

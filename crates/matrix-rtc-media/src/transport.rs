@@ -108,6 +108,21 @@ pub trait RemoteTrackHandle: Send + Sync {
     }
 }
 
+/// One speaking participant and how loud they are.
+///
+/// The level travels with the identity because the two come from the same
+/// transport event: reporting only *who* is speaking forces a host to meter the
+/// PCM itself to answer "how loud", which means decoding audio it may not
+/// otherwise need and getting a different answer from the SFU's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeakingParticipant {
+    /// Transport-level participant identity.
+    pub identity: String,
+    /// Most recent audio level, `0.0` (silent) to `1.0` (loudest). Transports
+    /// that do not report one send `0.0`.
+    pub level: f32,
+}
+
 /// State changes of one transport connection, translated into the
 /// transport-neutral vocabulary.
 ///
@@ -139,7 +154,9 @@ pub enum ConnectionEvent {
         kind: MediaStreamKind,
     },
     ActiveSpeakers {
-        identities: Vec<String>,
+        /// Who is speaking, loudest first where the transport orders them, each
+        /// with its most recent audio level.
+        speakers: Vec<SpeakingParticipant>,
     },
     /// The frame cryptor's verdict on this participant's media changed.
     EncryptionStateChanged {
@@ -186,9 +203,9 @@ impl fmt::Debug for ConnectionEvent {
                 .field("identity", identity)
                 .field("kind", kind)
                 .finish(),
-            Self::ActiveSpeakers { identities } => f
+            Self::ActiveSpeakers { speakers } => f
                 .debug_struct("ActiveSpeakers")
-                .field("identities", identities)
+                .field("speakers", speakers)
                 .finish(),
             Self::EncryptionStateChanged { identity, state } => f
                 .debug_struct("EncryptionStateChanged")

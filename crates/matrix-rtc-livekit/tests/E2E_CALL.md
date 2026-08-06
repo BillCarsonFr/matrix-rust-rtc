@@ -25,7 +25,7 @@ registration).
 | **Signalling** | Each client publishes its own `m.rtc.member` membership as a sticky event (+ a dead-man's-switch delayed leave) and discovers the peer via `subscribe_to_sticky_events` → `RtcSessionManager`. Both peers join the room before RTC signalling. Success = each side sees 2 members. |
 | **Transport** | MSC4195 OpenID→JWT token exchange and SFU connect for both clients. |
 | **Encryption** | The core `EncryptionManager` generates a per-participant media key and distributes it to the peer as an Olm-encrypted `m.rtc.encryption_key` to-device message (`SdkCommandSender::send_to_device_message`). Each side imports received keys into its LiveKit `KeyProvider` (`MediaKeyBridge`), addressed by the MSC4195 pseudonymous identity. Success = `bob` imported `alice`'s key. |
-| **Media** | 440 Hz tone published by `alice`, **GCM frame-encrypted** at the SFU, decrypted and recorded by `bob`, verified with a Goertzel filter (`media::detect_tone > 0.5`). A WAV is written to `<temp_dir>/e2e_received.wav` (uploaded as a CI artifact on failure). The tone only decodes because the keys were exchanged and mapped correctly. |
+| **Media** | 440 Hz tone published by `alice`, **GCM frame-encrypted** at the SFU, decrypted and recorded by `bob`, verified with a Goertzel filter (`media::detect_tone > 0.5`). A WAV is written to `target/e2e/received-<label>.wav` — inside the repo, not the system temp dir — and uploaded as a CI artifact on failure. A scenario that records twice (the redial) keeps both files. The tone only decodes because the keys were exchanged and mapped correctly. |
 | **Multi-SFU** (`e2e_call_two_clients_two_foci`) | The same flow with `alice` publishing on SFU 1 and `bob` on SFU 2 (the backend stack runs two SFU + lk-jwt pairs). Each client's `CallEngine` reads the peer's `transports` from their membership and opens a second connection to the peer's focus (MSC4195 multi-SFU). Tones flow in **both directions** (alice 440 Hz, bob 660 Hz) and are received through the transport-agnostic media API (`Call::participants` → `Call::remote_track` → frame streams) instead of raw LiveKit events. |
 | **Video + constraints** (same scenario) | `alice` publishes a synthetic half-bright/half-dark I420 pattern through `Call::publish` (camera track, simulcast + dynacast); `bob` receives it via `video_frames()` across the SFUs and verifies the luma split (robust to VP8 compression). Then `bob` exercises both constraint demand states: `visible = false` **pauses** the stream (frames stop, subscription kept — `set_enabled(false)`) and `visible = true` resumes it instantly; `enabled = false` turns it **off** (released as fully as the transport supports — LiveKit currently pauses here too, because its client-side resubscribe is unreliable at 0.7.48) and `enabled = true` brings frames back. |
 
@@ -124,7 +124,7 @@ collisions. Overrides for pointing at another deployment:
 [bob]   sees 2 members (sticky round-trip OK)
 [alice] publishing 440 Hz tone
 [bob]   track subscribed from …
-[bob]   wrote /tmp/e2e_received.wav (… samples)
+[bob]   wrote target/e2e/received-first-call.wav (… samples)
 [bob]   440 Hz energy ratio: 0.9xx
 [bob]   imported alice's per-participant media key: true
 === RESULT ===

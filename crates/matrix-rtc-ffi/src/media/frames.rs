@@ -24,7 +24,11 @@
 //!   delivery is latest-frame-wins upstream, so a slow consumer drops
 //!   frames instead of buffering.
 //! - **Audio frames go by value** ([`FfiAudioFrame`], ~2 KB at 10 ms/48 kHz
-//!   mono — the copy is noise at 100 calls/s).
+//!   mono — the copy is noise at 100 calls/s), as little-endian bytes rather
+//!   than a sample list: uniffi maps `Vec<u8>` to a `ByteArray`/`Data`, whereas
+//!   a `Vec<i16>` becomes a boxed `List<Short>` — roughly 48 000 boxed objects a
+//!   second at 48 kHz mono, which was the single biggest cost this API imposed
+//!   on a host.
 //! - **Video frames are objects** ([`VideoFrameRef`]) exposing both safe
 //!   copies (`data_y`/`data_u`/`data_v`) and zero-copy plane pointers
 //!   (`plane_ptr` + strides) for renderers that consume raw memory. The
@@ -47,11 +51,37 @@ use super::types::FfiStreamKind;
 /// A chunk of interleaved 16-bit PCM.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiAudioFrame {
-    /// Interleaved samples, `samples_per_channel * num_channels` long.
-    pub data: Vec<i16>,
+    /// Interleaved samples as **little-endian `int16`** bytes:
+    /// `samples_per_channel * num_channels * 2` long.
+    ///
+    /// Bytes rather than a list of samples because uniffi renders `Vec<u8>` as a
+    /// `ByteArray` (Kotlin) / `Data` (Swift) — a single buffer — while a list of
+    /// samples arrives boxed, one object per sample. On Kotlin, read with
+    /// `ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()`;
+    /// `AudioTrack`/`AudioRecord` accept the byte form directly.
+    pub data: Vec<u8>,
     pub sample_rate: u32,
     pub num_channels: u32,
     pub samples_per_channel: u32,
+}
+
+/// Little-endian `i16` bytes, the shape [`FfiAudioFrame::data`] carries.
+fn pcm_to_le_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+/// Inverse of [`pcm_to_le_bytes`]. A trailing odd byte is dropped: it cannot be
+/// half a sample, and truncating is better than shifting every later sample by
+/// one byte, which turns the whole frame into noise.
+fn pcm_from_le_bytes(bytes: &[u8]) -> Vec<i16> {
+    bytes
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
 }
 
 /// Frame rotation to apply before rendering.
@@ -114,7 +144,7 @@ impl AudioFrameStream {
     pub async fn next(&self) -> Option<FfiAudioFrame> {
         let frame = self.frames.lock().await.next().await?;
         Some(FfiAudioFrame {
-            data: frame.data,
+            data: pcm_to_le_bytes(&frame.data),
             sample_rate: frame.sample_rate,
             num_channels: frame.num_channels,
             samples_per_channel: frame.samples_per_channel,
@@ -255,7 +285,7 @@ impl FfiLocalTrack {
     pub async fn capture_audio(&self, frame: FfiAudioFrame) -> Result<(), MediaFfiError> {
         self.inner
             .capture_audio(AudioFrame {
-                data: frame.data,
+                data: pcm_from_le_bytes(&frame.data),
                 sample_rate: frame.sample_rate,
                 num_channels: frame.num_channels,
                 samples_per_channel: frame.samples_per_channel,
@@ -283,5 +313,35 @@ impl FfiLocalTrack {
                 timestamp_us: frame.timestamp_us,
             })
             .map_err(|error| MediaFfiError::Transport(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The byte encoding is a wire contract with the host: a host that reads it
+    /// as little-endian `int16` must get back exactly what was captured. Getting
+    /// the endianness or the pairing wrong does not fail — it produces noise.
+    #[test]
+    fn pcm_survives_a_round_trip_through_bytes() {
+        let samples: Vec<i16> = vec![0, 1, -1, i16::MAX, i16::MIN, 1234, -4321];
+        let bytes = pcm_to_le_bytes(&samples);
+
+        assert_eq!(bytes.len(), samples.len() * 2, "two bytes per sample");
+        assert_eq!(&bytes[..2], &[0x00, 0x00]);
+        assert_eq!(&bytes[2..4], &[0x01, 0x00], "little-endian, low byte first");
+        assert_eq!(pcm_from_le_bytes(&bytes), samples);
+    }
+
+    /// A host that hands us a half sample gets the whole samples and no panic.
+    /// Shifting by the stray byte instead would silently turn the rest of the
+    /// frame into noise.
+    #[test]
+    fn a_trailing_odd_byte_is_dropped_rather_than_shifting_the_frame() {
+        let mut bytes = pcm_to_le_bytes(&[7, 8]);
+        bytes.push(0xff);
+
+        assert_eq!(pcm_from_le_bytes(&bytes), vec![7, 8]);
     }
 }

@@ -52,12 +52,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_core::JoinedMembership;
+use matrix_rtc_core::{DiscardedKey, JoinedMembership};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::constraints::MediaConstraints;
-use crate::event::{CallEvent, EndedReason};
+use crate::event::{
+    CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState, SpeakingMember,
+};
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 use crate::stats::ReceiveStats;
@@ -159,7 +161,22 @@ enum ActorMessage {
         idle_generation: u64,
     },
     /// A media decryption key was imported for a transport identity.
-    KeyImported { identity: String, key_index: u8 },
+    KeyImported {
+        identity: String,
+        key_index: u8,
+    },
+    KeyDiscarded(DiscardedKey),
+    /// A local publication went up; the roster must show it and peers were
+    /// already told by the transport.
+    LocalPublished {
+        kind: MediaStreamKind,
+        track: Arc<dyn LocalTrackHandle>,
+    },
+    SetLocalMuted {
+        kind: MediaStreamKind,
+        muted: bool,
+        respond: oneshot::Sender<Result<(), TransportError>>,
+    },
     /// Publish a local track on the own-focus connection.
     Publish {
         options: PublishOptions,
@@ -178,7 +195,9 @@ enum ActorMessage {
         generation: u64,
     },
     /// Close every pooled connection and stop.
-    Shutdown { ack: oneshot::Sender<()> },
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 /// A cheap, cloneable handle for feeding the engine from other components
@@ -195,6 +214,11 @@ impl EngineHandle {
             identity: identity.into(),
             key_index,
         });
+    }
+
+    /// See [`CallEngine::notify_key_discarded`]. No-op once the engine is gone.
+    pub fn notify_key_discarded(&self, report: DiscardedKey) {
+        let _ = self.messages.send(ActorMessage::KeyDiscarded(report));
     }
 }
 
@@ -248,6 +272,9 @@ impl CallEngine {
             member_identities: HashMap::new(),
             constraints: HashMap::new(),
             pending_tracks: HashMap::new(),
+            local_tracks: HashMap::new(),
+            encryption_states: HashMap::new(),
+            installed_keys: HashMap::new(),
             pending_keys: HashMap::new(),
             pool: HashMap::new(),
             connection_generation: 0,
@@ -310,6 +337,16 @@ impl CallEngine {
         });
     }
 
+    /// Report that a media key was refused, so the engine can surface
+    /// [`CallEvent::KeyDiscarded`] with the reason.
+    ///
+    /// Keyed by `member_id` rather than a transport identity: the core refuses a
+    /// key before any identity derivation applies to it, and a refused key may
+    /// well name a member the transport has never seen.
+    pub fn notify_key_discarded(&self, report: DiscardedKey) {
+        let _ = self.messages.send(ActorMessage::KeyDiscarded(report));
+    }
+
     /// Publish a local track on the own-focus connection (see
     /// [`PublishOptions`]); push captured frames into the returned handle.
     /// Fails while that connection is not up.
@@ -320,6 +357,33 @@ impl CallEngine {
         let (respond, response) = oneshot::channel();
         self.messages
             .send(ActorMessage::Publish { options, respond })
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
+        response
+            .await
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?
+    }
+
+    /// Mute or unmute one of our own publications.
+    ///
+    /// Peers are told, so their UI can show it — which is the difference
+    /// between a muted sender and one that has simply stopped sending. The
+    /// roster and the event stream are updated too, so a host can render its own
+    /// state from the same source it renders everyone else's rather than
+    /// shadowing it separately.
+    ///
+    /// Errors if nothing of that kind is published.
+    pub async fn set_local_muted(
+        &self,
+        kind: MediaStreamKind,
+        muted: bool,
+    ) -> Result<(), TransportError> {
+        let (respond, response) = oneshot::channel();
+        self.messages
+            .send(ActorMessage::SetLocalMuted {
+                kind,
+                muted,
+                respond,
+            })
             .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
         response
             .await
@@ -446,8 +510,29 @@ struct Actor {
     constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
     /// Media that arrived before its membership, flushed when it lands.
     pending_tracks: PendingTracks,
-    /// Imported keys awaiting their membership (latest index per identity).
-    pending_keys: HashMap<String, u8>,
+    /// Last frame-encryption state reported per member.
+    ///
+    /// Only so the log line can name the transition. A bare "is MissingKey"
+    /// cannot be read: a momentary drop during a rotation and a permanent failure
+    /// produce the same line, and only the previous state separates them.
+    encryption_states: HashMap<String, FrameEncryptionState>,
+    /// Our own live publications, so a mute can reach the transport and the
+    /// roster can be corrected in one place.
+    local_tracks: HashMap<MediaStreamKind, Arc<dyn LocalTrackHandle>>,
+    /// Key indices installed per member, in the order they were imported.
+    ///
+    /// Kept so a frame-encryption failure can say whether *any* key reached this
+    /// participant. Without it a `MissingKey` is unattributable from outside: a
+    /// key that never arrived and a rotation still in flight look identical.
+    installed_keys: HashMap<String, Vec<u8>>,
+    /// Imported key indices awaiting their membership, in arrival order.
+    ///
+    /// A `Vec`, not a single index: at join a member can be handed more than one
+    /// index before their sticky membership lands (their first key plus a
+    /// rotation, say), and keeping only the latest silently dropped the others —
+    /// so the host saw one `KeyImported` where the core had imported several, and
+    /// could not tell which index the transport actually held.
+    pending_keys: HashMap<String, Vec<u8>>,
     pool: HashMap<String, ManagedConnection>,
     connection_generation: u64,
     /// Connections currently impaired (reconnecting or failing to connect);
@@ -570,6 +655,7 @@ impl Actor {
             } => match self.identity_map.get(&identity) {
                 Some(member_id) => {
                     let member_id = member_id.clone();
+                    self.record_installed_key(&member_id, key_index);
                     self.emit(CallEvent::KeyImported {
                         member_id,
                         key_index,
@@ -577,9 +663,29 @@ impl Actor {
                 }
                 None => {
                     // To-device keys regularly beat sticky memberships.
-                    self.pending_keys.insert(identity, key_index);
+                    let pending = self.pending_keys.entry(identity).or_default();
+                    if !pending.contains(&key_index) {
+                        pending.push(key_index);
+                    }
                 }
             },
+            ActorMessage::KeyDiscarded(report) => {
+                log::warn!(
+                    "media key index {:?} for member {} refused: {} (from {}/{})",
+                    report.key_index,
+                    report.member_id,
+                    report.reason,
+                    report.sender_user_id.as_deref().unwrap_or("<unattributed>"),
+                    report.sender_device_id.as_deref().unwrap_or("<unknown>"),
+                );
+                self.emit(CallEvent::KeyDiscarded {
+                    member_id: report.member_id,
+                    key_index: report.key_index,
+                    sender_user_id: report.sender_user_id,
+                    sender_device_id: report.sender_device_id,
+                    reason: report.reason,
+                });
+            }
             ActorMessage::Publish { options, respond } => {
                 // Local tracks always go to the focus we announced in our
                 // membership — that is where peers subscribe to us.
@@ -593,8 +699,23 @@ impl Actor {
                     });
                 match connection {
                     Some(connection) => {
+                        // The publish itself is awaited off-actor so a slow SFU
+                        // does not stall every other message; the actor learns
+                        // the outcome through `LocalPublished`, which is what
+                        // puts the stream on our own roster entry. Without that
+                        // a host sees no event for its own microphone and has to
+                        // shadow the state to render itself truthfully.
+                        let kind = options.kind;
+                        let messages = self.messages_tx.clone();
                         tokio::spawn(async move {
-                            let _ = respond.send(connection.publish(options).await);
+                            let outcome = connection.publish(options).await;
+                            if let Ok(track) = &outcome {
+                                let _ = messages.send(ActorMessage::LocalPublished {
+                                    kind,
+                                    track: Arc::clone(track),
+                                });
+                            }
+                            let _ = respond.send(outcome);
                         });
                     }
                     None => {
@@ -603,6 +724,28 @@ impl Actor {
                         )));
                     }
                 }
+            }
+            ActorMessage::LocalPublished { kind, track } => {
+                self.local_tracks.insert(kind, track);
+                let own_member_id = self.own_member_id.clone();
+                self.add_local_stream(&own_member_id, kind);
+            }
+            ActorMessage::SetLocalMuted {
+                kind,
+                muted,
+                respond,
+            } => {
+                let outcome = match self.local_tracks.get(&kind) {
+                    Some(track) => track.set_muted(muted),
+                    None => Err(TransportError::Unsupported(format!(
+                        "nothing of kind {kind:?} is published locally"
+                    ))),
+                };
+                if outcome.is_ok() {
+                    let own_member_id = self.own_member_id.clone();
+                    self.set_member_muted(&own_member_id, kind, muted);
+                }
+                let _ = respond.send(outcome);
             }
             ActorMessage::SetConstraints {
                 member_id,
@@ -1017,20 +1160,42 @@ impl Actor {
             ConnectionEvent::TrackUnmuted { identity, kind } => {
                 self.set_muted(&identity, kind, false);
             }
-            ConnectionEvent::ActiveSpeakers { identities } => {
-                let member_ids: Vec<String> = identities
+            ConnectionEvent::ActiveSpeakers { speakers } => {
+                // Speakers with no known membership are dropped: a level we
+                // cannot attribute to a member is not actionable.
+                let speakers: Vec<SpeakingMember> = speakers
                     .iter()
-                    .filter_map(|identity| self.identity_map.get(identity).cloned())
+                    .filter_map(|speaker| {
+                        self.identity_map
+                            .get(&speaker.identity)
+                            .map(|member_id| SpeakingMember {
+                                member_id: member_id.clone(),
+                                level: speaker.level,
+                            })
+                    })
                     .collect();
-                self.emit(CallEvent::ActiveSpeakers { member_ids });
+                self.emit(CallEvent::ActiveSpeakers { speakers });
             }
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
                 match self.identity_map.get(&identity).cloned() {
                     Some(member_id) => {
+                        let diagnostic = self.encryption_diagnostic(&member_id, state);
+                        let previous = self.encryption_states.insert(member_id.clone(), state);
                         if state.is_failure() {
-                            log::warn!("frame encryption for {member_id} is {state:?}");
+                            log::warn!(
+                                "frame encryption {state:?} for {member_id} (was {previous:?}), \
+                                 {diagnostic:?}"
+                            );
+                        } else {
+                            log::info!(
+                                "frame encryption {state:?} for {member_id} (was {previous:?})"
+                            );
                         }
-                        self.emit(CallEvent::FrameEncryptionState { member_id, state });
+                        self.emit(CallEvent::FrameEncryptionState {
+                            member_id,
+                            state,
+                            diagnostic,
+                        });
                     }
                     None => {
                         // No membership to attribute it to; `UnknownParticipant`
@@ -1148,7 +1313,8 @@ impl Actor {
                     self.add_stream(&member.member_id.clone(), kind, track);
                 }
             }
-            if let Some(key_index) = self.pending_keys.remove(&identity) {
+            for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
+                self.record_installed_key(&member.member_id.clone(), key_index);
                 self.emit(CallEvent::KeyImported {
                     member_id: member.member_id.clone(),
                     key_index,
@@ -1157,11 +1323,46 @@ impl Actor {
         }
     }
 
+    fn record_installed_key(&mut self, member_id: &str, key_index: u8) {
+        let installed = self.installed_keys.entry(member_id.to_owned()).or_default();
+        if !installed.contains(&key_index) {
+            installed.push(key_index);
+        }
+    }
+
+    /// What we can say about a frame-encryption state, from what we installed.
+    fn encryption_diagnostic(
+        &self,
+        member_id: &str,
+        state: FrameEncryptionState,
+    ) -> FrameEncryptionDiagnostic {
+        if !state.is_failure() {
+            return FrameEncryptionDiagnostic::NotApplicable;
+        }
+        match self.installed_keys.get(member_id) {
+            Some(indices) if !indices.is_empty() => FrameEncryptionDiagnostic::KeysInstalled {
+                key_indices: indices.clone(),
+            },
+            _ => FrameEncryptionDiagnostic::NoKeyInstalled,
+        }
+    }
+
     fn remove_member(&mut self, member_id: &str) {
         self.roster
             .retain(|participant| participant.member_id != member_id);
+        // Read the identity out before dropping the mappings, so the
+        // identity-keyed buffers can be cleared too. They used to be left behind
+        // on every departure: a stale index could then resurface against a later
+        // member that happened to reuse the identity, and in a long-lived process
+        // the maps only ever grew.
+        let identity = self.member_identities.remove(member_id);
+        if let Some(identity) = &identity {
+            self.pending_keys.remove(identity);
+            self.pending_tracks.remove(identity);
+        }
+        self.installed_keys.remove(member_id);
+        self.encryption_states.remove(member_id);
         self.identity_map.retain(|_, mapped| mapped != member_id);
-        self.member_identities.remove(member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
         self.constraints
@@ -1176,6 +1377,30 @@ impl Actor {
     }
 
     // ---- streams ----------------------------------------------------------
+
+    /// Put one of our own publications on our roster entry.
+    ///
+    /// Deliberately not `add_stream`: there is no `RemoteTrackHandle` for our
+    /// own media (nothing subscribes us to ourselves) and no constraints to
+    /// push, so the two share only the roster bookkeeping.
+    fn add_local_stream(&mut self, member_id: &str, kind: MediaStreamKind) {
+        let Some(participant) = self.roster.iter_mut().find(|p| p.member_id == member_id) else {
+            // Our own membership has not come back through the sticky map yet.
+            // The publication is live at the transport regardless; the roster
+            // catches up when `add_member` runs.
+            log::debug!("published {kind:?} before our own membership is known");
+            return;
+        };
+        if participant.streams.iter().any(|stream| stream.kind == kind) {
+            return;
+        }
+        participant.streams.push(StreamState { kind, muted: false });
+        self.emit(CallEvent::StreamStarted {
+            member_id: member_id.to_owned(),
+            kind,
+        });
+        self.publish_roster();
+    }
 
     fn add_stream(
         &mut self,
@@ -1247,6 +1472,13 @@ impl Actor {
         let Some(member_id) = self.identity_map.get(identity).cloned() else {
             return;
         };
+        self.set_member_muted(&member_id, kind, muted);
+    }
+
+    /// Mute state keyed by member rather than transport identity, so it serves
+    /// our own publications too — those never arrive as transport events, since
+    /// nothing subscribes us to ourselves.
+    fn set_member_muted(&mut self, member_id: &str, kind: MediaStreamKind, muted: bool) {
         let Some(stream) = self
             .roster
             .iter_mut()
@@ -1259,6 +1491,7 @@ impl Actor {
             return;
         }
         stream.muted = muted;
+        let member_id = member_id.to_owned();
         let event = if muted {
             CallEvent::StreamMuted { member_id, kind }
         } else {
@@ -1341,12 +1574,13 @@ mod tests {
     use futures_util::StreamExt;
     use matrix_rtc_core::{EventOrigin, LiveKitTransport, RtcTransport};
 
-    use crate::event::FrameEncryptionState;
+    use crate::event::{FrameEncryptionDiagnostic, FrameEncryptionState};
+    use matrix_rtc_core::KeyRejection;
     use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
     use crate::frame::AudioFrame;
-    use crate::transport::OwnMemberClaims;
+    use crate::transport::{OwnMemberClaims, SpeakingParticipant};
 
     const OWN_FOCUS: &str = "https://sfu.example.org";
     const PEER_FOCUS: &str = "https://sfu-b.example.org";
@@ -1364,6 +1598,8 @@ mod tests {
         published: StdMutex<Vec<(String, MediaStreamKind)>>,
         /// `(identity, kind, resolved)` of every apply_constraints call.
         applied: StdMutex<Vec<(String, MediaStreamKind, crate::ResolvedConstraints)>>,
+        /// `(kind, muted)` of every local mute call that reached the transport.
+        local_mutes: StdMutex<Vec<(MediaStreamKind, bool)>>,
     }
 
     struct FakeTransport {
@@ -1422,7 +1658,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((self.key.clone(), options.kind));
-            Ok(Arc::new(FakeLocalTrack { kind: options.kind }))
+            Ok(Arc::new(FakeLocalTrack::new(
+                options.kind,
+                Arc::clone(&self.state),
+            )))
         }
 
         async fn apply_constraints(
@@ -1447,12 +1686,28 @@ mod tests {
 
     struct FakeLocalTrack {
         kind: MediaStreamKind,
+        state: Arc<TransportState>,
+    }
+
+    impl FakeLocalTrack {
+        fn new(kind: MediaStreamKind, state: Arc<TransportState>) -> Self {
+            Self { kind, state }
+        }
     }
 
     #[async_trait::async_trait]
     impl LocalTrackHandle for FakeLocalTrack {
         fn kind(&self) -> MediaStreamKind {
             self.kind
+        }
+
+        fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
+            self.state
+                .local_mutes
+                .lock()
+                .unwrap()
+                .push((self.kind, muted));
+            Ok(())
         }
     }
 
@@ -1784,6 +2039,88 @@ mod tests {
         }));
     }
 
+    /// More than one key can be imported before a membership lands — a first key
+    /// plus a rotation, which is exactly what a rejoin produces. Keeping only the
+    /// latest index left the host believing the transport held one key when it
+    /// held several, and unable to tell which.
+    #[tokio::test]
+    async fn every_early_key_surfaces_once_the_membership_lands() {
+        let mut fx = fixture();
+
+        fx.engine.notify_key_imported("id-bob", 0);
+        fx.engine.notify_key_imported("id-bob", 1);
+        // A repeat of an index already buffered is still just one import.
+        fx.engine.notify_key_imported("id-bob", 1);
+
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "bob".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyImported {
+                member_id: "bob".to_owned(),
+                key_index: 0,
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyImported {
+                member_id: "bob".to_owned(),
+                key_index: 1,
+            }
+        );
+    }
+
+    /// A departure must take its identity-keyed buffers with it, or a key
+    /// imported for the member who left resurfaces against whoever next occupies
+    /// that identity.
+    #[tokio::test]
+    async fn a_departure_forgets_the_keys_buffered_against_its_identity() {
+        let mut fx = fixture();
+
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "bob".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+            }
+        );
+
+        // Bob leaves, and a key for his identity lands late.
+        fx.memberships.send(Vec::new()).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantLeft {
+                member_id: "bob".to_owned(),
+            }
+        );
+        fx.engine.notify_key_imported("id-bob", 7);
+
+        // Bob rejoins under a fresh member id, as MSC4143 requires. The stale
+        // index must not be attributed to the new participation.
+        fx.memberships
+            .send(vec![member("bob-2", "@bob:example.org")])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "bob-2".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn a_decryption_failure_is_surfaced_against_the_membership() {
         let mut fx = fixture();
@@ -1801,12 +2138,151 @@ mod tests {
             .unwrap();
 
         // The host learns which *member* is undecryptable, not which opaque
-        // transport identity.
+        // transport identity — and that no key ever reached them, which is the
+        // difference between a signalling bug and a rotation in flight.
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::FrameEncryptionState {
                 member_id: "bob".to_owned(),
                 state: FrameEncryptionState::MissingKey,
+                diagnostic: FrameEncryptionDiagnostic::NoKeyInstalled,
+            }
+        );
+    }
+
+    /// The same failure means something different once a key *has* been
+    /// installed: the frames are carrying an index we were not given, so the key
+    /// path is working and a rotation is simply in flight.
+    #[tokio::test]
+    async fn a_failure_after_an_import_reports_the_keys_it_holds() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        fx.engine.notify_key_imported("id-bob", 4);
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyImported {
+                member_id: "bob".to_owned(),
+                key_index: 4,
+            }
+        );
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::FrameEncryptionState {
+                member_id: "bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+                diagnostic: FrameEncryptionDiagnostic::KeysInstalled {
+                    key_indices: vec![4]
+                },
+            }
+        );
+    }
+
+    /// A refused key must reach the host, with the reason and the device that
+    /// sent it. It is reported against a `member_id` and needs no membership or
+    /// transport identity: the core refuses the key before either applies, and a
+    /// key naming a member we have never seen is exactly the case worth reporting.
+    #[tokio::test]
+    async fn a_refused_key_surfaces_with_its_reason() {
+        let mut fx = fixture();
+
+        fx.engine.notify_key_discarded(DiscardedKey {
+            member_id: "bob".to_owned(),
+            key_index: Some(2),
+            sender_user_id: Some("@bob:example.org".to_owned()),
+            sender_device_id: Some("BOBDEV".to_owned()),
+            reason: KeyRejection::NotCrossSigned,
+        });
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyDiscarded {
+                member_id: "bob".to_owned(),
+                key_index: Some(2),
+                sender_user_id: Some("@bob:example.org".to_owned()),
+                sender_device_id: Some("BOBDEV".to_owned()),
+                reason: KeyRejection::NotCrossSigned,
+            }
+        );
+    }
+
+    /// A recovery carries no diagnostic — there is nothing to explain, and an
+    /// `Ok` that still named a reason would read as a lingering fault.
+    #[tokio::test]
+    async fn a_recovered_stream_reports_no_diagnostic() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::Ok,
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::FrameEncryptionState {
+                member_id: "bob".to_owned(),
+                state: FrameEncryptionState::Ok,
+                diagnostic: FrameEncryptionDiagnostic::NotApplicable,
+            }
+        );
+    }
+
+    /// "Who is talking" and "how loud" arrive in the same transport event, so
+    /// they must leave together: a host that gets only the identities has to
+    /// meter the PCM itself, decoding audio it may not otherwise need to answer
+    /// a question the SFU already answered.
+    #[tokio::test]
+    async fn active_speakers_carry_their_audio_level() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::ActiveSpeakers {
+                speakers: vec![
+                    SpeakingParticipant {
+                        identity: "id-bob".to_owned(),
+                        level: 0.75,
+                    },
+                    // No membership maps to this one, so it cannot be attributed
+                    // and is dropped rather than reported against nobody.
+                    SpeakingParticipant {
+                        identity: "id-ghost".to_owned(),
+                        level: 0.9,
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ActiveSpeakers {
+                speakers: vec![SpeakingMember {
+                    member_id: "bob".to_owned(),
+                    level: 0.75,
+                }],
             }
         );
     }
@@ -1825,14 +2301,14 @@ mod tests {
         // no event rather than merely being slower.
         connection
             .send(ConnectionEvent::ActiveSpeakers {
-                identities: Vec::new(),
+                speakers: Vec::new(),
             })
             .unwrap();
 
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::ActiveSpeakers {
-                member_ids: Vec::new(),
+                speakers: Vec::new(),
             }
         );
     }
@@ -2135,6 +2611,109 @@ mod tests {
         tokio::time::sleep(IDLE_GRACE * 2).await;
         assert!(!closed(&fx, PEER_FOCUS));
         assert_eq!(connect_count(&fx, PEER_FOCUS), 1);
+    }
+
+    /// A host must be able to render itself from the same roster it renders
+    /// everyone else from. Publishing raised no event, so its own entry lacked
+    /// the microphone it was actively capturing — and alone in a call nothing
+    /// later prompted a re-read to correct it.
+    #[tokio::test]
+    async fn publishing_puts_the_stream_on_our_own_roster_entry() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "own".to_owned(),
+                user_id: "@own:example.org".to_owned(),
+            }
+        );
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .expect("we are on our own roster");
+        assert_eq!(own.streams.len(), 1);
+        assert_eq!(own.streams[0].kind, MediaStreamKind::Microphone);
+        assert!(!own.streams[0].muted);
+    }
+
+    /// Muting must reach the transport (so peers are told, rather than seeing a
+    /// sender that merely stopped) *and* the roster, so the host does not have to
+    /// keep its own copy of the answer.
+    #[tokio::test]
+    async fn muting_ourselves_reaches_the_transport_and_the_roster() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+        let _ = next_event(&mut fx.events).await; // StreamStarted
+
+        fx.engine
+            .set_local_muted(MediaStreamKind::Microphone, true)
+            .await
+            .expect("muting a live publication should succeed");
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamMuted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        assert_eq!(
+            *fx.state.local_mutes.lock().unwrap(),
+            vec![(MediaStreamKind::Microphone, true)],
+            "the mute must reach the transport, or peers just see a stalled sender",
+        );
+        assert!(
+            fx.engine
+                .participants()
+                .into_iter()
+                .find(|p| p.is_local)
+                .expect("we are on our own roster")
+                .streams[0]
+                .muted
+        );
+    }
+
+    /// Muting something we never published is an error, not a silent no-op that
+    /// leaves the host believing it is muted.
+    #[tokio::test]
+    async fn muting_an_unpublished_kind_fails() {
+        let fx = fixture();
+        let _connection = adopt(&fx);
+
+        assert!(
+            fx.engine
+                .set_local_muted(MediaStreamKind::Camera, true)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

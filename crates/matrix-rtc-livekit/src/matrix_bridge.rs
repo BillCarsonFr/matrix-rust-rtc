@@ -29,7 +29,6 @@
 //!
 //! Requires the `matrix-sdk` feature.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,8 +51,8 @@ use tokio::sync::broadcast::error::RecvError;
 
 use matrix_rtc_core::{
     CommandError, EventOrigin, RawSlotEvent, RawSlotEventContent, RawStickyEvent,
-    RawStickyEventContent, RtcCommandSender, RtcSessionManager, SLOT_EVENT_TYPE,
-    StickyEventsUpdate,
+    RawStickyEventContent, RtcCommandSender, RtcSessionManager, SLOT_EVENT_TYPE, ToDeviceDelivery,
+    ToDeviceRecipient,
 };
 
 // The sticky duration for `m.rtc.member` now comes from the core
@@ -186,20 +185,20 @@ impl RtcCommandSender for SdkCommandSender {
             .with_request_config(rtc_request_config())
             .await
             .map_err(command_error)?;
-        // The trait's "event_id" is the delay_id used to restart/cancel it.
+        // Returns the MSC4140 delay id, which is what restart/cancel take.
         Ok(response.delay_id)
     }
 
     async fn restart_delayed_event(
         &self,
         _room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
         // MSC4140's "heartbeat ping": resets the timer to now + the original
         // delay, keeping the same delay id. One request, and never a moment
         // with no delayed leave armed.
         let request =
-            update_delayed_event::unstable_v1::Request::new(event_id, UpdateAction::Restart);
+            update_delayed_event::unstable_v1::Request::new(delay_id, UpdateAction::Restart);
         self.client
             .send(request)
             .with_request_config(rtc_request_config())
@@ -211,11 +210,10 @@ impl RtcCommandSender for SdkCommandSender {
     async fn cancel_delayed_event(
         &self,
         _room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
-        // `event_id` is the delay_id returned by `send_delayed_event`.
         let request =
-            update_delayed_event::unstable_v1::Request::new(event_id, UpdateAction::Cancel);
+            update_delayed_event::unstable_v1::Request::new(delay_id, UpdateAction::Cancel);
         self.client
             .send(request)
             .with_request_config(rtc_request_config())
@@ -245,66 +243,91 @@ impl RtcCommandSender for SdkCommandSender {
 
     async fn send_to_device_message(
         &self,
-        user_id: String,
-        device_id: String,
+        recipients: Vec<ToDeviceRecipient>,
         message_type: String,
         content: Value,
-    ) -> Result<(), CommandError> {
-        // MSC4143 encryption-key distribution: send the media key as an
-        // Olm-encrypted to-device message to exactly one device — the one that
-        // published the membership. There is deliberately no `"*"` fan-out: media
-        // keys must not reach devices that are not in the call, and for our own
-        // user a fan-out would include this device, which Olm cannot encrypt to.
-        let user = UserId::parse(&user_id).map_err(command_error)?;
+    ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+        // MSC4143 encryption-key distribution: the media key goes out as an
+        // Olm-encrypted to-device message to exactly the devices that published
+        // the memberships. There is deliberately no `"*"` fan-out: media keys
+        // must not reach devices outside the call, and for our own user a
+        // fan-out would include this device, which Olm cannot encrypt to.
+        //
+        // One SDK call for the whole batch — `encrypt_and_send_raw_to_device`
+        // takes a device list and answers with the ones it could not reach, which
+        // is exactly the per-recipient outcome the core needs.
         let encryption = self.client.encryption();
+        let mut devices = Vec::with_capacity(recipients.len());
+        let mut unknown = Vec::new();
 
-        let dev_id = <&DeviceId>::from(device_id.as_str());
-        let Some(device) = encryption
-            .get_device(&user, dev_id)
-            .await
-            .map_err(command_error)?
-        else {
-            log::warn!(
-                "no known device {device_id} for {user_id}; dropping to-device {message_type}"
-            );
-            return Ok(());
-        };
+        for recipient in &recipients {
+            let user = match UserId::parse(&recipient.user_id) {
+                Ok(user) => user,
+                Err(error) => {
+                    unknown.push(ToDeviceDelivery::failed(
+                        recipient.clone(),
+                        format!("unparseable user id: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            let device_id = <&DeviceId>::from(recipient.device_id.as_str());
+            match encryption.get_device(&user, device_id).await {
+                Ok(Some(device)) => devices.push(device),
+                // Not an error for the batch: the other recipients still get the
+                // key, and this one is reported unserved so it is retried once
+                // the device is known.
+                Ok(None) => unknown.push(ToDeviceDelivery::failed(
+                    recipient.clone(),
+                    "no such known device",
+                )),
+                Err(error) => unknown.push(ToDeviceDelivery::failed(
+                    recipient.clone(),
+                    format!("could not look up the device: {error}"),
+                )),
+            }
+        }
+
+        if devices.is_empty() {
+            return Ok(unknown);
+        }
 
         let raw: Raw<AnyToDeviceEventContent> =
             Raw::new(&content).map_err(command_error)?.cast_unchecked();
-
         let failures = encryption
             .encrypt_and_send_raw_to_device(
-                vec![&device],
+                devices.iter().collect(),
                 &message_type,
                 raw,
-                // `AllDevices` sends to every device regardless of verification/cross-
-                // signing state. A production integration should prefer
-                // `IdentityBasedStrategy` (MSC4153) to refuse sending keys to
-                // unverified identities.
+                // MSC4153: refuse to hand keys to unverified identities.
                 CollectStrategy::IdentityBasedStrategy,
             )
             .await
             .map_err(command_error)?;
+
+        let mut deliveries = unknown;
+        for device in &devices {
+            let recipient =
+                ToDeviceRecipient::new(device.user_id().as_str(), device.device_id().as_str());
+            let failed = failures
+                .iter()
+                .any(|(user, dev)| user == device.user_id() && dev == device.device_id());
+            deliveries.push(if failed {
+                ToDeviceDelivery::failed(recipient, "the homeserver did not accept the message")
+            } else {
+                ToDeviceDelivery::sent(recipient)
+            });
+        }
+
         if !failures.is_empty() {
             log::warn!(
-                "to-device {message_type}: {} device(s) did not receive the key",
-                failures.len()
+                "to-device {message_type}: {} of {} device(s) did not receive the key",
+                failures.len(),
+                devices.len(),
             );
         }
-        Ok(())
+        Ok(deliveries)
     }
-}
-
-/// Identifies one sticky entry across snapshots: `(sender, type, sticky_key)`.
-type StickyId = (String, String, String);
-
-fn sticky_id(event: &RawStickyEvent) -> StickyId {
-    (
-        event.sender.clone(),
-        event.event_type.clone(),
-        event.content.sticky_key.clone(),
-    )
 }
 
 /// Snapshot the room's live `m.rtc.member` sticky events as core DTOs.
@@ -324,7 +347,29 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
             if event_type != "m.rtc.member" && event_type != "org.matrix.msc4143.rtc.member" {
                 return None;
             }
-            let content: RawStickyEventContent = entry.raw().get_field("content").ok().flatten()?;
+            // A member event we cannot parse is a member who never appears in
+            // the call, so say so — silently dropping it here is indistinguishable
+            // from the peer never having joined, and that ambiguity has cost real
+            // debugging time.
+            let content: RawStickyEventContent = match entry.raw().get_field("content") {
+                Ok(Some(content)) => content,
+                Ok(None) => {
+                    log::warn!(
+                        "[{room_id}] ignoring an {event_type} sticky with no content object \
+                         (sticky key {})",
+                        entry.key.sticky_key.as_deref().unwrap_or("<none>"),
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[{room_id}] ignoring an unparseable {event_type} sticky (sticky key \
+                         {}): {error}. That member will not appear in the call.",
+                        entry.key.sticky_key.as_deref().unwrap_or("<none>"),
+                    );
+                    return None;
+                }
+            };
             // The sticky map only files plaintext and successfully decrypted
             // events, so the presence of decryption metadata is exactly whether
             // this arrived encrypted — never "we don't know".
@@ -485,11 +530,7 @@ pub async fn run_sticky_bridge(
     // room state says is closed.
     feed_room_state(&room, &manager).await;
 
-    let mut known: HashMap<StickyId, RawStickyEvent> = HashMap::new();
     let initial = snapshot(&room);
-    for event in &initial {
-        known.insert(sticky_id(event), event.clone());
-    }
     log::debug!(
         "[{room_id}] sticky bridge seeding with {} live event(s)",
         initial.len(),
@@ -497,10 +538,10 @@ pub async fn run_sticky_bridge(
     if let Err(error) = manager
         .lock()
         .await
-        .on_sticky_events_snapshot_received(initial)
+        .set_current_sticky_state(&room_id, initial)
         .await
     {
-        log::warn!("failed to apply initial sticky snapshot: {error}");
+        log::warn!("failed to apply the initial sticky state: {error}");
     }
 
     while let Ok(_) | Err(RecvError::Lagged(_)) = receiver.recv().await {
@@ -511,41 +552,23 @@ pub async fn run_sticky_bridge(
         // room-state subscription of its own; that is a follow-up.
         feed_room_state(&room, &manager).await;
 
+        // The live set *is* the current state, so hand it over whole. This used
+        // to keep a copy of the previous set and diff it to turn TTL expiries
+        // into synthetic leaves, because the core merged rather than replaced;
+        // `set_current_sticky_state` does that now, and correctly for a slot
+        // whose last member expired — such a slot contributes no events at all,
+        // so a diff over events could never have noticed it.
         let current = snapshot(&room);
-        let current_ids: HashMap<StickyId, RawStickyEvent> =
-            current.iter().map(|e| (sticky_id(e), e.clone())).collect();
-
-        // Entries that disappeared from the live set (TTL expiry) become
-        // leaves; entries still present (joins and explicit disconnects)
-        // are re-applied via `added`.
-        let removed = known
-            .iter()
-            .filter(|(id, _)| !current_ids.contains_key(*id))
-            .map(|(_, event)| event.clone())
-            .collect();
-
-        let update = StickyEventsUpdate {
-            added: current,
-            updated: Vec::new(),
-            removed,
-        };
-
-        log::debug!(
-            "[{room_id}] sticky tick: {} live, {} expired",
-            update.added.len(),
-            update.removed.len(),
-        );
+        log::debug!("[{room_id}] sticky tick: {} live event(s)", current.len());
 
         if let Err(error) = manager
             .lock()
             .await
-            .on_sticky_events_update_received(update)
+            .set_current_sticky_state(&room_id, current)
             .await
         {
-            log::warn!("failed to apply sticky update: {error}");
+            log::warn!("failed to apply the current sticky state: {error}");
         }
-
-        known = current_ids;
     }
 
     log::info!("[{room_id}] sticky bridge stopped");

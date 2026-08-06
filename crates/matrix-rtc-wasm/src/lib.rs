@@ -22,8 +22,8 @@
 
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,
-    LeaveSessionParams, RawRtcTransport, RawSlotEvent, RawStickyEvent, RawStickyEventUpdate,
-    RtcSession, RtcSessionManager, RtcTransport, StickyEventsUpdate,
+    LeaveSessionParams, RawRtcTransport, RawSlotEvent, RawStickyEvent, RtcSession,
+    RtcSessionManager, RtcTransport,
 };
 
 mod commands;
@@ -71,8 +71,10 @@ impl WasmRtcSessionManager {
         self.command_sender.is_some()
     }
 
-    /// Applies the initial sticky snapshot for one room from a JS iterable/array payload.
-    pub async fn on_sticky_events_snapshot_received(
+    /// Applies the **complete** current sticky state for one room, from a JS
+    /// iterable/array payload. Replaces rather than merges: a member absent from
+    /// `events` is gone, and an empty list clears the room.
+    pub async fn set_current_sticky_state(
         &mut self,
         room_id: String,
         events: JsValue,
@@ -91,45 +93,7 @@ impl WasmRtcSessionManager {
         let mapped: Vec<RawStickyEvent> = input.into_iter().map(Into::into).collect();
 
         self.inner
-            .initial_sticky_for_room(&room_id, mapped)
-            .await
-            .map_err(|err| JsError::new(&err.to_string()))
-    }
-
-    /// Applies one sticky diff payload for one room from JS (`added`, `updated`, `removed`).
-    pub async fn on_sticky_events_update_received(
-        &mut self,
-        room_id: String,
-        update: JsValue,
-    ) -> Result<(), JsError> {
-        let input: WasmStickyEventsUpdate =
-            serde_wasm_bindgen::from_value(update).map_err(|err| {
-                log::warn!("manager: [{room_id}] invalid sticky event payload: {err}");
-                JsError::new(&format!("invalid sticky event payload: {err}"))
-            })?;
-
-        log::debug!(
-            "manager: [{room_id}] sticky update in, +{} ~{} -{}",
-            input.added.len(),
-            input.updated.len(),
-            input.removed.len(),
-        );
-
-        let mapped = StickyEventsUpdate {
-            added: input.added.into_iter().map(Into::into).collect(),
-            updated: input
-                .updated
-                .into_iter()
-                .map(|item| RawStickyEventUpdate {
-                    current: item.current.into(),
-                    previous: item.previous.into(),
-                })
-                .collect(),
-            removed: input.removed.into_iter().map(Into::into).collect(),
-        };
-
-        self.inner
-            .sticky_update_for_room(&room_id, mapped)
+            .set_current_sticky_state(&room_id, mapped)
             .await
             .map_err(|err| JsError::new(&err.to_string()))
     }
@@ -541,11 +505,9 @@ impl WasmRtcSession {
         self.command_sender.is_some()
     }
 
-    /// Applies initial sticky events for this single session.
-    pub async fn on_sticky_events_snapshot_received(
-        &mut self,
-        events: JsValue,
-    ) -> Result<(), JsError> {
+    /// Applies the complete current sticky state for this single session,
+    /// replacing what it held: a member absent from `events` is gone.
+    pub async fn set_current_sticky_state(&mut self, events: JsValue) -> Result<(), JsError> {
         let input: Vec<WasmStickyEvent> = serde_wasm_bindgen::from_value(events)
             .map_err(|err| JsError::new(&format!("invalid sticky snapshot payload: {err}")))?;
 
@@ -559,46 +521,7 @@ impl WasmRtcSession {
             }
         }
 
-        self.inner.initial_events(membership_events).await;
-
-        Ok(())
-    }
-
-    /// Applies one sticky diff payload for this single session.
-    pub async fn on_sticky_events_update_received(
-        &mut self,
-        update: JsValue,
-    ) -> Result<(), JsError> {
-        let input: WasmStickyEventsUpdate = serde_wasm_bindgen::from_value(update)
-            .map_err(|err| JsError::new(&format!("invalid sticky event payload: {err}")))?;
-
-        let mut membership_events = Vec::new();
-
-        for event in input.added {
-            match RawStickyEvent::from(event).try_into_call_membership_event() {
-                Ok(event) => membership_events.push(event),
-                Err(EventConversionError::UnsupportedEventType { .. }) => continue,
-                Err(err) => return Err(JsError::new(&err.to_string())),
-            }
-        }
-
-        for item in input.updated {
-            match RawStickyEvent::from(item.current).try_into_call_membership_event() {
-                Ok(event) => membership_events.push(event),
-                Err(EventConversionError::UnsupportedEventType { .. }) => continue,
-                Err(err) => return Err(JsError::new(&err.to_string())),
-            }
-        }
-
-        for event in input.removed {
-            match RawStickyEvent::from(event).try_into_left_membership_event() {
-                Ok(event) => membership_events.push(event),
-                Err(EventConversionError::UnsupportedEventType { .. }) => continue,
-                Err(err) => return Err(JsError::new(&err.to_string())),
-            }
-        }
-
-        self.inner.handle_update(membership_events).await;
+        self.inner.set_current_state(membership_events).await;
 
         Ok(())
     }
@@ -759,19 +682,6 @@ struct WasmMember {
     membership: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct WasmStickyEventUpdate {
-    current: WasmStickyEvent,
-    previous: WasmStickyEvent,
-}
-
-#[derive(Debug, Deserialize)]
-struct WasmStickyEventsUpdate {
-    added: Vec<WasmStickyEvent>,
-    updated: Vec<WasmStickyEventUpdate>,
-    removed: Vec<WasmStickyEvent>,
-}
-
 impl From<WasmRawRtcTransport> for RawRtcTransport {
     fn from(value: WasmRawRtcTransport) -> Self {
         RawRtcTransport {
@@ -885,7 +795,7 @@ mod tests {
     fn next_snapshot_returns_current_snapshot_on_first_poll() {
         let mut session = WasmRtcSession::new();
         let events = serde_wasm_bindgen::to_value(&vec![joined_event()]).unwrap();
-        session.on_sticky_events_snapshot_received(events).unwrap();
+        session.set_current_sticky_state(events).unwrap();
 
         let mut subscription = session.subscribe_membership_snapshots();
         let first = subscription.next_snapshot().unwrap();

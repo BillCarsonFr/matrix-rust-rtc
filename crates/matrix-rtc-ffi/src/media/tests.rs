@@ -22,7 +22,10 @@
 
 use std::sync::Arc;
 
-use crate::commands::{CommandSenderCallback, CommandSenderError, FfiTransportConfig};
+use crate::commands::{
+    CommandSenderCallback, CommandSenderError, FfiToDeviceDelivery, FfiToDeviceRecipient,
+    FfiTransportConfig,
+};
 use crate::{FfiJoinSessionParams, RtcSessionManagerHandle};
 
 use super::session::{MediaSessionConfig, connect_media_session};
@@ -67,7 +70,7 @@ impl CommandSenderCallback for NoopCommands {
     fn restart_delayed_event(
         &self,
         _room_id: String,
-        _event_id: String,
+        _delay_id: String,
     ) -> Result<(), CommandSenderError> {
         Ok(())
     }
@@ -75,19 +78,25 @@ impl CommandSenderCallback for NoopCommands {
     fn cancel_delayed_event(
         &self,
         _room_id: String,
-        _event_id: String,
+        _delay_id: String,
     ) -> Result<(), CommandSenderError> {
         Ok(())
     }
 
     fn send_to_device_message(
         &self,
-        _user_id: String,
-        _device_id: String,
+        recipients: Vec<FfiToDeviceRecipient>,
         _message_type: String,
         _content_json: String,
-    ) -> Result<(), CommandSenderError> {
-        Ok(())
+    ) -> Result<Vec<FfiToDeviceDelivery>, CommandSenderError> {
+        Ok(recipients
+            .into_iter()
+            .map(|r| FfiToDeviceDelivery {
+                user_id: r.user_id,
+                device_id: r.device_id,
+                error: None,
+            })
+            .collect())
     }
 }
 
