@@ -53,8 +53,8 @@ pub mod call;
 pub mod matrix_bridge;
 
 pub use keys::{
-    KeyImportListener, MediaKeyBridge, NATIVE_KEY_RING_MAX, ParticipantKey, msc4195_key_provider,
-    msc4195_key_provider_options,
+    KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
+    ParticipantKey, msc4195_key_provider, msc4195_key_provider_options,
 };
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};

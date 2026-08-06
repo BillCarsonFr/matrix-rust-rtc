@@ -188,6 +188,14 @@ async fn build_media_session(
         engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
     }));
 
+    // Refused keys surface as `FfiCallEvent::KeyDiscarded`. Without this the
+    // reason a key was rejected never leaves the core, and the host sees only a
+    // `MissingKey` it cannot distinguish from a key that never arrived.
+    let engine_handle = engine.handle();
+    bridge.set_key_discard_listener(Box::new(move |discarded| {
+        engine_handle.notify_key_discarded(discarded);
+    }));
+
     // Keys signalled between `join` and now were stored but dropped — nothing
     // was listening. Without this, every participant whose key arrived before
     // media attached stays undecryptable until a rotation, which only a
@@ -228,6 +236,22 @@ async fn build_media_session(
 
     let events = engine.subscribe_events();
     let own_identity = pseudonymous_identity(&config.user_id, &config.device_id, &member_id);
+
+    // Move our sender onto each key we rotate to. Importing a key only fills the
+    // provider's ring; the index our frames actually carry lives on the frame
+    // cryptor. Without this we advertise a rotation to peers and carry on
+    // encrypting with the previous key, so anyone joining after it decrypts
+    // nothing — and the forward secrecy the rotation exists for is not delivered.
+    let connection_for_keys = connection.clone();
+    bridge.set_local_sender(
+        own_identity.clone(),
+        Box::new(move |key_index| connection_for_keys.set_local_key_index(key_index)),
+    );
+    // Adopt the index we are already on rather than assuming 0, and record it for
+    // tracks published later.
+    if let Some(own_key) = bridge.key_for(&own_identity) {
+        connection.set_local_key_index(own_key.key_index);
+    }
 
     log::info!("media: connected as member {member_id}, local identity {own_identity}");
 

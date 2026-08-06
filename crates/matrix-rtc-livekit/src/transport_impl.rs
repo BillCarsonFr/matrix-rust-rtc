@@ -30,7 +30,7 @@
 //! connection.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -143,6 +143,12 @@ impl LiveKitMediaTransport {
             LiveKitTransportConnection {
                 connection_key: livekit_service_url.to_owned(),
                 session: Arc::new(connection.session),
+                own_identity: crate::identity::pseudonymous_identity(
+                    &ctx.member.user_id,
+                    &ctx.member.device_id,
+                    &ctx.member.member_id,
+                ),
+                local_key_index: Arc::new(Mutex::new(None)),
             },
             events_rx,
         ))
@@ -199,6 +205,14 @@ impl MediaTransport for LiveKitMediaTransport {
 pub struct LiveKitTransportConnection {
     connection_key: String,
     session: Arc<LiveKitSession>,
+    /// Our own MSC4195 participant identity on this connection.
+    own_identity: String,
+    /// The key index our own frames must carry, once a rotation has activated.
+    ///
+    /// Held because a frame cryptor is created per published track and starts at
+    /// index 0: a track published after a rotation would otherwise be stamped
+    /// with an index no peer holds a key for.
+    local_key_index: Arc<Mutex<Option<u8>>>,
 }
 
 impl LiveKitTransportConnection {
@@ -206,6 +220,53 @@ impl LiveKitTransportConnection {
     /// accessors.
     pub fn session(&self) -> &LiveKitSession {
         &self.session
+    }
+
+    /// Switch our own outgoing frames to `key_index`, and remember it for tracks
+    /// published later.
+    ///
+    /// The key provider's `set_key` only fills the key *ring*; the index a
+    /// sender stamps lives on its frame cryptor and changes only here. Called
+    /// when one of our own rotated keys activates — see
+    /// [`crate::LocalKeyIndexHook`].
+    pub fn set_local_key_index(&self, key_index: u8) {
+        *self
+            .local_key_index
+            .lock()
+            .expect("local key index mutex poisoned") = Some(key_index);
+        self.apply_local_key_index(key_index);
+    }
+
+    /// Re-assert the current index on our senders, for a track published after a
+    /// rotation: its cryptor is new, and new cryptors start at index 0.
+    fn reassert_local_key_index(&self) {
+        let current = *self
+            .local_key_index
+            .lock()
+            .expect("local key index mutex poisoned");
+        if let Some(key_index) = current {
+            self.apply_local_key_index(key_index);
+        }
+    }
+
+    fn apply_local_key_index(&self, key_index: u8) {
+        let mut switched = 0usize;
+        for ((identity, _track_sid), cryptor) in self.session.room().e2ee_manager().frame_cryptors()
+        {
+            if identity.as_str() == self.own_identity {
+                cryptor.set_key_index(i32::from(key_index));
+                switched += 1;
+            }
+        }
+        if switched == 0 {
+            // Nothing published yet; `reassert_local_key_index` picks it up when
+            // a track is.
+            log::debug!(
+                "no local frame cryptor to move to key index {key_index} yet (nothing published)"
+            );
+        } else {
+            log::debug!("our own frames now carry key index {key_index} ({switched} cryptor(s))");
+        }
     }
 }
 
@@ -246,6 +307,10 @@ impl TransportConnection for LiveKitTransportConnection {
                     )
                     .await
                     .map_err(|error| TransportError::Connect(error.to_string()))?;
+                // A frame cryptor is created per published track, at index 0.
+                // If we have already rotated, this one must be moved onto the
+                // current index or its frames carry a key nobody holds.
+                self.reassert_local_key_index();
                 Ok(Arc::new(LiveKitLocalTrack {
                     kind,
                     source: LocalSource::Audio(source),
@@ -285,6 +350,7 @@ impl TransportConnection for LiveKitTransportConnection {
                     )
                     .await
                     .map_err(|error| TransportError::Connect(error.to_string()))?;
+                self.reassert_local_key_index();
                 Ok(Arc::new(LiveKitLocalTrack {
                     kind,
                     source: LocalSource::Video(source),

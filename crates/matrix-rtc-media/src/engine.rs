@@ -52,12 +52,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_core::JoinedMembership;
+use matrix_rtc_core::{DiscardedKey, JoinedMembership};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::constraints::MediaConstraints;
-use crate::event::{CallEvent, EndedReason};
+use crate::event::{CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState};
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 use crate::stats::ReceiveStats;
@@ -159,7 +159,11 @@ enum ActorMessage {
         idle_generation: u64,
     },
     /// A media decryption key was imported for a transport identity.
-    KeyImported { identity: String, key_index: u8 },
+    KeyImported {
+        identity: String,
+        key_index: u8,
+    },
+    KeyDiscarded(DiscardedKey),
     /// Publish a local track on the own-focus connection.
     Publish {
         options: PublishOptions,
@@ -178,7 +182,9 @@ enum ActorMessage {
         generation: u64,
     },
     /// Close every pooled connection and stop.
-    Shutdown { ack: oneshot::Sender<()> },
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 /// A cheap, cloneable handle for feeding the engine from other components
@@ -195,6 +201,11 @@ impl EngineHandle {
             identity: identity.into(),
             key_index,
         });
+    }
+
+    /// See [`CallEngine::notify_key_discarded`]. No-op once the engine is gone.
+    pub fn notify_key_discarded(&self, report: DiscardedKey) {
+        let _ = self.messages.send(ActorMessage::KeyDiscarded(report));
     }
 }
 
@@ -248,6 +259,8 @@ impl CallEngine {
             member_identities: HashMap::new(),
             constraints: HashMap::new(),
             pending_tracks: HashMap::new(),
+            encryption_states: HashMap::new(),
+            installed_keys: HashMap::new(),
             pending_keys: HashMap::new(),
             pool: HashMap::new(),
             connection_generation: 0,
@@ -308,6 +321,16 @@ impl CallEngine {
             identity: identity.into(),
             key_index,
         });
+    }
+
+    /// Report that a media key was refused, so the engine can surface
+    /// [`CallEvent::KeyDiscarded`] with the reason.
+    ///
+    /// Keyed by `member_id` rather than a transport identity: the core refuses a
+    /// key before any identity derivation applies to it, and a refused key may
+    /// well name a member the transport has never seen.
+    pub fn notify_key_discarded(&self, report: DiscardedKey) {
+        let _ = self.messages.send(ActorMessage::KeyDiscarded(report));
     }
 
     /// Publish a local track on the own-focus connection (see
@@ -446,6 +469,18 @@ struct Actor {
     constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
     /// Media that arrived before its membership, flushed when it lands.
     pending_tracks: PendingTracks,
+    /// Last frame-encryption state reported per member.
+    ///
+    /// Only so the log line can name the transition. A bare "is MissingKey"
+    /// cannot be read: a momentary drop during a rotation and a permanent failure
+    /// produce the same line, and only the previous state separates them.
+    encryption_states: HashMap<String, FrameEncryptionState>,
+    /// Key indices installed per member, in the order they were imported.
+    ///
+    /// Kept so a frame-encryption failure can say whether *any* key reached this
+    /// participant. Without it a `MissingKey` is unattributable from outside: a
+    /// key that never arrived and a rotation still in flight look identical.
+    installed_keys: HashMap<String, Vec<u8>>,
     /// Imported key indices awaiting their membership, in arrival order.
     ///
     /// A `Vec`, not a single index: at join a member can be handed more than one
@@ -576,6 +611,7 @@ impl Actor {
             } => match self.identity_map.get(&identity) {
                 Some(member_id) => {
                     let member_id = member_id.clone();
+                    self.record_installed_key(&member_id, key_index);
                     self.emit(CallEvent::KeyImported {
                         member_id,
                         key_index,
@@ -589,6 +625,23 @@ impl Actor {
                     }
                 }
             },
+            ActorMessage::KeyDiscarded(report) => {
+                log::warn!(
+                    "media key index {:?} for member {} refused: {} (from {}/{})",
+                    report.key_index,
+                    report.member_id,
+                    report.reason,
+                    report.sender_user_id.as_deref().unwrap_or("<unattributed>"),
+                    report.sender_device_id.as_deref().unwrap_or("<unknown>"),
+                );
+                self.emit(CallEvent::KeyDiscarded {
+                    member_id: report.member_id,
+                    key_index: report.key_index,
+                    sender_user_id: report.sender_user_id,
+                    sender_device_id: report.sender_device_id,
+                    reason: report.reason,
+                });
+            }
             ActorMessage::Publish { options, respond } => {
                 // Local tracks always go to the focus we announced in our
                 // membership — that is where peers subscribe to us.
@@ -1036,10 +1089,23 @@ impl Actor {
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
                 match self.identity_map.get(&identity).cloned() {
                     Some(member_id) => {
+                        let diagnostic = self.encryption_diagnostic(&member_id, state);
+                        let previous = self.encryption_states.insert(member_id.clone(), state);
                         if state.is_failure() {
-                            log::warn!("frame encryption for {member_id} is {state:?}");
+                            log::warn!(
+                                "frame encryption {state:?} for {member_id} (was {previous:?}), \
+                                 {diagnostic:?}"
+                            );
+                        } else {
+                            log::info!(
+                                "frame encryption {state:?} for {member_id} (was {previous:?})"
+                            );
                         }
-                        self.emit(CallEvent::FrameEncryptionState { member_id, state });
+                        self.emit(CallEvent::FrameEncryptionState {
+                            member_id,
+                            state,
+                            diagnostic,
+                        });
                     }
                     None => {
                         // No membership to attribute it to; `UnknownParticipant`
@@ -1158,11 +1224,36 @@ impl Actor {
                 }
             }
             for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
+                self.record_installed_key(&member.member_id.clone(), key_index);
                 self.emit(CallEvent::KeyImported {
                     member_id: member.member_id.clone(),
                     key_index,
                 });
             }
+        }
+    }
+
+    fn record_installed_key(&mut self, member_id: &str, key_index: u8) {
+        let installed = self.installed_keys.entry(member_id.to_owned()).or_default();
+        if !installed.contains(&key_index) {
+            installed.push(key_index);
+        }
+    }
+
+    /// What we can say about a frame-encryption state, from what we installed.
+    fn encryption_diagnostic(
+        &self,
+        member_id: &str,
+        state: FrameEncryptionState,
+    ) -> FrameEncryptionDiagnostic {
+        if !state.is_failure() {
+            return FrameEncryptionDiagnostic::NotApplicable;
+        }
+        match self.installed_keys.get(member_id) {
+            Some(indices) if !indices.is_empty() => FrameEncryptionDiagnostic::KeysInstalled {
+                key_indices: indices.clone(),
+            },
+            _ => FrameEncryptionDiagnostic::NoKeyInstalled,
         }
     }
 
@@ -1179,6 +1270,8 @@ impl Actor {
             self.pending_keys.remove(identity);
             self.pending_tracks.remove(identity);
         }
+        self.installed_keys.remove(member_id);
+        self.encryption_states.remove(member_id);
         self.identity_map.retain(|_, mapped| mapped != member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
@@ -1359,7 +1452,8 @@ mod tests {
     use futures_util::StreamExt;
     use matrix_rtc_core::{EventOrigin, LiveKitTransport, RtcTransport};
 
-    use crate::event::FrameEncryptionState;
+    use crate::event::{FrameEncryptionDiagnostic, FrameEncryptionState};
+    use matrix_rtc_core::KeyRejection;
     use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
@@ -1901,12 +1995,110 @@ mod tests {
             .unwrap();
 
         // The host learns which *member* is undecryptable, not which opaque
-        // transport identity.
+        // transport identity — and that no key ever reached them, which is the
+        // difference between a signalling bug and a rotation in flight.
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::FrameEncryptionState {
                 member_id: "bob".to_owned(),
                 state: FrameEncryptionState::MissingKey,
+                diagnostic: FrameEncryptionDiagnostic::NoKeyInstalled,
+            }
+        );
+    }
+
+    /// The same failure means something different once a key *has* been
+    /// installed: the frames are carrying an index we were not given, so the key
+    /// path is working and a rotation is simply in flight.
+    #[tokio::test]
+    async fn a_failure_after_an_import_reports_the_keys_it_holds() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        fx.engine.notify_key_imported("id-bob", 4);
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyImported {
+                member_id: "bob".to_owned(),
+                key_index: 4,
+            }
+        );
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::FrameEncryptionState {
+                member_id: "bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+                diagnostic: FrameEncryptionDiagnostic::KeysInstalled {
+                    key_indices: vec![4]
+                },
+            }
+        );
+    }
+
+    /// A refused key must reach the host, with the reason and the device that
+    /// sent it. It is reported against a `member_id` and needs no membership or
+    /// transport identity: the core refuses the key before either applies, and a
+    /// key naming a member we have never seen is exactly the case worth reporting.
+    #[tokio::test]
+    async fn a_refused_key_surfaces_with_its_reason() {
+        let mut fx = fixture();
+
+        fx.engine.notify_key_discarded(DiscardedKey {
+            member_id: "bob".to_owned(),
+            key_index: Some(2),
+            sender_user_id: Some("@bob:example.org".to_owned()),
+            sender_device_id: Some("BOBDEV".to_owned()),
+            reason: KeyRejection::NotCrossSigned,
+        });
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyDiscarded {
+                member_id: "bob".to_owned(),
+                key_index: Some(2),
+                sender_user_id: Some("@bob:example.org".to_owned()),
+                sender_device_id: Some("BOBDEV".to_owned()),
+                reason: KeyRejection::NotCrossSigned,
+            }
+        );
+    }
+
+    /// A recovery carries no diagnostic — there is nothing to explain, and an
+    /// `Ok` that still named a reason would read as a lingering fault.
+    #[tokio::test]
+    async fn a_recovered_stream_reports_no_diagnostic() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::Ok,
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::FrameEncryptionState {
+                member_id: "bob".to_owned(),
+                state: FrameEncryptionState::Ok,
+                diagnostic: FrameEncryptionDiagnostic::NotApplicable,
             }
         );
     }

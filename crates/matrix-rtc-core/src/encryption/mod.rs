@@ -195,6 +195,59 @@ pub trait EncryptionKeySignalHandler: Send + Sync {
     /// # Arguments
     /// * `signal` - Contains the raw key bytes, key index, and RTC backend identity
     async fn on_new_key_material(&self, signal: KeyMaterialSignal);
+
+    /// Called when a key was received but refused, with the reason.
+    ///
+    /// The media layer can only report *that* a participant's frames will not
+    /// decrypt; the reason is visible here and nowhere else, because this is the
+    /// only layer that sees the to-device message and its provenance. A refused
+    /// key and a key that never arrived look identical downstream, yet one is a
+    /// trust or configuration problem and the other a delivery one.
+    ///
+    /// Defaulted to a no-op so existing handlers need not change.
+    async fn on_key_discarded(&self, discarded: DiscardedKey) {
+        let _ = discarded;
+    }
+}
+
+/// A media key that was received and refused, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscardedKey {
+    /// The member the key claimed to be for.
+    pub member_id: String,
+    /// The key's index, when the message got far enough for it to be meaningful.
+    pub key_index: Option<u8>,
+    /// The user the message was attributed to, if it was attributable at all.
+    pub sender_user_id: Option<String>,
+    /// The device it was attributed to, if known.
+    pub sender_device_id: Option<String>,
+    /// Why it was refused.
+    pub reason: KeyRejection,
+}
+
+impl DiscardedKey {
+    fn new(
+        member_id: &str,
+        key_index: Option<u8>,
+        origin: &KeyOrigin,
+        reason: KeyRejection,
+    ) -> Self {
+        let (sender_user_id, sender_device_id) = match origin {
+            KeyOrigin::Encrypted {
+                sender_user_id,
+                sender_device_id,
+                ..
+            } => (Some(sender_user_id.clone()), sender_device_id.clone()),
+            KeyOrigin::Cleartext => (None, None),
+        };
+        Self {
+            member_id: member_id.to_owned(),
+            key_index,
+            sender_user_id,
+            sender_device_id,
+            reason,
+        }
+    }
 }
 
 /// Maps a `(user_id, device_id, member_id)` triple to the RTC-backend
@@ -886,6 +939,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // their send succeeded, so a failure is never retried and that member
         // cannot decrypt us for the rest of the call. Track delivery per
         // recipient and re-attempt the failures on the next membership update.
+        let mut failed: Vec<&str> = Vec::new();
         for participant in &to_distribute_to {
             if let Err(error) = self
                 .send_key_to_participant(
@@ -903,7 +957,33 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                     outbound_key_to_use.key_index,
                     participant.member_id,
                 );
+                failed.push(&participant.member_id);
             }
+        }
+
+        // One line per rollout saying how it went as a whole. Per-recipient
+        // errors above are easy to miss in a busy log, and "distributed to 1 of 3"
+        // is the shape of the problem — the rollout continued, but two members
+        // cannot decrypt us and will not be retried.
+        if failed.is_empty() {
+            log::info!(
+                "[{}/{}] distributed key index {} to {} member(s)",
+                self.room_id,
+                self.slot_id,
+                outbound_key_to_use.key_index,
+                to_distribute_to.len(),
+            );
+        } else {
+            log::warn!(
+                "[{}/{}] distributed key index {} to {} of {} member(s); not delivered to {:?}, \
+                 whose media will not decrypt for us",
+                self.room_id,
+                self.slot_id,
+                outbound_key_to_use.key_index,
+                to_distribute_to.len() - failed.len(),
+                to_distribute_to.len(),
+                failed,
+            );
         }
 
         // Update or store the outbound key
@@ -1045,12 +1125,22 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                     return Ok(());
                 };
 
+                // Recipient *and* index, on one line: an Android integration had
+                // to add exactly this to discover that the core was addressing a
+                // key to the device it was running on. Whether a member was
+                // addressed at all, and with which index, is not answerable from
+                // any other line the core emits.
                 log::debug!(
-                    "[{}/{}] Sending key to user={}, device={}",
+                    "[{}/{}] sending key index {index} for member {target_member_id} to \
+                     {target_user_id}/{target_device_id}{}",
                     self.room_id,
                     self.slot_id,
-                    target_user_id,
-                    target_device_id
+                    if target_user_id == &self.own_user_id && target_device_id == self.own_device_id
+                    {
+                        " (ourselves — a homeserver will drop this)"
+                    } else {
+                        ""
+                    },
                 );
 
                 self.command_sender
@@ -1077,6 +1167,13 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     }
 
     /// Signals a key to the application layer.
+    /// Reports a refused key to the handler, so the reason leaves the core.
+    async fn signal_discarded_key(&self, discarded: DiscardedKey) {
+        if let Some(handler) = &self.signal_handler {
+            handler.clone().on_key_discarded(discarded).await;
+        }
+    }
+
     /// Signals our own outbound key to the application layer.
     ///
     /// `use_after_ms` is the MSC4143 `delayBeforeUse` the consumer must observe
@@ -1196,14 +1293,47 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// they can be checked once it does — a key is never signalled to the
     /// application before it has been verified.
     pub async fn receive_key(&self, received: ReceivedEncryptionKey) -> Result<(), CommandError> {
-        if let Err(rejection) = self.verify_origin(&received) {
-            log::warn!(
-                "[{}/{}] Discarding key for member {}: {}",
+        // What the host claimed, logged before we decide anything about it, so a
+        // discard can be read against the message that caused it.
+        match &received.origin {
+            KeyOrigin::Encrypted {
+                sender_user_id,
+                sender_device_id,
+                sender_is_cross_signed,
+            } => log::debug!(
+                "[{}/{}] key index {} for member {} from {sender_user_id}/{} \
+                 cross_signed={sender_is_cross_signed}",
                 self.room_id,
                 self.slot_id,
+                received.key_index,
+                received.member_id,
+                sender_device_id.as_deref().unwrap_or("<unknown>"),
+            ),
+            KeyOrigin::Cleartext => log::debug!(
+                "[{}/{}] key index {} for member {} arrived in cleartext",
+                self.room_id,
+                self.slot_id,
+                received.key_index,
+                received.member_id,
+            ),
+        }
+
+        if let Err(rejection) = self.verify_origin(&received) {
+            log::warn!(
+                "[{}/{}] Discarding key index {} for member {}: {}",
+                self.room_id,
+                self.slot_id,
+                received.key_index,
                 received.member_id,
                 rejection
             );
+            self.signal_discarded_key(DiscardedKey::new(
+                &received.member_id,
+                Some(received.key_index),
+                &received.origin,
+                rejection,
+            ))
+            .await;
             return Ok(());
         }
 
@@ -1275,12 +1405,20 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     ) {
         if let Err(rejection) = Self::verify_against_membership(origin, membership) {
             log::warn!(
-                "[{}/{}] Discarding key for member {}: {}",
+                "[{}/{}] Discarding key index {} for member {}: {}",
                 self.room_id,
                 self.slot_id,
+                key.key_index,
                 key.member_id,
                 rejection
             );
+            self.signal_discarded_key(DiscardedKey::new(
+                &key.member_id,
+                Some(key.key_index),
+                origin,
+                rejection,
+            ))
+            .await;
             return;
         }
 
@@ -1560,6 +1698,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingHandler {
         signals: Mutex<Vec<KeyMaterialSignal>>,
+        discarded: Mutex<Vec<DiscardedKey>>,
     }
 
     impl RecordingHandler {
@@ -1577,6 +1716,10 @@ mod tests {
     impl EncryptionKeySignalHandler for RecordingHandler {
         async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
             self.signals.lock().unwrap().push(signal);
+        }
+
+        async fn on_key_discarded(&self, discarded: DiscardedKey) {
+            self.discarded.lock().unwrap().push(discarded);
         }
     }
 
@@ -2147,6 +2290,99 @@ mod tests {
             manager.get_inbound_keys(&member_id).is_empty(),
             "key should have been discarded"
         );
+    }
+
+    /// A discarded key must reach the host with its reason attached. Downstream,
+    /// a refused key and one that never arrived both surface as `MISSING_KEY`, so
+    /// without this the host cannot tell a trust problem from a delivery one —
+    /// the reason was warn-logged inside the core and went nowhere.
+    #[tokio::test]
+    async fn a_refused_key_is_reported_with_its_reason() {
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+
+        // MSC4153: bob's device is not cross-signed, so his key is refused.
+        let mut key = bob_key(vec![1u8; 32], 3);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@bob:example.org".to_string(),
+            sender_device_id: Some("device456".to_string()),
+            sender_is_cross_signed: false,
+        };
+        manager
+            .receive_key(key)
+            .await
+            .expect("a discarded key is not an error");
+
+        let discarded = handler.discarded.lock().unwrap();
+        assert_eq!(
+            *discarded,
+            vec![DiscardedKey {
+                member_id: "bob-device456-uuid".to_string(),
+                key_index: Some(3),
+                sender_user_id: Some("@bob:example.org".to_string()),
+                sender_device_id: Some("device456".to_string()),
+                reason: KeyRejection::NotCrossSigned,
+            }],
+        );
+        assert!(
+            handler.signals.lock().unwrap().is_empty(),
+            "a refused key must not also be signalled as usable"
+        );
+    }
+
+    /// The other rejection stage — the key passed the origin checks but does not
+    /// match the member event it claims — must report too, and say who sent it.
+    #[tokio::test]
+    async fn a_key_from_the_wrong_device_is_reported_with_its_reason() {
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopCommandSender),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+
+        let mut key = bob_key(vec![1u8; 32], 0);
+        key.origin = KeyOrigin::Encrypted {
+            sender_user_id: "@bob:example.org".to_string(),
+            sender_device_id: Some("SOMEOTHERDEV".to_string()),
+            sender_is_cross_signed: true,
+        };
+        manager
+            .receive_key(key)
+            .await
+            .expect("a discarded key is not an error");
+
+        let discarded = handler.discarded.lock().unwrap();
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the rejection should have been reported"
+        );
+        assert_eq!(
+            discarded[0].sender_device_id.as_deref(),
+            Some("SOMEOTHERDEV"),
+            "the host needs the device that actually sent it, to act on this",
+        );
+        assert!(matches!(
+            discarded[0].reason,
+            KeyRejection::DeviceMismatch { .. }
+        ));
     }
 
     /// MSC4143: "clients SHOULD discard any m.rtc.encryption_key events that

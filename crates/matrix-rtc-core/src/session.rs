@@ -473,6 +473,26 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     ///
     /// This sends a left membership event and cancels any active keep-alive delayed event.
     ///
+    /// # What survives
+    ///
+    /// Only *own-participation* state is dropped: the membership machine, the
+    /// encryption manager and our identity. Room state (`slot`, `room_members`,
+    /// `room_encryption`) and peer `candidates` are kept, and the session itself
+    /// stays registered with its manager. Three reasons, all load-bearing:
+    ///
+    /// - Hosts feed sticky *deltas*. An unchanged peer membership is never
+    ///   re-delivered, so a session reset to pristine would rejoin into an empty
+    ///   roster and never learn about the members already in the call.
+    /// - A host that has hung up may still want the roster — "3 people are in
+    ///   this call" outlives our own participation.
+    /// - The media session is torn down separately, with no ordering guarantee
+    ///   relative to this call. Dropping the membership channel here would make a
+    ///   still-running engine stop tracking membership mid-call.
+    ///
+    /// Because the session outlives a leave, [`Self::join`] must not depend on the
+    /// roster changing after it returns — it drives the first key distribution
+    /// itself.
+    ///
     /// # Arguments
     ///
     /// * `params` - The leave parameters including optional disconnect reason.

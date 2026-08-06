@@ -146,6 +146,12 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// This will find the appropriate session for the given room_id and slot_id,
     /// and then call leave on that session.
     ///
+    /// The session is **kept**, not removed: it is keyed by `(room_id, slot_id)`
+    /// and stays usable for a later join in the same process. See
+    /// [`RtcSession::leave`] for why, and for what it does and does not clear —
+    /// a rejoin therefore starts with the previous call's roster in place, which
+    /// [`RtcSession::join`] accounts for.
+    ///
     /// # Arguments
     ///
     /// * `room_id` - The room ID of the session to leave

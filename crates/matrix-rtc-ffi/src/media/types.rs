@@ -129,6 +129,85 @@ pub enum FfiFrameEncryptionState {
     InternalError,
 }
 
+/// What the media layer knows about a frame-encryption failure (mirrors
+/// `matrix_rtc_media::FrameEncryptionDiagnostic`).
+///
+/// The transport's cryptor reports *that* it cannot decrypt, never why. This says
+/// whether any key was installed for that participant at all, which splits a
+/// `MissingKey` into the two cases needing different investigations: nothing ever
+/// arrived (signalling or identity), versus frames carrying an index we have not
+/// been given yet (a rotation in flight).
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiFrameEncryptionDiagnostic {
+    /// The state is not a failure, so there is nothing to explain.
+    NotApplicable,
+    /// No key installed for this participant under any index.
+    NoKeyInstalled,
+    /// Keys installed at these indices, so the frames carry a different one.
+    ///
+    /// Indices are MSC4143 `u8`s, widened here on purpose: uniffi maps
+    /// `Vec<u8>` to a Kotlin `ByteArray`, whose `Byte` is *signed*, so index
+    /// 200 would read as `-56` — while the `keyIndex` on `KeyImported` (a
+    /// scalar `u8`, mapped to `UByte`) would read as `200`. Indices above 127
+    /// are reachable: the core's index wraps at 256.
+    KeysInstalled { key_indices: Vec<u16> },
+}
+
+impl From<matrix_rtc_media::FrameEncryptionDiagnostic> for FfiFrameEncryptionDiagnostic {
+    fn from(diagnostic: matrix_rtc_media::FrameEncryptionDiagnostic) -> Self {
+        use matrix_rtc_media::FrameEncryptionDiagnostic as Diagnostic;
+        match diagnostic {
+            Diagnostic::NotApplicable => Self::NotApplicable,
+            Diagnostic::NoKeyInstalled => Self::NoKeyInstalled,
+            Diagnostic::KeysInstalled { key_indices } => Self::KeysInstalled {
+                key_indices: key_indices.into_iter().map(u16::from).collect(),
+            },
+        }
+    }
+}
+
+/// Why a media key was refused (mirrors `matrix_rtc_core::KeyRejection`).
+///
+/// Typed rather than a message so a host can act on it: `NotCrossSigned` is a
+/// "verify this device" prompt, not just something to log.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiKeyRejection {
+    /// Sent in cleartext, so the sender cannot be authenticated (MSC4143).
+    Cleartext,
+    /// The sending device is not cross-signed (MSC4153).
+    NotCrossSigned,
+    /// The message named a different room than this session's.
+    RoomMismatch { claimed: String },
+    /// The sender does not match the one on the member event it claims.
+    SenderMismatch { expected: String, actual: String },
+    /// The member event names no sending device, so the required match cannot be
+    /// performed at all.
+    UnverifiableDevice,
+    /// The sending device is not the one that sent the member event.
+    DeviceMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
+}
+
+impl From<matrix_rtc_core::KeyRejection> for FfiKeyRejection {
+    fn from(reason: matrix_rtc_core::KeyRejection) -> Self {
+        use matrix_rtc_core::KeyRejection as Rejection;
+        match reason {
+            Rejection::Cleartext => Self::Cleartext,
+            Rejection::NotCrossSigned => Self::NotCrossSigned,
+            Rejection::RoomMismatch { claimed } => Self::RoomMismatch { claimed },
+            Rejection::SenderMismatch { expected, actual } => {
+                Self::SenderMismatch { expected, actual }
+            }
+            Rejection::UnverifiableDevice => Self::UnverifiableDevice,
+            Rejection::DeviceMismatch { expected, actual } => {
+                Self::DeviceMismatch { expected, actual }
+            }
+        }
+    }
+}
+
 impl From<matrix_rtc_media::FrameEncryptionState> for FfiFrameEncryptionState {
     fn from(state: matrix_rtc_media::FrameEncryptionState) -> Self {
         use matrix_rtc_media::FrameEncryptionState as State;
@@ -254,6 +333,23 @@ pub enum FfiCallEvent {
     FrameEncryptionState {
         member_id: String,
         state: FfiFrameEncryptionState,
+        /// Whether any key was installed for this participant — the half the
+        /// cryptor's own state cannot tell you.
+        diagnostic: FfiFrameEncryptionDiagnostic,
+    },
+    /// A media key for this participant was received and *refused*, so their
+    /// frames will not decrypt. Carries the reason, which was previously only
+    /// ever written to the core's log.
+    ///
+    /// Distinct from a key that never arrived: this one arrived and failed a
+    /// check, which is a trust or configuration problem rather than a delivery
+    /// one, and the two are indistinguishable from `MissingKey` alone.
+    KeyDiscarded {
+        member_id: String,
+        key_index: Option<u8>,
+        sender_user_id: Option<String>,
+        sender_device_id: Option<String>,
+        reason: FfiKeyRejection,
     },
     /// A transport-level participant with no signalled membership; it gets
     /// no subscription. Diagnostics only.
@@ -302,9 +398,27 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                 member_id,
                 key_index,
             },
-            Event::FrameEncryptionState { member_id, state } => Self::FrameEncryptionState {
+            Event::FrameEncryptionState {
+                member_id,
+                state,
+                diagnostic,
+            } => Self::FrameEncryptionState {
                 member_id,
                 state: state.into(),
+                diagnostic: diagnostic.into(),
+            },
+            Event::KeyDiscarded {
+                member_id,
+                key_index,
+                sender_user_id,
+                sender_device_id,
+                reason,
+            } => Self::KeyDiscarded {
+                member_id,
+                key_index,
+                sender_user_id,
+                sender_device_id,
+                reason: reason.into(),
             },
             Event::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
             Event::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },

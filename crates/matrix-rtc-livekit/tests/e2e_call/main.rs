@@ -55,6 +55,7 @@ mod provision;
 
 use std::env;
 use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
@@ -344,6 +345,24 @@ async fn wait_for_members(call: &Call, target: usize, label: &str) -> bool {
     false
 }
 
+/// Poll until a peer's media key has been imported, or time out.
+///
+/// Distinct from [`wait_for_members`]: that one proves the *signalling* round
+/// trip, this one proves the *key* round trip, which is a separate hop
+/// (to-device, via the homeserver) and completes later. Anything that reads
+/// media before this holds is measuring key latency rather than media.
+async fn wait_for_key(call: &Call, peer_identity: &str, label: &str) -> bool {
+    for _ in 0..60 {
+        if call.imported_key_for(peer_identity) {
+            println!("[{label}] imported the peer's media key");
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("[{label}] WARNING: no media key for {peer_identity} within 30s");
+    false
+}
+
 #[test]
 #[ignore = "requires the demo/backend docker stack (make backend-up)"]
 fn e2e_call_two_clients_audio() {
@@ -470,7 +489,7 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     let mut _alice_video = None;
     let (tone_ok, reverse_tone_ok, video_ok, constraints_ok) = match mode {
         RunMode::SingleFocus | RunMode::RejoinSameProcess => (
-            record_and_verify_tone(&mut bob.call).await?,
+            record_and_verify_tone(&mut bob.call, "first-call").await?,
             true,
             true,
             true,
@@ -525,9 +544,18 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
             println!("[bob] WARNING: the second call never saw alice's membership");
         }
 
-        let tone_ok = record_and_verify_tone(&mut second.call).await?;
-        let key_ok = second.call.imported_key_for(alice.call.local_identity());
-        println!("[bob] second call imported alice's media key: {key_ok}");
+        // Wait for alice's key before recording, which the first call never had
+        // to do. There, both peers exchanged keys while the call settled and
+        // alice only published afterwards. Here she is *already* publishing, so
+        // the redial subscribes to her track within milliseconds of connecting —
+        // while her key for this new membership is still making its way through
+        // a to-device round trip. Recording on subscription samples that gap and
+        // sees silence, which says nothing about whether the redial works.
+        //
+        // The wait is the test being fair, not the test being lenient: a peer
+        // that never gets a key fails it just the same, on the deadline.
+        let key_ok = wait_for_key(&second.call, alice.call.local_identity(), "bob-redial").await;
+        let tone_ok = record_and_verify_tone(&mut second.call, "redial").await?;
         bob = second;
         (tone_ok, key_ok)
     } else {
@@ -946,7 +974,31 @@ async fn record_peer_tone(call: &Call, label: &str, freq: f64) -> Result<bool, B
 
 /// Consume bob's SFU events until a remote audio track is subscribed, record a
 /// couple of seconds, write a WAV, and verify the 440 Hz tone.
-async fn record_and_verify_tone(call: &mut Call) -> Result<bool, Box<dyn Error>> {
+/// Where this test writes recordings: `target/e2e/`, inside the repository.
+///
+/// Not the system temp directory — on macOS that is a per-user
+/// `/var/folders/…` path nobody can guess from the outside, so the evidence a
+/// failed run leaves behind is effectively hidden. `target/` is already
+/// git-ignored and `cargo clean` disposes of it.
+///
+/// Derived from `CARGO_TARGET_TMPDIR` (`<target-dir>/tmp`) because that is the
+/// only pointer cargo gives an integration test to the target directory, which
+/// `CARGO_TARGET_DIR` may have relocated.
+fn artifact_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new("target"))
+        .join("e2e");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("could not create {}: {error}", dir.display());
+    }
+    dir
+}
+
+/// `label` names the recording, so a scenario that records more than once (the
+/// redial) keeps both files instead of overwriting the first — the two are
+/// different evidence when only the second one fails.
+async fn record_and_verify_tone(call: &mut Call, label: &str) -> Result<bool, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
     loop {
@@ -970,9 +1022,8 @@ async fn record_and_verify_tone(call: &mut Call) -> Result<bool, Box<dyn Error>>
                 if let RemoteTrack::Audio(audio) = track {
                     println!("[bob] recording ~2s of audio...");
                     let pcm = media::record_track(&audio, Duration::from_secs(2)).await;
-                    // CI uploads this on failure, so keep the path predictable
-                    // (temp_dir is /tmp on the linux runners).
-                    let wav_path = std::env::temp_dir().join("e2e_received.wav");
+                    // CI uploads target/e2e/ on failure, so keep the name stable.
+                    let wav_path = artifact_dir().join(format!("received-{label}.wav"));
                     let wav_path = wav_path.to_string_lossy();
                     if let Err(error) = media::write_wav(&wav_path, &pcm, media::SAMPLE_RATE) {
                         eprintln!("[bob] failed to write WAV: {error}");

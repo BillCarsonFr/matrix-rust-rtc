@@ -337,10 +337,16 @@ impl Call {
             memberships,
         );
 
-        // Imported media keys surface as `CallEvent::KeyImported`.
+        // Imported media keys surface as `CallEvent::KeyImported`, and refused
+        // ones as `CallEvent::KeyDiscarded` — the only way the reason a key was
+        // rejected leaves the core.
         let engine_handle = engine.handle();
         bridge.set_key_import_listener(Box::new(move |key| {
             engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
+        }));
+        let engine_handle = engine.handle();
+        bridge.set_key_discard_listener(Box::new(move |discarded| {
+            engine_handle.notify_key_discarded(discarded);
         }));
 
         // Re-signal every key held so far, now that the listener above exists.
@@ -400,6 +406,29 @@ impl Call {
             }
         };
         engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
+
+        // Now that a room exists, let the bridge move our sender onto each key we
+        // rotate to. Importing a key only fills the provider's ring — the index
+        // our frames actually carry lives on the frame cryptor, and without this
+        // we advertise a rotation to peers and keep encrypting with the previous
+        // key. A peer joining after a rotation then holds only the new index and
+        // decrypts nothing, and the forward secrecy the rotation exists for is
+        // not delivered.
+        //
+        // Installed after `connect_livekit`, and after the replay above, so the
+        // first key is already in the ring; the hook only ever *moves* the index.
+        let connection_for_keys = connection.clone();
+        bridge.set_local_sender(
+            own_identity.clone(),
+            Box::new(move |key_index| connection_for_keys.set_local_key_index(key_index)),
+        );
+        // Adopt whatever index we are already on, rather than assuming 0: a
+        // rotation between `join` and here would otherwise be missed, and the
+        // connection remembers the value for tracks published later (nothing is
+        // published yet, so this only records it).
+        if let Some(own_key) = bridge.key_for(&own_identity) {
+            connection.set_local_key_index(own_key.key_index);
+        }
 
         log::info!("[{room_id}/{}] join: complete", options.slot_id);
 

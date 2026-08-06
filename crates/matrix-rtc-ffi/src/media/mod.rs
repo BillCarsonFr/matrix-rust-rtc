@@ -63,10 +63,10 @@ pub use frames::{
 };
 pub use session::{MediaSession, MediaSessionConfig, connect_media_session};
 pub use types::{
-    FfiAudioSourceConfig, FfiCallEvent, FfiEndedReason, FfiFrameEncryptionState,
-    FfiMediaConstraints, FfiOpenIdToken, FfiParticipant, FfiPublishOptions, FfiQualityLimit,
-    FfiReceiveStats, FfiStreamKind, FfiStreamState, FfiVideoDetail, FfiVideoSourceConfig,
-    OpenIdTokenProvider,
+    FfiAudioSourceConfig, FfiCallEvent, FfiEndedReason, FfiFrameEncryptionDiagnostic,
+    FfiFrameEncryptionState, FfiKeyRejection, FfiMediaConstraints, FfiOpenIdToken, FfiParticipant,
+    FfiPublishOptions, FfiQualityLimit, FfiReceiveStats, FfiStreamKind, FfiStreamState,
+    FfiVideoDetail, FfiVideoSourceConfig, OpenIdTokenProvider,
 };
 
 /// Errors produced by the media layer of the FFI.

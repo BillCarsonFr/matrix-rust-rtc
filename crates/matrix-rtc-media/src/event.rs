@@ -26,6 +26,8 @@
 //! Events are plain data (`Clone + PartialEq`) so they can be broadcast to any
 //! number of subscribers and later cross the FFI boundary unchanged.
 
+use matrix_rtc_core::KeyRejection;
+
 use crate::participant::MediaStreamKind;
 
 /// Whether a participant's frames are encrypting and decrypting cleanly.
@@ -55,6 +57,35 @@ impl FrameEncryptionState {
     pub fn is_failure(&self) -> bool {
         !matches!(self, Self::Ok)
     }
+}
+
+/// What the media layer can say about a frame-encryption failure.
+///
+/// The state itself comes from the transport's frame cryptor, which reports
+/// *that* it cannot decrypt but not why. This adds the half the media layer does
+/// know — which keys it has actually installed for that participant — because the
+/// two cases behind a `MissingKey` need completely different investigations:
+/// a key that never arrived (or arrived under an identity the transport does not
+/// use) is a signalling or identity problem, while frames carrying an index we
+/// have not been given yet is a rotation still in flight.
+///
+/// Reasons a key was *refused* live in the core, which is the only layer that
+/// sees the to-device message; those surface separately as
+/// [`CallEvent::KeyDiscarded`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameEncryptionDiagnostic {
+    /// The state is not a failure, so there is nothing to explain.
+    NotApplicable,
+    /// No media key has been installed for this participant under any index.
+    /// Either none ever arrived, or it arrived under a different identity.
+    NoKeyInstalled,
+    /// Keys are installed at these indices, so the frames must be carrying a
+    /// different one — or the material itself disagrees.
+    KeysInstalled {
+        /// Key indices installed for this participant, in the order they were
+        /// imported.
+        key_indices: Vec<u8>,
+    },
 }
 
 /// Why the call ended.
@@ -114,6 +145,28 @@ pub enum CallEvent {
     FrameEncryptionState {
         member_id: String,
         state: FrameEncryptionState,
+        /// What the media layer knows about the failure — chiefly whether any key
+        /// was installed for this participant at all.
+        diagnostic: FrameEncryptionDiagnostic,
+    },
+    /// A media key for this participant was refused, so their frames will not
+    /// decrypt. Carries the reason, which is otherwise only ever logged.
+    ///
+    /// Distinct from a key that never arrived: this one arrived and was rejected,
+    /// which is a configuration or trust problem (an unverified device, say)
+    /// rather than a delivery one.
+    KeyDiscarded {
+        /// The member the key claimed to be for.
+        member_id: String,
+        /// The rejected key's index, when the message got far enough to have one.
+        key_index: Option<u8>,
+        /// Who sent it, as far as decryption metadata could attribute it.
+        sender_user_id: Option<String>,
+        sender_device_id: Option<String>,
+        /// Why it was refused. Typed rather than a message, so a host can act on
+        /// it — `NotCrossSigned` is a "verify this device" prompt, not just a log
+        /// line.
+        reason: KeyRejection,
     },
     /// A transport-level participant appeared that maps to no signalled
     /// membership. It gets no subscription (and could not be decrypted

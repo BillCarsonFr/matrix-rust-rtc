@@ -90,7 +90,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-received-wav
-          path: /tmp/e2e_received.wav
+          path: target/e2e/*.wav
           if-no-files-found: ignore
 
       - name: Teardown backend
