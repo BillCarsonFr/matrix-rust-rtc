@@ -262,6 +262,14 @@ pub trait CommandSenderCallback: Send + Sync {
     ///   in the call, so a shorter lifetime here silently drops the membership
     ///   mid-call and a longer one leaves a ghost behind.
     ///
+    ///   It is a `u64` here and a `u32` in matrix-rust-sdk's
+    ///   `withStickyDurationMs`, so the value narrows on the way down. Clamp
+    ///   rather than truncate: a bare cast turns an over-large duration into a
+    ///   near-instant expiry, which reads as the membership vanishing for no
+    ///   reason. The SDK clamps its own resolved value to one hour
+    ///   (`MAX_STICKY_DURATION_MS`) before it ever reaches you, so in practice
+    ///   the value always fits — the clamp is for hosts that pass their own.
+    ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
     fn send_sticky_event(
@@ -281,7 +289,9 @@ pub trait CommandSenderCallback: Send + Sync {
     /// * `delay_ms` - Delay in milliseconds before the event is sent
     ///
     /// # Returns
-    /// Return Ok(event_id) with the scheduled event ID on success, or Err on failure.
+    /// Return Ok(delay_id) with the MSC4140 delay ID on success, or Err on
+    /// failure. That id — not an event id — is what `restartDelayedEvent` and
+    /// `cancelDelayedEvent` take.
     fn send_delayed_event(
         &self,
         room_id: String,
@@ -315,7 +325,10 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Arguments
     /// * `room_id` - The room ID where the delayed event was scheduled
-    /// * `event_id` - The delay ID returned by send_delayed_event
+    /// * `delay_id` - The MSC4140 delay ID returned by `sendDelayedEvent`. Not
+    ///   an event id: a delayed event has no event id until it fires. Passing
+    ///   one here fails silently at the server and surfaces minutes later as the
+    ///   dead man's switch retiring a live membership.
     ///
     /// # Implementation
     /// matrix-rust-sdk: `update_delayed_event` with `UpdateAction::Restart`.
@@ -333,42 +346,68 @@ pub trait CommandSenderCallback: Send + Sync {
     fn restart_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandSenderError>;
 
     /// Called when a previously scheduled delayed event needs to be canceled.
     ///
     /// # Arguments
     /// * `room_id` - The room ID where the delayed event was scheduled
-    /// * `event_id` - The event ID returned by send_delayed_event
+    /// * `delay_id` - The MSC4140 delay ID returned by `sendDelayedEvent`, as
+    ///   for `restartDelayedEvent`.
     ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
     fn cancel_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandSenderError>;
 
-    /// Called when a to-device message needs to be sent (MSC4143).
+    /// Called when one to-device message must go to a set of devices (MSC4143).
     ///
-    /// # Arguments
-    /// * `user_id` - The target user ID
-    /// * `device_id` - The target device ID. Always one device — send to exactly
-    ///   that device and do not widen it to the user's other devices; the SDK
-    ///   never asks for a fan-out.
-    /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
-    /// * `content_json` - The message content as a JSON string
+    /// The same `content_json` goes to every recipient. Each is one specific
+    /// device — send to exactly that device and never widen to the user's other
+    /// devices; the SDK never asks for a fan-out.
     ///
     /// # Returns
-    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    ///
+    /// One [`FfiToDeviceDelivery`] per recipient, saying whether it was
+    /// delivered. **A recipient you report as delivered is recorded as holding
+    /// the media key and is never re-sent to**, so reporting a failure as a
+    /// success costs that member the rest of the call; mark it failed instead
+    /// and the next rollout retries them. A recipient you omit is treated as
+    /// undelivered.
+    ///
+    /// Return `Err` only when the batch could not be attempted at all — then
+    /// every recipient is treated as unserved. Do not throw for a single bad
+    /// recipient: that abandons the send for every recipient after it.
+    ///
+    /// matrix-rust-sdk's own `sendToDeviceMessage` already takes a recipient
+    /// list, so this maps onto one call.
     fn send_to_device_message(
         &self,
-        user_id: String,
-        device_id: String,
+        recipients: Vec<FfiToDeviceRecipient>,
         message_type: String,
         content_json: String,
-    ) -> Result<(), CommandSenderError>;
+    ) -> Result<Vec<FfiToDeviceDelivery>, CommandSenderError>;
+}
+
+/// One device a to-device message is addressed to.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiToDeviceRecipient {
+    pub user_id: String,
+    pub device_id: String,
+}
+
+/// What became of one recipient of a to-device send.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiToDeviceDelivery {
+    pub user_id: String,
+    pub device_id: String,
+    /// `null` when delivered; otherwise why not. The reason is surfaced to the
+    /// host's logs, not interpreted.
+    pub error: Option<String>,
 }
 
 /// FFI-friendly command sender that wraps a native callback implementation.
@@ -462,13 +501,13 @@ impl RtcCommandSender for FfiCommandSender {
     async fn restart_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
-        let what = format!("restart delayed [{room_id}] id={event_id}");
+        let what = format!("restart delayed [{room_id}] delay_id={delay_id}");
         log_command(
             &what,
             self.callback
-                .restart_delayed_event(room_id, event_id)
+                .restart_delayed_event(room_id, delay_id)
                 .map_err(CommandError::from),
         )
     }
@@ -476,38 +515,60 @@ impl RtcCommandSender for FfiCommandSender {
     async fn cancel_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
-        let what = format!("cancel delayed [{room_id}] event_id={event_id}");
+        let what = format!("cancel delayed [{room_id}] delay_id={delay_id}");
 
         log_command(
             &what,
             self.callback
-                .cancel_delayed_event(room_id, event_id)
+                .cancel_delayed_event(room_id, delay_id)
                 .map_err(CommandError::from),
         )
     }
 
     async fn send_to_device_message(
         &self,
-        user_id: String,
-        device_id: String,
+        recipients: Vec<matrix_rtc_core::ToDeviceRecipient>,
         message_type: String,
         content: Value,
-    ) -> Result<(), CommandError> {
+    ) -> Result<Vec<matrix_rtc_core::ToDeviceDelivery>, CommandError> {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
         let wire_message_type = wire_type(message_type);
-        let what = format!("to-device {user_id}/{device_id} type={wire_message_type}");
+        let what = format!(
+            "to-device type={wire_message_type} to {} recipient(s)",
+            recipients.len(),
+        );
         trace_command_content(&what, &content_json);
 
-        log_command(
+        let ffi_recipients: Vec<FfiToDeviceRecipient> = recipients
+            .iter()
+            .map(|recipient| FfiToDeviceRecipient {
+                user_id: recipient.user_id.clone(),
+                device_id: recipient.device_id.clone(),
+            })
+            .collect();
+
+        let deliveries = log_command(
             &what,
             self.callback
-                .send_to_device_message(user_id, device_id, wire_message_type, content_json)
+                .send_to_device_message(ffi_recipients, wire_message_type, content_json)
                 .map_err(CommandError::from),
-        )
+        )?;
+
+        Ok(deliveries
+            .into_iter()
+            .map(|delivery| {
+                let recipient =
+                    matrix_rtc_core::ToDeviceRecipient::new(delivery.user_id, delivery.device_id);
+                match delivery.error {
+                    Some(error) => matrix_rtc_core::ToDeviceDelivery::failed(recipient, error),
+                    None => matrix_rtc_core::ToDeviceDelivery::sent(recipient),
+                }
+            })
+            .collect())
     }
 
     async fn send_state_event(
@@ -620,7 +681,7 @@ mod tests {
         fn restart_delayed_event(
             &self,
             _room_id: String,
-            _event_id: String,
+            _delay_id: String,
         ) -> Result<(), CommandSenderError> {
             self.record("restart_delayed_event");
             Ok(())
@@ -629,25 +690,37 @@ mod tests {
         fn cancel_delayed_event(
             &self,
             _room_id: String,
-            _event_id: String,
+            _delay_id: String,
         ) -> Result<(), CommandSenderError> {
             Ok(())
         }
 
         fn send_to_device_message(
             &self,
-            user_id: String,
-            device_id: String,
+            recipients: Vec<FfiToDeviceRecipient>,
             message_type: String,
             content_json: String,
-        ) -> Result<(), CommandSenderError> {
+        ) -> Result<Vec<FfiToDeviceDelivery>, CommandSenderError> {
             self.record(&message_type);
-            self.to_device.lock().unwrap().push(ToDeviceSend {
-                user_id,
-                device_id,
-                content: serde_json::from_str(&content_json).unwrap_or(serde_json::Value::Null),
-            });
-            Ok(())
+            let content: serde_json::Value =
+                serde_json::from_str(&content_json).unwrap_or(serde_json::Value::Null);
+            let mut guard = self.to_device.lock().unwrap();
+            let deliveries = recipients
+                .into_iter()
+                .map(|recipient| {
+                    guard.push(ToDeviceSend {
+                        user_id: recipient.user_id.clone(),
+                        device_id: recipient.device_id.clone(),
+                        content: content.clone(),
+                    });
+                    FfiToDeviceDelivery {
+                        user_id: recipient.user_id,
+                        device_id: recipient.device_id,
+                        error: None,
+                    }
+                })
+                .collect();
+            Ok(deliveries)
         }
     }
 
@@ -687,27 +760,26 @@ mod tests {
         fn restart_delayed_event(
             &self,
             room_id: String,
-            event_id: String,
+            delay_id: String,
         ) -> Result<(), CommandSenderError> {
-            (**self).restart_delayed_event(room_id, event_id)
+            (**self).restart_delayed_event(room_id, delay_id)
         }
 
         fn cancel_delayed_event(
             &self,
             room_id: String,
-            event_id: String,
+            delay_id: String,
         ) -> Result<(), CommandSenderError> {
-            (**self).cancel_delayed_event(room_id, event_id)
+            (**self).cancel_delayed_event(room_id, delay_id)
         }
 
         fn send_to_device_message(
             &self,
-            user_id: String,
-            device_id: String,
+            recipients: Vec<FfiToDeviceRecipient>,
             message_type: String,
             content_json: String,
-        ) -> Result<(), CommandSenderError> {
-            (**self).send_to_device_message(user_id, device_id, message_type, content_json)
+        ) -> Result<Vec<FfiToDeviceDelivery>, CommandSenderError> {
+            (**self).send_to_device_message(recipients, message_type, content_json)
         }
     }
 
@@ -782,8 +854,10 @@ mod tests {
             .unwrap();
         command_sender
             .send_to_device_message(
-                "@bob:example.org".to_string(),
-                "device456".to_string(),
+                vec![matrix_rtc_core::ToDeviceRecipient::new(
+                    "@bob:example.org",
+                    "device456",
+                )],
                 matrix_rtc_core::KEY_MESSAGE_TYPE.to_string(),
                 serde_json::json!({ "key": "…" }),
             )
@@ -916,10 +990,9 @@ mod tests {
         // First call: bob arrives after we joined, so there is a roster change.
         manager.join(join_params()).expect("first join");
         manager
-            .on_sticky_events_update_received(
+            .set_current_sticky_state(
+                room_id.clone(),
                 vec![joined_sticky("@bob:example.org", "BOBDEV", "bob-a")],
-                Vec::new(),
-                Vec::new(),
             )
             .expect("bob's membership");
         assert!(

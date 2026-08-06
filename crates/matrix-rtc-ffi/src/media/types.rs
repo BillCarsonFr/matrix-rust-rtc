@@ -166,6 +166,14 @@ impl From<matrix_rtc_media::FrameEncryptionDiagnostic> for FfiFrameEncryptionDia
     }
 }
 
+/// One speaking member and how loud they are.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiSpeakingMember {
+    pub member_id: String,
+    /// `0.0` (silent) to `1.0` (loudest); `0.0` from transports reporting none.
+    pub level: f32,
+}
+
 /// Why a media key was refused (mirrors `matrix_rtc_core::KeyRejection`).
 ///
 /// Typed rather than a message so a host can act on it: `NotCrossSigned` is a
@@ -316,7 +324,10 @@ pub enum FfiCallEvent {
         kind: FfiStreamKind,
     },
     ActiveSpeakers {
-        member_ids: Vec<String>,
+        /// Who is speaking, each with their current audio level. The level rides
+        /// along because it comes from the same transport event — without it a
+        /// host has to meter the PCM itself to answer "how loud".
+        speakers: Vec<FfiSpeakingMember>,
     },
     /// This participant's media is decryptable from here on.
     KeyImported {
@@ -338,8 +349,7 @@ pub enum FfiCallEvent {
         diagnostic: FfiFrameEncryptionDiagnostic,
     },
     /// A media key for this participant was received and *refused*, so their
-    /// frames will not decrypt. Carries the reason, which was previously only
-    /// ever written to the core's log.
+    /// frames will not decrypt. Carries the reason.
     ///
     /// Distinct from a key that never arrived: this one arrived and failed a
     /// check, which is a trust or configuration problem rather than a delivery
@@ -390,7 +400,15 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                 member_id,
                 kind: kind.into(),
             },
-            Event::ActiveSpeakers { member_ids } => Self::ActiveSpeakers { member_ids },
+            Event::ActiveSpeakers { speakers } => Self::ActiveSpeakers {
+                speakers: speakers
+                    .into_iter()
+                    .map(|speaker| FfiSpeakingMember {
+                        member_id: speaker.member_id,
+                        level: speaker.level,
+                    })
+                    .collect(),
+            },
             Event::KeyImported {
                 member_id,
                 key_index,

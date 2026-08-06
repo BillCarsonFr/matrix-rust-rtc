@@ -30,6 +30,60 @@ use serde_json::Value;
 
 use crate::error::CommandError;
 
+/// One device a to-device message is addressed to.
+///
+/// Always one specific device rather than a `*` wildcard: media keys go to the
+/// device that published the membership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToDeviceRecipient {
+    pub user_id: String,
+    pub device_id: String,
+}
+
+impl ToDeviceRecipient {
+    pub fn new(user_id: impl Into<String>, device_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            device_id: device_id.into(),
+        }
+    }
+}
+
+/// What became of one recipient of a to-device send.
+///
+/// The distinction matters beyond reporting: a recipient recorded as served is
+/// taken to hold the key and is never re-sent to, so a failure mistaken for a
+/// success costs that member the rest of the call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToDeviceDelivery {
+    pub recipient: ToDeviceRecipient,
+    /// `None` when the message was accepted for this recipient; otherwise why
+    /// it was not.
+    pub error: Option<String>,
+}
+
+impl ToDeviceDelivery {
+    /// The message was accepted for this recipient.
+    pub fn sent(recipient: ToDeviceRecipient) -> Self {
+        Self {
+            recipient,
+            error: None,
+        }
+    }
+
+    /// The message could not be delivered to this recipient.
+    pub fn failed(recipient: ToDeviceRecipient, error: impl Into<String>) -> Self {
+        Self {
+            recipient,
+            error: Some(error.into()),
+        }
+    }
+
+    pub fn is_sent(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
 /// Trait for sending Matrix events from the core crate to the client SDK.
 ///
 /// Implementations of this trait are provided by the binding layers (WASM, FFI)
@@ -68,7 +122,10 @@ pub trait RtcCommandSender: Send + Sync {
     /// Send a delayed event to a Matrix room.
     ///
     /// The event will be scheduled to be sent after the specified delay.
-    /// Returns Ok(event_id) with the scheduled event's ID on success, or an error on failure.
+    ///
+    /// Returns the MSC4140 **delay id** on success — the handle used to restart
+    /// or cancel the scheduled send. It is not an event id: the event has none
+    /// until it actually fires.
     ///
     /// This is used for implementing the keep-alive mechanism where a delayed
     /// cleanup event is scheduled and periodically restarted.
@@ -103,11 +160,12 @@ pub trait RtcCommandSender: Send + Sync {
     /// # Arguments
     ///
     /// * `room_id` - The room ID where the delayed event was scheduled
-    /// * `event_id` - The delay id returned by `send_delayed_event`
+    /// * `delay_id` - The MSC4140 delay id returned by `send_delayed_event`.
+    ///   Not an event id: the delayed event has no event id until it fires.
     async fn restart_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError>;
 
     /// Cancel a previously scheduled delayed event.
@@ -118,27 +176,38 @@ pub trait RtcCommandSender: Send + Sync {
     /// # Arguments
     ///
     /// * `room_id` - The room ID where the delayed event was scheduled
-    /// * `event_id` - The event ID returned by `send_delayed_event`
+    /// * `delay_id` - The MSC4140 delay id returned by `send_delayed_event`.
+    ///   Not an event id: the delayed event has no event id until it fires.
     async fn cancel_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError>;
 
-    /// Send a to-device message to a specific device.
+    /// Send one to-device message to a set of devices, reporting the outcome
+    /// per recipient.
     ///
-    /// This is used for encryption key distribution as specified in MSC4143.
-    /// To-device messages are encrypted using Olm and delivered directly to the
-    /// target device(s).
+    /// Used for encryption key distribution (MSC4143). The same `content` goes
+    /// to every recipient; each is one specific device, never a `*` fan-out —
+    /// media keys go to the device that published the membership, and widening
+    /// would hand the key to devices outside the call (and, for our own user, to
+    /// this very device, which Olm cannot encrypt to).
+    ///
+    /// # Why per recipient
+    ///
+    /// One unreachable device must not silence the others, and the caller has to
+    /// know *which* ones were served: a recipient reported as delivered is
+    /// recorded as holding the key and never retried, so reporting a failure as
+    /// success costs that member the call. Returning a result per recipient lets
+    /// the caller record only what actually landed and re-send the rest on the
+    /// next rollout.
+    ///
+    /// An `Err` return means the batch could not be attempted at all; the caller
+    /// treats every recipient as unserved.
     ///
     /// # Arguments
     ///
-    /// * `user_id` - The target user ID
-    /// * `device_id` - The target device ID. Always a single device: media keys
-    ///   go to the device that published the membership, and the SDK never asks
-    ///   for a fan-out to every device of a user (that would hand the key to
-    ///   devices outside the call, and for our own user to this very device,
-    ///   which Olm cannot encrypt to).
+    /// * `recipients` - The target devices
     /// * `message_type` - The message type (e.g., "org.matrix.msc4143.rtc.encryption_key")
     /// * `content` - The message content as a JSON value
     ///
@@ -148,11 +217,10 @@ pub trait RtcCommandSender: Send + Sync {
     /// messages. Keys sent in cleartext SHOULD be discarded by recipients.
     async fn send_to_device_message(
         &self,
-        user_id: String,
-        device_id: String,
+        recipients: Vec<ToDeviceRecipient>,
         message_type: String,
         content: Value,
-    ) -> Result<(), CommandError>;
+    ) -> Result<Vec<ToDeviceDelivery>, CommandError>;
 
     /// Send a state event to a Matrix room.
     ///
@@ -209,7 +277,7 @@ impl RtcCommandSender for NoopCommandSender {
     async fn restart_delayed_event(
         &self,
         _room_id: String,
-        _event_id: String,
+        _delay_id: String,
     ) -> Result<(), CommandError> {
         Ok(())
     }
@@ -217,19 +285,18 @@ impl RtcCommandSender for NoopCommandSender {
     async fn cancel_delayed_event(
         &self,
         _room_id: String,
-        _event_id: String,
+        _delay_id: String,
     ) -> Result<(), CommandError> {
         Ok(())
     }
 
     async fn send_to_device_message(
         &self,
-        _user_id: String,
-        _device_id: String,
+        recipients: Vec<ToDeviceRecipient>,
         _message_type: String,
         _content: Value,
-    ) -> Result<(), CommandError> {
-        Ok(())
+    ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+        Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
     }
 
     async fn send_state_event(
@@ -326,39 +393,43 @@ impl RtcCommandSender for MockCommandSender {
     async fn restart_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
         self.restarted_events
             .lock()
             .unwrap()
-            .push((room_id, event_id));
+            .push((room_id, delay_id));
         Ok(())
     }
 
     async fn cancel_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
         self.cancelled_events
             .lock()
             .unwrap()
-            .push((room_id, event_id));
+            .push((room_id, delay_id));
         Ok(())
     }
 
     async fn send_to_device_message(
         &self,
-        user_id: String,
-        device_id: String,
+        recipients: Vec<ToDeviceRecipient>,
         message_type: String,
         content: Value,
-    ) -> Result<(), CommandError> {
-        self.to_device_messages
-            .lock()
-            .unwrap()
-            .push((user_id, device_id, message_type, content));
-        Ok(())
+    ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+        let mut guard = self.to_device_messages.lock().unwrap();
+        for recipient in &recipients {
+            guard.push((
+                recipient.user_id.clone(),
+                recipient.device_id.clone(),
+                message_type.clone(),
+                content.clone(),
+            ));
+        }
+        Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
     }
 
     async fn send_state_event(

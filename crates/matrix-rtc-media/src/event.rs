@@ -88,6 +88,15 @@ pub enum FrameEncryptionDiagnostic {
     },
 }
 
+/// One speaking member and how loud they are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeakingMember {
+    pub member_id: String,
+    /// `0.0` (silent) to `1.0` (loudest); `0.0` from transports that report no
+    /// level.
+    pub level: f32,
+}
+
 /// Why the call ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EndedReason {
@@ -103,7 +112,9 @@ pub enum EndedReason {
 }
 
 /// An event on the unified call stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: an audio level is an `f32`.
+#[derive(Clone, Debug, PartialEq)]
 pub enum CallEvent {
     /// A membership joined the call (including our own).
     ParticipantJoined { member_id: String, user_id: String },
@@ -130,7 +141,11 @@ pub enum CallEvent {
         kind: MediaStreamKind,
     },
     /// The set of currently speaking participants changed.
-    ActiveSpeakers { member_ids: Vec<String> },
+    ///
+    /// Carries each speaker's audio level alongside their `member_id`: "who is
+    /// talking" and "how loud" arrive together from the transport, and splitting
+    /// them forces a host to meter the PCM itself for the second half.
+    ActiveSpeakers { speakers: Vec<SpeakingMember> },
     /// A media decryption key for this participant was imported; their frames
     /// are decryptable from here on.
     KeyImported { member_id: String, key_index: u8 },

@@ -62,5 +62,5 @@ pub use participant::{MediaStreamKind, Participant, StreamState};
 pub use stats::ReceiveStats;
 pub use transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, OwnMemberClaims, RemoteTrackHandle,
-    TransportConnection, TransportError,
+    SpeakingParticipant, TransportConnection, TransportError,
 };

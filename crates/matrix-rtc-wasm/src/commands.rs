@@ -22,7 +22,9 @@
 
 use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
-use matrix_rtc_core::{CommandError, RtcCommandSender, wire_event_type};
+use matrix_rtc_core::{
+    CommandError, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient, wire_event_type,
+};
 use serde_json::Value;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -49,8 +51,10 @@ impl JsCommandSender {
     /// The client must implement the following methods:
     /// - sendStickyEvent(roomId, eventType, content, durationMs, callback)
     /// - sendDelayedEvent(roomId, eventType, content, delayMs, callback)
-    /// - restartDelayedEvent(roomId, eventId, callback)
-    /// - cancelDelayedEvent(roomId, eventId, callback)
+    /// - sendToDeviceMessage(recipients, type, content) -> Promise, resolving to
+    ///   `[{userId, deviceId, error?}, ...]` (or nothing, meaning all delivered)
+    /// - restartDelayedEvent(roomId, delayId, callback)
+    /// - cancelDelayedEvent(roomId, delayId, callback)
     /// - sendToDeviceMessage(userId, deviceId, messageType, content, callback)
     #[wasm_bindgen(constructor)]
     pub fn new(client: JsValue) -> Self {
@@ -244,27 +248,27 @@ impl RtcCommandSender for JsCommandSender {
             .map_err(JsCommandSender::convert_js_error)?;
 
         // Convert the Promise to a Rust Future and await it
-        // The Promise should resolve to the event_id string
+        // The Promise should resolve to the MSC4140 delay id
         let js_result = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(JsCommandSender::convert_js_error)?;
 
-        // Extract the event_id from the result
-        let event_id = js_result.as_string().ok_or_else(|| {
-            CommandError::SendError("sendDelayedEvent did not return a string event_id".to_string())
+        // Extract the delay id from the result
+        let delay_id = js_result.as_string().ok_or_else(|| {
+            CommandError::SendError("sendDelayedEvent did not return a string delay id".to_string())
         })?;
 
-        Ok(event_id)
+        Ok(delay_id)
     }
 
     async fn restart_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
         self.log_command(&format!(
-            "restart_delayed_event: room={}, event_id={}",
-            room_id, event_id
+            "restart_delayed_event: room={}, delay_id={}",
+            room_id, delay_id
         ));
 
         // MSC4140's `restart` action, not cancel-then-reschedule: one request,
@@ -272,7 +276,7 @@ impl RtcCommandSender for JsCommandSender {
         let promise = self
             .call_js_promise_method(
                 "restartDelayedEvent",
-                vec![JsValue::from_str(&room_id), JsValue::from_str(&event_id)],
+                vec![JsValue::from_str(&room_id), JsValue::from_str(&delay_id)],
             )
             .map_err(JsCommandSender::convert_js_error)?;
 
@@ -286,18 +290,18 @@ impl RtcCommandSender for JsCommandSender {
     async fn cancel_delayed_event(
         &self,
         room_id: String,
-        event_id: String,
+        delay_id: String,
     ) -> Result<(), CommandError> {
         self.log_command(&format!(
-            "cancel_delayed_event: room={}, event_id={}",
-            room_id, event_id
+            "cancel_delayed_event: room={}, delay_id={}",
+            room_id, delay_id
         ));
 
         // Create a Promise that will be resolved by the JS callback
         let promise = self
             .call_js_promise_method(
                 "cancelDelayedEvent",
-                vec![JsValue::from_str(&room_id), JsValue::from_str(&event_id)],
+                vec![JsValue::from_str(&room_id), JsValue::from_str(&delay_id)],
             )
             .map_err(JsCommandSender::convert_js_error)?;
 
@@ -311,40 +315,77 @@ impl RtcCommandSender for JsCommandSender {
 
     async fn send_to_device_message(
         &self,
-        user_id: String,
-        device_id: String,
+        recipients: Vec<ToDeviceRecipient>,
         message_type: String,
         content: Value,
-    ) -> Result<(), CommandError> {
+    ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
         let message_type = wire_event_type(&message_type);
         self.log_command(&format!(
-            "send_to_device_message: user={}, device={}, type={}",
-            user_id, device_id, message_type
+            "send_to_device_message: {} recipient(s), type={}",
+            recipients.len(),
+            message_type
         ));
 
-        // Convert Rust Value to JsValue
         let js_content = serde_wasm_bindgen::to_value(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        // `[{userId, deviceId}, ...]`, mirroring matrix-js-sdk's own to-device
+        // shape so a host can pass it straight through.
+        let js_recipients = serde_wasm_bindgen::to_value(
+            &recipients
+                .iter()
+                .map(|recipient| {
+                    serde_json::json!({
+                        "userId": recipient.user_id,
+                        "deviceId": recipient.device_id,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        // Create a Promise that will be resolved by the JS callback
         let promise = self
             .call_js_promise_method(
                 "sendToDeviceMessage",
-                vec![
-                    JsValue::from_str(&user_id),
-                    JsValue::from_str(&device_id),
-                    JsValue::from_str(message_type),
-                    js_content,
-                ],
+                vec![js_recipients, JsValue::from_str(message_type), js_content],
             )
             .map_err(JsCommandSender::convert_js_error)?;
 
-        // Convert the Promise to a Rust Future and await it
-        wasm_bindgen_futures::JsFuture::from(promise)
+        let result = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(JsCommandSender::convert_js_error)?;
 
-        Ok(())
+        // A host that resolves with nothing is taken to have served everyone —
+        // the shape the callback had before it could report per recipient. One
+        // that resolves with `[{userId, deviceId, error?}, ...]` is believed.
+        if result.is_undefined() || result.is_null() {
+            return Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect());
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct JsDelivery {
+            user_id: String,
+            device_id: String,
+            #[serde(default)]
+            error: Option<String>,
+        }
+
+        let reported: Vec<JsDelivery> = serde_wasm_bindgen::from_value(result).map_err(|e| {
+            CommandError::SerializationError(format!(
+                "sendToDeviceMessage resolved with something that is not a delivery list: {e}"
+            ))
+        })?;
+
+        Ok(reported
+            .into_iter()
+            .map(|delivery| {
+                let recipient = ToDeviceRecipient::new(delivery.user_id, delivery.device_id);
+                match delivery.error {
+                    Some(error) => ToDeviceDelivery::failed(recipient, error),
+                    None => ToDeviceDelivery::sent(recipient),
+                }
+            })
+            .collect())
     }
 }
 

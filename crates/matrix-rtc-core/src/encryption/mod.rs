@@ -79,7 +79,7 @@
 //! # Example Usage
 //!
 //! ```no_run
-//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, RtcCommandSender};
+//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient};
 //! use async_trait::async_trait;
 //! use std::sync::Arc;
 //! use base64::{Engine as _, engine::general_purpose};
@@ -101,8 +101,8 @@
 //!     async fn cancel_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
 //!         Ok(())
 //!     }
-//!     async fn send_to_device_message(&self, _user_id: String, _device_id: String, _message_type: String, _content: serde_json::Value) -> Result<(), CommandError> {
-//!         Ok(())
+//!     async fn send_to_device_message(&self, recipients: Vec<ToDeviceRecipient>, _message_type: String, _content: serde_json::Value) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+//!         Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
 //!     }
 //!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<(), CommandError> {
 //!         Ok(())
@@ -149,8 +149,10 @@
 //!     key_index: 0,
 //! }).await.unwrap();
 //!
-//! // Get current keys for application layer
-//! let keys = manager.get_encryption_keys();
+//! // Keys reach the media layer through the signal handler installed above.
+//! // A handler attached after keys arrived (the normal case — media connects
+//! // some time after the slot is joined) calls `replay_keys_to_handler()` to
+//! // receive the ones it missed.
 //! # });
 //! ```
 
@@ -168,7 +170,7 @@ use types::*;
 /// Closure type for getting current memberships, wrapped for thread-safety.
 type GetMembershipsFn = Arc<Mutex<Box<dyn Fn() -> Vec<JoinedMembership> + Send>>>;
 
-use crate::commands::RtcCommandSender;
+use crate::commands::{RtcCommandSender, ToDeviceRecipient};
 use crate::error::CommandError;
 use crate::event::EventOrigin;
 use crate::session::JoinedMembership;
@@ -927,45 +929,34 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             return Ok(());
         }
 
-        // Send keys via to-device messages
-        let key_b64 = general_purpose::STANDARD.encode(&outbound_key_to_use.key);
-
-        // One unreachable recipient must not abort the rollout. This loop used to
-        // `?`, which meant every later recipient got nothing *and* the block
-        // below never ran — so the new key was neither stored nor signalled and
-        // the rotation was silently abandoned while we kept using the old key.
+        // Send the key to every recipient in one call, and record only the
+        // recipients it actually reached.
         //
-        // TODO: recipients are recorded in `shared_with` below whether or not
-        // their send succeeded, so a failure is never retried and that member
-        // cannot decrypt us for the rest of the call. Track delivery per
-        // recipient and re-attempt the failures on the next membership update.
-        let mut failed: Vec<&str> = Vec::new();
-        for participant in &to_distribute_to {
-            if let Err(error) = self
-                .send_key_to_participant(
-                    &key_b64,
-                    outbound_key_to_use.key_index,
-                    &participant.member_id,
-                )
-                .await
-            {
-                log::error!(
-                    "[{}/{}] Could not send key index {} to member {}: {error}. They will not be \
-                     able to decrypt our media.",
-                    self.room_id,
-                    self.slot_id,
-                    outbound_key_to_use.key_index,
-                    participant.member_id,
-                );
-                failed.push(&participant.member_id);
-            }
-        }
+        // This used to be a loop of single-recipient sends whose failures were
+        // logged and then forgotten: `shared_with` was set to the full list
+        // regardless, so a member the send never reached was treated as holding
+        // the key and never re-sent to — they could not decrypt us for the rest
+        // of the call. Recording only the served recipients makes the next
+        // rollout see the rest as newly joined and try again.
+        let key_b64 = general_purpose::STANDARD.encode(&outbound_key_to_use.key);
+        let served = self
+            .send_key_to_participants(&key_b64, outbound_key_to_use.key_index, &to_distribute_to)
+            .await;
 
-        // One line per rollout saying how it went as a whole. Per-recipient
-        // errors above are easy to miss in a busy log, and "distributed to 1 of 3"
-        // is the shape of the problem — the rollout continued, but two members
-        // cannot decrypt us and will not be retried.
-        if failed.is_empty() {
+        let unreached: Vec<&str> = to_distribute_to
+            .iter()
+            .map(|participant| participant.member_id.as_str())
+            .filter(|member_id| {
+                !served
+                    .iter()
+                    .any(|participant| participant.member_id == *member_id)
+            })
+            .collect();
+
+        // One line per rollout saying how it went as a whole: per-recipient
+        // errors are easy to miss in a busy log, and "distributed to 1 of 3" is
+        // the shape of the problem.
+        if unreached.is_empty() {
             log::info!(
                 "[{}/{}] distributed key index {} to {} member(s)",
                 self.room_id,
@@ -976,13 +967,13 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         } else {
             log::warn!(
                 "[{}/{}] distributed key index {} to {} of {} member(s); not delivered to {:?}, \
-                 whose media will not decrypt for us",
+                 who cannot decrypt our media until the next rollout retries them",
                 self.room_id,
                 self.slot_id,
                 outbound_key_to_use.key_index,
-                to_distribute_to.len() - failed.len(),
+                served.len(),
                 to_distribute_to.len(),
-                failed,
+                unreached,
             );
         }
 
@@ -991,7 +982,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             {
                 let mut guard = self.outbound_key.write().unwrap();
                 let mut new_key = outbound_key_to_use.clone();
-                new_key.shared_with = to_distribute_to.clone();
+                new_key.shared_with = served.clone();
                 *guard = Some(new_key);
             }
 
@@ -1030,11 +1021,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             self.signal_key_to_app(&outbound_key_to_use, use_after_ms)
                 .await;
         } else {
-            // Reusing existing key, just update shared_with
+            // Reusing the existing key: record only the recipients we reached,
+            // so the rest are retried on the next rollout.
             {
                 let mut guard = self.outbound_key.write().unwrap();
                 if let Some(ref mut key) = *guard {
-                    for recipient in &to_distribute_to {
+                    for recipient in &served {
                         if !key
                             .shared_with
                             .iter()
@@ -1072,14 +1064,26 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         }
     }
 
-    /// Sends a key to a specific participant via to-device message (MSC4143 format).
-    async fn send_key_to_participant(
+    /// Sends the key to every reachable participant, returning those the send
+    /// actually reached.
+    ///
+    /// Recipients whose membership names no sending device are unreachable and
+    /// are dropped before the call — MSC4143 puts key material on the device that
+    /// encrypted the member event, and there is deliberately no `*` fallback
+    /// (that hands the key to devices outside the call, and for our own user to
+    /// this very device, which Olm cannot encrypt to).
+    async fn send_key_to_participants(
         &self,
         key_b64: &str,
         index: u8,
-        target_member_id: &str,
-    ) -> Result<(), CommandError> {
-        // Build the to-device message content (MSC4143 format)
+        targets: &[ParticipantDeviceInfo],
+    ) -> Vec<ParticipantDeviceInfo> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+
+        // The same content for every recipient: it names *our* member id and key,
+        // not theirs.
         let content = json!({
             "room_id": self.room_id,
             "member_id": self.own_member_id,
@@ -1091,79 +1095,117 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             "format": 0
         });
 
-        log::trace!(
-            "[{}/{}] Sending key index {} to member {}",
-            self.room_id,
-            self.slot_id,
-            index,
-            target_member_id
-        );
-
-        // Find the target participant in our membership list
         let memberships = (self.get_memberships.lock().unwrap())();
-        let target = memberships.iter().find(|m| m.member_id == target_member_id);
+        let mut recipients = Vec::with_capacity(targets.len());
+        let mut addressed = Vec::with_capacity(targets.len());
 
-        match target {
-            Some(membership) => {
-                // MSC4143: key material goes to the device that encrypted the
-                // member event. There is deliberately no "*" fallback — sending
-                // to every device of that user hands the key to devices that are
-                // not in the call, and for our own user it includes this device,
-                // which Olm cannot encrypt to. A membership with no sending
-                // device is unreachable; say so and move on.
-                let target_user_id = &membership.sender;
-                let Some(target_device_id) = membership.origin.sender_device_id() else {
-                    log::warn!(
-                        "[{}/{}] Cannot send key to member {}: its member event names no sending \
-                         device, and we will not broadcast the key to every device of {}. Their \
-                         media will not decrypt for us.",
-                        self.room_id,
-                        self.slot_id,
-                        target_member_id,
-                        target_user_id,
-                    );
-                    return Ok(());
-                };
-
-                // Recipient *and* index, on one line: an Android integration had
-                // to add exactly this to discover that the core was addressing a
-                // key to the device it was running on. Whether a member was
-                // addressed at all, and with which index, is not answerable from
-                // any other line the core emits.
-                log::debug!(
-                    "[{}/{}] sending key index {index} for member {target_member_id} to \
-                     {target_user_id}/{target_device_id}{}",
-                    self.room_id,
-                    self.slot_id,
-                    if target_user_id == &self.own_user_id && target_device_id == self.own_device_id
-                    {
-                        " (ourselves — a homeserver will drop this)"
-                    } else {
-                        ""
-                    },
-                );
-
-                self.command_sender
-                    .send_to_device_message(
-                        target_user_id.clone(),
-                        target_device_id.to_string(),
-                        KEY_MESSAGE_TYPE.to_string(),
-                        content,
-                    )
-                    .await
-            }
-            None => {
+        for target in targets {
+            let Some(membership) = memberships.iter().find(|m| m.member_id == target.member_id)
+            else {
                 log::warn!(
-                    "[{}/{}] Cannot send key to member {}: no matching membership found",
+                    "[{}/{}] cannot send key to member {}: no matching membership found",
                     self.room_id,
                     self.slot_id,
-                    target_member_id
+                    target.member_id,
                 );
-                // Buffer the key for when membership arrives
-                // For now, just return Ok - the key will be sent when membership is known
-                Ok(())
-            }
+                continue;
+            };
+            let user_id = &membership.sender;
+            let Some(device_id) = membership.origin.sender_device_id() else {
+                log::warn!(
+                    "[{}/{}] cannot send key to member {}: its member event names no sending \
+                     device, and we will not broadcast the key to every device of {user_id}. \
+                     Their media will not decrypt for us.",
+                    self.room_id,
+                    self.slot_id,
+                    target.member_id,
+                );
+                continue;
+            };
+
+            // Recipient *and* index, on one line: an Android integration had to
+            // add exactly this to discover that the core was addressing a key to
+            // the device it was running on. Whether a member was addressed at
+            // all, and with which index, is not answerable from any other line.
+            log::debug!(
+                "[{}/{}] sending key index {index} for member {} to {user_id}/{device_id}{}",
+                self.room_id,
+                self.slot_id,
+                target.member_id,
+                if user_id == &self.own_user_id && device_id == self.own_device_id {
+                    " (ourselves — a homeserver will drop this)"
+                } else {
+                    ""
+                },
+            );
+
+            recipients.push(ToDeviceRecipient::new(user_id.clone(), device_id));
+            addressed.push(target.clone());
         }
+
+        if recipients.is_empty() {
+            return Vec::new();
+        }
+
+        let deliveries = match self
+            .command_sender
+            .send_to_device_message(recipients, KEY_MESSAGE_TYPE.to_string(), content)
+            .await
+        {
+            Ok(deliveries) => deliveries,
+            Err(error) => {
+                // The batch never left; nobody was served, so nobody is recorded
+                // as holding the key and the next rollout retries all of them.
+                log::error!(
+                    "[{}/{}] could not send key index {index} to any of {} recipient(s): {error}",
+                    self.room_id,
+                    self.slot_id,
+                    addressed.len(),
+                );
+                return Vec::new();
+            }
+        };
+
+        // Match results back by recipient rather than by position: an
+        // implementation is free to reorder or to answer for only some of them,
+        // and treating an unanswered recipient as served is the failure this
+        // whole shape exists to prevent.
+        addressed
+            .into_iter()
+            .filter(|target| {
+                let delivered = deliveries.iter().find(|delivery| {
+                    delivery.recipient.user_id == target.user_id
+                        && delivery.recipient.device_id == target.device_id
+                });
+                match delivered {
+                    Some(delivery) if delivery.is_sent() => true,
+                    Some(delivery) => {
+                        log::error!(
+                            "[{}/{}] key index {index} was not delivered to member {} ({}/{}): {}",
+                            self.room_id,
+                            self.slot_id,
+                            target.member_id,
+                            target.user_id,
+                            target.device_id,
+                            delivery.error.as_deref().unwrap_or("no reason given"),
+                        );
+                        false
+                    }
+                    None => {
+                        log::error!(
+                            "[{}/{}] the host reported no outcome for member {} ({}/{}); treating \
+                             key index {index} as undelivered so it is retried",
+                            self.room_id,
+                            self.slot_id,
+                            target.member_id,
+                            target.user_id,
+                            target.device_id,
+                        );
+                        false
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Signals a key to the application layer.
@@ -1555,52 +1597,6 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     pub fn get_all_inbound_keys(&self) -> HashMap<String, Vec<InboundEncryptionKey>> {
         self.inbound_keys.read().unwrap().clone()
     }
-
-    /// Gets encryption keys for the application layer.
-    ///
-    /// Returns a map of member_id to their key rings (multiple keys per participant
-    /// for rotation support).
-    pub fn get_encryption_keys(&self) -> HashMap<String, Vec<KeyMaterialSignal>> {
-        let mut result: HashMap<String, Vec<KeyMaterialSignal>> = HashMap::new();
-
-        // Add outbound key
-        if let Some(outbound) = self.get_outbound_key() {
-            let rtc_backend_id = self.get_own_rtc_backend_identity();
-            let signal = KeyMaterialSignal {
-                key: outbound.key.clone(),
-                key_index: outbound.key_index,
-                rtc_backend_identity: rtc_backend_id,
-                // A snapshot of keys already held, not a new-key notification:
-                // whatever delay applied to them has long since been observed.
-                use_after_ms: 0,
-            };
-            result
-                .entry(self.own_member_id.clone())
-                .or_default()
-                .push(signal);
-        }
-
-        // Add inbound keys
-        for (member_id, keys) in self.get_all_inbound_keys() {
-            let member_id_clone = member_id.clone();
-            for key in keys {
-                // We need to compute the backend identity
-                // For simplicity, use the member_id as identity
-                let signal = KeyMaterialSignal {
-                    key: key.key.clone(),
-                    key_index: key.key_index,
-                    rtc_backend_identity: member_id_clone.clone(),
-                    use_after_ms: 0,
-                };
-                result
-                    .entry(member_id_clone.clone())
-                    .or_default()
-                    .push(signal);
-            }
-        }
-
-        result
-    }
 }
 
 impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
@@ -1638,7 +1634,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{MockCommandSender, NoopCommandSender};
+    use crate::commands::{MockCommandSender, NoopCommandSender, ToDeviceDelivery};
     use crate::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
@@ -2770,8 +2766,10 @@ mod tests {
         );
     }
 
-    /// One unreachable recipient must not cost the others their key, and must
-    /// not abandon the rotation: the key still has to be stored and signalled.
+    /// One unreachable recipient must not cost the others their key, must not
+    /// abandon the rotation (the key still has to be stored and signalled) —
+    /// and must not be recorded as holding the key, or it is never retried and
+    /// that member cannot decrypt us for the rest of the call.
     #[tokio::test]
     async fn a_failed_recipient_does_not_abort_the_rollout() {
         struct FailsFirstRecipient {
@@ -2801,30 +2799,35 @@ mod tests {
             async fn restart_delayed_event(
                 &self,
                 _room_id: String,
-                _event_id: String,
+                _delay_id: String,
             ) -> Result<(), CommandError> {
                 Ok(())
             }
             async fn cancel_delayed_event(
                 &self,
                 _room_id: String,
-                _event_id: String,
+                _delay_id: String,
             ) -> Result<(), CommandError> {
                 Ok(())
             }
             async fn send_to_device_message(
                 &self,
-                user_id: String,
-                _device_id: String,
+                recipients: Vec<ToDeviceRecipient>,
                 _message_type: String,
                 _content: serde_json::Value,
-            ) -> Result<(), CommandError> {
-                self.attempted.lock().unwrap().push(user_id.clone());
-                if user_id == "@bob:example.org" {
-                    Err(CommandError::from_message("no olm session"))
-                } else {
-                    Ok(())
-                }
+            ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+                let mut attempted = self.attempted.lock().unwrap();
+                Ok(recipients
+                    .into_iter()
+                    .map(|recipient| {
+                        attempted.push(recipient.user_id.clone());
+                        if recipient.user_id == "@bob:example.org" {
+                            ToDeviceDelivery::failed(recipient, "no olm session")
+                        } else {
+                            ToDeviceDelivery::sent(recipient)
+                        }
+                    })
+                    .collect())
             }
             async fn send_state_event(
                 &self,
@@ -2878,6 +2881,33 @@ mod tests {
         assert!(
             !handler.signals.lock().unwrap().is_empty(),
             "the key must still reach the media layer, or we encrypt with nothing",
+        );
+
+        let shared_with: Vec<String> = manager
+            .get_outbound_key()
+            .expect("the key is stored")
+            .shared_with
+            .into_iter()
+            .map(|participant| participant.user_id)
+            .collect();
+        assert_eq!(
+            shared_with,
+            vec!["@carol:example.org"],
+            "only the recipient the send actually reached may be recorded as holding \
+             the key; recording bob would mean never retrying him",
+        );
+
+        // Next rollout: bob is not in `shared_with`, so he counts as newly
+        // joined and is addressed again.
+        sender.attempted.lock().unwrap().clear();
+        manager
+            .on_memberships_update()
+            .await
+            .expect("the retry rollout should succeed");
+        assert_eq!(
+            *sender.attempted.lock().unwrap(),
+            vec!["@bob:example.org"],
+            "the unreached recipient should be retried, and the served one left alone",
         );
     }
 }

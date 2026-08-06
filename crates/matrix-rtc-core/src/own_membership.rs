@@ -705,7 +705,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::commands::{MockCommandSender, NoopCommandSender};
+    use crate::commands::{
+        MockCommandSender, NoopCommandSender, ToDeviceDelivery, ToDeviceRecipient,
+    };
     use crate::transport::RawRtcTransport;
 
     const APPLICATION_TYPE: &str = "m.call";
@@ -1113,12 +1115,11 @@ mod tests {
 
         async fn send_to_device_message(
             &self,
-            _user_id: String,
-            _device_id: String,
+            recipients: Vec<ToDeviceRecipient>,
             _message_type: String,
             _content: Value,
-        ) -> Result<(), CommandError> {
-            Ok(())
+        ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+            Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
         }
 
         async fn send_state_event(

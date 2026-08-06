@@ -11,8 +11,63 @@ log only.
 
 ### Breaking
 
-Hosts implementing the FFI/WASM command sender must update. All three are
+Hosts implementing the FFI/WASM command sender must update. All of these are
 compile errors, not silent behaviour changes.
+
+**v0.2.0 sweep** — deliberately batched into one release while there is still a
+single integrator, rather than dripped out over several:
+
+- **`sendToDeviceMessage` now takes a recipient *list* and returns a result per
+  recipient**, replacing the per-device call whose only failure channel was an
+  exception. That exception landed inside the core's loop over members, so one
+  undeliverable recipient silenced every member after it; and because the core
+  had no way to learn who was actually served, it recorded everyone as holding
+  the key and never retried. Now: return `FfiToDeviceDelivery { userId,
+  deviceId, error }` per recipient — a recipient you report as delivered is
+  never re-sent to, one you mark failed or omit is retried on the next rollout.
+  Reserve `Err` for "the batch could not be attempted at all". This also removes
+  a loop and several FFI crossings, and maps onto matrix-rust-sdk's own
+  recipient-list `sendToDeviceMessage`.
+- **`restartDelayedEvent` / `cancelDelayedEvent` take `delayId`, not
+  `eventId`.** The value was always the MSC4140 delay id; the parameter name
+  said otherwise, and transposing the two fails silently, surfacing minutes
+  later as the dead man's switch retiring a live membership. Renamed everywhere,
+  including `sendDelayedEvent`'s documented return.
+- **One way in for membership: `setCurrentStickyState(roomId, events)`.** It
+  carries the room's *complete* current sticky state and **replaces** what the
+  core held — a member absent from it is gone, and an empty list clears the
+  room. `initialStickyForRoom`, `onStickyEventsSnapshotReceived`,
+  `stickyUpdateForRoom` and `onStickyEventsUpdateReceived` are all gone, along
+  with the `StickyEventUpdate` record.
+
+  A delta bought nothing: the core discarded the `previous` half of an update,
+  flattened every removal to a plain leave, and an explicit leave arrives inside
+  the current state anyway as a leave-shaped sticky replacing the join under the
+  same key. Meanwhile `matrix-sdk-ffi` hands hosts a full snapshot on every
+  change (it collapses the SDK's delta before it crosses the boundary), so the
+  current state is the shape hosts already have — and the core now does the
+  diffing once instead of each host doing it. Feeding a shrunken set is how an
+  expired membership departs.
+- **`RtcSessionHandle` is gone.** Its `leave()` could only ever return an error,
+  and a session created through it was invisible to `RtcSessionManagerHandle`,
+  so nothing else could act on it. Its one unique capability — observing the
+  roster — is now on the manager. Drive sessions through the manager handle.
+- **`FfiAudioFrame.data` is a `ByteArray` of little-endian `int16`**, not a
+  `List<Short>`. uniffi renders a sample list boxed — roughly 48 000 objects a
+  second at 48 kHz mono, the single biggest cost this API imposed on a host.
+  Read it with
+  `ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()`;
+  `AudioTrack`/`AudioRecord` take the byte form directly.
+- **`FfiCallEvent.ActiveSpeakers` carries `speakers: List<FfiSpeakingMember>`**
+  (`memberId` + `level`) rather than bare member ids. The level arrives in the
+  same transport event, and dropping it forced hosts to meter the PCM
+  themselves to answer "how loud".
+- **`EncryptionManager::get_encryption_keys()` is gone.** It derived participant
+  identities itself, ignoring the installed identity mapper, so anything
+  importing from it addressed keys under identities the transport never sees —
+  indistinguishable from the keys never arriving. Use
+  `replayKeysToHandler`/`replay_encryption_keys`, which derive identities the
+  same way the live signal path does.
 
 - **`CommandSenderCallback.sendStickyEvent` takes a new `durationMs`
   argument.** Pass it through verbatim — with matrix-rust-sdk that is
@@ -47,6 +102,13 @@ compile errors, not silent behaviour changes.
 
 ### Added
 
+- **`subscribeMembershipSnapshots(roomId, slotId)` on
+  `RtcSessionManagerHandle`.** The roster previously existed only on
+  `RtcSessionHandle`, while media requires the manager — so a host driving the
+  manager could read `memberCount` but never learn *who* was in the call, and
+  polling a count once a second was the only way to notice a change. Returns
+  `null` when no session exists for that slot yet. This is also what a host
+  watches to be told a call has started.
 - `MediaSession.receiveStats(memberId, kind)` reports cumulative receive-side
   RTP counters — packets, bytes, loss, jitter, `framesDecoded`, and the audio
   concealment counters. The receive path emits frames at a fixed cadence whether

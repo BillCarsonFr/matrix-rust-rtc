@@ -57,7 +57,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::constraints::MediaConstraints;
-use crate::event::{CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState};
+use crate::event::{
+    CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState, SpeakingMember,
+};
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 use crate::stats::ReceiveStats;
@@ -1079,12 +1081,21 @@ impl Actor {
             ConnectionEvent::TrackUnmuted { identity, kind } => {
                 self.set_muted(&identity, kind, false);
             }
-            ConnectionEvent::ActiveSpeakers { identities } => {
-                let member_ids: Vec<String> = identities
+            ConnectionEvent::ActiveSpeakers { speakers } => {
+                // Speakers with no known membership are dropped: a level we
+                // cannot attribute to a member is not actionable.
+                let speakers: Vec<SpeakingMember> = speakers
                     .iter()
-                    .filter_map(|identity| self.identity_map.get(identity).cloned())
+                    .filter_map(|speaker| {
+                        self.identity_map
+                            .get(&speaker.identity)
+                            .map(|member_id| SpeakingMember {
+                                member_id: member_id.clone(),
+                                level: speaker.level,
+                            })
+                    })
                     .collect();
-                self.emit(CallEvent::ActiveSpeakers { member_ids });
+                self.emit(CallEvent::ActiveSpeakers { speakers });
             }
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
                 match self.identity_map.get(&identity).cloned() {
@@ -1458,7 +1469,7 @@ mod tests {
 
     use super::*;
     use crate::frame::AudioFrame;
-    use crate::transport::OwnMemberClaims;
+    use crate::transport::{OwnMemberClaims, SpeakingParticipant};
 
     const OWN_FOCUS: &str = "https://sfu.example.org";
     const PEER_FOCUS: &str = "https://sfu-b.example.org";
@@ -2103,6 +2114,47 @@ mod tests {
         );
     }
 
+    /// "Who is talking" and "how loud" arrive in the same transport event, so
+    /// they must leave together: a host that gets only the identities has to
+    /// meter the PCM itself, decoding audio it may not otherwise need to answer
+    /// a question the SFU already answered.
+    #[tokio::test]
+    async fn active_speakers_carry_their_audio_level() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::ActiveSpeakers {
+                speakers: vec![
+                    SpeakingParticipant {
+                        identity: "id-bob".to_owned(),
+                        level: 0.75,
+                    },
+                    // No membership maps to this one, so it cannot be attributed
+                    // and is dropped rather than reported against nobody.
+                    SpeakingParticipant {
+                        identity: "id-ghost".to_owned(),
+                        level: 0.9,
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ActiveSpeakers {
+                speakers: vec![SpeakingMember {
+                    member_id: "bob".to_owned(),
+                    level: 0.75,
+                }],
+            }
+        );
+    }
+
     #[tokio::test]
     async fn an_encryption_state_for_an_unmapped_identity_is_dropped() {
         let mut fx = fixture();
@@ -2117,14 +2169,14 @@ mod tests {
         // no event rather than merely being slower.
         connection
             .send(ConnectionEvent::ActiveSpeakers {
-                identities: Vec::new(),
+                speakers: Vec::new(),
             })
             .unwrap();
 
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::ActiveSpeakers {
-                member_ids: Vec::new(),
+                speakers: Vec::new(),
             }
         );
     }

@@ -60,8 +60,8 @@ use matrix_rtc_core::{JoinedMembership, RtcTransport};
 use matrix_rtc_media::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
     LocalTrackHandle, MediaStreamKind, MediaTransport, PublishOptions, QualityLimit, ReceiveStats,
-    RemoteTrackHandle, ResolvedConstraints, StreamDemand, TransportConnection, TransportError,
-    VideoDetail, VideoFrame, VideoRotation,
+    RemoteTrackHandle, ResolvedConstraints, SpeakingParticipant, StreamDemand, TransportConnection,
+    TransportError, VideoDetail, VideoFrame, VideoRotation,
 };
 
 use crate::identity::pseudonymous_identity;
@@ -549,9 +549,14 @@ async fn translate_room_events(
             } => remote_mute_event(&participant, &publication, false),
             RoomEvent::ActiveSpeakersChanged { speakers } => {
                 Some(ConnectionEvent::ActiveSpeakers {
-                    identities: speakers
+                    // `audio_level` comes with the same event; without it a host
+                    // has to meter the PCM itself to answer "how loud".
+                    speakers: speakers
                         .iter()
-                        .map(|speaker| speaker.identity().to_string())
+                        .map(|speaker| SpeakingParticipant {
+                            identity: speaker.identity().to_string(),
+                            level: speaker.audio_level(),
+                        })
                         .collect(),
                 })
             }

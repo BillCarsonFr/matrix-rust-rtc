@@ -586,17 +586,46 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     }
 
     /// Applies the initial membership events for this single session.
-    pub async fn initial_events(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
+    pub async fn set_current_state(
+        &mut self,
+        events: impl IntoIterator<Item = CallMembershipEvent>,
+    ) {
+        // Replace, do not merge: `events` is the complete set for this slot, so
+        // a candidate missing from it is gone.
+        //
+        // The distinction is not academic. A member does not only leave by
+        // sending a leave event — an MSC4354 sticky entry expires when its owner
+        // stops refreshing it, which is exactly what a crashed client does, and
+        // an entry lapsing produces no event at all. Merging would leave that
+        // member in the call for good, and force every host to diff snapshots
+        // itself to notice.
+        let previous = std::mem::take(&mut self.candidates);
         for event in events {
             self.apply_membership_event(event).await;
         }
-    }
 
-    /// Applies a membership update batch for this single session.
-    pub async fn handle_update(&mut self, events: impl IntoIterator<Item = CallMembershipEvent>) {
-        for event in events {
-            self.apply_membership_event(event).await;
+        let dropped: Vec<&str> = previous
+            .iter()
+            .filter(|before| {
+                !self
+                    .candidates
+                    .iter()
+                    .any(|now| now.sender == before.sender && now.sticky_key == before.sticky_key)
+            })
+            .map(|candidate| candidate.sticky_key.as_str())
+            .collect();
+        if !dropped.is_empty() {
+            log::info!(
+                "[{}] {} candidate(s) gone from the current sticky state (expired or \
+                 withdrawn): {dropped:?}",
+                self.log_tag,
+                dropped.len(),
+            );
         }
+
+        // `apply_membership_event` refreshes only when it changed something, so
+        // a purely shrinking update would otherwise never republish.
+        self.refresh().await;
     }
 
     /// Applies one membership event to this session.

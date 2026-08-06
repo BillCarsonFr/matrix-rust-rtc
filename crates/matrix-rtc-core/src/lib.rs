@@ -33,7 +33,7 @@ mod slot;
 mod transport;
 mod wire;
 
-pub use commands::RtcCommandSender;
+pub use commands::{RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient};
 pub use encryption::types::{
     EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, KeyOrigin, KeyRejection,
     OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,
@@ -176,7 +176,7 @@ mod tests {
         manager.join(params).await.expect("join should succeed");
     }
 
-    /// Feeds a peer membership as a sticky delta, the way a host does.
+    /// Feeds the current sticky state containing one peer, the way a host does.
     async fn admit_peer(
         manager: &mut RtcSessionManager<crate::commands::MockCommandSender>,
         user_id: &str,
@@ -188,14 +188,7 @@ mod tests {
             ..joined_event(user_id, "m.call#ROOM", member_id)
         };
         manager
-            .sticky_update_for_room(
-                ROOM_ID,
-                StickyEventsUpdate {
-                    added: vec![event],
-                    updated: Vec::new(),
-                    removed: Vec::new(),
-                },
-            )
+            .set_current_sticky_state(ROOM_ID, vec![event])
             .await
             .unwrap();
     }
@@ -230,6 +223,70 @@ mod tests {
             .on_room_slots_received(ROOM_ID, vec![encrypted_call_slot()])
             .await;
         manager
+    }
+
+    /// An MSC4354 sticky entry expires when its owner stops refreshing it — a
+    /// crashed client — and the lapse produces no event at all. So the current
+    /// state simply arrives smaller, and the member has to go: this call
+    /// replaces rather than merges. Merging kept them in the call for good and
+    /// pushed expiry detection onto every host.
+    #[tokio::test]
+    async fn a_member_whose_sticky_entry_expired_is_dropped() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let alice = joined_event("@alice:example.org", "m.call#ROOM", "alice-a");
+        let bob = joined_event("@bob:example.org", "m.call#ROOM", "bob-a");
+
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![alice.clone(), bob])
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(2));
+
+        // Bob's entry lapsed: no leave event, he is simply absent now.
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![alice])
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.member_count(ROOM_ID, "m.call#ROOM"),
+            Some(1),
+            "an expired entry must leave the call, with no leave event to feed in"
+        );
+
+        // And an empty state empties the room, rather than being a no-op.
+        manager
+            .set_current_sticky_state(ROOM_ID, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
+    }
+
+    /// A slot whose last member expired contributes no events at all, so it
+    /// vanishes from the payload entirely. It still has to be cleared, or the
+    /// replace has a hole exactly where the ghost would be.
+    #[tokio::test]
+    async fn a_slot_missing_from_the_current_state_is_cleared_too() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let in_call = joined_event("@alice:example.org", "m.call#ROOM", "alice-a");
+        let in_other = joined_event("@bob:example.org", "m.call#OTHER", "bob-a");
+
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![in_call.clone(), in_other])
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#OTHER"), Some(1));
+
+        // Only the first slot is represented now; the second must empty.
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![in_call])
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
+        assert_eq!(
+            manager.member_count(ROOM_ID, "m.call#OTHER"),
+            Some(0),
+            "a slot absent from the current state is empty, not untouched"
+        );
     }
 
     /// A second call in the same process must distribute a key just as the first
@@ -357,23 +414,18 @@ mod tests {
         let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
 
         manager
-            .initial_sticky_for_room(ROOM_ID, vec![joined.clone()])
+            .set_current_sticky_state(ROOM_ID, vec![joined.clone()])
             .await
             .unwrap();
 
         assert_eq!(manager.session_count(), 1);
         assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
 
+        // A departure reaches the core as a leave-shaped sticky replacing the
+        // join under the same key — and, once that lapses too, as plain absence.
         let left = left_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
         manager
-            .sticky_update_for_room(
-                ROOM_ID,
-                StickyEventsUpdate {
-                    added: Vec::new(),
-                    updated: Vec::new(),
-                    removed: vec![left],
-                },
-            )
+            .set_current_sticky_state(ROOM_ID, vec![left])
             .await
             .unwrap();
 
@@ -391,7 +443,7 @@ mod tests {
         };
 
         manager
-            .initial_sticky_for_room(ROOM_ID, vec![stable, unstable])
+            .set_current_sticky_state(ROOM_ID, vec![stable, unstable])
             .await
             .unwrap();
 
@@ -408,7 +460,7 @@ mod tests {
         };
 
         manager
-            .initial_sticky_for_room(ROOM_ID, vec![event])
+            .set_current_sticky_state(ROOM_ID, vec![event])
             .await
             .unwrap();
 
@@ -423,7 +475,7 @@ mod tests {
         let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
 
         manager
-            .initial_sticky_for_room(
+            .set_current_sticky_state(
                 ROOM_ID,
                 vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
             )
@@ -441,7 +493,7 @@ mod tests {
         let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
 
         manager
-            .initial_sticky_for_room(
+            .set_current_sticky_state(
                 ROOM_ID,
                 vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
             )
@@ -464,7 +516,7 @@ mod tests {
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
             .await;
         manager
-            .initial_sticky_for_room(
+            .set_current_sticky_state(
                 ROOM_ID,
                 vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
             )
@@ -485,7 +537,7 @@ mod tests {
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
             .await;
         manager
-            .initial_sticky_for_room(
+            .set_current_sticky_state(
                 ROOM_ID,
                 vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
             )
@@ -514,7 +566,7 @@ mod tests {
 
         manager.on_room_slots_received(ROOM_ID, Vec::new()).await;
         manager
-            .initial_sticky_for_room(
+            .set_current_sticky_state(
                 ROOM_ID,
                 vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
             )
@@ -545,7 +597,7 @@ mod tests {
         let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
 
         manager
-            .initial_sticky_for_room(
+            .set_current_sticky_state(
                 ROOM_ID,
                 vec![
                     joined_event("@alice:example.org", "m.call#ROOM", "alice-a"),
@@ -580,7 +632,7 @@ mod tests {
         };
 
         manager
-            .initial_sticky_for_room(ROOM_ID, vec![encrypted, cleartext])
+            .set_current_sticky_state(ROOM_ID, vec![encrypted, cleartext])
             .await
             .unwrap();
         // Nothing has reported the room's encryption yet, so neither is judged.
@@ -600,7 +652,7 @@ mod tests {
             ..joined_event("@bob:example.org", "m.call#ROOM", "bob-a")
         };
         manager
-            .initial_sticky_for_room(ROOM_ID, vec![cleartext])
+            .set_current_sticky_state(ROOM_ID, vec![cleartext])
             .await
             .unwrap();
         manager.on_room_encryption_received(ROOM_ID, false).await;
@@ -618,7 +670,7 @@ mod tests {
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
             .await;
         manager
-            .initial_sticky_for_room(
+            .set_current_sticky_state(
                 ROOM_ID,
                 vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
             )
@@ -744,14 +796,7 @@ mod tests {
             ..joined_event("@bob:example.org", "m.call#ROOM", "bob-a")
         };
         manager
-            .sticky_update_for_room(
-                ROOM_ID,
-                StickyEventsUpdate {
-                    added: vec![bob],
-                    updated: Vec::new(),
-                    removed: Vec::new(),
-                },
-            )
+            .set_current_sticky_state(ROOM_ID, vec![bob])
             .await
             .unwrap();
     }
