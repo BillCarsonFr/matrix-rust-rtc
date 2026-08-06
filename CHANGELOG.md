@@ -33,6 +33,28 @@ single integrator, rather than dripped out over several:
   said otherwise, and transposing the two fails silently, surfacing minutes
   later as the dead man's switch retiring a live membership. Renamed everywhere,
   including `sendDelayedEvent`'s documented return.
+- **`CommandSenderCallback` is async, and so is every manager-handle method
+  that touches the core.** In Kotlin they are `suspend fun`s; in Swift, `async`.
+  A synchronous callback forced hosts to bridge to their async Matrix client
+  themselves — `runBlocking` on a dedicated dispatcher on Android — while every
+  corresponding matrix-rust-sdk call is already async.
+
+  `setCommandSender` now takes the interface directly rather than a boxed one
+  (uniffi `with_foreign`), and `CommandSenderError` gained a `Display` impl,
+  which uniffi requires of a foreign-trait error type.
+
+  This was blocked until now by a subtlety worth recording: uniffi's async
+  exports must be `Send`, while `matrix-rtc-core`'s command traits were
+  `?Send` on every target to accommodate WASM's JS-backed futures. They are now
+  `Send` everywhere except `wasm32`, via a `cfg_attr` pair that **every
+  implementation of those traits must carry**. A consequence is that
+  `matrix-rtc-wasm` no longer compiles for a host target — its crate body is
+  gated to `wasm32` and a `Clippy (wasm32)` CI job type-checks it instead.
+
+  Internally this removed the blocking bridge entirely: no `block_on`, and the
+  keep-alive is a spawned task rather than a thread per session (it needed a
+  thread only because its future held a `std::sync::MutexGuard` and so was not
+  `Send`).
 - **One way in for membership: `setCurrentStickyState(roomId, events)`.** It
   carries the room's *complete* current sticky state and **replaces** what the
   core held — a member absent from it is gone, and an empty list clears the

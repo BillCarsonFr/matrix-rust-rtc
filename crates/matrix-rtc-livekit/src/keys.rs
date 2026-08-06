@@ -280,7 +280,8 @@ impl MediaKeyBridge {
     }
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl EncryptionKeySignalHandler for MediaKeyBridge {
     /// Applies a signalled key, honouring the MSC4143 `delayBeforeUse` the core
     /// attaches as [`KeyMaterialSignal::use_after_ms`].

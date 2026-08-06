@@ -138,6 +138,8 @@ impl JsCommandSender {
 unsafe impl Send for JsCommandSender {}
 unsafe impl Sync for JsCommandSender {}
 
+// Unconditionally `?Send`: this crate is only ever built for wasm32, where the
+// core's trait takes the `?Send` shape, and these futures wrap JS promises.
 #[async_trait(?Send)]
 impl RtcCommandSender for JsCommandSender {
     async fn send_sticky_event(

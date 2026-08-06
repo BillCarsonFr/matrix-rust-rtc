@@ -19,6 +19,22 @@
 //!
 //! This layer accepts JS-shaped sticky events and maps them into core DTOs.
 //! Keeping this conversion here lets the core remain independent from wasm/JS types.
+//!
+//! # Only built for `wasm32`
+//!
+//! The crate body is `cfg`-gated to `wasm32` because it cannot compile anywhere
+//! else: its futures wrap JS promises and are therefore `!Send`, while
+//! `matrix-rtc-core`'s command traits are `Send` on every target *but* wasm32
+//! (see [`matrix_rtc_core::RtcCommandSender`]). On other targets this compiles
+//! to an empty crate so a workspace-wide `cargo check`/`clippy` still passes.
+//!
+//! The consequence is that a host-target build no longer type-checks this crate.
+//! Check it explicitly:
+//!
+//! ```sh
+//! cargo check -p matrix-rtc-wasm --target wasm32-unknown-unknown
+//! ```
+#![cfg(target_arch = "wasm32")]
 
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,

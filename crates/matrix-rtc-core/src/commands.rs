@@ -92,10 +92,18 @@ impl ToDeviceDelivery {
 /// The client layer is expected to provide:
 /// - **Retry strategy**: For handling shaky connections or 429 rate limiting
 ///
-/// Methods are async to allow awaiting completion and proper error handling.
-/// Note: The `?Send` bound is used to support platforms like WASM where futures
-/// may not be `Send` (e.g., when wrapping JavaScript Promises).
-#[async_trait(?Send)]
+/// Methods are async so the core can await completion and handle errors.
+///
+/// The futures are `Send` everywhere except `wasm32`, where they cannot be: a
+/// JS-backed future (`JsFuture` around a `Promise`) is not `Send`, and the
+/// browser is single-threaded anyway. Every implementation of this trait needs
+/// the same pair of `cfg_attr`s, or it will not satisfy the trait on one of the
+/// two targets.
+///
+/// Native being `Send` is not incidental — it is what lets a uniffi async
+/// export return one of these futures, since uniffi spawns them.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait RtcCommandSender: Send + Sync {
     /// Send a sticky event to a Matrix room.
     ///
@@ -252,7 +260,8 @@ pub trait RtcCommandSender: Send + Sync {
 pub struct NoopCommandSender;
 
 #[cfg(test)]
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl RtcCommandSender for NoopCommandSender {
     async fn send_sticky_event(
         &self,
@@ -358,7 +367,8 @@ impl MockCommandSender {
 }
 
 #[cfg(test)]
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl RtcCommandSender for MockCommandSender {
     async fn send_sticky_event(
         &self,
