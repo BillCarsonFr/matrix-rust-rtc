@@ -166,6 +166,17 @@ enum ActorMessage {
         key_index: u8,
     },
     KeyDiscarded(DiscardedKey),
+    /// A local publication went up; the roster must show it and peers were
+    /// already told by the transport.
+    LocalPublished {
+        kind: MediaStreamKind,
+        track: Arc<dyn LocalTrackHandle>,
+    },
+    SetLocalMuted {
+        kind: MediaStreamKind,
+        muted: bool,
+        respond: oneshot::Sender<Result<(), TransportError>>,
+    },
     /// Publish a local track on the own-focus connection.
     Publish {
         options: PublishOptions,
@@ -261,6 +272,7 @@ impl CallEngine {
             member_identities: HashMap::new(),
             constraints: HashMap::new(),
             pending_tracks: HashMap::new(),
+            local_tracks: HashMap::new(),
             encryption_states: HashMap::new(),
             installed_keys: HashMap::new(),
             pending_keys: HashMap::new(),
@@ -345,6 +357,33 @@ impl CallEngine {
         let (respond, response) = oneshot::channel();
         self.messages
             .send(ActorMessage::Publish { options, respond })
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
+        response
+            .await
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?
+    }
+
+    /// Mute or unmute one of our own publications.
+    ///
+    /// Peers are told, so their UI can show it — which is the difference
+    /// between a muted sender and one that has simply stopped sending. The
+    /// roster and the event stream are updated too, so a host can render its own
+    /// state from the same source it renders everyone else's rather than
+    /// shadowing it separately.
+    ///
+    /// Errors if nothing of that kind is published.
+    pub async fn set_local_muted(
+        &self,
+        kind: MediaStreamKind,
+        muted: bool,
+    ) -> Result<(), TransportError> {
+        let (respond, response) = oneshot::channel();
+        self.messages
+            .send(ActorMessage::SetLocalMuted {
+                kind,
+                muted,
+                respond,
+            })
             .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
         response
             .await
@@ -477,6 +516,9 @@ struct Actor {
     /// cannot be read: a momentary drop during a rotation and a permanent failure
     /// produce the same line, and only the previous state separates them.
     encryption_states: HashMap<String, FrameEncryptionState>,
+    /// Our own live publications, so a mute can reach the transport and the
+    /// roster can be corrected in one place.
+    local_tracks: HashMap<MediaStreamKind, Arc<dyn LocalTrackHandle>>,
     /// Key indices installed per member, in the order they were imported.
     ///
     /// Kept so a frame-encryption failure can say whether *any* key reached this
@@ -657,8 +699,23 @@ impl Actor {
                     });
                 match connection {
                     Some(connection) => {
+                        // The publish itself is awaited off-actor so a slow SFU
+                        // does not stall every other message; the actor learns
+                        // the outcome through `LocalPublished`, which is what
+                        // puts the stream on our own roster entry. Without that
+                        // a host sees no event for its own microphone and has to
+                        // shadow the state to render itself truthfully.
+                        let kind = options.kind;
+                        let messages = self.messages_tx.clone();
                         tokio::spawn(async move {
-                            let _ = respond.send(connection.publish(options).await);
+                            let outcome = connection.publish(options).await;
+                            if let Ok(track) = &outcome {
+                                let _ = messages.send(ActorMessage::LocalPublished {
+                                    kind,
+                                    track: Arc::clone(track),
+                                });
+                            }
+                            let _ = respond.send(outcome);
                         });
                     }
                     None => {
@@ -667,6 +724,28 @@ impl Actor {
                         )));
                     }
                 }
+            }
+            ActorMessage::LocalPublished { kind, track } => {
+                self.local_tracks.insert(kind, track);
+                let own_member_id = self.own_member_id.clone();
+                self.add_local_stream(&own_member_id, kind);
+            }
+            ActorMessage::SetLocalMuted {
+                kind,
+                muted,
+                respond,
+            } => {
+                let outcome = match self.local_tracks.get(&kind) {
+                    Some(track) => track.set_muted(muted),
+                    None => Err(TransportError::Unsupported(format!(
+                        "nothing of kind {kind:?} is published locally"
+                    ))),
+                };
+                if outcome.is_ok() {
+                    let own_member_id = self.own_member_id.clone();
+                    self.set_member_muted(&own_member_id, kind, muted);
+                }
+                let _ = respond.send(outcome);
             }
             ActorMessage::SetConstraints {
                 member_id,
@@ -1299,6 +1378,30 @@ impl Actor {
 
     // ---- streams ----------------------------------------------------------
 
+    /// Put one of our own publications on our roster entry.
+    ///
+    /// Deliberately not `add_stream`: there is no `RemoteTrackHandle` for our
+    /// own media (nothing subscribes us to ourselves) and no constraints to
+    /// push, so the two share only the roster bookkeeping.
+    fn add_local_stream(&mut self, member_id: &str, kind: MediaStreamKind) {
+        let Some(participant) = self.roster.iter_mut().find(|p| p.member_id == member_id) else {
+            // Our own membership has not come back through the sticky map yet.
+            // The publication is live at the transport regardless; the roster
+            // catches up when `add_member` runs.
+            log::debug!("published {kind:?} before our own membership is known");
+            return;
+        };
+        if participant.streams.iter().any(|stream| stream.kind == kind) {
+            return;
+        }
+        participant.streams.push(StreamState { kind, muted: false });
+        self.emit(CallEvent::StreamStarted {
+            member_id: member_id.to_owned(),
+            kind,
+        });
+        self.publish_roster();
+    }
+
     fn add_stream(
         &mut self,
         member_id: &str,
@@ -1369,6 +1472,13 @@ impl Actor {
         let Some(member_id) = self.identity_map.get(identity).cloned() else {
             return;
         };
+        self.set_member_muted(&member_id, kind, muted);
+    }
+
+    /// Mute state keyed by member rather than transport identity, so it serves
+    /// our own publications too — those never arrive as transport events, since
+    /// nothing subscribes us to ourselves.
+    fn set_member_muted(&mut self, member_id: &str, kind: MediaStreamKind, muted: bool) {
         let Some(stream) = self
             .roster
             .iter_mut()
@@ -1381,6 +1491,7 @@ impl Actor {
             return;
         }
         stream.muted = muted;
+        let member_id = member_id.to_owned();
         let event = if muted {
             CallEvent::StreamMuted { member_id, kind }
         } else {
@@ -1487,6 +1598,8 @@ mod tests {
         published: StdMutex<Vec<(String, MediaStreamKind)>>,
         /// `(identity, kind, resolved)` of every apply_constraints call.
         applied: StdMutex<Vec<(String, MediaStreamKind, crate::ResolvedConstraints)>>,
+        /// `(kind, muted)` of every local mute call that reached the transport.
+        local_mutes: StdMutex<Vec<(MediaStreamKind, bool)>>,
     }
 
     struct FakeTransport {
@@ -1545,7 +1658,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((self.key.clone(), options.kind));
-            Ok(Arc::new(FakeLocalTrack { kind: options.kind }))
+            Ok(Arc::new(FakeLocalTrack::new(
+                options.kind,
+                Arc::clone(&self.state),
+            )))
         }
 
         async fn apply_constraints(
@@ -1570,12 +1686,28 @@ mod tests {
 
     struct FakeLocalTrack {
         kind: MediaStreamKind,
+        state: Arc<TransportState>,
+    }
+
+    impl FakeLocalTrack {
+        fn new(kind: MediaStreamKind, state: Arc<TransportState>) -> Self {
+            Self { kind, state }
+        }
     }
 
     #[async_trait::async_trait]
     impl LocalTrackHandle for FakeLocalTrack {
         fn kind(&self) -> MediaStreamKind {
             self.kind
+        }
+
+        fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
+            self.state
+                .local_mutes
+                .lock()
+                .unwrap()
+                .push((self.kind, muted));
+            Ok(())
         }
     }
 
@@ -2479,6 +2611,109 @@ mod tests {
         tokio::time::sleep(IDLE_GRACE * 2).await;
         assert!(!closed(&fx, PEER_FOCUS));
         assert_eq!(connect_count(&fx, PEER_FOCUS), 1);
+    }
+
+    /// A host must be able to render itself from the same roster it renders
+    /// everyone else from. Publishing raised no event, so its own entry lacked
+    /// the microphone it was actively capturing — and alone in a call nothing
+    /// later prompted a re-read to correct it.
+    #[tokio::test]
+    async fn publishing_puts_the_stream_on_our_own_roster_entry() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "own".to_owned(),
+                user_id: "@own:example.org".to_owned(),
+            }
+        );
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .expect("we are on our own roster");
+        assert_eq!(own.streams.len(), 1);
+        assert_eq!(own.streams[0].kind, MediaStreamKind::Microphone);
+        assert!(!own.streams[0].muted);
+    }
+
+    /// Muting must reach the transport (so peers are told, rather than seeing a
+    /// sender that merely stopped) *and* the roster, so the host does not have to
+    /// keep its own copy of the answer.
+    #[tokio::test]
+    async fn muting_ourselves_reaches_the_transport_and_the_roster() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+        let _ = next_event(&mut fx.events).await; // StreamStarted
+
+        fx.engine
+            .set_local_muted(MediaStreamKind::Microphone, true)
+            .await
+            .expect("muting a live publication should succeed");
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamMuted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        assert_eq!(
+            *fx.state.local_mutes.lock().unwrap(),
+            vec![(MediaStreamKind::Microphone, true)],
+            "the mute must reach the transport, or peers just see a stalled sender",
+        );
+        assert!(
+            fx.engine
+                .participants()
+                .into_iter()
+                .find(|p| p.is_local)
+                .expect("we are on our own roster")
+                .streams[0]
+                .muted
+        );
+    }
+
+    /// Muting something we never published is an error, not a silent no-op that
+    /// leaves the host believing it is muted.
+    #[tokio::test]
+    async fn muting_an_unpublished_kind_fails() {
+        let fx = fixture();
+        let _connection = adopt(&fx);
+
+        assert!(
+            fx.engine
+                .set_local_muted(MediaStreamKind::Camera, true)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

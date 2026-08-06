@@ -295,6 +295,7 @@ impl TransportConnection for LiveKitTransportConnection {
                     "audio",
                     RtcAudioSource::Native(source.clone()),
                 );
+                let published = LocalTrack::Audio(track.clone());
                 self.session
                     .room()
                     .local_participant()
@@ -314,6 +315,7 @@ impl TransportConnection for LiveKitTransportConnection {
                 Ok(Arc::new(LiveKitLocalTrack {
                     kind,
                     source: LocalSource::Audio(source),
+                    track: published,
                 }))
             }
             MediaStreamKind::Camera | MediaStreamKind::ScreenShare => {
@@ -333,6 +335,7 @@ impl TransportConnection for LiveKitTransportConnection {
                     "video",
                     RtcVideoSource::Native(source.clone()),
                 );
+                let published = LocalTrack::Video(track.clone());
                 // Below 480px livekit computes a single simulcast encoding
                 // (rid "q" only) — a degenerate shape the SFU delivered no
                 // frames for in testing. One layer wants a plain encoding.
@@ -354,6 +357,7 @@ impl TransportConnection for LiveKitTransportConnection {
                 Ok(Arc::new(LiveKitLocalTrack {
                     kind,
                     source: LocalSource::Video(source),
+                    track: published,
                 }))
             }
             MediaStreamKind::Data => Err(TransportError::Unsupported(
@@ -461,12 +465,25 @@ enum LocalSource {
 struct LiveKitLocalTrack {
     kind: MediaStreamKind,
     source: LocalSource,
+    /// The published track, kept so it can be muted. Cheap to clone — LiveKit's
+    /// track types are handles.
+    track: LocalTrack,
 }
 
 #[async_trait]
 impl LocalTrackHandle for LiveKitLocalTrack {
     fn kind(&self) -> MediaStreamKind {
         self.kind
+    }
+
+    fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
+        match (&self.track, muted) {
+            (LocalTrack::Audio(track), true) => track.mute(),
+            (LocalTrack::Audio(track), false) => track.unmute(),
+            (LocalTrack::Video(track), true) => track.mute(),
+            (LocalTrack::Video(track), false) => track.unmute(),
+        }
+        Ok(())
     }
 
     async fn capture_audio(&self, frame: AudioFrame) -> Result<(), TransportError> {

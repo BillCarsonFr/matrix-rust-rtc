@@ -102,6 +102,18 @@ single integrator, rather than dripped out over several:
 
 ### Added
 
+- **Publishing raises `StreamStarted` against our own `member_id`, and
+  `MediaSession.setLocalMuted(kind, muted)` mutes it.** Our own publications
+  never arrive as transport events — nothing subscribes us to ourselves — so a
+  host's own roster entry lacked the microphone it was actively capturing, and
+  alone in a call nothing later prompted a re-read to correct it. Hosts were
+  shadowing their own mute state to render themselves truthfully.
+
+  Muting goes to the transport as well as the roster, so peers are told: a muted
+  sender and one that has merely stopped pushing frames look the same to a peer
+  otherwise, and the second is what a wedged client looks like.
+  `StreamMuted`/`StreamUnmuted` are emitted against our `member_id` exactly as
+  for anyone else, so a host can render itself from the same source.
 - **`subscribeMembershipSnapshots(roomId, slotId)` on
   `RtcSessionManagerHandle`.** The roster previously existed only on
   `RtcSessionHandle`, while media requires the manager — so a host driving the

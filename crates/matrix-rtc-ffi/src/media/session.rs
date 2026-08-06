@@ -385,6 +385,32 @@ impl MediaSession {
         Ok(Arc::new(FfiLocalTrack::new(handle)))
     }
 
+    /// Mute or unmute one of our own publications.
+    ///
+    /// Peers are told, so their UI can show it — muting is not the same as
+    /// simply not pushing frames, which looks to a peer like a stalled sender.
+    /// Our own roster entry and the event stream are updated too
+    /// (`StreamMuted`/`StreamUnmuted` against our `member_id`), so a host can
+    /// render its own state from the same source it renders everyone else's
+    /// instead of keeping a parallel copy.
+    ///
+    /// Errors if nothing of that kind is currently published.
+    pub async fn set_local_muted(
+        &self,
+        kind: FfiStreamKind,
+        muted: bool,
+    ) -> Result<(), MediaFfiError> {
+        log::info!("media: setting our own {kind:?} muted={muted}");
+
+        self.engine
+            .set_local_muted(kind.into(), muted)
+            .await
+            .map_err(|error| {
+                log::warn!("media: local mute failed: {error}");
+                MediaFfiError::Transport(error.to_string())
+            })
+    }
+
     /// End the media session: emits `Ended { Left }`, closes every
     /// peer-focus connection, then the own-focus one. Leave the slot via the
     /// manager separately.

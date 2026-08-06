@@ -109,6 +109,17 @@ impl PublishOptions {
 pub trait LocalTrackHandle: Send + Sync {
     fn kind(&self) -> MediaStreamKind;
 
+    /// Mute or unmute this publication at the transport.
+    ///
+    /// Muting stops media reaching peers and tells them why, so their UI can
+    /// show it. Distinct from simply not calling `capture_*`: that looks like a
+    /// stalled sender to a peer, which is what they see for a wedged client.
+    fn set_muted(&self, _muted: bool) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this publication cannot be muted".into(),
+        ))
+    }
+
     /// Push a chunk of captured PCM. Paced by the transport: resolves when
     /// the frame has been accepted, applying backpressure to the capture
     /// loop. Errors once the publication is gone.

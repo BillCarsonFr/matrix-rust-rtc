@@ -35,11 +35,12 @@
 //! 6. `alice` publishes a 440 Hz tone and `bob` records what the SFU forwards
 //!    and verifies the frequency.
 //!
-//! Two scenarios share this flow: `e2e_call_two_clients_audio` (both on one
-//! SFU, verified over the raw LiveKit event stream) and
-//! `e2e_call_two_clients_two_foci` (each participant on their own SFU —
-//! MSC4195 multi-SFU — with tones in both directions verified through the
-//! transport-agnostic media API).
+//! Three scenarios share this flow: `e2e_call_two_clients_audio` (both on one
+//! SFU, verified over the raw LiveKit event stream), `e2e_call_two_clients_two_foci`
+//! (each participant on their own SFU — MSC4195 multi-SFU — with tones in both
+//! directions verified through the transport-agnostic media API), and
+//! `e2e_call_rejoin_in_the_same_process` (one peer hangs up and calls again
+//! while the other stays, so the incumbent has to re-key the new participation).
 //!
 //! Runs against the `demo/backend` stack (see its README) with no further
 //! configuration — every endpoint defaults to the stack's localhost ports and
@@ -715,7 +716,7 @@ async fn publish_pattern_video(call: &Call) -> Result<VideoPublisher, Box<dyn Er
             }
             captured += 1;
             // ~every 5s at 15fps, so a silent capture-side death is visible.
-            if captured % 75 == 0 {
+            if captured.is_multiple_of(75) {
                 println!("[alice] captured {captured} video frames");
             }
         }
