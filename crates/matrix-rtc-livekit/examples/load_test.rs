@@ -77,6 +77,7 @@ use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::{OwnedDeviceId, RoomId};
 use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::sync_service::SyncService;
+use tokio::signal::unix::{SignalKind, signal};
 
 /// Duration of one captured audio frame; 10 ms is the WebRTC convention.
 const AUDIO_FRAME_MS: u32 = 10;
@@ -93,6 +94,10 @@ const LOGIN_ATTEMPTS: u32 = 5;
 /// Ceiling for the login backoff, so a misconfigured run fails in a readable
 /// time instead of doubling into the horizon.
 const MAX_LOGIN_BACKOFF: Duration = Duration::from_secs(60);
+/// What, typed at stdin, ends a run. Vim's `:q` spelling because that is the
+/// reflex a scrolling terminal tool invites; the bare forms are there because
+/// nobody should have to guess which one this accepts.
+const QUIT_COMMANDS: [&str; 4] = [":q", ":quit", "q", "quit"];
 /// Settle time after the warm-up messages, before any device joins the call.
 const WARMUP_SETTLE: Duration = Duration::from_secs(2);
 
@@ -185,6 +190,22 @@ struct Args {
     /// Seconds to keep publishing; 0 runs until Ctrl-C.
     #[arg(long, default_value_t = 0)]
     duration: u64,
+
+    /// How long the homeserver keeps each membership in the sticky map.
+    ///
+    /// Short here on purpose, against the library default of an hour. A run
+    /// that is killed rather than left cleanly (Ctrl-C mid-ramp, `kill -9`, a
+    /// panic) leaves its memberships standing until this elapses — the dead
+    /// man's switch does not clear them, because its delayed leave is a plain
+    /// event that never replaces the sticky entry. An hour of ghosts poisons
+    /// the room for the next attempt; two minutes does not.
+    ///
+    /// The cost is signalling: the heartbeat re-sends each membership once it
+    /// is halfway to expiring, so this many milliseconds means one extra send
+    /// per device every half of it. Keep it well above twice the heartbeat
+    /// interval (15s), or memberships lapse between beats.
+    #[arg(long, default_value_t = 120_000)]
+    sticky_duration_ms: u64,
 
     /// Publish the `m.rtc.slot` state event first. Needs the power level for
     /// it, and is unnecessary when a real client already opened the call.
@@ -297,15 +318,132 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     // so its membership expires through the dead man's switch instead of a
     // leave event; the device itself is still removed.
     let mut fleet = Fleet::new(&args);
+    let interrupted = spawn_interrupt_watch();
+    let stopped = stop_on_input(spawn_stdin_watch());
     let result = tokio::select! {
         result = fleet.run(&args, clip) => result,
-        _ = tokio::signal::ctrl_c() => {
-            println!("\ninterrupted; shutting down");
+        _ = interrupted => Ok(()),
+        _ = stopped => {
+            println!("stopping; leaving the call");
             Ok(())
         }
     };
     fleet.shutdown(&args).await;
     result
+}
+
+/// Stop the run on a line from stdin.
+///
+/// **This is the only reliable way to end a run**, because signals do not
+/// arrive in this process: SIGINT and SIGTERM are both ignored even with
+/// handlers installed, and only SIGKILL — which cannot be blocked — lands. That
+/// is not something this tool or the SDK sets up; the realistic culprit is
+/// libwebrtc, which spawns a large thread pool and is the one dependency here
+/// capable of masking signals process-wide. Until that is fixed upstream,
+/// Ctrl-C is not available and typing `:q` takes its place.
+///
+/// A plain OS thread doing a blocking read, rather than `tokio::io::stdin`: it
+/// needs no extra tokio features, and the thread simply parks in `read_line`
+/// for the life of the run.
+fn spawn_stdin_watch() -> tokio::sync::oneshot::Receiver<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        if read_quit_command() {
+            let _ = tx.send(());
+        }
+        // Otherwise stdin ended without asking us to stop (closed, or not a
+        // terminal: `< /dev/null`, a CI runner). Dropping `tx` unblocks the
+        // waiter, which `stop_on_input` reads as "no input to wait on" rather
+        // than as a stop.
+    });
+    rx
+}
+
+/// Read stdin until it asks us to quit; `false` if it ends without doing so.
+///
+/// A deliberate command rather than any keypress: this output scrolls
+/// continuously for the length of a run, and a stray Enter should not end one.
+/// Unrecognised lines are called out rather than ignored, so a typo does not
+/// look like the tool hanging.
+fn read_quit_command() -> bool {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        let command = line.trim();
+        if command.is_empty() {
+            continue;
+        }
+        if QUIT_COMMANDS
+            .iter()
+            .any(|quit| command.eq_ignore_ascii_case(quit))
+        {
+            return true;
+        }
+        eprintln!("unrecognised input {command:?}; type :q to stop the run");
+    }
+}
+
+/// Wait for [`spawn_stdin_watch`] to report a line, and never resolve if stdin
+/// cannot give us one.
+///
+/// A dropped sender means there is no usable stdin, which must not be mistaken
+/// for a stop request — that would end every run started without a terminal the
+/// instant it began.
+async fn stop_on_input(rx: tokio::sync::oneshot::Receiver<()>) {
+    if rx.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Watch for interrupts, and make the second one final.
+///
+/// The returned receiver fires on the first SIGINT or SIGTERM, which the run
+/// loop races to start a graceful shutdown. A second signal exits outright.
+///
+/// That escape hatch is not a nicety. A graceful shutdown is one leave and one
+/// logout per device, in sequence, and the logout goes through the SDK's
+/// default request config, which retries a 429 without limit — so on a
+/// homeserver this tool has just been hammering, "shutting down" can outlast
+/// anyone's patience with no way to abort but `kill -9` from another terminal.
+///
+/// Spawned with `tokio::spawn`, so it lives on the multithreaded runtime rather
+/// than the `LocalSet` every device's signalling shares. A saturated local
+/// thread therefore cannot delay it.
+///
+/// SIGTERM is handled alongside SIGINT so a plain `kill` behaves the same as
+/// Ctrl-C; nothing else in the process claims it.
+fn spawn_interrupt_watch() -> tokio::sync::oneshot::Receiver<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut interrupt =
+            signal(SignalKind::interrupt()).expect("SIGINT handler must be installable");
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("SIGTERM handler must be installable");
+
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        println!("\ninterrupted; leaving the call (interrupt again to exit immediately)");
+        let _ = tx.send(());
+
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        eprintln!(
+            "second interrupt; exiting without a clean leave. Memberships expire in \
+             --sticky-duration-ms; devices may need --purge-devices."
+        );
+        // 130 is the conventional "terminated by SIGINT" status.
+        std::process::exit(130);
+    });
+    rx
 }
 
 /// One decoded, looping clip shared by every device.
@@ -448,6 +586,7 @@ impl Fleet {
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
                     legacy_element_call: args.legacy_element_call,
+                    sticky_duration_ms: Some(args.sticky_duration_ms),
                     ..CallOptions::default()
                 },
             )
@@ -484,8 +623,8 @@ impl Fleet {
             "{} devices publishing; {}",
             args.devices,
             match deadline {
-                Some(_) => format!("stopping after {}s (Ctrl-C to stop early)", args.duration),
-                None => "Ctrl-C to stop".to_owned(),
+                Some(_) => format!("stopping after {}s (type :q to stop early)", args.duration),
+                None => "type :q to stop".to_owned(),
             }
         );
 

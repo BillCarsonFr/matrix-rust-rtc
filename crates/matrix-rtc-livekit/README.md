@@ -163,6 +163,14 @@ Notes:
 - **Devices are removed on exit** (a plain logout per device). A run killed
   with `kill -9` leaves them behind; `--purge-devices` deletes every device
   whose display name carries `--device-prefix` and exits.
+- **`--sticky-duration-ms` defaults to 2 minutes here, against the library's
+  one hour.** A run that is killed rather than left cleanly leaves its
+  memberships standing until this elapses: the dead man's switch does *not*
+  clear them, because its delayed leave is a plain event that never replaces
+  the sticky entry. An hour of ghost participants makes the next attempt
+  useless. The cost is one extra membership send per device every half of it,
+  and it must stay well above twice the 15 s heartbeat or memberships lapse
+  between beats.
 - **Scale is bounded by your machine, not the SFU** — see
   [How many devices?](#how-many-devices) below.
 - Devices join publish-only by default (`CallOptions::auto_subscribe = false`).
