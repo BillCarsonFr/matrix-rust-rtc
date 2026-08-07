@@ -64,19 +64,20 @@ use tokio::task::JoinHandle;
 
 use matrix_rtc_core::{
     EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, ReceivedEncryptionKey,
-    RtcIdentityMapper, RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
+    RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
     MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,
 };
 
-use crate::compat::{self, ElementCallDialect};
-use crate::identity::pseudonymous_identity;
+use crate::compat::{
+    self, ElementCallCompat, ElementCallDialect, ElementCallStateDialect, OutboundDialect,
+};
 use crate::matrix_bridge::{SdkCommandSender, run_sticky_bridge};
 use crate::session::LiveKitSession;
 use crate::transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
-use crate::{MediaKeyBridge, msc4195_key_provider};
+use crate::{MediaKeyBridge, TokenEndpoint, msc4195_key_provider};
 
 type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
 
@@ -147,21 +148,28 @@ pub struct CallOptions {
     /// [`Call::remote_track`] never produce anything. Only a load generator
     /// wants this.
     pub auto_subscribe: bool,
-    /// Also speak the pre-2026 Element Call dialect on the way out, for calls
-    /// with clients that have not caught up with the 2026 MSC4143 rewrite (the
-    /// JS SDK, and so Element Call).
+    /// Render this call for an older MatrixRTC generation, for interoperating
+    /// with Element Call builds that have not caught up with the 2026 MSC4143
+    /// rewrite.
     ///
-    /// A join stays MSC4143-valid — the legacy fields ride alongside. A leave
-    /// and a media key cannot: a leave becomes the legacy bare-sticky-key
-    /// content (Element Call has no `membership` field, and a padded spec leave
-    /// would read to it as still joined), and keys go out as
-    /// `io.element.call.encryption_keys` *instead of* the spec type, since a
-    /// to-device message has only one type. A call with this on therefore
-    /// exchanges keys with legacy peers and not with spec-current ones.
+    /// [`ElementCallCompat::StickyEvents`] keeps a join MSC4143-valid — the
+    /// legacy fields ride alongside. A leave and a media key cannot: a leave
+    /// becomes the legacy bare-sticky-key content (that generation has no
+    /// `membership` field, and a padded spec leave would read to it as still
+    /// joined), and keys go out as `io.element.call.encryption_keys` *instead of*
+    /// the spec type, since a to-device message has only one type. A call in that
+    /// mode therefore exchanges keys with legacy peers and not with spec-current
+    /// ones.
     ///
-    /// Reading the legacy dialect needs no flag and is always on. See
+    /// [`ElementCallCompat::StateEvents`] goes further and is not additive at
+    /// all: the membership moves to `org.matrix.msc3401.call.member` room state,
+    /// the SFU participant identity becomes the plain `{user}:{device}` string,
+    /// and the token comes from the pre-MSC4195 `/sfu/get` endpoint. Nothing
+    /// about such a call is visible to a spec-current peer.
+    ///
+    /// Reading the 2025 sticky dialect needs no flag and is always on. See
     /// [`crate::compat`], and delete all of it once Element Call catches up.
-    pub legacy_element_call: bool,
+    pub element_call_compat: ElementCallCompat,
 }
 
 impl Default for CallOptions {
@@ -175,7 +183,7 @@ impl Default for CallOptions {
             sticky_duration_ms: None,
             http: None,
             auto_subscribe: true,
-            legacy_element_call: false,
+            element_call_compat: ElementCallCompat::default(),
         }
     }
 }
@@ -249,30 +257,45 @@ impl Call {
         let room_id = room.room_id().to_string();
 
         // The manager plus the bridge feeding it peer memberships.
-        let command_sender = if options.legacy_element_call {
-            log::warn!(
-                "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
-                 go out as {} and will not reach spec-current peers",
-                options.slot_id,
-                compat::LEGACY_KEY_EVENT_TYPE,
-            );
-            SdkCommandSender::with_element_call_compat(
-                client.clone(),
-                ElementCallDialect::new(
+        let dialect = match options.element_call_compat {
+            ElementCallCompat::Off => OutboundDialect::None,
+            ElementCallCompat::StickyEvents => {
+                log::warn!(
+                    "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
+                     go out as {} and will not reach spec-current peers",
+                    options.slot_id,
+                    compat::LEGACY_KEY_EVENT_TYPE,
+                );
+                OutboundDialect::Sticky(ElementCallDialect::new(
                     user_id.clone(),
                     device_id.clone(),
                     options.slot_id.clone(),
-                ),
-            )
-        } else {
-            SdkCommandSender::new(client.clone())
+                ))
+            }
+            ElementCallCompat::StateEvents => {
+                log::warn!(
+                    "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
+                     membership goes out as {} room state, our SFU identity is the plain \
+                     {{user}}:{{device}} string, and the token comes from /sfu/get. Nothing about \
+                     this call is visible to a spec-current peer.",
+                    options.slot_id,
+                    compat::STATE_MEMBER_EVENT_TYPE,
+                );
+                OutboundDialect::State(ElementCallStateDialect::new(
+                    user_id.clone(),
+                    device_id.clone(),
+                    room_id.clone(),
+                    options.slot_id.clone(),
+                ))
+            }
         };
         let manager: Manager = Arc::new(Mutex::new(RtcSessionManager::with_command_sender(
-            Arc::new(command_sender),
+            Arc::new(SdkCommandSender::with_compat(client.clone(), dialect)),
         )));
         let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_sticky_bridge(
             room.clone(),
             manager.clone(),
+            options.element_call_compat.reads_state_membership(),
         )));
 
         // Frame encryption: a single shared KeyProvider handle feeds both the
@@ -294,13 +317,37 @@ impl Call {
         // type entirely, which ruma has no typed event for. Always registered:
         // reading the legacy dialect costs a string comparison and cannot
         // affect a spec-current call.
-        let legacy_key_handler =
-            client.event_handler_drop_guard(register_legacy_key_receiver(&client, key_tx));
+        let legacy_key_handler = client.event_handler_drop_guard(register_legacy_key_receiver(
+            &client,
+            key_tx,
+            options.element_call_compat,
+        ));
 
         // MSC4143 requires a fresh `member.id` on every join, so this must not
         // be derived from the (stable) user and device IDs.
-        let membership_id = generate_member_id();
-        let own_identity = pseudonymous_identity(&user_id, &device_id, &membership_id);
+        //
+        // The pre-sticky Element Call generation is the one exception, and it is
+        // not optional: there the member id *is* the legacy `membershipID`, which
+        // is also the SFU participant identity, and both are
+        // `{user}:{device}` by definition of that generation's authorisation
+        // service. Using a random id instead would leave our own state event —
+        // echoed back to us through sync — failing
+        // `JoinCondition::SupersededOwnParticipation`, which drops a candidate
+        // from our own device whose member id is not the one we joined with. We
+        // would mark ourselves departed on our own join.
+        //
+        // The cost is inherent to that generation rather than to this choice: a
+        // rejoin reuses the id, so the core cannot tell a stale participation from
+        // the current one, and two slots joined from one device would collide.
+        // That generation's SFU identity has no session component at all.
+        let identity_mapper = options.element_call_compat.identity_mapper();
+        let membership_id = match options.element_call_compat {
+            ElementCallCompat::StateEvents => {
+                compat::element_call_state::participant_identity(&user_id, &device_id)
+            }
+            _ => generate_member_id(),
+        };
+        let own_identity = identity_mapper(&user_id, &device_id, &membership_id);
 
         log::info!(
             "[{room_id}/{}] join: user={user_id} device={device_id} member={membership_id} \
@@ -335,10 +382,13 @@ impl Call {
         let memberships = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;
-            let identity_mapper: RtcIdentityMapper =
-                Arc::new(|user_id: &str, device_id: &str, member_id: &str| {
-                    pseudonymous_identity(user_id, device_id, member_id)
-                });
+            // The same `Arc` that produced `own_identity` above and that the
+            // media transport is given below. One value for all of them, so the
+            // four derivation sites cannot skew — a divergence there is not an
+            // error but a silence: peers sit in the roster with no media, their
+            // keys land under an identity the SFU never assigned, and nothing
+            // logs a problem.
+            let identity_mapper = identity_mapper.clone();
             // The mapper goes in *before* the signal handler. Identities are
             // derived at signal time, so a key signalled in between would be
             // imported under the fallback `user:device` identity — one the SFU
@@ -378,7 +428,17 @@ impl Call {
         };
         let transport = Arc::new(
             LiveKitMediaTransport::new(http, Arc::new(client.clone()), provider)
-                .with_auto_subscribe(options.auto_subscribe),
+                .with_auto_subscribe(options.auto_subscribe)
+                // The same mapper the core got, so our own identity, the peers'
+                // and the key ring's all agree.
+                .with_identity_mapper(identity_mapper.clone())
+                .with_token_endpoint(match options.element_call_compat {
+                    // Pre-MSC4195 `/sfu/get`, which is also where the unhashed
+                    // `{user}:{device}` identity above comes from — the two are
+                    // one decision, not two.
+                    ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+                    _ => TokenEndpoint::Msc4195,
+                }),
         );
         let ctx = ConnectionContext {
             room_id: room_id.clone(),
@@ -801,6 +861,7 @@ fn register_key_receiver(
 fn register_legacy_key_receiver(
     client: &Client,
     key_tx: UnboundedSender<ReceivedKey>,
+    compat: ElementCallCompat,
 ) -> matrix_sdk::event_handler::EventHandlerHandle {
     client.add_event_handler(
         move |event: Raw<AnyToDeviceEvent>, encryption_info: Option<EncryptionInfo>| {
@@ -823,19 +884,75 @@ fn register_legacy_key_receiver(
                     }
                 };
 
-                let Some(key) = compat::element_call::parse_key_message(&content) else {
+                // The sender is needed for the pre-sticky generation, whose key
+                // messages carry no `member` object at all and are bound to
+                // `{sender}:{content.device_id}` instead. Homeserver-stamped, so
+                // it is the one identity in the event worth trusting anyway.
+                let sender = match event.get_field::<String>("sender") {
+                    Ok(Some(sender)) => sender,
+                    _ => {
+                        log::warn!(
+                            "ignoring a {} to-device message with no sender",
+                            compat::LEGACY_KEY_EVENT_TYPE,
+                        );
+                        return;
+                    }
+                };
+
+                let Some(key) = compat::element_call::parse_key_message(&sender, &content) else {
                     log::warn!(
-                        "ignoring a {} to-device message missing a required field; that peer's \
-                         media will not decrypt",
+                        "ignoring a {} to-device message from {sender} missing a required field; \
+                         that peer's media will not decrypt",
                         compat::LEGACY_KEY_EVENT_TYPE,
                     );
                     return;
                 };
 
+                let origin = key_origin(encryption_info.as_ref());
+
+                // In the pre-sticky generation the `member.id` a key message
+                // carries is Element Call's own per-session UUID, and it appears
+                // in *no* field of the membership state event — so binding the
+                // key by it can never match anything, and the key sits buffered
+                // while that peer's media stays undecryptable. Observed exactly
+                // that: `key index 0 for member ef8adf45-… / No matching RTC
+                // membership … buffering`.
+                //
+                // Everything in that generation is keyed on `{user}:{device}` —
+                // the SFU identity, our translated `member_id`, and the
+                // `membershipID` — so bind on that instead. The device comes
+                // from the Olm decryption where possible, so both halves are
+                // authenticated rather than self-asserted.
+                let member_id = match compat {
+                    ElementCallCompat::StateEvents => {
+                        let device_id = match &origin {
+                            KeyOrigin::Encrypted {
+                                sender_device_id, ..
+                            } => sender_device_id.clone(),
+                            KeyOrigin::Cleartext => None,
+                        }
+                        .or_else(|| compat::element_call::claimed_key_device_id(&content));
+                        match device_id {
+                            Some(device_id) => compat::element_call_state::participant_identity(
+                                &sender, &device_id,
+                            ),
+                            None => {
+                                log::warn!(
+                                    "ignoring a {} to-device message from {sender}: no device to \
+                                     bind it to, so it could not be matched to a membership",
+                                    compat::LEGACY_KEY_EVENT_TYPE,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    _ => key.member_id,
+                };
+
                 let _ = key_tx.send(ReceivedKey {
-                    origin: key_origin(encryption_info.as_ref()),
+                    origin,
                     room_id: key.room_id,
-                    member_id: key.member_id,
+                    member_id,
                     key_index: key.key_index,
                     key_b64: key.key_b64,
                 });

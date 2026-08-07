@@ -52,6 +52,7 @@ use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
 use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::RoomId;
@@ -92,10 +93,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let livekit_service_url =
         env::var("LIVEKIT_SERVICE_URL").unwrap_or_else(|_| "http://localhost:6080".to_owned());
     let insecure_tls = env::var("INSECURE_TLS").is_ok();
-    // Set for a call shared with Element Call on the JS SDK: our membership then
-    // also carries the pre-2026 fields it needs, and our media key goes out
-    // under the to-device type it listens for (and only that one).
-    let legacy_element_call = env::var("LEGACY_ELEMENT_CALL").is_ok();
+    // Set for a call shared with Element Call on the JS SDK.
+    //
+    // `sticky` (or a bare value, for continuity with when this was a boolean):
+    // our membership also carries the pre-2026 fields it needs, and our media
+    // key goes out under the to-device type it listens for, and only that one.
+    //
+    // `state`: the generation before MSC4354, where membership is room state.
+    // Nothing about such a call is visible to a spec-current peer.
+    let element_call_compat = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
+        None => ElementCallCompat::Off,
+        Some("state") => ElementCallCompat::StateEvents,
+        Some(_) => ElementCallCompat::StickyEvents,
+    };
     let record_secs: u64 = env::var("RECORD_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -194,7 +204,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             slot_id,
             livekit_service_url_fallback: Some(livekit_service_url),
             http: Some(http),
-            legacy_element_call,
+            element_call_compat,
             ..CallOptions::default()
         },
     )

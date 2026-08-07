@@ -202,7 +202,11 @@ fn infer_membership(object: &mut Map<String, Value>) {
 }
 
 /// Whether this content states `member.membership = "leave"`.
-fn is_leave(content: &Value) -> bool {
+///
+/// Shared with [`super::element_call_state`]: both legacy generations signal a
+/// departure by replacing the content wholesale, so both need to recognise the
+/// spec leave they are translating *from*.
+pub(crate) fn is_leave(content: &Value) -> bool {
     content
         .get("member")
         .and_then(|member| member.get("membership"))
@@ -232,6 +236,23 @@ pub fn claimed_device_id(content: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The device a legacy key message claims to come from, under either spelling.
+///
+/// A fallback for when Olm decryption produced no sending device. Self-asserted,
+/// so it is never preferred over an authenticated one.
+pub fn claimed_key_device_id(content: &Value) -> Option<String> {
+    content
+        .get("device_id")
+        .or_else(|| {
+            content
+                .get("member")
+                .and_then(|member| member.get("claimed_device_id"))
+        })?
+        .as_str()
+        .filter(|device_id| !device_id.is_empty())
+        .map(str::to_owned)
+}
+
 /// A media key lifted out of a legacy `io.element.call.encryption_keys`
 /// to-device message.
 ///
@@ -256,14 +277,41 @@ pub struct LegacyKeyMessage {
 /// Returns `None` when a required field is missing, which for this message
 /// means it cannot be used at all.
 ///
+/// `sender` is the to-device event's sender, needed only for the pre-sticky
+/// generation: that one has no `member` object, and binds the key to
+/// `{sender}:{content.device_id}` — the same string
+/// [`element_call_state::participant_identity`](super::element_call_state::participant_identity)
+/// builds, and the same one the inbound state translation uses as `member.id`. If
+/// the two ever diverged the key would be filed against a membership that does
+/// not exist, so they share the one function rather than the one format string.
+///
+/// Both `keys` spellings are accepted: an object (2025) or an array of them
+/// (pre-sticky), in which case the **highest** index wins, that being the most
+/// recent key the sender is offering.
+///
 /// Note the key material is 16 bytes here where MSC4143 uses 32. Nothing needs
 /// to convert it: both sides feed the raw bytes to the same LiveKit HKDF, so
 /// they only have to agree, and the core already accepts either length.
-pub fn parse_key_message(content: &Value) -> Option<LegacyKeyMessage> {
-    let keys = content.get("keys")?;
+pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessage> {
+    let keys = match content.get("keys")? {
+        Value::Array(entries) => entries
+            .iter()
+            .filter(|entry| entry.get("key").is_some())
+            .max_by_key(|entry| entry.get("index").and_then(Value::as_u64).unwrap_or(0))?,
+        object => object,
+    };
+
+    let member_id = match content.get("member").and_then(|member| member.get("id")) {
+        Some(Value::String(member_id)) if !member_id.is_empty() => member_id.clone(),
+        _ => {
+            let device_id = content.get("device_id")?.as_str()?;
+            super::element_call_state::participant_identity(sender, device_id)
+        }
+    };
+
     Some(LegacyKeyMessage {
         room_id: content.get("room_id")?.as_str()?.to_owned(),
-        member_id: content.get("member")?.get("id")?.as_str()?.to_owned(),
+        member_id,
         key_b64: keys.get("key")?.as_str()?.to_owned(),
         key_index: u8::try_from(keys.get("index")?.as_u64()?).ok()?,
     })
@@ -272,7 +320,7 @@ pub fn parse_key_message(content: &Value) -> Option<LegacyKeyMessage> {
 /// The outbound half: rewrites what we send so a pre-2026 Element Call can read
 /// it.
 ///
-/// Opt-in per call ([`CallOptions::legacy_element_call`](crate::CallOptions::legacy_element_call)),
+/// Opt-in per call ([`CallOptions::element_call_compat`](crate::CallOptions::element_call_compat)),
 /// because unlike the inbound normalisation this changes what every peer sees.
 ///
 /// Member events are rewritten **additively** — the MSC4143 fields all stay put
@@ -389,49 +437,89 @@ impl ElementCallDialect {
         message_type: &str,
         content: &Value,
     ) -> Option<(String, Value)> {
-        if !KEY_EVENT_TYPES.contains(&message_type) {
-            return None;
-        }
+        rewrite_key_message(&self.own_device_id, &self.slot_id, message_type, content)
+    }
+}
 
-        let media_key = content.get("media_key")?;
-        let (application, call_id) = self.legacy_session();
-
-        let legacy = json!({
-            "keys": {
-                "index": media_key.get("index")?,
-                "key": media_key.get("key")?,
-            },
-            "member": {
-                "id": content.get("member_id")?,
-                // Self-asserted, and the only device id Element Call can work
-                // with — it cannot read decryption metadata.
-                "claimed_device_id": self.own_device_id,
-            },
-            "room_id": content.get("room_id")?,
-            "sent_ts": now_ms(),
-            "session": {
-                "application": application,
-                "call_id": call_id,
-                "scope": "m.room",
-            },
-        });
-
-        Some((LEGACY_KEY_EVENT_TYPE.to_owned(), legacy))
+/// Translate an outbound media-key to-device message into the legacy type and
+/// shape.
+///
+/// Returns `None` for any other message type, which the caller then sends
+/// untouched.
+///
+/// Shared verbatim by both legacy generations. They differ only in what
+/// `member_id` the core happens to be carrying, and in the state dialect that id
+/// is already the legacy `membershipID`, so it comes out correct with no special
+/// case.
+///
+/// `keys` is an **object**, for both. An earlier version of this made it an
+/// array for the pre-sticky dialect on the assumption that the two generations
+/// disagreed about it; a captured key message from a real pre-sticky Element Call
+/// settled it — that build sends `keys` as an object with a `member.id` beside
+/// it, exactly like its successor. The key-message format simply did not change
+/// when the membership carrier did.
+///
+/// The remaining fields are the union of both observed shapes — a top-level
+/// `device_id` and `call_id` beside the `member` and `session` objects. Those do
+/// not collide, so a reader of either generation finds what it needs and ignores
+/// the rest.
+pub fn rewrite_key_message(
+    own_device_id: &str,
+    slot_id: &str,
+    message_type: &str,
+    content: &Value,
+) -> Option<(String, Value)> {
+    if !KEY_EVENT_TYPES.contains(&message_type) {
+        return None;
     }
 
-    /// Reconstruct the legacy `session` identifiers from the slot id.
-    ///
-    /// MSC4143 folded the old `{application, call_id, scope}` triple into a
-    /// single slot id of the form `<application>#<call_id>`, where the sentinel
-    /// `ROOM` is the room-scoped session that used to be an empty `call_id`.
-    fn legacy_session(&self) -> (&str, &str) {
-        match self.slot_id.split_once('#') {
-            Some((application, "ROOM")) => (application, ""),
-            Some((application, call_id)) => (application, call_id),
-            // No separator: treat the whole thing as the application, which is
-            // the room-scoped case again.
-            None => (self.slot_id.as_str(), ""),
-        }
+    let media_key = content.get("media_key")?;
+    let index = media_key.get("index")?;
+    let key = media_key.get("key")?;
+    let (application, call_id) = legacy_session(slot_id);
+
+    let legacy = json!({
+        "keys": { "index": index, "key": key },
+        "member": {
+            "id": content.get("member_id")?,
+            // Self-asserted, and the only device id Element Call can work
+            // with — it cannot read decryption metadata.
+            "claimed_device_id": own_device_id,
+        },
+        // The pre-sticky generation has no `member` object: it binds the key to
+        // `{sender}:{content.device_id}` and looks for the device here.
+        "device_id": own_device_id,
+        "room_id": content.get("room_id")?,
+        "call_id": call_id,
+        "sent_ts": now_ms(),
+        "session": {
+            "application": application,
+            "call_id": call_id,
+            "scope": "m.room",
+        },
+    });
+
+    Some((LEGACY_KEY_EVENT_TYPE.to_owned(), legacy))
+}
+
+/// Reconstruct the legacy `{application, call_id}` pair from a slot id.
+///
+/// MSC4143 folded the old `{application, call_id, scope}` triple into a single
+/// slot id of the form `<application>#<call_id>`, where the sentinel `ROOM` is
+/// the room-scoped session that used to be an empty `call_id`.
+///
+/// A free function, and shared with [`super::element_call_state`], because that
+/// generation needs the same split in three places — the member content, the
+/// state key and the key message's `session` object — and a second copy of the
+/// sentinel rule is a second chance to get it wrong. Getting it wrong puts a
+/// peer in a session we are not in, and the roster is silently empty.
+pub(crate) fn legacy_session(slot_id: &str) -> (&str, &str) {
+    match slot_id.split_once('#') {
+        Some((application, "ROOM")) => (application, ""),
+        Some((application, call_id)) => (application, call_id),
+        // No separator: treat the whole thing as the application, which is
+        // the room-scoped case again.
+        None => (slot_id, ""),
     }
 }
 
@@ -575,7 +663,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            parse_key_message(&content),
+            parse_key_message("@alice:example.io", &content),
             Some(LegacyKeyMessage {
                 room_id: "!room:example.io".to_owned(),
                 member_id: "526e16aa".to_owned(),
@@ -588,7 +676,58 @@ mod tests {
     #[test]
     fn a_key_message_missing_a_field_is_rejected() {
         let content = json!({ "keys": { "index": 0 }, "room_id": "!room:example.io" });
-        assert_eq!(parse_key_message(&content), None);
+        assert_eq!(parse_key_message("@alice:example.io", &content), None);
+    }
+
+    /// The pre-sticky generation's shape: `keys` is an array and there is no
+    /// `member` object, so the member id has to be built from the sender and the
+    /// device the content states.
+    #[test]
+    fn a_pre_sticky_key_message_binds_to_the_sender_and_device() {
+        let content = json!({
+            "keys": [
+                { "index": 0, "key": "b2xkZXIga2V5IG1hdGVyaWFs" },
+                { "index": 2, "key": "36/SXoTd/H/DnPU1NNzS1g==" },
+                { "index": 1, "key": "bWlkZGxlIGtleSBtYXRlcmlhbA==" },
+            ],
+            "device_id": "V5cP8FErcB",
+            "call_id": "",
+            "room_id": "!room:example.io",
+            "sent_ts": 1786096055586u64,
+        });
+
+        assert_eq!(
+            parse_key_message("@alice:example.io", &content),
+            Some(LegacyKeyMessage {
+                room_id: "!room:example.io".to_owned(),
+                // The same string the inbound state translation uses as
+                // `member.id`; if these diverged the key would be filed against
+                // a membership that does not exist.
+                member_id: "@alice:example.io:V5cP8FErcB".to_owned(),
+                // The highest index wins: that is the most recent key on offer.
+                key_b64: "36/SXoTd/H/DnPU1NNzS1g==".to_owned(),
+                key_index: 2,
+            })
+        );
+    }
+
+    /// An explicit `member.id` always wins over the sender-derived fallback,
+    /// even when the content also states a device.
+    #[test]
+    fn an_explicit_member_id_beats_the_fallback() {
+        let content = json!({
+            "keys": { "index": 0, "key": "36/SXoTd/H/DnPU1NNzS1g==" },
+            "member": { "id": "526e16aa" },
+            "device_id": "V5cP8FErcB",
+            "room_id": "!room:example.io",
+        });
+
+        assert_eq!(
+            parse_key_message("@alice:example.io", &content)
+                .expect("parses")
+                .member_id,
+            "526e16aa"
+        );
     }
 
     fn dialect() -> ElementCallDialect {
@@ -757,8 +896,9 @@ mod tests {
 
     #[test]
     fn a_named_call_id_survives_the_slot_id_split() {
-        let named = ElementCallDialect::new("@bob:example.io", "BOBDEVICE", "m.call#standup");
-        assert_eq!(named.legacy_session(), ("m.call", "standup"));
-        assert_eq!(dialect().legacy_session(), ("m.call", ""));
+        assert_eq!(legacy_session("m.call#standup"), ("m.call", "standup"));
+        assert_eq!(legacy_session("m.call#ROOM"), ("m.call", ""));
+        // No separator at all is the room-scoped case again.
+        assert_eq!(legacy_session("m.call"), ("m.call", ""));
     }
 }

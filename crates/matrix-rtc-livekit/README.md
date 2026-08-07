@@ -188,14 +188,16 @@ Notes:
   on a random per-join `member_id`, the MSC4195 identity hashes
   `(user, device, member_id)`, and the core distributes media keys to other
   devices of our own user like any other peer.
-- **Sharing the call with Element Call** (the JS SDK, which still speaks the
-  pre-2026 MatrixRTC format) needs `--legacy-element-call` /
-  `LEGACY_ELEMENT_CALL=1`, plus `--open-slot`: that client publishes no
+- **Sharing the call with Element Call** (the JS SDK, which still speaks a
+  pre-2026 MatrixRTC format) needs `--element-call-compat sticky` /
+  `LEGACY_ELEMENT_CALL=sticky`, plus `--open-slot`: that client publishes no
   `m.rtc.slot`, and a slot nobody opened reads as closed, which projects every
   member out of the call. Media keys then go out under the legacy to-device type
   *instead of* the spec one, so such a run exchanges keys with Element Call or
-  with spec-current peers, never both. Reading the old format needs no flag.
-  See [`compat`](src/compat/).
+  with spec-current peers, never both. Reading that format needs no flag.
+  For a build older still — membership as `org.matrix.msc3401.call.member` room
+  state — use `state` instead of `sticky`, and leave `--open-slot` off: that
+  generation has no slot concept. See [`compat`](src/compat/).
 
 Homeservers with rate limiting may reject a burst of logins or messages;
 `--login-delay-ms` and `--ramp-ms` space them out. **Past 3 devices this is not
@@ -271,7 +273,7 @@ hit deliberately:
 | **`call`** *(feature `matrix-sdk`)* | The high-level facade: `Call::join`/`Call::leave`, `open_slot`, LiveKit transport discovery (MSC4143 `GET /rtc/transports` with fallback). Start here. |
 | **`matrix_bridge`** *(feature `matrix-sdk`)* | The layer under `call`: `SdkCommandSender` turns core commands (sticky membership events, delayed leaves, slot state, encrypted to-device keys) into Client-Server API calls; `run_sticky_bridge` feeds live sticky events and room state back into the core. |
 | **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through the `OpenIdTokenSource` trait, so this layer is not hard-wired to a particular Matrix SDK. |
-| **`compat`** | Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite (today: Element Call on the JS SDK). Two JSON funnels at the crate's edge, so no legacy field reaches the core — reading the old format is always on, writing it is opt-in via `CallOptions::legacy_element_call`. Scaffolding, to be deleted once Element Call catches up. |
+| **`compat`** | Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite (today: Element Call on the JS SDK), in two generations selected by `CallOptions::element_call_compat`. `StickyEvents` is the 2025 format — JSON funnels at the crate's edge, so no legacy field reaches the core; reading it is always on, writing it is opt-in. `StateEvents` is the format before MSC4354, with membership as `org.matrix.msc3401.call.member` room state, plain `{user}:{device}` SFU identities and the `/sfu/get` token endpoint; opt-in in both directions, and visible to nobody but that generation. Scaffolding, to be deleted once Element Call catches up. |
 | **`identity`** | The MSC4195 hash derivations (`livekit_alias`, pseudonymous participant identity) used to map keys onto LiveKit participants. |
 | **`session`** | Connects to the SFU and exposes the LiveKit room + event stream. |
 | **`keys`** | Bridges `matrix-rtc-core` media keys into the LiveKit `KeyProvider` (`MediaKeyBridge`), keyed by pseudonymous identity — this is what makes frame E2EE per-participant. |

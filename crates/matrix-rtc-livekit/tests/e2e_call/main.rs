@@ -66,11 +66,13 @@ use matrix_sdk::ruma::events::InitialStateEvent;
 use matrix_sdk::ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
+use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 
 use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
 use matrix_rtc_media::{
     I420Buffer, MediaConstraints, MediaStreamKind, Participant as MediaParticipant, PublishOptions,
@@ -155,6 +157,20 @@ enum RunMode {
     /// (matrix-rtc-core) and `a_rejoin_distributes_keys_without_new_sticky_events`
     /// (matrix-rtc-ffi).
     RejoinSameProcess,
+    /// Single focus, but both participants speak the **pre-sticky Element Call**
+    /// dialect: membership as `org.matrix.msc3401.call.member` room state, plain
+    /// `{user}:{device}` SFU identities, and the `/sfu/get` token endpoint.
+    ///
+    /// The highest-value check of that path available without an actual Element
+    /// Call, because in this mode both halves of the protocol are ours: it
+    /// exercises the state-event write, the delayed *state* event and its
+    /// cancellation, the `{}` leave, the unhashed identity end to end through
+    /// frame decryption, and the legacy key exchange.
+    ///
+    /// Note no slot is opened: that generation has no slot concept, so the bridge
+    /// leaves the condition unenforced rather than reporting an empty (all-closed)
+    /// room. See `matrix_rtc_livekit::compat`.
+    LegacyStateEvents,
 }
 
 /// Use `ALICE`/`BOB` (+`_PW`) when supplied (long-lived stacks with closed
@@ -236,6 +252,22 @@ async fn create_encrypted_room(
 ) -> Result<OwnedRoomId, Box<dyn Error>> {
     let mut request = CreateRoomRequest::new();
     request.invite = vec![invitee.to_owned()];
+    // `org.matrix.msc3401.call.member` is a *state* event, so `state_default`
+    // (50) gates it and only the room creator could publish a membership — the
+    // invitee, at PL 0, would fail their join with `M_FORBIDDEN`. Real Element
+    // Call rooms ship exactly this override, which is why nobody hits it there.
+    // Harmless for the sticky modes, which never send the type at all.
+    //
+    // Raw JSON rather than the typed content: this replaces the homeserver's
+    // whole default `events` map, which is fine for a throwaway test room (alice
+    // is the PL 100 creator and nobody demotes anyone), and it keeps the test off
+    // a ruma struct whose shape is not the point of this test.
+    request.power_level_content_override = Some(
+        Raw::new(&serde_json::json!({
+            "events": { matrix_rtc_livekit::compat::STATE_MEMBER_EVENT_TYPE: 0 },
+        }))?
+        .cast_unchecked(),
+    );
     request.initial_state = vec![
         InitialStateEvent::with_empty_state_key(RoomHistoryVisibilityEventContent::new(
             HistoryVisibility::Shared,
@@ -257,9 +289,10 @@ async fn join_call(
     room: matrix_sdk::Room,
     user: &str,
     livekit_service_url: &str,
+    compat: ElementCallCompat,
 ) -> Result<Participant, Box<dyn Error>> {
     let SyncedClient { client: _, sync } = synced;
-    let call = open_call(cfg, &room, user, livekit_service_url).await?;
+    let call = open_call(cfg, &room, user, livekit_service_url, compat).await?;
     Ok(Participant { call, _sync: sync })
 }
 
@@ -270,6 +303,7 @@ async fn open_call(
     room: &matrix_sdk::Room,
     user: &str,
     livekit_service_url: &str,
+    compat: ElementCallCompat,
 ) -> Result<Call, Box<dyn Error>> {
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(cfg.insecure_tls)
@@ -280,6 +314,7 @@ async fn open_call(
             slot_id: cfg.slot_id.clone(),
             livekit_service_url_fallback: Some(livekit_service_url.to_owned()),
             http: Some(http),
+            element_call_compat: compat,
             ..CallOptions::default()
         },
     )
@@ -382,6 +417,12 @@ fn e2e_call_rejoin_in_the_same_process() {
     harness(RunMode::RejoinSameProcess);
 }
 
+#[test]
+#[ignore = "requires the demo/backend docker stack (make backend-up)"]
+fn e2e_call_two_clients_pre_sticky_element_call() {
+    harness(RunMode::LegacyStateEvents);
+}
+
 /// Process-wide one-time setup, safe to call from every test in this binary.
 fn init_test_process() {
     // The dependency tree enables both rustls crypto backends (`ring` via
@@ -440,35 +481,57 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     wait_for_joined_members(&alice_room, 2, "alice").await?;
     wait_for_joined_members(&bob_room, 2, "bob").await?;
 
+    let compat = match mode {
+        RunMode::LegacyStateEvents => ElementCallCompat::StateEvents,
+        _ => ElementCallCompat::Off,
+    };
+
     // 4. Alice (the room creator, so the only one with the power level for it)
     //    opens the slot. Without an open `m.rtc.slot` in room state, MSC4143
     //    says no member of it counts as joined.
-    open_slot(
-        &alice.client,
-        room_id.as_str(),
-        &cfg.slot_id,
-        "m.call",
-        Some(SlotEncryption {
-            encryption_type: "m.per_member".to_owned(),
-            extra: Default::default(),
-        }),
-    )
-    .await?;
-    println!("[alice] opened slot {}", cfg.slot_id);
+    //
+    //    Skipped in the pre-sticky dialect, which has no slot concept at all:
+    //    opening one there would be a claim about a room that generation of
+    //    Element Call never makes, and the bridge leaves the slot condition
+    //    unenforced in that mode anyway.
+    if compat != ElementCallCompat::StateEvents {
+        open_slot(
+            &alice.client,
+            room_id.as_str(),
+            &cfg.slot_id,
+            "m.call",
+            Some(SlotEncryption {
+                encryption_type: "m.per_member".to_owned(),
+                extra: Default::default(),
+            }),
+        )
+        .await?;
+        println!("[alice] opened slot {}", cfg.slot_id);
+    }
 
     // 5. Now both join the call (membership stickies + key exchange + SFU
     //    connect, all through the facade). In two-foci mode each participant
     //    publishes on their own SFU; the engines then cross-connect to the
     //    peer's focus for subscribing (MSC4195 multi-SFU).
     let bob_url = match mode {
-        RunMode::SingleFocus | RunMode::RejoinSameProcess => cfg.livekit_service_url.clone(),
+        RunMode::SingleFocus | RunMode::RejoinSameProcess | RunMode::LegacyStateEvents => {
+            cfg.livekit_service_url.clone()
+        }
         RunMode::TwoFoci => cfg.livekit_service_url_2.clone(),
     };
     let alice_url = cfg.livekit_service_url.clone();
     // Kept so bob can redial on the same room handle after hanging up.
     let bob_room_again = bob_room.clone();
-    let alice = join_call(&cfg, alice, alice_room, &alice_creds.user, &alice_url).await?;
-    let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &bob_url).await?;
+    let alice = join_call(
+        &cfg,
+        alice,
+        alice_room,
+        &alice_creds.user,
+        &alice_url,
+        compat,
+    )
+    .await?;
+    let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &bob_url, compat).await?;
 
     // Signalling proof: each side discovers the other's membership
     // via stickies (own + peer == 2).
@@ -489,7 +552,7 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     let mut _bob_tone = None;
     let mut _alice_video = None;
     let (tone_ok, reverse_tone_ok, video_ok, constraints_ok) = match mode {
-        RunMode::SingleFocus | RunMode::RejoinSameProcess => (
+        RunMode::SingleFocus | RunMode::RejoinSameProcess | RunMode::LegacyStateEvents => (
             record_and_verify_tone(&mut bob.call, "first-call").await?,
             true,
             true,
@@ -538,7 +601,7 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
         first_call.leave().await?;
 
         let mut second = Participant {
-            call: open_call(&cfg, &bob_room_again, &bob_creds.user, &bob_url).await?,
+            call: open_call(&cfg, &bob_room_again, &bob_creds.user, &bob_url, compat).await?,
             _sync,
         };
         if !wait_for_members(&second.call, 2, "bob-redial").await {
