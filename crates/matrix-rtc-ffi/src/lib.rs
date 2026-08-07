@@ -22,9 +22,9 @@
 //! types and binding-tooling concerns.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::watch;
 
 use matrix_rtc_core::{
@@ -220,11 +220,13 @@ pub struct JoinedMembership {
 }
 #[derive(uniffi::Object)]
 pub struct RtcSessionManagerHandle {
-    /// `Arc` so a heartbeat driver can hold a `Weak` to it without keeping the
-    /// manager alive past the handle.
-    inner: Arc<Mutex<RtcSessionManager<FfiCommandSender>>>,
+    /// An async mutex because every entry point is async and holds it across
+    /// awaits into the host. `Arc` so a heartbeat driver can hold a `Weak` to it
+    /// without keeping the manager alive past the handle.
+    inner: Arc<TokioMutex<RtcSessionManager<FfiCommandSender>>>,
     /// One driver per joined session, keyed by `(room_id, slot_id)`. Dropping
-    /// the entry stops its thread.
+    /// the entry stops its task. A `std::sync::Mutex` on purpose: it is only
+    /// ever held for a map insert or remove, never across an await.
     heartbeats: Mutex<HashMap<(String, String), HeartbeatDriver>>,
 }
 
@@ -234,30 +236,25 @@ pub struct RtcSessionManagerHandle {
 /// (the manager was busy) or one slow round trip cannot let the switch fire.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Owns the thread that drives one session's keep-alive.
-///
-/// A plain thread rather than a `tokio::spawn`: the beat needs `&mut` on the
-/// manager across an await, so its future holds a `std::sync::MutexGuard` and is
-/// therefore `!Send`. Blocking on it from a dedicated thread sidesteps that,
-/// and sleeping on the channel means a stop takes effect immediately instead of
-/// at the end of the current interval.
+/// Owns the task that drives one session's keep-alive.
 struct HeartbeatDriver {
-    /// Dropped to ask the thread to stop; it observes the disconnect.
-    _stop: mpsc::Sender<()>,
+    /// Dropped to ask the task to stop; it observes the closed channel.
+    _stop: tokio::sync::mpsc::Sender<()>,
 }
 
 /// Runs one session's keep-alive until the session ends or the handle goes away.
-fn run_heartbeat(
-    manager: Weak<Mutex<RtcSessionManager<FfiCommandSender>>>,
+async fn run_heartbeat(
+    manager: Weak<TokioMutex<RtcSessionManager<FfiCommandSender>>>,
     room_id: String,
     slot_id: String,
-    stop: mpsc::Receiver<()>,
+    mut stop: tokio::sync::mpsc::Receiver<()>,
 ) {
     loop {
-        match stop.recv_timeout(HEARTBEAT_INTERVAL) {
-            // The driver was dropped (leave, rejoin, or the handle died).
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        tokio::select! {
+            // The driver was dropped (leave, rejoin, or the handle died), so a
+            // stop takes effect at once rather than at the end of the interval.
+            _ = stop.recv() => break,
+            _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
         }
 
         let Some(manager) = manager.upgrade() else {
@@ -265,30 +262,16 @@ fn run_heartbeat(
             break;
         };
 
-        // Holding the guard across the await is the point: `heartbeat` needs
-        // `&mut` on the manager for its whole duration, and the manager is
-        // behind a `std::sync::Mutex` because the sync FFI entry points share
-        // it — an async mutex is not an option. Safe because this future is
-        // driven by `block_on` on this dedicated thread and never spawned, so
-        // it is never required to be `Send`.
-        #[allow(clippy::await_holding_lock)]
-        let still_joined = crate::runtime::block_on(async {
-            let mut guard = match manager.try_lock() {
-                Ok(guard) => guard,
-                // An FFI call holds the manager. Skip rather than queue behind
-                // it: the next tick is 10 s away and the switch has 30 s.
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    log::debug!("[{room_id}/{slot_id}] heartbeat: manager busy, skipping a tick");
-                    return true;
-                }
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    log::error!("[{room_id}/{slot_id}] heartbeat: recovering a poisoned manager");
-                    manager.clear_poison();
-                    poisoned.into_inner()
-                }
-            };
-            guard.heartbeat(&room_id, &slot_id).await
-        });
+        // Skip rather than queue behind an in-flight FFI call: the next tick is
+        // 10 s away and the dead man's switch has 30 s, so waiting our turn
+        // behind a slow host would only make the beat later than it needs to be.
+        let still_joined = match manager.try_lock() {
+            Ok(mut guard) => guard.heartbeat(&room_id, &slot_id).await,
+            Err(_) => {
+                log::debug!("[{room_id}/{slot_id}] heartbeat: manager busy, skipping a tick");
+                true
+            }
+        };
 
         // `false` means the session is gone or has left — `leave` takes the
         // membership machine, so a beat racing a leave is a no-op and lands
@@ -310,12 +293,12 @@ pub struct MembershipSnapshotSubscription {
     state: Mutex<SubscriptionState>,
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl RtcSessionManagerHandle {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(Mutex::new(RtcSessionManager::new())),
+            inner: Arc::new(TokioMutex::new(RtcSessionManager::new())),
             heartbeats: Mutex::new(HashMap::new()),
         })
     }
@@ -328,13 +311,13 @@ impl RtcSessionManagerHandle {
     ///
     /// # Arguments
     /// * `callback` - Native implementation of CommandSenderCallback
-    pub fn set_command_sender(
+    pub async fn set_command_sender(
         &self,
-        callback: Box<dyn CommandSenderCallback>,
+        callback: Arc<dyn CommandSenderCallback>,
     ) -> Result<(), MatrixRtcFfiError> {
         log::info!("manager: command sender installed");
-        let command_sender = FfiCommandSender::new(Arc::from(callback));
-        let mut manager = lock_mutex(&self.inner)?;
+        let command_sender = FfiCommandSender::new(callback);
+        let mut manager = self.inner.lock().await;
         manager.set_command_sender(command_sender);
         Ok(())
     }
@@ -354,7 +337,7 @@ impl RtcSessionManagerHandle {
     /// the room, and again whenever it changes. It is the only way membership
     /// reaches the core, and safe to call as often as you like — re-asserting
     /// the full state is also how you resynchronise after a reconnect.
-    pub fn set_current_sticky_state(
+    pub async fn set_current_sticky_state(
         &self,
         room_id: String,
         events: Vec<StickyEvent>,
@@ -366,13 +349,11 @@ impl RtcSessionManagerHandle {
         );
         trace_sticky_events("current", &events);
 
-        let mut manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager
-                .set_current_sticky_state(&room_id, to_core_events(events))
-                .await
-                .map_err(map_conversion_error)
-        })
+        let mut manager = self.inner.lock().await;
+        manager
+            .set_current_sticky_state(&room_id, to_core_events(events))
+            .await
+            .map_err(map_conversion_error)
     }
 
     /// Applies a room's complete `m.rtc.slot` state.
@@ -381,7 +362,7 @@ impl RtcSessionManagerHandle {
     /// room; until then it cannot be evaluated and is not enforced. Any slot in
     /// the room not present in `slots` is treated as closed, so always pass the
     /// full set — an empty list included.
-    pub fn on_room_slots_received(
+    pub async fn on_room_slots_received(
         &self,
         room_id: String,
         slots: Vec<SlotEvent>,
@@ -397,18 +378,16 @@ impl RtcSessionManagerHandle {
             .collect::<Result<Vec<_>, _>>()
             .inspect_err(|err| log::warn!("manager: [{room_id}] rejected a slot event: {err}"))?;
 
-        let mut manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager.on_room_slots_received(&room_id, mapped).await;
-            Ok(())
-        })
+        let mut manager = self.inner.lock().await;
+        manager.on_room_slots_received(&room_id, mapped).await;
+        Ok(())
     }
 
     /// Sets the users currently joined to a room.
     ///
     /// MSC4143 only counts a member event while its sender is still joined to
     /// the room; until this is called that condition is not enforced.
-    pub fn on_room_members_received(
+    pub async fn on_room_members_received(
         &self,
         room_id: String,
         joined_user_ids: Vec<String>,
@@ -419,13 +398,11 @@ impl RtcSessionManagerHandle {
         );
         log::trace!("manager: [{room_id}] joined users: {joined_user_ids:?}");
 
-        let mut manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager
-                .on_room_members_received(&room_id, joined_user_ids)
-                .await;
-            Ok(())
-        })
+        let mut manager = self.inner.lock().await;
+        manager
+            .on_room_members_received(&room_id, joined_user_ids)
+            .await;
+        Ok(())
     }
 
     /// Reports whether a room is end-to-end encrypted.
@@ -433,26 +410,24 @@ impl RtcSessionManagerHandle {
     /// MSC4143 requires RTC encryption in encrypted rooms and forbids it
     /// elsewhere, so this changes how the room's slots resolve and whether
     /// cleartext member events count.
-    pub fn on_room_encryption_received(
+    pub async fn on_room_encryption_received(
         &self,
         room_id: String,
         encrypted: bool,
     ) -> Result<(), MatrixRtcFfiError> {
         log::info!("manager: [{room_id}] room encryption in: encrypted={encrypted}");
 
-        let mut manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager
-                .on_room_encryption_received(&room_id, encrypted)
-                .await;
-            Ok(())
-        })
+        let mut manager = self.inner.lock().await;
+        manager
+            .on_room_encryption_received(&room_id, encrypted)
+            .await;
+        Ok(())
     }
 
     /// Feeds a decrypted `m.rtc.encryption_key` to-device message to every
     /// session of its room. Call for each such message the host's sync
     /// delivers; without it peers' media never becomes decryptable.
-    pub fn receive_encryption_key(
+    pub async fn receive_encryption_key(
         &self,
         key: FfiReceivedEncryptionKey,
     ) -> Result<(), MatrixRtcFfiError> {
@@ -471,16 +446,14 @@ impl RtcSessionManagerHandle {
         );
 
         let received = key.into_core()?;
-        let manager = lock_mutex(&self.inner)?;
-        crate::runtime::block_on(async {
-            manager
-                .receive_encryption_key(received)
-                .await
-                .map_err(|error| {
-                    log::warn!("manager: encryption key rejected: {error}");
-                    MatrixRtcFfiError::InvalidInput(error.to_string())
-                })
-        })
+        let manager = self.inner.lock().await;
+        manager
+            .receive_encryption_key(received)
+            .await
+            .map_err(|error| {
+                log::warn!("manager: encryption key rejected: {error}");
+                MatrixRtcFfiError::InvalidInput(error.to_string())
+            })
     }
 
     /// A JSON dump of everything the manager and its sessions currently
@@ -489,22 +462,22 @@ impl RtcSessionManagerHandle {
     ///
     /// For bug reports and for answering "what does Rust think the state is
     /// right now?" without a debugger. Contains no key material.
-    pub fn debug_snapshot(&self) -> Result<String, MatrixRtcFfiError> {
-        let manager = lock_mutex(&self.inner)?;
+    pub async fn debug_snapshot(&self) -> Result<String, MatrixRtcFfiError> {
+        let manager = self.inner.lock().await;
         Ok(manager.debug_snapshot().to_string())
     }
 
-    pub fn session_count(&self) -> Result<u64, MatrixRtcFfiError> {
-        let manager = lock_mutex(&self.inner)?;
+    pub async fn session_count(&self) -> Result<u64, MatrixRtcFfiError> {
+        let manager = self.inner.lock().await;
         Ok(manager.session_count() as u64)
     }
 
-    pub fn member_count(
+    pub async fn member_count(
         &self,
         room_id: String,
         slot_id: String,
     ) -> Result<Option<u64>, MatrixRtcFfiError> {
-        let manager = lock_mutex(&self.inner)?;
+        let manager = self.inner.lock().await;
         Ok(manager
             .member_count(&room_id, &slot_id)
             .map(|count| count as u64))
@@ -525,12 +498,12 @@ impl RtcSessionManagerHandle {
     /// The subscription yields the current roster on its first
     /// `nextSnapshot()` and then only on change, so a host can attach at any
     /// point without missing the state it attached to.
-    pub fn subscribe_membership_snapshots(
+    pub async fn subscribe_membership_snapshots(
         &self,
         room_id: String,
         slot_id: String,
     ) -> Result<Option<Arc<MembershipSnapshotSubscription>>, MatrixRtcFfiError> {
-        let manager = lock_mutex(&self.inner)?;
+        let manager = self.inner.lock().await;
         Ok(manager
             .subscribe_membership_snapshots(&room_id, &slot_id)
             .map(|receiver| {
@@ -556,7 +529,7 @@ impl RtcSessionManagerHandle {
     /// [`connect_media_session`](crate::media::connect_media_session)) can read
     /// it back with [`Self::own_member_id`] instead of storing it, which cannot
     /// go stale across a rejoin.
-    pub fn join(&self, params: FfiJoinSessionParams) -> Result<String, MatrixRtcFfiError> {
+    pub async fn join(&self, params: FfiJoinSessionParams) -> Result<String, MatrixRtcFfiError> {
         log::info!("manager: join requested {}", params.summary());
 
         // Kept for the keep-alive driver, which outlives `params`.
@@ -582,14 +555,14 @@ impl RtcSessionManagerHandle {
         // Serialising instead is safe because no host callback re-enters a
         // handle: the command sender only sends events outward. If that ever
         // changes, this becomes a deadlock rather than lost state.
-        let mut manager = lock_mutex(&self.inner)?;
+        let mut manager = self.inner.lock().await;
 
-        let result = crate::runtime::block_on(async {
+        let result = {
             manager.join(core_params).await.map_err(|e| {
                 log::warn!("manager: join failed: {e}");
                 MatrixRtcFfiError::InvalidInput(e.to_string())
             })
-        });
+        };
 
         if result.is_ok() {
             log::info!("manager: join succeeded as {member_id}");
@@ -608,12 +581,12 @@ impl RtcSessionManagerHandle {
     ///
     /// Changes on every join (MSC4143), so read it when needed rather than
     /// caching what [`Self::join`] returned.
-    pub fn own_member_id(
+    pub async fn own_member_id(
         &self,
         room_id: String,
         slot_id: String,
     ) -> Result<Option<String>, MatrixRtcFfiError> {
-        let manager = lock_mutex(&self.inner)?;
+        let manager = self.inner.lock().await;
         Ok(manager.own_member_id(&room_id, &slot_id))
     }
 
@@ -627,16 +600,18 @@ impl RtcSessionManagerHandle {
     ///
     /// Returns `false` if there is no joined session for `(room_id, slot_id)`,
     /// which means there is nothing to keep alive.
-    pub fn heartbeat(&self, room_id: String, slot_id: String) -> Result<bool, MatrixRtcFfiError> {
-        let mut manager = lock_mutex(&self.inner)?;
-        Ok(crate::runtime::block_on(async {
-            manager.heartbeat(&room_id, &slot_id).await
-        }))
+    pub async fn heartbeat(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<bool, MatrixRtcFfiError> {
+        let mut manager = self.inner.lock().await;
+        Ok(manager.heartbeat(&room_id, &slot_id).await)
     }
 
     /// Starts (or replaces) the keep-alive driver for one session.
     fn start_heartbeat(&self, room_id: String, slot_id: String) {
-        let (stop, stop_rx) = mpsc::channel();
+        let (stop, stop_rx) = tokio::sync::mpsc::channel(1);
         let manager = Arc::downgrade(&self.inner);
         let key = (room_id.clone(), slot_id.clone());
 
@@ -684,7 +659,7 @@ impl RtcSessionManagerHandle {
         }
     }
 
-    pub fn leave(
+    pub async fn leave(
         &self,
         room_id: String,
         slot_id: String,
@@ -707,9 +682,9 @@ impl RtcSessionManagerHandle {
         // most here: losing the manager to a placeholder mid-leave would drop
         // the very state needed to depart, leaving the membership live until the
         // dead man's switch expired.
-        let mut manager = lock_mutex(&self.inner)?;
+        let mut manager = self.inner.lock().await;
 
-        let result = crate::runtime::block_on(async {
+        let result = {
             manager
                 .leave(room_id, slot_id, core_params)
                 .await
@@ -717,7 +692,7 @@ impl RtcSessionManagerHandle {
                     log::warn!("manager: leave failed: {e}");
                     MatrixRtcFfiError::InvalidInput(e.to_string())
                 })
-        });
+        };
 
         if result.is_ok() {
             log::info!("manager: leave succeeded");
@@ -910,12 +885,13 @@ mod tests {
 
     /// The manual entry point exists and reports honestly when there is nothing
     /// to keep alive, rather than pretending it beat something.
-    #[test]
-    fn heartbeat_reports_no_session_when_not_joined() {
+    #[tokio::test]
+    async fn heartbeat_reports_no_session_when_not_joined() {
         let manager = RtcSessionManagerHandle::new();
         assert!(
             !manager
                 .heartbeat("!room:example.org".to_owned(), "m.call#ROOM".to_owned())
+                .await
                 .expect("the call itself should succeed"),
         );
     }
@@ -950,27 +926,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ffi_snapshot_entrypoint_accepts_join_event() {
+    #[tokio::test]
+    async fn ffi_snapshot_entrypoint_accepts_join_event() {
         let manager = RtcSessionManagerHandle::new();
 
-        let result =
-            manager.set_current_sticky_state("!room:example.org".to_owned(), vec![join_event()]);
+        let result = manager
+            .set_current_sticky_state("!room:example.org".to_owned(), vec![join_event()])
+            .await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn transports_round_trip_through_the_ffi() {
+    #[tokio::test]
+    async fn transports_round_trip_through_the_ffi() {
         let manager = RtcSessionManagerHandle::new();
         manager
             .set_current_sticky_state("!room:example.org".to_owned(), vec![join_event()])
+            .await
             .unwrap();
         let subscription = manager
             .subscribe_membership_snapshots(
                 "!room:example.org".to_owned(),
                 "m.call#ROOM".to_owned(),
             )
+            .await
             .unwrap()
             .expect("the member event should have created the session");
 
@@ -989,14 +968,15 @@ mod tests {
     /// on `RtcSessionHandle`, so a host running the manager could see
     /// `memberCount` but never who was in the call — and polling a count once a
     /// second was the only way to notice a change.
-    #[test]
-    fn the_manager_publishes_the_roster_of_a_session() {
+    #[tokio::test]
+    async fn the_manager_publishes_the_roster_of_a_session() {
         let manager = RtcSessionManagerHandle::new();
         let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
 
         assert!(
             manager
                 .subscribe_membership_snapshots(room_id.clone(), slot_id.clone())
+                .await
                 .unwrap()
                 .is_none(),
             "no session for that slot yet, so nothing to observe"
@@ -1004,10 +984,12 @@ mod tests {
 
         manager
             .set_current_sticky_state(room_id.clone(), vec![join_event()])
+            .await
             .expect("the current state should be accepted");
 
         let subscription = manager
             .subscribe_membership_snapshots(room_id, slot_id)
+            .await
             .unwrap()
             .expect("the member event should have created the session");
 

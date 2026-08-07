@@ -1065,7 +1065,8 @@ mod tests {
         fail_sticky: bool,
     }
 
-    #[async_trait::async_trait(?Send)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl RtcCommandSender for CancelFailsSender {
         async fn send_sticky_event(
             &self,

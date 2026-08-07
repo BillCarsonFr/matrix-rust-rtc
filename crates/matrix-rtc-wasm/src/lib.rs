@@ -19,6 +19,22 @@
 //!
 //! This layer accepts JS-shaped sticky events and maps them into core DTOs.
 //! Keeping this conversion here lets the core remain independent from wasm/JS types.
+//!
+//! # Only built for `wasm32`
+//!
+//! The crate body is `cfg`-gated to `wasm32` because it cannot compile anywhere
+//! else: its futures wrap JS promises and are therefore `!Send`, while
+//! `matrix-rtc-core`'s command traits are `Send` on every target *but* wasm32
+//! (see [`matrix_rtc_core::RtcCommandSender`]). On other targets this compiles
+//! to an empty crate so a workspace-wide `cargo check`/`clippy` still passes.
+//!
+//! The consequence is that a host-target build no longer type-checks this crate.
+//! Check it explicitly:
+//!
+//! ```sh
+//! cargo check -p matrix-rtc-wasm --target wasm32-unknown-unknown
+//! ```
+#![cfg(target_arch = "wasm32")]
 
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,
@@ -792,10 +808,10 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn next_snapshot_returns_current_snapshot_on_first_poll() {
+    async fn next_snapshot_returns_current_snapshot_on_first_poll() {
         let mut session = WasmRtcSession::new();
         let events = serde_wasm_bindgen::to_value(&vec![joined_event()]).unwrap();
-        session.set_current_sticky_state(events).unwrap();
+        session.set_current_sticky_state(events).await.unwrap();
 
         let mut subscription = session.subscribe_membership_snapshots();
         let first = subscription.next_snapshot().unwrap();

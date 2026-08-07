@@ -98,12 +98,10 @@ async fn build_media_session(
     let bridge = Arc::new(MediaKeyBridge::with_provider(provider.clone()));
 
     // Wire the core's encryption manager to the bridge and to the MSC4195
-    // identity derivation, and take the membership snapshot channel the
-    // engine consumes. All sync — the manager mutex is never held across an
-    // await.
+    // identity derivation, and take the membership snapshot channel the engine
+    // consumes.
     let (memberships, member_id) = {
-        let mut mgr =
-            crate::lock_mutex(&manager.inner).map_err(|_| MediaFfiError::InternalLockPoisoned)?;
+        let mut mgr = manager.inner.lock().await;
         // Read the `member.id` from the join rather than taking one from the
         // host: it is what our MSC4195 participant identity is derived from, so
         // a value that disagrees with the published membership would put our
@@ -208,16 +206,10 @@ async fn build_media_session(
     // the bug this replay exists to fix. Still before `connect_livekit`, so the
     // key ring is populated before the first frame can arrive.
     //
-    // `block_on` rather than `.await`: this function is spawned, so its future
-    // must be `Send`, and awaiting here would hold the manager's `MutexGuard`
-    // across a yield point. The replay does not yield either way — a key already
-    // in use is signalled with `use_after_ms: 0` and applied inline, and a
-    // rotation still inside its `delayBeforeUse` is signalled with whatever
-    // remains of it, which the bridge *schedules* without blocking.
     {
-        let mgr =
-            crate::lock_mutex(&manager.inner).map_err(|_| MediaFfiError::InternalLockPoisoned)?;
-        crate::runtime::block_on(mgr.replay_encryption_keys(&config.room_id, &config.slot_id));
+        let mgr = manager.inner.lock().await;
+        mgr.replay_encryption_keys(&config.room_id, &config.slot_id)
+            .await;
     }
 
     // Own focus connects synchronously so a broken SFU fails this call

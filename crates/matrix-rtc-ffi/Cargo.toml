@@ -33,8 +33,10 @@ thiserror.workspace = true
 # `media`: every synchronous entry point bridges to the async core through the
 # runtime in `src/runtime.rs`, and the core arms a `delayBeforeUse` timer on the
 # key-rotation path. See that module for why it has to be multi-threaded.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
-uniffi.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# `tokio`: the manager handle's exported methods are async, and
+# `async_runtime = "tokio"` needs uniffi's tokio integration (async_compat).
+uniffi = { workspace = true, features = ["tokio"] }
 async-trait.workspace = true
 futures = "0.3"
 log.workspace = true
@@ -74,11 +76,7 @@ media = [
     "dep:jni",
     "dep:webrtc-sys-build",
     "tokio/rt-multi-thread",
-    "tokio/macros",
     "tokio/time",
-    # `async_runtime = "tokio"` on exported async fns needs uniffi's tokio
-    # integration (async_compat).
-    "uniffi/tokio",
 ]
 
 [build-dependencies]

@@ -41,11 +41,13 @@ fn wire_type(event_type: String) -> String {
 ///
 /// This is used as the error type for the CommandSenderCallback trait to ensure
 /// UniFFI can properly generate bindings for it.
-#[derive(Debug, Clone, uniffi::Error)]
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum CommandSenderError {
     /// Serialization error when converting content to JSON
+    #[error("could not serialize the event content: {0}")]
     SerializationError(String),
     /// Error from the native SDK when sending the event
+    #[error("the send failed: {0}")]
     SendError(String),
 }
 
@@ -246,7 +248,18 @@ impl FfiLeaveSessionParams {
 /// The native implementation must guarantee:
 /// - **Delivery**: Events will be delivered or an error will be reported
 /// - **Ordering**: Events will be sent in the order they are received
-#[uniffi::export(callback_interface)]
+/// Host-implemented outbound sends.
+///
+/// Async: every corresponding matrix-rust-sdk call is async, and a synchronous
+/// callback forced hosts to bridge that themselves (`runBlocking` on a dedicated
+/// dispatcher, on Android). uniffi renders these as `suspend` in Kotlin and
+/// `async` in Swift.
+///
+/// (`async_trait` must sit *under* the uniffi attribute: uniffi parses the
+/// original `async fn` tokens, `async_trait` then makes the trait
+/// dyn-compatible for the Rust side.)
+#[uniffi::export(with_foreign)]
+#[async_trait]
 pub trait CommandSenderCallback: Send + Sync {
     /// Called when a sticky event needs to be sent.
     ///
@@ -272,7 +285,7 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
-    fn send_sticky_event(
+    async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
@@ -292,7 +305,7 @@ pub trait CommandSenderCallback: Send + Sync {
     /// Return Ok(delay_id) with the MSC4140 delay ID on success, or Err on
     /// failure. That id — not an event id — is what `restartDelayedEvent` and
     /// `cancelDelayedEvent` take.
-    fn send_delayed_event(
+    async fn send_delayed_event(
         &self,
         room_id: String,
         event_type: String,
@@ -313,7 +326,7 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
-    fn send_state_event(
+    async fn send_state_event(
         &self,
         room_id: String,
         event_type: String,
@@ -343,7 +356,7 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
-    fn restart_delayed_event(
+    async fn restart_delayed_event(
         &self,
         room_id: String,
         delay_id: String,
@@ -358,7 +371,7 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// # Returns
     /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
-    fn cancel_delayed_event(
+    async fn cancel_delayed_event(
         &self,
         room_id: String,
         delay_id: String,
@@ -385,7 +398,7 @@ pub trait CommandSenderCallback: Send + Sync {
     ///
     /// matrix-rust-sdk's own `sendToDeviceMessage` already takes a recipient
     /// list, so this maps onto one call.
-    fn send_to_device_message(
+    async fn send_to_device_message(
         &self,
         recipients: Vec<FfiToDeviceRecipient>,
         message_type: String,
@@ -452,7 +465,8 @@ fn trace_command_content(what: &str, content_json: &str) {
     log::trace!("command sending: {what} content={content_json}");
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl RtcCommandSender for FfiCommandSender {
     async fn send_sticky_event(
         &self,
@@ -472,6 +486,7 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .send_sticky_event(room_id, wire_event_type, content_json, duration_ms)
+                .await
                 .map_err(CommandError::from),
         )
     }
@@ -494,6 +509,7 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .send_delayed_event(room_id, wire_event_type, content_json, delay_ms)
+                .await
                 .map_err(CommandError::from),
         )
     }
@@ -508,6 +524,7 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .restart_delayed_event(room_id, delay_id)
+                .await
                 .map_err(CommandError::from),
         )
     }
@@ -523,6 +540,7 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .cancel_delayed_event(room_id, delay_id)
+                .await
                 .map_err(CommandError::from),
         )
     }
@@ -555,6 +573,7 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .send_to_device_message(ffi_recipients, wire_message_type, content_json)
+                .await
                 .map_err(CommandError::from),
         )?;
 
@@ -589,6 +608,7 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .send_state_event(room_id, wire_event_type, state_key, content_json)
+                .await
                 .map_err(CommandError::from),
         )
     }
@@ -643,8 +663,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl CommandSenderCallback for MockCommandSenderCallback {
-        fn send_sticky_event(
+        async fn send_sticky_event(
             &self,
             _room_id: String,
             event_type: String,
@@ -656,7 +677,7 @@ mod tests {
             Ok(())
         }
 
-        fn send_delayed_event(
+        async fn send_delayed_event(
             &self,
             room_id: String,
             event_type: String,
@@ -667,7 +688,7 @@ mod tests {
             Ok(format!("event-{}-{}", room_id, event_type))
         }
 
-        fn send_state_event(
+        async fn send_state_event(
             &self,
             _room_id: String,
             event_type: String,
@@ -678,7 +699,7 @@ mod tests {
             Ok(())
         }
 
-        fn restart_delayed_event(
+        async fn restart_delayed_event(
             &self,
             _room_id: String,
             _delay_id: String,
@@ -687,7 +708,7 @@ mod tests {
             Ok(())
         }
 
-        fn cancel_delayed_event(
+        async fn cancel_delayed_event(
             &self,
             _room_id: String,
             _delay_id: String,
@@ -695,7 +716,7 @@ mod tests {
             Ok(())
         }
 
-        fn send_to_device_message(
+        async fn send_to_device_message(
             &self,
             recipients: Vec<FfiToDeviceRecipient>,
             message_type: String,
@@ -726,60 +747,69 @@ mod tests {
 
     /// Lets a test keep hold of the mock after handing it to
     /// `set_command_sender`, which takes ownership of a `Box`.
+    #[async_trait]
     impl CommandSenderCallback for Arc<MockCommandSenderCallback> {
-        fn send_sticky_event(
+        async fn send_sticky_event(
             &self,
             room_id: String,
             event_type: String,
             content_json: String,
             duration_ms: u64,
         ) -> Result<(), CommandSenderError> {
-            (**self).send_sticky_event(room_id, event_type, content_json, duration_ms)
+            (**self)
+                .send_sticky_event(room_id, event_type, content_json, duration_ms)
+                .await
         }
 
-        fn send_delayed_event(
+        async fn send_delayed_event(
             &self,
             room_id: String,
             event_type: String,
             content_json: String,
             delay_ms: u64,
         ) -> Result<String, CommandSenderError> {
-            (**self).send_delayed_event(room_id, event_type, content_json, delay_ms)
+            (**self)
+                .send_delayed_event(room_id, event_type, content_json, delay_ms)
+                .await
         }
 
-        fn send_state_event(
+        async fn send_state_event(
             &self,
             room_id: String,
             event_type: String,
             state_key: String,
             content_json: String,
         ) -> Result<(), CommandSenderError> {
-            (**self).send_state_event(room_id, event_type, state_key, content_json)
+            (**self)
+                .send_state_event(room_id, event_type, state_key, content_json)
+                .await
         }
 
-        fn restart_delayed_event(
+        async fn restart_delayed_event(
             &self,
             room_id: String,
             delay_id: String,
         ) -> Result<(), CommandSenderError> {
-            (**self).restart_delayed_event(room_id, delay_id)
+            (**self).restart_delayed_event(room_id, delay_id).await
         }
 
-        fn cancel_delayed_event(
+        async fn cancel_delayed_event(
             &self,
             room_id: String,
             delay_id: String,
         ) -> Result<(), CommandSenderError> {
-            (**self).cancel_delayed_event(room_id, delay_id)
+            (**self).cancel_delayed_event(room_id, delay_id).await
         }
 
-        fn send_to_device_message(
+        async fn send_to_device_message(
             &self,
             recipients: Vec<FfiToDeviceRecipient>,
             message_type: String,
             content_json: String,
         ) -> Result<Vec<FfiToDeviceDelivery>, CommandSenderError> {
-            (**self).send_to_device_message(recipients, message_type, content_json)
+            (**self)
+                .send_to_device_message(recipients, message_type, content_json)
+                .await
         }
     }
 
@@ -904,18 +934,20 @@ mod tests {
     /// one. Reuse keeps the MSC4195 participant identity stable while our key
     /// index restarts at 0, so every peer decrypts the new call's media with the
     /// old call's key and never recovers — which is why hosts cannot supply one.
-    #[test]
-    fn every_join_gets_a_fresh_member_id() {
+    #[tokio::test]
+    async fn every_join_gets_a_fresh_member_id() {
         let manager = crate::RtcSessionManagerHandle::new();
         manager
-            .set_command_sender(Box::new(MockCommandSenderCallback::default()))
+            .set_command_sender(Arc::new(MockCommandSenderCallback::default()))
+            .await
             .expect("the mock sender should be accepted");
         let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
 
-        let first = manager.join(join_params()).expect("first join");
+        let first = manager.join(join_params()).await.expect("first join");
         assert_eq!(
             manager
                 .own_member_id(room_id.clone(), slot_id.clone())
+                .await
                 .expect("the call itself should succeed"),
             Some(first.clone()),
             "the id returned by join must be the one the membership was published under",
@@ -927,13 +959,15 @@ mod tests {
                 slot_id.clone(),
                 FfiLeaveSessionParams { leave_reason: None },
             )
+            .await
             .expect("leave");
-        let second = manager.join(join_params()).expect("rejoin");
+        let second = manager.join(join_params()).await.expect("rejoin");
 
         assert_ne!(first, second, "a rejoin must not reuse the member id");
         assert_eq!(
             manager
                 .own_member_id(room_id, slot_id)
+                .await
                 .expect("the call itself should succeed"),
             Some(second),
         );
@@ -962,17 +996,19 @@ mod tests {
     /// an Android integration hit it. Kept at this layer too because the host
     /// reaches key distribution only via `join`/`leave` on the manager handle,
     /// and a fix that works in the core but not through the handle is no fix.
-    #[test]
-    fn a_rejoin_distributes_keys_without_new_sticky_events() {
+    #[tokio::test]
+    async fn a_rejoin_distributes_keys_without_new_sticky_events() {
         let mock = Arc::new(MockCommandSenderCallback::default());
         let manager = crate::RtcSessionManagerHandle::new();
         manager
-            .set_command_sender(Box::new(mock.clone()))
+            .set_command_sender(Arc::new(mock.clone()))
+            .await
             .expect("the mock sender should be accepted");
         let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
 
         manager
             .on_room_encryption_received(room_id.clone(), true)
+            .await
             .expect("room encryption");
         manager
             .on_room_slots_received(
@@ -985,15 +1021,17 @@ mod tests {
                         .to_owned(),
                 }],
             )
+            .await
             .expect("room slots");
 
         // First call: bob arrives after we joined, so there is a roster change.
-        manager.join(join_params()).expect("first join");
+        manager.join(join_params()).await.expect("first join");
         manager
             .set_current_sticky_state(
                 room_id.clone(),
                 vec![joined_sticky("@bob:example.org", "BOBDEV", "bob-a")],
             )
+            .await
             .expect("bob's membership");
         assert!(
             !mock.to_device_for("@bob:example.org", "BOBDEV").is_empty(),
@@ -1006,11 +1044,12 @@ mod tests {
                 slot_id.clone(),
                 FfiLeaveSessionParams { leave_reason: None },
             )
+            .await
             .expect("leave");
         mock.clear_to_device();
 
         // Second call: no new sticky events at all. Bob has not moved.
-        let second = manager.join(join_params()).expect("rejoin");
+        let second = manager.join(join_params()).await.expect("rejoin");
 
         let sent = mock.to_device_for("@bob:example.org", "BOBDEV");
         assert!(

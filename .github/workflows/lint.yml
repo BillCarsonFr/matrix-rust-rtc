@@ -65,6 +65,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev
 
-      # Covers the whole workspace, including matrix-rtc-livekit.
+      # Covers the whole workspace, including matrix-rtc-livekit. Note this
+      # does NOT cover matrix-rtc-wasm, whose body is cfg-gated to wasm32 (its
+      # JS-backed futures are !Send, so it cannot compile on a host target) —
+      # the `wasm` job below is what checks it.
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  wasm:
+    name: Clippy (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # matrix-rtc-wasm compiles to an empty crate on any other target, so a
+      # host-target clippy run says nothing about it. Everything in it — and the
+      # `?Send` half of the core's command traits — is only ever type-checked
+      # here.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Run clippy
+        run: >
+          cargo clippy -p matrix-rtc-wasm --target wasm32-unknown-unknown
+          --all-targets -- -D warnings

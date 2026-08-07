@@ -87,7 +87,8 @@
 //! // Implement RtcCommandSender for your platform
 //! struct MyCommandSender;
 //!
-//! #[async_trait(?Send)]
+//! #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+//! #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 //! impl RtcCommandSender for MyCommandSender {
 //!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _duration_ms: u64) -> Result<(), CommandError> {
 //!         Ok(())
@@ -187,7 +188,8 @@ pub const KEY_MESSAGE_TYPE: &str = "org.matrix.msc4143.rtc.encryption_key";
 ///
 /// Implementations receive notifications when new key material is available
 /// for use by the media layer.
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait EncryptionKeySignalHandler: Send + Sync {
     /// Called when new key material is available for a participant.
     ///
@@ -1708,7 +1710,8 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl EncryptionKeySignalHandler for RecordingHandler {
         async fn on_new_key_material(&self, signal: KeyMaterialSignal) {
             self.signals.lock().unwrap().push(signal);
@@ -2776,7 +2779,8 @@ mod tests {
             attempted: Mutex<Vec<String>>,
         }
 
-        #[async_trait(?Send)]
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl RtcCommandSender for FailsFirstRecipient {
             async fn send_sticky_event(
                 &self,
