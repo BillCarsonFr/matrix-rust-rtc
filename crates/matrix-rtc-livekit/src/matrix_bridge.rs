@@ -164,11 +164,27 @@ impl SdkCommandSender {
 /// wedged homeserver into an indefinitely hanging send (observed: a leave
 /// awaiting forever while synapse was down with sqlite I/O errors). MatrixRTC
 /// state is time-critical — peers act on our membership within seconds — so
-/// fail after a couple of attempts and let the caller decide.
+/// this stays bounded rather than becoming the SDK's unlimited default.
+///
+/// The limit is attempts, not retries. Two was too few to survive a rate limit:
+/// joining sends a delayed leave *and* a membership, so N clients joining is 2N
+/// events, and synapse's `rc_message` defaults to a burst of 10 and 0.2/s after
+/// that. The second attempt landed inside the same closed window and the join
+/// failed outright, discarding a fleet that had already half-joined.
+///
+/// Five gives a rate limit room to clear while still failing a genuinely dead
+/// homeserver in a readable time. The waits are not ours: on `M_LIMIT_EXCEEDED`
+/// the SDK uses the server's own `Retry-After` when it sends one, so the delay
+/// is what the homeserver asked for rather than a number we invented.
+///
+/// Retrying is not a substitute for pacing. A client joining N devices faster
+/// than the server's sustained rate will exhaust any attempt count; the retry is
+/// there to absorb a burst, not to outlast a limiter (see `--ramp-ms` in the
+/// load generator).
 fn rtc_request_config() -> matrix_sdk::config::RequestConfig {
     matrix_sdk::config::RequestConfig::new()
         .timeout(Duration::from_secs(15))
-        .retry_limit(2)
+        .retry_limit(5)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
