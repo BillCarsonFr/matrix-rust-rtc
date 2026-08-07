@@ -124,6 +124,34 @@ single integrator, rather than dripped out over several:
 
 ### Added
 
+- **Interop with pre-2026 Element Call (`matrix-rtc-livekit`'s `compat`
+  module).** Element Call on the JS SDK is the only other MatrixRTC
+  implementation available to test against, and it still speaks the wire format
+  from before the 2026 MSC4143 rewrite: `member: {user_id, device_id, id}` with
+  no `membership`, a flat `rtc_transports` array, a leave whose content is a
+  bare sticky key, and media keys as `io.element.call.encryption_keys`.
+
+  All of it is confined to two JSON funnels at the crate's edge — the core never
+  sees a dialect parameter or a legacy field. **Reading** the old format needs no
+  flag and is always on: every rule fires only where the modern field is absent
+  and its legacy counterpart is present, so a spec-shaped event is passed through
+  untouched. **Writing** it is opt-in per call via
+  `CallOptions::legacy_element_call`, since it is the half that changes what
+  peers see; member events stay MSC4143-valid (the legacy fields ride alongside)
+  but media keys go out under the legacy type *instead of* the spec one, a
+  to-device message having only one type. Delete the module and the flag once
+  Element Call catches up.
+
+- **`EventOrigin::Claimed`** — a sending device a member event asserts rather
+  than one decryption proved. Element Call runs as a widget and the widget API
+  gives it no decryption metadata, so a self-asserted device is the only one it
+  can state or read; without somewhere to put it, no media key can travel in
+  either direction with such a peer. Ranked below `Encrypted` throughout:
+  `was_encrypted()` stays `None`, so it never satisfies the "member events MUST
+  be encrypted in an encrypted room" rule, and an inbound key must still arrive
+  Olm-encrypted from the very device named. Produced only by the compatibility
+  path, and only where no authenticated device was available.
+
 - **Publishing raises `StreamStarted` against our own `member_id`, and
   `MediaSession.setLocalMuted(kind, muted)` mutes it.** Our own publications
   never arrive as transport events — nothing subscribes us to ourselves — so a

@@ -92,6 +92,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let livekit_service_url =
         env::var("LIVEKIT_SERVICE_URL").unwrap_or_else(|_| "http://localhost:6080".to_owned());
     let insecure_tls = env::var("INSECURE_TLS").is_ok();
+    // Set for a call shared with Element Call on the JS SDK: our membership then
+    // also carries the pre-2026 fields it needs, and our media key goes out
+    // under the to-device type it listens for (and only that one).
+    let legacy_element_call = env::var("LEGACY_ELEMENT_CALL").is_ok();
     let record_secs: u64 = env::var("RECORD_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -190,6 +194,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             slot_id,
             livekit_service_url_fallback: Some(livekit_service_url),
             http: Some(http),
+            legacy_element_call,
             ..CallOptions::default()
         },
     )

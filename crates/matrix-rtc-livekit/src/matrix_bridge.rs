@@ -55,6 +55,8 @@ use matrix_rtc_core::{
     ToDeviceRecipient,
 };
 
+use crate::compat::{ElementCallDialect, MemberContent, element_call};
+
 // The sticky duration for `m.rtc.member` now comes from the core
 // (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
 // half that interval to stay in the map. It used to be a constant here, which
@@ -106,12 +108,34 @@ fn wire_event_type(event_type: String) -> MessageLikeEventType {
 #[derive(Clone)]
 pub struct SdkCommandSender {
     client: Client,
+    /// When set, everything this sender puts on the wire is also rendered in
+    /// the pre-2026 Element Call dialect. Opt-in; see [`crate::compat`].
+    compat: Option<ElementCallDialect>,
 }
 
 impl SdkCommandSender {
     /// Create a command sender for the given logged-in client.
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            compat: None,
+        }
+    }
+
+    /// Create a command sender that also speaks the pre-2026 Element Call
+    /// dialect, for interoperating with clients that have not caught up with
+    /// the 2026 MSC4143 rewrite.
+    ///
+    /// Member events stay MSC4143-valid — the legacy fields are added alongside
+    /// — so this costs spec-current peers nothing. Media keys, whose message
+    /// type cannot be two things at once, go out in the legacy dialect *only*.
+    ///
+    /// Temporary: see [`crate::compat`].
+    pub fn with_element_call_compat(client: Client, dialect: ElementCallDialect) -> Self {
+        Self {
+            client,
+            compat: Some(dialect),
+        }
     }
 
     fn room(&self, room_id: &str) -> Result<Room, CommandError> {
@@ -119,6 +143,16 @@ impl SdkCommandSender {
         self.client
             .get_room(&room_id)
             .ok_or_else(|| CommandError::from_message(format!("room {room_id} not found")))
+    }
+
+    /// Render an outgoing room event in the legacy dialect as well, when one is
+    /// configured. No-op otherwise, which is every non-compat call.
+    fn apply_compat(&self, event_type: &str, content: &mut Value) {
+        if let Some(dialect) = &self.compat
+            && ElementCallDialect::is_member_event(event_type)
+        {
+            dialect.add_member_aliases(content);
+        }
     }
 }
 
@@ -142,10 +176,11 @@ impl RtcCommandSender for SdkCommandSender {
         &self,
         room_id: String,
         event_type: String,
-        content: Value,
+        mut content: Value,
         duration_ms: u64,
     ) -> Result<(), CommandError> {
         let room = self.room(&room_id)?;
+        self.apply_compat(&event_type, &mut content);
         let event_type = wire_event_type(event_type).to_string();
         // The core's value, not a constant of ours: it schedules the refresh
         // against exactly this lifetime, so substituting one here would break
@@ -166,10 +201,13 @@ impl RtcCommandSender for SdkCommandSender {
         &self,
         room_id: String,
         event_type: String,
-        content: Value,
+        mut content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
         let room_id = RoomId::parse(&room_id).map_err(command_error)?;
+        // The delayed leave is a member event like any other, and a peer that
+        // cannot read it is a peer we stay visible to forever.
+        self.apply_compat(&event_type, &mut content);
         let raw = serde_json::value::to_raw_value(&content).map_err(command_error)?;
         let request = delayed_message_event::unstable::Request::new_raw(
             room_id,
@@ -248,6 +286,16 @@ impl RtcCommandSender for SdkCommandSender {
         message_type: String,
         content: Value,
     ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+        // Unlike a member event, a to-device message cannot carry both dialects
+        // at once — the type is one or the other — so in compat mode the media
+        // key goes out in the legacy dialect alone.
+        let (message_type, content) = match &self.compat {
+            Some(dialect) => dialect
+                .rewrite_key_message(&message_type, &content)
+                .unwrap_or((message_type, content)),
+            None => (message_type, content),
+        };
+
         // MSC4143 encryption-key distribution: the media key goes out as an
         // Olm-encrypted to-device message to exactly the devices that published
         // the memberships. There is deliberately no `"*"` fan-out: media keys
@@ -331,14 +379,21 @@ impl RtcCommandSender for SdkCommandSender {
     }
 }
 
+/// An origin built from a device the member event only claims, or `None` when
+/// it claimed none. Never used where decryption named a device.
+fn claimed_origin(claimed_device: &Option<String>) -> Option<EventOrigin> {
+    claimed_device.as_ref().map(EventOrigin::claimed)
+}
+
 /// Snapshot the room's live `m.rtc.member` sticky events as core DTOs.
 ///
 /// The sending device comes from the event's decryption metadata, which is the
 /// only place MSC4143 leaves it: the proposal removed the self-asserted
 /// `member.claimed_device_id`, and key distribution targets "the devices that
-/// were used to encrypt these member events". Cleartext events have no such
-/// metadata, so `sender_device_id` stays `None` and key delivery falls back to
-/// all of the sender's devices.
+/// were used to encrypt these member events". An event with no such metadata
+/// falls back to the device it claims, if any (see [`crate::compat`]), and
+/// otherwise names none — in which case that member can neither be sent a key
+/// nor have one accepted from them.
 fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
     let room_id = room.room_id().to_string();
     room.live_sticky_events()
@@ -352,7 +407,12 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
             // the call, so say so — silently dropping it here is indistinguishable
             // from the peer never having joined, and that ambiguity has cost real
             // debugging time.
-            let content: RawStickyEventContent = match entry.raw().get_field("content") {
+            //
+            // Parsed as raw JSON first so the pre-2026 dialect can be normalised
+            // away before anything typed sees it. That step is unconditional: it
+            // only ever fills in a modern field that is absent, so a spec-shaped
+            // event reaches `RawStickyEventContent` byte-identical either way.
+            let mut value: Value = match entry.raw().get_field("content") {
                 Ok(Some(content)) => content,
                 Ok(None) => {
                     log::warn!(
@@ -371,26 +431,63 @@ fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
                     return None;
                 }
             };
+
+            if element_call::normalize_member_content(&mut value) == MemberContent::BareLeave {
+                // A pre-2026 leave: content is the sticky key and nothing else,
+                // so there is no slot to file it under. Dropping it *is* the
+                // leave — the live set below is applied whole, and a member who
+                // contributes no event is a member who is gone.
+                log::debug!(
+                    "[{room_id}] pre-2026 leave for sticky key {}; treating the member as gone",
+                    entry.key.sticky_key.as_deref().unwrap_or("<none>"),
+                );
+                return None;
+            }
+            let claimed_device = element_call::claimed_device_id(&value);
+
+            let content: RawStickyEventContent = match serde_json::from_value(value) {
+                Ok(content) => content,
+                Err(error) => {
+                    log::warn!(
+                        "[{room_id}] ignoring an unparseable {event_type} sticky (sticky key \
+                         {}): {error}. That member will not appear in the call.",
+                        entry.key.sticky_key.as_deref().unwrap_or("<none>"),
+                    );
+                    return None;
+                }
+            };
+
             // The sticky map only files plaintext and successfully decrypted
             // events, so the presence of decryption metadata is exactly whether
             // this arrived encrypted — never "we don't know".
+            //
+            // A device the event merely *claims* is the last resort, never a
+            // preference: it is consulted only where decryption produced none,
+            // and it is what makes a pre-2026 Element Call peer usable at all
+            // (the widget API gives that client no decryption metadata, so a
+            // self-asserted device is the only one it can state). See
+            // `EventOrigin::Claimed`.
             let origin = match entry.encryption_info() {
                 Some(info) => {
                     let device = info.sender_device.as_ref().map(|device| device.to_string());
-                    if device.is_none() {
+                    match device {
+                        Some(device) => EventOrigin::encrypted(Some(device)),
                         // Olm messages carry the sender's device keys, so a
                         // decrypted event should always name one. Worth saying
                         // out loud here: downstream this member cannot be bound
                         // to a device, so their media keys get rejected.
-                        log::warn!(
-                            "decrypted {} from {} resolved to no sending device",
-                            event_type,
-                            entry.key.sender,
-                        );
+                        None => {
+                            log::warn!(
+                                "decrypted {} from {} resolved to no sending device",
+                                event_type,
+                                entry.key.sender,
+                            );
+                            claimed_origin(&claimed_device)
+                                .unwrap_or_else(|| EventOrigin::encrypted(None))
+                        }
                     }
-                    EventOrigin::encrypted(device)
                 }
-                None => EventOrigin::Cleartext,
+                None => claimed_origin(&claimed_device).unwrap_or(EventOrigin::Cleartext),
             };
             Some(RawStickyEvent {
                 room_id: room_id.clone(),

@@ -1279,6 +1279,13 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 sender_device_id: Some(device),
             } => device.as_str(),
 
+            // A device the member event only claims (see `EventOrigin::Claimed`
+            // — the pre-2026 Element Call path). Checking against it is weaker
+            // than MSC4143 wants, but not vacuous: the key still has to arrive
+            // Olm-encrypted from that exact device, so a forged claim only ever
+            // names a device its author cannot send as.
+            EventOrigin::Claimed { device_id } => device_id.as_str(),
+
             // The host never said how the member event arrived, so there is
             // nothing to check against and nothing to accuse it of — the same
             // stance the rest of the design takes on unreported facts.
@@ -2464,6 +2471,41 @@ mod tests {
         );
 
         assert_discarded(&manager, bob_key(vec![1u8; 32], 0)).await;
+    }
+
+    /// A member event that only *claims* its device still binds the key to that
+    /// device — the pre-2026 Element Call path, where no authenticated device
+    /// exists to be had. The claim narrows rather than widens: the key must
+    /// still arrive from the named device.
+    #[tokio::test]
+    async fn key_is_checked_against_a_claimed_device() {
+        let claimed = |device_id: &str| {
+            EncryptionManager::new(
+                Arc::new(NoopCommandSender),
+                USER_ID.to_string(),
+                DEVICE_ID.to_string(),
+                MEMBER_ID.to_string(),
+                ROOM_ID.to_string(),
+                SLOT_ID.to_string(),
+                create_mock_get_memberships(vec![JoinedMembership {
+                    origin: EventOrigin::claimed(device_id),
+                    ..bob_membership()
+                }]),
+            )
+        };
+
+        // Bob's key arrives Olm-encrypted from the device his member event
+        // named, which is exactly the match MSC4143 asks for.
+        let manager = claimed("device456");
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 0))
+            .await
+            .expect("should succeed");
+        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
+
+        // A claim naming some other device is not a licence to accept anything:
+        // the key came from `device456`, so it does not match.
+        assert_discarded(&claimed("someOtherDevice"), bob_key(vec![1u8; 32], 0)).await;
     }
 
     /// But an unreported origin is not an accusation: hosts that do not supply
