@@ -123,6 +123,20 @@ pub struct CallOptions {
     pub encryption_config: Option<EncryptionConfig>,
     /// How often to refresh the dead man's switch delayed leave.
     pub heartbeat_interval: Duration,
+    /// How long the homeserver keeps our membership in the sticky map. `None`
+    /// keeps the core's default of an hour.
+    ///
+    /// This is what governs how long a **crashed** client lingers as a ghost.
+    /// The dead man's switch does not help there: its delayed leave is a plain
+    /// event, so it never replaces the sticky entry, and the membership stands
+    /// until this elapses. A tool that expects to be killed — a load generator,
+    /// a test — wants it short.
+    ///
+    /// Not free: the heartbeat re-sends the membership once it is halfway to
+    /// expiring, so halving this doubles that signalling rate. Keep it well
+    /// above twice [`heartbeat_interval`](Self::heartbeat_interval), or the
+    /// entry can lapse between beats.
+    pub sticky_duration_ms: Option<u64>,
     /// HTTP client used for the token exchange with the authorisation
     /// service. Supply one to control TLS behaviour (e.g. self-signed dev
     /// certs); `None` builds a default client.
@@ -137,11 +151,13 @@ pub struct CallOptions {
     /// with clients that have not caught up with the 2026 MSC4143 rewrite (the
     /// JS SDK, and so Element Call).
     ///
-    /// Membership events stay MSC4143-valid — the legacy fields ride alongside
-    /// — but media keys go out as `io.element.call.encryption_keys` *instead of*
-    /// the spec type, since a to-device message has only one type. A call with
-    /// this on therefore exchanges keys with legacy peers and not with
-    /// spec-current ones.
+    /// A join stays MSC4143-valid — the legacy fields ride alongside. A leave
+    /// and a media key cannot: a leave becomes the legacy bare-sticky-key
+    /// content (Element Call has no `membership` field, and a padded spec leave
+    /// would read to it as still joined), and keys go out as
+    /// `io.element.call.encryption_keys` *instead of* the spec type, since a
+    /// to-device message has only one type. A call with this on therefore
+    /// exchanges keys with legacy peers and not with spec-current ones.
     ///
     /// Reading the legacy dialect needs no flag and is always on. See
     /// [`crate::compat`], and delete all of it once Element Call catches up.
@@ -156,6 +172,7 @@ impl Default for CallOptions {
             livekit_service_url_fallback: None,
             encryption_config: None,
             heartbeat_interval: Duration::from_secs(15),
+            sticky_duration_ms: None,
             http: None,
             auto_subscribe: true,
             legacy_element_call: false,
@@ -314,6 +331,7 @@ impl Call {
         );
         params.membership_id = Some(membership_id.clone());
         params.encryption_config = options.encryption_config.clone();
+        params.sticky_duration_ms = options.sticky_duration_ms;
         let memberships = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;

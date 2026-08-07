@@ -42,7 +42,7 @@
 //! comes from. Two consequences shape this module:
 //!
 //! - It cannot address a to-device key to us unless our member event *states*
-//!   our device, so [`ElementCallDialect::add_member_aliases`] puts
+//!   our device, so [`ElementCallDialect::rewrite_member_content`] puts
 //!   `member.user_id` / `member.device_id` back on the wire. Without them,
 //!   Element Call has no way to send us its media key and its media never
 //!   decrypts for us.
@@ -201,6 +201,23 @@ fn infer_membership(object: &mut Map<String, Value>) {
     member.insert("membership".to_owned(), Value::String("join".to_owned()));
 }
 
+/// Whether this content states `member.membership = "leave"`.
+fn is_leave(content: &Value) -> bool {
+    content
+        .get("member")
+        .and_then(|member| member.get("membership"))
+        .and_then(Value::as_str)
+        == Some("leave")
+}
+
+/// The sticky key this content carries, under either spelling.
+fn sticky_key_of(content: &Value) -> Option<&str> {
+    content
+        .get("msc4354_sticky_key")
+        .or_else(|| content.get("sticky_key"))
+        .and_then(Value::as_str)
+}
+
 /// The device a member event claims to come from (`member.device_id`).
 ///
 /// Self-asserted and unauthenticated — MSC4143 removed the field for exactly
@@ -292,16 +309,45 @@ impl ElementCallDialect {
         event_type == MEMBER_EVENT_TYPE || event_type == "org.matrix.msc4143.rtc.member"
     }
 
-    /// Add the pre-2026 aliases to an MSC4143 `m.rtc.member` content, in place.
+    /// Rewrite an MSC4143 `m.rtc.member` content into something a pre-2026
+    /// Element Call can read, in place.
     ///
-    /// Additive only. `member.user_id` / `member.device_id` are what let Element
-    /// Call address a to-device key to us at all (see the module docs);
-    /// `rtc_transports` is where it looks for our SFU; `versions` it expects to
-    /// exist.
-    pub fn add_member_aliases(&self, content: &mut Value) {
+    /// A **join** is rewritten additively: every MSC4143 field stays and the
+    /// legacy ones are added beside it, so one event serves both dialects.
+    /// `member.user_id` / `member.device_id` are what let Element Call address a
+    /// to-device key to us at all (see the module docs); `rtc_transports` is
+    /// where it looks for our SFU; `versions` it expects to exist.
+    ///
+    /// A **leave** cannot be additive. Element Call has no `membership` field —
+    /// it signals departure by sending content holding nothing but the sticky
+    /// key — and its validator requires `rtc_transports` on anything it does
+    /// parse. Handed our spec leave it rejects the event outright; padded with
+    /// an empty `rtc_transports` it would read us as *joined* and publishing
+    /// nothing, which is a worse ghost than the one we are trying to clear. So a
+    /// leave is replaced wholesale with the legacy shape.
+    ///
+    /// That costs a spec-current peer nothing that matters: it cannot parse a
+    /// bare sticky key either, and a member event it cannot parse is one it
+    /// already treats as departed. Same outcome, which is what makes this safe
+    /// to do in a mode that is explicitly for talking to Element Call.
+    pub fn rewrite_member_content(&self, content: &mut Value) {
+        if is_leave(content)
+            && let Some(sticky_key) = sticky_key_of(content).map(str::to_owned)
+        {
+            *content = json!({ "msc4354_sticky_key": sticky_key });
+            return;
+        }
+
         let Some(object) = content.as_object_mut() else {
             return;
         };
+
+        // Already the legacy leave (or otherwise not a membership we can dress
+        // up). Adding a `member` object here would turn a departure back into
+        // something that looks like a membership.
+        if !object.contains_key("slot_id") {
+            return;
+        }
 
         // Mirror `transports.published` back into the flat array. A leave
         // carries no transports, and then neither does the alias.
@@ -554,7 +600,7 @@ mod tests {
     #[test]
     fn outbound_join_keeps_the_spec_fields_and_gains_the_legacy_ones() {
         let mut content: Value = serde_json::from_str(SPEC_JOIN).unwrap();
-        dialect().add_member_aliases(&mut content);
+        dialect().rewrite_member_content(&mut content);
 
         assert_eq!(content.pointer("/member/membership").unwrap(), "join");
         assert_eq!(content.pointer("/member/id").unwrap(), "xyzABCDEF0123");
@@ -577,30 +623,83 @@ mod tests {
         assert_eq!(content.get("versions").unwrap(), &json!([]));
     }
 
-    /// A leave publishes no transports, so it must not sprout an empty alias.
+    /// A leave becomes the legacy shape outright: content holding nothing but
+    /// the sticky key, exactly what Element Call itself sends.
+    ///
+    /// Keeping `membership: "leave"` would be worse than useless — Element Call
+    /// has no such field, its validator would reject the event for the missing
+    /// `rtc_transports`, and padding that in would make us read as *joined*.
     #[test]
-    fn outbound_leave_gains_a_device_but_no_transports() {
+    fn outbound_leave_becomes_a_bare_sticky_key() {
         let mut content = json!({
             "slot_id": "m.call#ROOM",
             "member": { "id": "abc", "membership": "leave" },
             "leave_reason": { "code": "leave" },
             "msc4354_sticky_key": "abc"
         });
-        dialect().add_member_aliases(&mut content);
+        dialect().rewrite_member_content(&mut content);
 
-        assert_eq!(content.pointer("/member/device_id").unwrap(), "BOBDEVICE");
-        assert!(content.get("rtc_transports").is_none());
+        assert_eq!(content, json!({ "msc4354_sticky_key": "abc" }));
+    }
+
+    /// The delayed leave (the dead man's switch) travels the same path, so it
+    /// must come out the same way rather than carrying a `leave_reason` Element
+    /// Call would choke on.
+    #[test]
+    fn outbound_delayed_leave_becomes_a_bare_sticky_key_too() {
+        let mut content = json!({
+            "slot_id": "m.call#ROOM",
+            "member": { "id": "abc", "membership": "leave" },
+            "leave_reason": {
+                "code": "delayed_leave",
+                "reason": "Dead man's switch: client failed to heartbeat"
+            },
+            "msc4354_sticky_key": "abc"
+        });
+        dialect().rewrite_member_content(&mut content);
+
+        assert_eq!(content, json!({ "msc4354_sticky_key": "abc" }));
+    }
+
+    /// A leave we cannot name a sticky key for is left alone: an empty object
+    /// would be a departure nobody can attribute.
+    #[test]
+    fn a_leave_without_a_sticky_key_is_not_replaced() {
+        let mut content = json!({
+            "slot_id": "m.call#ROOM",
+            "member": { "id": "abc", "membership": "leave" }
+        });
+        dialect().rewrite_member_content(&mut content);
+
         assert_eq!(content.pointer("/member/membership").unwrap(), "leave");
     }
 
     #[test]
     fn outbound_aliases_are_idempotent() {
         let mut once: Value = serde_json::from_str(SPEC_JOIN).unwrap();
-        dialect().add_member_aliases(&mut once);
+        dialect().rewrite_member_content(&mut once);
         let mut twice = once.clone();
-        dialect().add_member_aliases(&mut twice);
+        dialect().rewrite_member_content(&mut twice);
 
         assert_eq!(once, twice);
+    }
+
+    /// Idempotent for leaves too. A second pass sees a bare sticky key with no
+    /// `slot_id` and must leave it be — growing a `member` object there would
+    /// turn the departure back into something membership-shaped.
+    #[test]
+    fn a_rewritten_leave_survives_a_second_pass() {
+        let mut content = json!({
+            "slot_id": "m.call#ROOM",
+            "member": { "id": "abc", "membership": "leave" },
+            "msc4354_sticky_key": "abc"
+        });
+        dialect().rewrite_member_content(&mut content);
+        let once = content.clone();
+        dialect().rewrite_member_content(&mut content);
+
+        assert_eq!(content, once);
+        assert!(content.get("member").is_none());
     }
 
     #[test]

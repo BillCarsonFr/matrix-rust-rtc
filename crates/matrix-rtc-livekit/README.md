@@ -148,12 +148,29 @@ Notes:
 - **The recovery key is required.** Each device is a fresh login, and neither
   the SDK's identity-based to-device strategy nor the core's MSC4153 policy
   will exchange media keys with a device that is not cross-signed.
+- **`--store <folder>` reuses devices between runs.** Device *i* keeps its
+  session and sqlite crypto store in `<folder>/device-i`; a run restores what is
+  there and only logs in for the devices that are missing. Two payoffs: repeat
+  runs pay no login cost at all (so the `--login-delay-ms` rate limiting above
+  stops mattering), and a restored device keeps its Megolm sessions, so it can
+  decrypt member events sent *before* the run started — a fresh device cannot,
+  which is why a peer already in the call can stay invisible to it until they
+  re-join. Implies `--keep-devices`, since logging out would revoke the stored
+  token; `--purge-devices` clears the folder along with the devices.
 - **The room must be encrypted.** A member event's sending device is only known
   from its decryption metadata, so in a cleartext room memberships cannot be
   mapped to media at all. The tool warns and continues.
 - **Devices are removed on exit** (a plain logout per device). A run killed
   with `kill -9` leaves them behind; `--purge-devices` deletes every device
   whose display name carries `--device-prefix` and exits.
+- **`--sticky-duration-ms` defaults to 2 minutes here, against the library's
+  one hour.** A run that is killed rather than left cleanly leaves its
+  memberships standing until this elapses: the dead man's switch does *not*
+  clear them, because its delayed leave is a plain event that never replaces
+  the sticky entry. An hour of ghost participants makes the next attempt
+  useless. The cost is one extra membership send per device every half of it,
+  and it must stay well above twice the 15 s heartbeat or memberships lapse
+  between beats.
 - **Scale is bounded by your machine, not the SFU** — see
   [How many devices?](#how-many-devices) below.
 - Devices join publish-only by default (`CallOptions::auto_subscribe = false`).

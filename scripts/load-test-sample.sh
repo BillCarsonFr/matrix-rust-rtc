@@ -83,7 +83,12 @@ SIMULCAST=1
 # Seconds of the file to decode up front and then loop.
 CLIP_SECONDS=10
 
-# 0 = run until Ctrl-C.
+# 0 = run until stopped by typing :q
+#
+# Ctrl-C does NOT work: signals never arrive in this process (SIGINT and
+# SIGTERM are both ignored even with handlers installed, and only SIGKILL
+# lands) — libwebrtc masks them process-wide. Type :q to stop, or set a
+# DURATION and let the run end itself.
 DURATION=0
 
 # Publish a per-device tone as well as video. Noisy with several devices.
@@ -123,6 +128,18 @@ LEGACY_ELEMENT_CALL=0
 # Accept self-signed certificates (the demo/backend stack).
 INSECURE_TLS=0
 
+# How long the homeserver keeps each membership in the sticky map.
+#
+# Short on purpose (the library default is an hour). A run that is killed rather
+# than left cleanly leaves its memberships standing until this elapses — the
+# dead man's switch does NOT clear them, because its delayed leave is a plain
+# event that never replaces the sticky entry. An hour of ghosts poisons the room
+# for the next attempt; two minutes does not.
+#
+# Costs one extra membership send per device every half of this. Keep it well
+# above twice the 15s heartbeat, or memberships lapse between beats.
+STICKY_DURATION_MS=120000
+
 # Pacing, to stay under homeserver rate limits.
 RAMP_MS=500
 
@@ -142,9 +159,49 @@ LOGIN_DELAY_MS=7000
 # matches on.
 DEVICE_PREFIX="rtc-loadtest"
 
+# Persist each device's session and crypto store here, and reuse them next run.
+# Empty = off (every run logs in fresh devices).
+#
+# Two reasons to set it:
+#   * Logins happen once. A fresh run of DEVICES=10 otherwise spends ~50s being
+#     rate-limited through LOGIN_DELAY_MS above; with a store it spends none.
+#   * A restored device keeps its megolm sessions, so it can decrypt member
+#     events sent BEFORE the run started. A fresh device cannot, which is why a
+#     peer already in the call can be invisible until they re-join.
+#
+# Devices are then kept on exit (logging out would revoke the stored token).
+# `--purge-devices` deletes the devices and this folder together.
+#
+# The folder is created if missing; it need not pre-exist. A folder that already
+# has contents and was not created by this tool is refused rather than adopted,
+# since a failed restore deletes <store>/device-N inside it.
+#
+# It holds access tokens and the devices' crypto stores unencrypted, so keep it
+# out of the repository and off shared disks — somewhere like
+# "$HOME/.matrix-rtc-loadtest" rather than a path under this checkout.
+STORE=""
+
 # --- end edit --------------------------------------------------------------
 
 cd "$(dirname "$0")/.."
+
+# Log filter, used only when RUST_LOG is not already set — so
+# `RUST_LOG=debug ./scripts/load-test.sh` still overrides it wholesale.
+#
+# Ours at debug, and four SDK subsystems silenced because they are pure noise
+# for this tool rather than because they are unimportant:
+#
+#   event_cache        "missing target event id from the redaction event"
+#   latest_events      the SDK trying to parse our MSC4143 member events as
+#                      legacy m.call.* ones: one error per membership we send
+#   identities::manager "Our own device might have been deleted" — expected when
+#                      a run mints and deletes devices every time
+#   gossiping          "Received a forwarded room key that we didn't request" —
+#                      our own devices sharing keys with each other
+#
+# Drop a line to see one of them again, or use RUST_LOG=debug for everything.
+: "${RUST_LOG:=warn,matrix_rtc_core=debug,matrix_rtc_media=debug,matrix_rtc_livekit=debug,matrix_sdk::event_cache=off,matrix_sdk::latest_events=off,matrix_sdk_crypto::identities::manager=off,matrix_sdk_crypto::gossiping=off}"
+export RUST_LOG
 
 if [[ -z "$RECOVERY_KEY" ]]; then
     echo "error: RECOVERY_KEY is empty." >&2
@@ -171,6 +228,7 @@ args=(
     --ramp-ms "$RAMP_MS"
     --login-delay-ms "$LOGIN_DELAY_MS"
     --device-prefix "$DEVICE_PREFIX"
+    --sticky-duration-ms "$STICKY_DURATION_MS"
 )
 [[ "$SIMULCAST" == "0" ]] && args+=(--no-simulcast)
 [[ "$AUDIO" == "1" ]] && args+=(--audio)
@@ -178,8 +236,16 @@ args=(
 [[ "$OPEN_SLOT" == "1" ]] && args+=(--open-slot)
 [[ "$LEGACY_ELEMENT_CALL" == "1" ]] && args+=(--legacy-element-call)
 [[ "$INSECURE_TLS" == "1" ]] && args+=(--insecure-tls)
+[[ -n "$STORE" ]] && args+=(--store "$STORE")
 
 # --release matters: a debug build cannot keep the encoders fed and you end up
 # measuring the generator instead of the deployment.
-exec cargo run --release -p matrix-rtc-livekit --example load_test \
-    --features matrix-sdk -- "${args[@]}" "$@"
+#
+# Built and then exec'd directly rather than run through `cargo run`, so that
+# Ctrl-C reaches this process and nothing else. Under `cargo run`, SIGINT goes
+# to the whole foreground process group: cargo dies at once and the generator is
+# orphaned out of that group, so every later Ctrl-C lands nowhere while it keeps
+# printing to the same terminal. `exec` also means no shell is left wrapping it,
+# so the PID you see is the one to signal.
+cargo build --release -p matrix-rtc-livekit --example load_test --features matrix-sdk,testing
+exec ./target/release/examples/load_test "${args[@]}" "$@"

@@ -137,10 +137,13 @@ single integrator, rather than dripped out over several:
   and its legacy counterpart is present, so a spec-shaped event is passed through
   untouched. **Writing** it is opt-in per call via
   `CallOptions::legacy_element_call`, since it is the half that changes what
-  peers see; member events stay MSC4143-valid (the legacy fields ride alongside)
-  but media keys go out under the legacy type *instead of* the spec one, a
-  to-device message having only one type. Delete the module and the flag once
-  Element Call catches up.
+  peers see. A join stays MSC4143-valid, the legacy fields riding alongside; a
+  leave and a media key cannot be both at once, so a leave becomes the legacy
+  bare-sticky-key content (Element Call has no `membership` field, and a spec
+  leave padded to satisfy its validator would read to it as still *joined*) and
+  keys go out under the legacy type *instead of* the spec one, a to-device
+  message having only one type. Delete the module and the flag once Element Call
+  catches up.
 
 - **`EventOrigin::Claimed`** — a sending device a member event asserts rather
   than one decryption proved. Element Call runs as a widget and the widget API

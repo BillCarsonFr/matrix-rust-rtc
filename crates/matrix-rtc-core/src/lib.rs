@@ -486,6 +486,54 @@ mod tests {
         assert_eq!(manager.slot_state(ROOM_ID, "m.call#ROOM"), None);
     }
 
+    /// Re-applying the same sticky state must publish nothing at all.
+    ///
+    /// `set_current_sticky_state` rebuilds the candidate set from scratch, and
+    /// used to refresh after *each* event in the batch. The roster was therefore
+    /// republished on the way up — one member, then two, then three — so the
+    /// first publication of every tick looked like everyone but one participant
+    /// leaving. The encryption manager believed it and rotated the key, once per
+    /// sticky tick per session, each rotation sending to every remaining member.
+    /// In a ten-device call that was a rotation every few seconds; the cost is
+    /// quadratic in participants.
+    ///
+    /// The sticky bridge re-sends the full live set on every tick, so "identical
+    /// input publishes nothing" is the property that matters.
+    #[tokio::test]
+    async fn re_applying_the_same_sticky_state_publishes_nothing() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let members = || {
+            vec![
+                joined_event("@alice:example.org", "m.call#ROOM", "alice-a"),
+                joined_event("@bob:example.org", "m.call#ROOM", "bob-a"),
+                joined_event("@carol:example.org", "m.call#ROOM", "carol-a"),
+            ]
+        };
+
+        manager
+            .set_current_sticky_state(ROOM_ID, members())
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(3));
+
+        let mut snapshots = manager
+            .subscribe_membership_snapshots(ROOM_ID, "m.call#ROOM")
+            .expect("the session exists");
+        snapshots.borrow_and_update();
+
+        manager
+            .set_current_sticky_state(ROOM_ID, members())
+            .await
+            .unwrap();
+
+        assert!(
+            !snapshots.has_changed().unwrap(),
+            "an unchanged sticky state must not republish the roster; every \
+             republication is a membership diff the encryption manager acts on",
+        );
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(3));
+    }
+
     /// MSC4143: a member event only counts as joined against an *open* slot.
     /// Supplying room state with no slot in it means the slot is closed.
     #[tokio::test]

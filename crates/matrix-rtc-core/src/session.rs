@@ -388,6 +388,15 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             member_id: membership_id.clone(),
         });
 
+        // Name ourselves in the log tag from here on. Until now `room/slot` was
+        // enough, because one process meant one session per slot. A host that
+        // runs several participations of the same slot in one process — the load
+        // generator does, with ten — otherwise emits every session's lines under
+        // an identical prefix, and the interleaving cannot be untangled even in
+        // principle: "membership changed" from one device sits next to
+        // "candidate added" from another, and any conclusion drawn is a guess.
+        self.log_tag = format!("{}/{}", self.log_tag, params.device_id);
+
         // Create the encryption manager
         // We need a closure that can access self.members
         // Since we can't capture self by reference in an Arc closure, we'll use a different approach
@@ -601,7 +610,12 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         // itself to notice.
         let previous = std::mem::take(&mut self.candidates);
         for event in events {
-            self.apply_membership_event(event).await;
+            // Deliberately *not* `apply_membership_event`: this loop rebuilds
+            // the whole candidate set, and publishing after each event would
+            // announce every partial roster on the way — starting with a
+            // one-member one, which reads as everybody else leaving. Refresh
+            // happens once, below.
+            self.record_membership_event(event);
         }
 
         let dropped: Vec<&str> = previous
@@ -633,7 +647,30 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         self.apply_membership_event(event).await;
     }
 
+    /// Applies one membership event and publishes the result.
     async fn apply_membership_event(&mut self, event: CallMembershipEvent) {
+        if self.record_membership_event(event) {
+            self.refresh().await;
+        }
+    }
+
+    /// Records one membership event against `candidates`, reporting whether it
+    /// changed anything. **Publishes nothing.**
+    ///
+    /// Separate from [`apply_membership_event`](Self::apply_membership_event)
+    /// because a batch must not publish per event. [`set_current_state`] rebuilds
+    /// the candidate set from scratch, so refreshing inside the loop announces
+    /// every intermediate state as though it were real: the first event of a
+    /// six-member snapshot publishes a *one*-member roster, which the encryption
+    /// manager reads as five members leaving and answers with a key rotation.
+    /// The five are re-added an instant later, so the roster ends up correct and
+    /// the rotation is pure waste — once per sticky tick, per session, and with
+    /// a to-device send to every remaining member. That is quadratic in the
+    /// participant count and was rotating keys every few seconds in a ten-device
+    /// call.
+    ///
+    /// [`set_current_state`]: Self::set_current_state
+    fn record_membership_event(&mut self, event: CallMembershipEvent) -> bool {
         match event {
             CallMembershipEvent::Joined(joined) => {
                 let existing = self.candidates.iter().position(|candidate| {
@@ -648,7 +685,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                             joined.sender,
                             joined.sticky_key,
                         );
-                        return;
+                        return false;
                     }
                     Some(index) => {
                         log::debug!(
@@ -683,7 +720,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                         left.sender,
                         left.sticky_key,
                     );
-                    return;
+                    return false;
                 }
 
                 log::debug!(
@@ -695,7 +732,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             }
         }
 
-        self.refresh().await;
+        true
     }
 
     /// Whether `candidate` satisfies the MSC4143 join conditions that depend on
