@@ -17,6 +17,17 @@ compile errors, not silent behaviour changes.
 **v0.2.0 sweep** — deliberately batched into one release while there is still a
 single integrator, rather than dripped out over several:
 
+- **`CallOptions::legacy_element_call: bool` is now
+  `CallOptions::element_call_compat: ElementCallCompat`** (`Off` / `StickyEvents`
+  / `StateEvents`). There are two pre-2026 Element Call generations to render for
+  now, and they disagree about the *carrier* of a membership rather than just its
+  fields, so they are mutually exclusive by construction — an enum makes the
+  impossible fourth state unrepresentable. `LiveKitTransportConfig` likewise
+  gains a `token_endpoint: TokenEndpoint` field. The load generator's
+  `--legacy-element-call` flag becomes `--element-call-compat <off|sticky|state>`,
+  and `join_and_record`'s `LEGACY_ELEMENT_CALL` now takes `sticky` or `state`
+  (any other value still means `sticky`).
+
 - **`sendToDeviceMessage` now takes a recipient *list* and returns a result per
   recipient**, replacing the per-device call whose only failure channel was an
   exception. That exception landed inside the core's loop over members, so one
@@ -124,6 +135,63 @@ single integrator, rather than dripped out over several:
 
 ### Added
 
+- **Interop with *pre-sticky* Element Call — membership as room state
+  (`matrix-rtc-livekit`'s `compat::element_call_state`).** One generation older
+  than the dialect below: before MSC4354 existed, Element Call carried MatrixRTC
+  membership as `org.matrix.msc3401.call.member` **room state events**, using the
+  state key for per-device keying and room state for the delivery guarantee
+  stickiness now provides.
+
+  Four things change at once, so unlike its sibling this cannot be an additive
+  rewrite — a call joined this way is visible to that generation and to nobody
+  else:
+
+  - **Carrier.** The membership is a state event keyed
+    `_{user}_{device}_{application}{call_id}`, sent with
+    `PUT /rooms/{id}/state/...`, and the dead man's switch becomes a *delayed
+    state* event. That last one is an improvement the spec path still lacks: a
+    delayed state event with `{}` content genuinely empties our membership,
+    whereas a delayed sticky leave clears nothing from the sticky map, so crash
+    cleanup there still rides on the sticky TTL.
+  - **SFU identity.** The plain `{user}:{device}` string the legacy
+    authorisation service mints, not the MSC4195 hash of
+    `[user, device, member_id]`. All four derivation sites — our own identity,
+    the core's `RtcIdentityMapper`, `remote_identity`, and the local frame
+    cryptor's compare — now share one `Arc`, because a divergence there is not an
+    error but a silence: peers sit in the roster with no media and their keys land
+    under an identity the SFU never assigned.
+  - **Token.** `POST /sfu/get` with `{room, openid_token, device_id}`, not
+    MSC4195's `/get_token`. Deliberately *not* a 404-driven fallback: the endpoint
+    is bundled with the identity derivation and the membership carrier, both
+    decided before any HTTP happens, so a 404 cannot retroactively change what we
+    already published — and succeeding with the wrong derivation yields a fully
+    connected session in which nothing decrypts and nobody appears.
+  - **Content.** `application` as a string plus `call_id`/`scope` instead of a
+    `slot_id`, `membershipID` instead of `member.id`, an in-content
+    `created_ts + expires` lifetime, and `foci_preferred` +
+    `focus_active.focus_selection` instead of `transports`.
+
+  The core still speaks only MSC4143. Inbound, state events are read from the SDK
+  store (`m.call.member` *is* in sliding sync's `required_state`, unlike the
+  MSC4143 slot type) and translated into synthetic sticky memberships with
+  `EventOrigin::Claimed`, with two things resolved in the translation because
+  nothing downstream can: expiry, since the core has no membership deadline and no
+  timer, and `focus_selection: "oldest_membership"`, which makes a peer's SFU a
+  property of the room's whole membership rather than of that peer's event.
+
+  Two consequences worth knowing. The bridge grows a room-state wake source and a
+  30 s poll in this mode, because a state-carried call produces **no sticky
+  traffic at all** and a bridge waiting only on sticky events would seed once and
+  sleep through the whole call. And the slot condition is left *unenforced*
+  (`SlotKnowledge::Unsupplied`) rather than reported empty: that generation has no
+  slot concept, so saying "no slots" would resolve every session closed and drop
+  every member, us included.
+
+  Opt-in in both directions, unlike the sticky dialect's always-on reader — this
+  one reads a different event type in a different part of the room, so left on
+  everywhere any room that ever hosted an old Element Call would show a call that
+  ended months ago.
+
 - **Interop with pre-2026 Element Call (`matrix-rtc-livekit`'s `compat`
   module).** Element Call on the JS SDK is the only other MatrixRTC
   implementation available to test against, and it still speaks the wire format
@@ -136,7 +204,7 @@ single integrator, rather than dripped out over several:
   flag and is always on: every rule fires only where the modern field is absent
   and its legacy counterpart is present, so a spec-shaped event is passed through
   untouched. **Writing** it is opt-in per call via
-  `CallOptions::legacy_element_call`, since it is the half that changes what
+  `CallOptions::element_call_compat = StickyEvents`, since it is the half that changes what
   peers see. A join stays MSC4143-valid, the legacy fields riding alongside; a
   leave and a media key cannot be both at once, so a leave becomes the legacy
   bare-sticky-key content (Element Call has no `membership` field, and a spec

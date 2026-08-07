@@ -64,6 +64,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, open_slot};
 use matrix_rtc_media::{
     AudioFrame, AudioSourceConfig, I420Buffer, LocalTrackHandle, PublishOptions, VideoFrame,
@@ -78,6 +79,28 @@ use matrix_sdk::ruma::{OwnedDeviceId, RoomId};
 use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::sync_service::SyncService;
 use tokio::signal::unix::{SignalKind, signal};
+
+/// Clap-facing mirror of [`ElementCallCompat`], which lives in a crate that
+/// should not grow a `clap` dependency for a delete-by-date module.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ElementCallCompatArg {
+    /// Current MSC4143 + MSC4354 only.
+    Off,
+    /// Element Call as of 2025: sticky events with the pre-2026 field names.
+    Sticky,
+    /// Element Call before MSC4354: membership as room state.
+    State,
+}
+
+impl From<ElementCallCompatArg> for ElementCallCompat {
+    fn from(arg: ElementCallCompatArg) -> Self {
+        match arg {
+            ElementCallCompatArg::Off => Self::Off,
+            ElementCallCompatArg::Sticky => Self::StickyEvents,
+            ElementCallCompatArg::State => Self::StateEvents,
+        }
+    }
+}
 
 /// Duration of one captured audio frame; 10 ms is the WebRTC convention.
 const AUDIO_FRAME_MS: u32 = 10;
@@ -212,11 +235,17 @@ struct Args {
     #[arg(long)]
     open_slot: bool,
 
-    /// Also speak the pre-2026 Element Call dialect, for a call shared with
-    /// Element Call on the JS SDK. Media keys then go out under the legacy
+    /// Render this run for an older Element Call generation, for a call shared
+    /// with Element Call on the JS SDK.
+    ///
+    /// `sticky` is the pre-2026 dialect: media keys then go out under the legacy
     /// to-device type *only*, so spec-current peers will not decrypt this run.
-    #[arg(long)]
-    legacy_element_call: bool,
+    /// `state` is the generation before MSC4354, where membership is
+    /// `org.matrix.msc3401.call.member` room state — nothing about such a run is
+    /// visible to a spec-current peer. Note `--open-slot` is pointless with
+    /// `state`: that generation has no slot concept.
+    #[arg(long, value_enum, default_value_t = ElementCallCompatArg::Off)]
+    element_call_compat: ElementCallCompatArg,
 
     #[arg(long)]
     insecure_tls: bool,
@@ -585,7 +614,7 @@ impl Fleet {
                     livekit_service_url_fallback: Some(args.livekit_url.clone()),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
-                    legacy_element_call: args.legacy_element_call,
+                    element_call_compat: args.element_call_compat.into(),
                     sticky_duration_ms: Some(args.sticky_duration_ms),
                     ..CallOptions::default()
                 },

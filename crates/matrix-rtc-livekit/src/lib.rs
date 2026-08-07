@@ -79,6 +79,17 @@ pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_sl
 #[cfg(feature = "matrix-sdk")]
 pub use matrix_bridge::{SdkCommandSender, run_sticky_bridge};
 
+/// Which authorisation-service dialect to speak.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TokenEndpoint {
+    /// MSC4195 `POST /get_token`.
+    #[default]
+    Msc4195,
+    /// Pre-MSC4195 `POST /sfu/get`, for Element Call builds older than MSC4354.
+    /// Temporary; see [`compat`].
+    LegacyElementCall,
+}
+
 /// Configuration identifying the MatrixRTC slot to connect to.
 #[derive(Clone, Debug)]
 pub struct LiveKitTransportConfig {
@@ -91,6 +102,47 @@ pub struct LiveKitTransportConfig {
     pub slot_id: String,
     /// `member` claims identifying this membership to the authorisation service.
     pub member: MemberClaims,
+    /// Which authorisation-service dialect to speak. Defaults to MSC4195.
+    pub token_endpoint: TokenEndpoint,
+}
+
+/// Obtain a fresh OpenID token and exchange it for an SFU JWT.
+///
+/// The one place the token dialect is chosen, so the two `connect` entry points
+/// cannot drift apart.
+async fn acquire_token(
+    http: &reqwest::Client,
+    config: &LiveKitTransportConfig,
+    token_source: &dyn OpenIdTokenSource,
+) -> Result<SfuToken, Error> {
+    let openid_token = token_source.open_id_token().await?;
+    match config.token_endpoint {
+        TokenEndpoint::Msc4195 => {
+            token::get_token(
+                http,
+                &config.livekit_service_url,
+                &config.room_id,
+                &config.slot_id,
+                &config.member,
+                &openid_token,
+            )
+            .await
+        }
+        // `room` is the room id, because that is the `livekit_alias` this
+        // generation announces on a focus; the two must agree or the clients land
+        // in different LiveKit rooms. See
+        // `compat::element_call_state::ElementCallStateDialect::member_content`.
+        TokenEndpoint::LegacyElementCall => {
+            token::get_legacy_token(
+                http,
+                &config.livekit_service_url,
+                &config.room_id,
+                &config.member.claimed_device_id,
+                &openid_token,
+            )
+            .await
+        }
+    }
 }
 
 /// Connect to the LiveKit SFU for a MatrixRTC slot.
@@ -103,16 +155,7 @@ pub async fn connect(
     config: &LiveKitTransportConfig,
     token_source: &dyn OpenIdTokenSource,
 ) -> Result<LiveKitConnection, Error> {
-    let openid_token = token_source.open_id_token().await?;
-    let sfu_token = token::get_token(
-        http,
-        &config.livekit_service_url,
-        &config.room_id,
-        &config.slot_id,
-        &config.member,
-        &openid_token,
-    )
-    .await?;
+    let sfu_token = acquire_token(http, config, token_source).await?;
     LiveKitSession::connect(&sfu_token).await
 }
 
@@ -137,16 +180,7 @@ pub async fn connect_e2ee(
     use livekit::RoomOptions;
     use livekit::e2ee::{E2eeOptions, EncryptionType};
 
-    let openid_token = token_source.open_id_token().await?;
-    let sfu_token = token::get_token(
-        http,
-        &config.livekit_service_url,
-        &config.room_id,
-        &config.slot_id,
-        &config.member,
-        &openid_token,
-    )
-    .await?;
+    let sfu_token = acquire_token(http, config, token_source).await?;
 
     // RoomOptions is #[non_exhaustive]; mutate a default instance.
     let mut options = RoomOptions::default();

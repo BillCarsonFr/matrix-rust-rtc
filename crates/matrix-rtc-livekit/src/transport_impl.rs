@@ -56,7 +56,7 @@ use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use matrix_rtc_core::{JoinedMembership, RtcTransport};
+use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
 use matrix_rtc_media::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
     LocalTrackHandle, MediaStreamKind, MediaTransport, PublishOptions, QualityLimit, ReceiveStats,
@@ -67,7 +67,7 @@ use matrix_rtc_media::{
 use crate::identity::pseudonymous_identity;
 use crate::session::LiveKitSession;
 use crate::token::{MemberClaims, OpenIdTokenSource};
-use crate::{LiveKitTransportConfig, connect_e2ee};
+use crate::{LiveKitTransportConfig, TokenEndpoint, connect_e2ee};
 
 /// Sample rate remote audio is resampled to before crossing the transport
 /// boundary, matching what the recording helpers in [`crate::media`] use.
@@ -85,6 +85,17 @@ pub struct LiveKitMediaTransport {
     token_source: Arc<dyn OpenIdTokenSource>,
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     auto_subscribe: bool,
+    /// How a `(user, device, member_id)` triple becomes an SFU participant
+    /// identity. The MSC4195 hash by default.
+    ///
+    /// MUST be the same value installed on the core's encryption manager. A
+    /// divergence does not error — it silences: every `identity_map` lookup
+    /// misses, so peers sit in the roster with no media and their keys are
+    /// installed under an identity the SFU never assigned. See [`crate::compat`].
+    identity_mapper: RtcIdentityMapper,
+    /// Which authorisation-service dialect to speak. MSC4195 `/get_token` by
+    /// default.
+    token_endpoint: TokenEndpoint,
 }
 
 impl LiveKitMediaTransport {
@@ -100,6 +111,8 @@ impl LiveKitMediaTransport {
             token_source,
             key_provider,
             auto_subscribe: true,
+            identity_mapper: Arc::new(pseudonymous_identity),
+            token_endpoint: TokenEndpoint::default(),
         }
     }
 
@@ -108,6 +121,24 @@ impl LiveKitMediaTransport {
     /// See [`crate::connect_e2ee`].
     pub fn with_auto_subscribe(mut self, auto_subscribe: bool) -> Self {
         self.auto_subscribe = auto_subscribe;
+        self
+    }
+
+    /// Substitute the participant-identity derivation.
+    ///
+    /// A builder rather than a `new` parameter so the FFI media session, which
+    /// installs the MSC4195 derivation of its own, stays untouched — legacy
+    /// interop is a native dev/test concern and has no business on the mobile
+    /// surface. Temporary; see [`crate::compat`].
+    pub fn with_identity_mapper(mut self, identity_mapper: RtcIdentityMapper) -> Self {
+        self.identity_mapper = identity_mapper;
+        self
+    }
+
+    /// Substitute the authorisation-service dialect. Temporary; see
+    /// [`crate::compat`].
+    pub fn with_token_endpoint(mut self, token_endpoint: TokenEndpoint) -> Self {
+        self.token_endpoint = token_endpoint;
         self
     }
 
@@ -134,6 +165,7 @@ impl LiveKitMediaTransport {
                 claimed_user_id: ctx.member.user_id.clone(),
                 claimed_device_id: ctx.member.device_id.clone(),
             },
+            token_endpoint: self.token_endpoint,
         };
         let connection = connect_e2ee(
             &self.http,
@@ -154,7 +186,7 @@ impl LiveKitMediaTransport {
             LiveKitTransportConnection {
                 connection_key: livekit_service_url.to_owned(),
                 session: Arc::new(connection.session),
-                own_identity: crate::identity::pseudonymous_identity(
+                own_identity: (self.identity_mapper)(
                     &ctx.member.user_id,
                     &ctx.member.device_id,
                     &ctx.member.member_id,
@@ -180,12 +212,17 @@ impl MediaTransport for LiveKitMediaTransport {
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-        // MSC4195: identity = hash(user, device, member_id); the device is
-        // the one that encrypted the member event (MSC4143 dropped
-        // `claimed_device_id`). Without an attributable device there is no
-        // identity to expect on the SFU.
+        // MSC4195: identity = hash(user, device, member_id); the device is the
+        // one that encrypted the member event (MSC4143 dropped
+        // `claimed_device_id`), or — on the pre-sticky legacy path — the one the
+        // member event merely claims. Either way, without an attributable device
+        // there is no identity to expect on the SFU, and no device to address a
+        // media key to.
+        //
+        // Through the mapper rather than `pseudonymous_identity` directly, so a
+        // legacy call derives peer identities exactly as it derives its own.
         let device_id = member.origin.sender_device_id()?;
-        Some(pseudonymous_identity(
+        Some((self.identity_mapper)(
             &member.sender,
             device_id,
             &member.member_id,

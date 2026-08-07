@@ -117,7 +117,8 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 - Implements the MSC4195 LiveKit transport: the "LiveKit SDK" layer that turns
   `matrix-rtc-core`'s membership/key outputs into a live SFU media session.
-- Owns the authorisation-service `/get_token` exchange (`token`) and the MSC4195
+- Owns the authorisation-service `/get_token` exchange (`token`; and the
+  pre-MSC4195 `/sfu/get` one, for legacy interop) and the MSC4195
   hash derivations (`identity`), drives a LiveKit `Room` (`session`), and bridges
   core media keys into LiveKit per-participant frame encryption (`keys`,
   `MediaKeyBridge` → `KeyProvider`, HKDF mode, GCM frames).
@@ -140,11 +141,24 @@ At this stage there is no persistence, network transport, or encryption key dist
 - `compat` holds interop with MatrixRTC implementations that predate the 2026
   MSC4143 rewrite — today only Element Call on the JS SDK, the sole other
   implementation available to test against. It is scaffolding with a delete-by
-  date, and is confined to two JSON funnels at the edge so no dialect parameter
-  or legacy field reaches the core: *reading* the old format is permissive and
-  always on (it only fills in modern fields that are absent, so spec-shaped
-  events pass through untouched), while *writing* it is opt-in per call via
-  `CallOptions::legacy_element_call`.
+  date, selected per call by `CallOptions::element_call_compat`, and covers two
+  generations:
+  - **`StickyEvents`**, the 2025 format: already MSC4354 sticky-based, differing
+    only in the fields inside the member content. Confined to JSON funnels at the
+    edge so no dialect parameter or legacy field reaches the core. *Reading* it is
+    permissive and always on (it only fills in modern fields that are absent, so
+    spec-shaped events pass through untouched); *writing* it is opt-in, being the
+    half that changes what other clients see.
+  - **`StateEvents`**, the format before MSC4354: membership as
+    `org.matrix.msc3401.call.member` **room state**, a plain `{user}:{device}` SFU
+    participant identity, and the pre-MSC4195 `/sfu/get` token endpoint. Opt-in in
+    both directions, and not additive — such a call is visible to that generation
+    and to nobody else. The core still sees only MSC4143: the state events are
+    translated into synthetic sticky memberships at the bridge, and the slot
+    condition is left unenforced because that generation has no slot concept.
+    Three things refuse to be JSON and so live outside `compat` as one `match`
+    each: the ruma request type (`matrix_bridge`), the token endpoint
+    (`token`/`lib`), and the identity derivation (`transport_impl`/`call`).
 - Native-only by nature (the LiveKit client pulls in `libwebrtc`); never targets wasm.
 
 ## Spec alignment

@@ -38,7 +38,7 @@ use std::env;
 use std::error::Error;
 
 use livekit::RoomEvent;
-use matrix_rtc_livekit::{LiveKitTransportConfig, MemberClaims, connect};
+use matrix_rtc_livekit::{LiveKitTransportConfig, MemberClaims, TokenEndpoint, connect};
 
 fn required(name: &str) -> Result<String, Box<dyn Error>> {
     env::var(name).map_err(|_| format!("missing required env var {name}").into())
@@ -90,6 +90,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             claimed_user_id: user.clone(),
             claimed_device_id: device_id,
         },
+        token_endpoint: TokenEndpoint::default(),
     };
 
     // 3. HTTP client for the authorisation service exchange.
