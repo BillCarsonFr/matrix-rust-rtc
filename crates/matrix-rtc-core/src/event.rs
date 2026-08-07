@@ -60,6 +60,29 @@ pub enum EventOrigin {
         /// being a normal case to design around.
         sender_device_id: Option<String>,
     },
+    /// The event named its own sending device, and nothing authenticated that
+    /// claim.
+    ///
+    /// This is not a shape MSC4143 produces — the 2026 rewrite removed
+    /// `member.claimed_device_id` precisely because it is unverifiable. It
+    /// exists for one peer: Element Call runs as a widget, the widget API gives
+    /// it no decryption metadata, and so a self-asserted device id is the only
+    /// one it can either state or read. A member from such a peer has to be
+    /// bound to *some* device or no media key can travel in either direction.
+    ///
+    /// Weaker than [`Encrypted`](Self::Encrypted) and treated as such:
+    /// [`was_encrypted`](Self::was_encrypted) stays `None`, so this never
+    /// satisfies the "member events MUST be encrypted in an encrypted room"
+    /// rule. What it does buy is a device to address keys to — and an inbound
+    /// key still has to arrive Olm-encrypted *from that very device*, which the
+    /// claim cannot fake.
+    ///
+    /// Produced only by the pre-2026 compatibility path, and only where no
+    /// authenticated device was available.
+    Claimed {
+        /// The device the event says sent it.
+        device_id: String,
+    },
 }
 
 impl EventOrigin {
@@ -68,18 +91,31 @@ impl EventOrigin {
         Self::Encrypted { sender_device_id }
     }
 
-    /// The sending device, if the event was encrypted and attributable.
+    /// Builds an origin from a device the event merely claims. See
+    /// [`EventOrigin::Claimed`] before reaching for this.
+    pub fn claimed(device_id: impl Into<String>) -> Self {
+        Self::Claimed {
+            device_id: device_id.into(),
+        }
+    }
+
+    /// The sending device, if the event was encrypted and attributable, or if it
+    /// claimed one.
     pub fn sender_device_id(&self) -> Option<&str> {
         match self {
             Self::Encrypted { sender_device_id } => sender_device_id.as_deref(),
+            Self::Claimed { device_id } => Some(device_id.as_str()),
             Self::Unknown | Self::Cleartext => None,
         }
     }
 
     /// Whether the event arrived encrypted; `None` when the host did not say.
+    ///
+    /// A claimed device says nothing about encryption, so it reports `None` —
+    /// the rules that depend on this are skipped rather than passed.
     pub fn was_encrypted(&self) -> Option<bool> {
         match self {
-            Self::Unknown => None,
+            Self::Unknown | Self::Claimed { .. } => None,
             Self::Cleartext => Some(false),
             Self::Encrypted { .. } => Some(true),
         }
@@ -382,6 +418,17 @@ mod tests {
         // are skipped rather than failed.
         assert_eq!(EventOrigin::Unknown.was_encrypted(), None);
         assert_eq!(EventOrigin::default(), EventOrigin::Unknown);
+    }
+
+    /// A claimed device is usable as a device but must never pass for
+    /// encryption — otherwise the legacy path would let an unencrypted member
+    /// event through the encrypted-room rule.
+    #[test]
+    fn a_claimed_device_is_named_but_not_authenticated() {
+        let claimed = EventOrigin::claimed("V5cP8FErcB");
+
+        assert_eq!(claimed.sender_device_id(), Some("V5cP8FErcB"));
+        assert_eq!(claimed.was_encrypted(), None);
     }
 
     #[test]

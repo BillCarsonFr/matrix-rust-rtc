@@ -137,6 +137,14 @@ At this stage there is no persistence, network transport, or encryption key dist
   e2e test drives). `Call::subscribe_call_events`/`Call::participants` are the
   transport-agnostic surface; the raw `Call::events`/`Call::session` accessors
   remain during the transition.
+- `compat` holds interop with MatrixRTC implementations that predate the 2026
+  MSC4143 rewrite — today only Element Call on the JS SDK, the sole other
+  implementation available to test against. It is scaffolding with a delete-by
+  date, and is confined to two JSON funnels at the edge so no dialect parameter
+  or legacy field reaches the core: *reading* the old format is permissive and
+  always on (it only fills in modern fields that are absent, so spec-shaped
+  events pass through untouched), while *writing* it is opt-in per call via
+  `CallOptions::legacy_element_call`.
 - Native-only by nature (the LiveKit client pulls in `libwebrtc`); never targets wasm.
 
 ## Spec alignment

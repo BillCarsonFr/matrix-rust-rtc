@@ -92,7 +92,24 @@ SLOT_ID="m.call#ROOM"
 
 # Publish the m.rtc.slot state event first. Needs the power level for it, and
 # is unnecessary when a real client already opened the call.
+#
+# Set this when the call was opened by Element Call (see LEGACY_ELEMENT_CALL):
+# that client publishes no m.rtc.slot at all, and a slot nobody opened reads as
+# closed, which projects every member — including these devices — out of the
+# call.
 OPEN_SLOT=0
+
+# Share the call with Element Call on the JS SDK, which still speaks the
+# MatrixRTC wire format from before the 2026 MSC4143 rewrite. Our membership
+# then also carries the fields it needs (notably the device id it addresses
+# media keys to, which it cannot obtain any other way — it runs as a widget and
+# gets no decryption metadata).
+#
+# Media keys then go out under the legacy to-device type INSTEAD of the spec
+# one, since a to-device message has only one type. So a run with this on
+# exchanges keys with Element Call or with spec-current peers, never both.
+# Reading the old format needs no flag and is always on.
+LEGACY_ELEMENT_CALL=0
 
 # Accept self-signed certificates (the demo/backend stack).
 INSECURE_TLS=0
@@ -139,6 +156,7 @@ args=(
 [[ "$AUDIO" == "1" ]] && args+=(--audio)
 [[ "$SUBSCRIBE" == "1" ]] && args+=(--subscribe)
 [[ "$OPEN_SLOT" == "1" ]] && args+=(--open-slot)
+[[ "$LEGACY_ELEMENT_CALL" == "1" ]] && args+=(--legacy-element-call)
 [[ "$INSECURE_TLS" == "1" ]] && args+=(--insecure-tls)
 
 # --release matters: a debug build cannot keep the encoders fed and you end up

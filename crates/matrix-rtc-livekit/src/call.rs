@@ -56,6 +56,7 @@ use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::ruma::api::client::rtc::transports::v1 as rtc_transports;
 use matrix_sdk::ruma::events::AnyToDeviceEvent;
 use matrix_sdk::ruma::events::rtc::transport::RtcTransport as RumaRtcTransport;
+use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::{Client, Room};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, broadcast, watch};
@@ -70,6 +71,7 @@ use matrix_rtc_media::{
     MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,
 };
 
+use crate::compat::{self, ElementCallDialect};
 use crate::identity::pseudonymous_identity;
 use crate::matrix_bridge::{SdkCommandSender, run_sticky_bridge};
 use crate::session::LiveKitSession;
@@ -131,6 +133,19 @@ pub struct CallOptions {
     /// [`Call::remote_track`] never produce anything. Only a load generator
     /// wants this.
     pub auto_subscribe: bool,
+    /// Also speak the pre-2026 Element Call dialect on the way out, for calls
+    /// with clients that have not caught up with the 2026 MSC4143 rewrite (the
+    /// JS SDK, and so Element Call).
+    ///
+    /// Membership events stay MSC4143-valid — the legacy fields ride alongside
+    /// — but media keys go out as `io.element.call.encryption_keys` *instead of*
+    /// the spec type, since a to-device message has only one type. A call with
+    /// this on therefore exchanges keys with legacy peers and not with
+    /// spec-current ones.
+    ///
+    /// Reading the legacy dialect needs no flag and is always on. See
+    /// [`crate::compat`], and delete all of it once Element Call catches up.
+    pub legacy_element_call: bool,
 }
 
 impl Default for CallOptions {
@@ -143,6 +158,7 @@ impl Default for CallOptions {
             heartbeat_interval: Duration::from_secs(15),
             http: None,
             auto_subscribe: true,
+            legacy_element_call: false,
         }
     }
 }
@@ -189,6 +205,7 @@ pub struct Call {
     key_pump: AbortOnDrop,
     _sticky_bridge: AbortOnDrop,
     _key_handler: EventHandlerDropGuard,
+    _legacy_key_handler: EventHandlerDropGuard,
 }
 
 impl Call {
@@ -215,8 +232,26 @@ impl Call {
         let room_id = room.room_id().to_string();
 
         // The manager plus the bridge feeding it peer memberships.
+        let command_sender = if options.legacy_element_call {
+            log::warn!(
+                "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
+                 go out as {} and will not reach spec-current peers",
+                options.slot_id,
+                compat::LEGACY_KEY_EVENT_TYPE,
+            );
+            SdkCommandSender::with_element_call_compat(
+                client.clone(),
+                ElementCallDialect::new(
+                    user_id.clone(),
+                    device_id.clone(),
+                    options.slot_id.clone(),
+                ),
+            )
+        } else {
+            SdkCommandSender::new(client.clone())
+        };
         let manager: Manager = Arc::new(Mutex::new(RtcSessionManager::with_command_sender(
-            Arc::new(SdkCommandSender::new(client.clone())),
+            Arc::new(command_sender),
         )));
         let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_sticky_bridge(
             room.clone(),
@@ -236,8 +271,14 @@ impl Call {
         // bytes over a channel to a `spawn_local` pump that drives the `!Send`
         // manager. The drop guard unregisters the handler with the `Call`.
         let (key_tx, key_rx) = unbounded_channel::<ReceivedKey>();
-        let handler = register_key_receiver(&client, key_tx);
+        let handler = register_key_receiver(&client, key_tx.clone());
         let key_handler = client.event_handler_drop_guard(handler);
+        // Peers that predate the 2026 rewrite send their keys under a different
+        // type entirely, which ruma has no typed event for. Always registered:
+        // reading the legacy dialect costs a string comparison and cannot
+        // affect a spec-current call.
+        let legacy_key_handler =
+            client.event_handler_drop_guard(register_legacy_key_receiver(&client, key_tx));
 
         // MSC4143 requires a fresh `member.id` on every join, so this must not
         // be derived from the (stable) user and device IDs.
@@ -456,6 +497,7 @@ impl Call {
             key_pump,
             _sticky_bridge: sticky_bridge,
             _key_handler: key_handler,
+            _legacy_key_handler: legacy_key_handler,
         })
     }
 
@@ -721,6 +763,64 @@ fn register_key_receiver(
                         key_b64: event.content.media_key.key,
                     });
                 }
+            }
+        },
+    )
+}
+
+/// Register a to-device handler for media keys from peers that predate the 2026
+/// MSC4143 rewrite (`io.element.call.encryption_keys`).
+///
+/// Takes the event raw rather than typed, for two reasons: ruma has no typed
+/// event for the legacy type at all, and a typed handler silently never fires
+/// when the content does not match ruma's model — a failure mode this crate has
+/// already been bitten by once. The type is filtered here instead, so a
+/// `Raw<AnyToDeviceEvent>` handler (which matches every to-device event) only
+/// ever acts on the one type it is for.
+///
+/// Feeds the same channel as [`register_key_receiver`]; the core neither knows
+/// nor cares which dialect a key arrived in. See [`crate::compat`].
+fn register_legacy_key_receiver(
+    client: &Client,
+    key_tx: UnboundedSender<ReceivedKey>,
+) -> matrix_sdk::event_handler::EventHandlerHandle {
+    client.add_event_handler(
+        move |event: Raw<AnyToDeviceEvent>, encryption_info: Option<EncryptionInfo>| {
+            let key_tx = key_tx.clone();
+            async move {
+                if event.get_field::<String>("type").ok().flatten().as_deref()
+                    != Some(compat::LEGACY_KEY_EVENT_TYPE)
+                {
+                    return;
+                }
+
+                let content = match event.get_field::<serde_json::Value>("content") {
+                    Ok(Some(content)) => content,
+                    _ => {
+                        log::warn!(
+                            "ignoring a {} to-device message with no content object",
+                            compat::LEGACY_KEY_EVENT_TYPE,
+                        );
+                        return;
+                    }
+                };
+
+                let Some(key) = compat::element_call::parse_key_message(&content) else {
+                    log::warn!(
+                        "ignoring a {} to-device message missing a required field; that peer's \
+                         media will not decrypt",
+                        compat::LEGACY_KEY_EVENT_TYPE,
+                    );
+                    return;
+                };
+
+                let _ = key_tx.send(ReceivedKey {
+                    origin: key_origin(encryption_info.as_ref()),
+                    room_id: key.room_id,
+                    member_id: key.member_id,
+                    key_index: key.key_index,
+                    key_b64: key.key_b64,
+                });
             }
         },
     )

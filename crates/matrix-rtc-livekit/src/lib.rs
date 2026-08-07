@@ -37,6 +37,9 @@
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
+// Interop with MatrixRTC implementations that predate the 2026 MSC4143
+// rewrite. Scaffolding with a delete-by date; nothing else should depend on it.
+pub mod compat;
 pub mod identity;
 pub mod keys;
 // Audio helpers. Recording a subscribed track and writing WAVs is shipped API

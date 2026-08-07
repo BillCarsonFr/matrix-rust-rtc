@@ -174,6 +174,12 @@ struct Args {
     #[arg(long)]
     open_slot: bool,
 
+    /// Also speak the pre-2026 Element Call dialect, for a call shared with
+    /// Element Call on the JS SDK. Media keys then go out under the legacy
+    /// to-device type *only*, so spec-current peers will not decrypt this run.
+    #[arg(long)]
+    legacy_element_call: bool,
+
     #[arg(long)]
     insecure_tls: bool,
 
@@ -402,6 +408,7 @@ impl Fleet {
                     livekit_service_url_fallback: Some(args.livekit_url.clone()),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
+                    legacy_element_call: args.legacy_element_call,
                     ..CallOptions::default()
                 },
             )
