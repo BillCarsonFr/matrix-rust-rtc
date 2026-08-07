@@ -76,7 +76,15 @@ futures-util = "0.3"
 # The experimental branch carries MSC4354 sticky-event support that the crates.io
 # release lacks; the whole MatrixRTC signalling path (own membership, keep-alive,
 # peer discovery) rides on it. See `matrix_bridge`. Keeps matrix-sdk's default
-# features (e2e-encryption, sqlite, rustls-aws-lc-rs) and adds sticky events.
+# features (e2e-encryption, sqlite, rustls-aws-lc-rs, automatic-room-key-
+# forwarding) and adds sticky events.
+#
+# Key forwarding stays ON deliberately. Without it a freshly logged-in device
+# cannot obtain the Megolm sessions for member events sent before it existed,
+# and simply does not see those peers — the exact failure that makes an
+# in-progress Element Call invisible to a new device. Tools that want the
+# request/forward chatter out of their measurements switch it off per client at
+# runtime instead; see `quiet_room_key_gossip` in `examples/load_test.rs`.
 #
 # Pinned to rev 3773300 ("Update ruma to the rewritten MSC4143"), which
 # repoints ruma to `BillCarsonFr/ruma@3fc675d`. That ruma models the 2026
@@ -122,7 +130,12 @@ matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-ui", "dep:matrix-sdk-base"]
 # frequency detector) for examples and integration tests; recording/WAV
 # helpers in that module are shipped API and need no feature. Otherwise the
 # test-only parts compile only under `cfg(test)`.
-testing = []
+#
+# Also turns on matrix-sdk's `testing`, whose only use here is
+# `Client::olm_machine_for_testing` — the one public route to the `OlmMachine`,
+# and so the only way to reach `set_room_key_forwarding_enabled`. It costs
+# `wiremock` and friends in the graph, which is what a testing feature is for.
+testing = ["matrix-sdk?/testing"]
 
 # The end-to-end call test (see tests/E2E_CALL.md). `required-features` keeps
 # plain `cargo test --workspace` from compiling it (and the git SDK + libwebrtc
@@ -158,7 +171,10 @@ name = "join_and_record"
 required-features = ["matrix-sdk", "testing"]
 
 # The load generator (see README.md). Publishes a video file from N devices of
-# one account; needs no `testing` feature — its tone generator is local.
+# one account. Its tone generator is local, so `testing` is here for one reason
+# only: reaching the `OlmMachine`.
 [[example]]
 name = "load_test"
-required-features = ["matrix-sdk"]
+# `testing` is only for `Client::olm_machine_for_testing`, used to keep room-key
+# gossip out of the to-device traffic this tool measures.
+required-features = ["matrix-sdk", "testing"]

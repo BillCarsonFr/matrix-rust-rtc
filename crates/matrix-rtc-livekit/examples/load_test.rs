@@ -657,7 +657,7 @@ impl Fleet {
             match restore_device(args, dir).await {
                 Ok(client) => {
                     println!("[{index}] restored device {}", device_id_of(&client)?);
-                    return self.device_from(client, index);
+                    return self.device_from(client, index).await;
                 }
                 // Never fatal: a store whose device was deleted server-side
                 // (--purge-devices, a logout elsewhere, a wiped account) would
@@ -703,12 +703,13 @@ impl Fleet {
             persist_session(&client, dir)?;
         }
 
-        self.device_from(client, index)
+        self.device_from(client, index).await
     }
 
     /// Assemble the bookkeeping around a client that is logged in, however it
     /// got there.
-    fn device_from(&self, client: Client, index: usize) -> Result<Device, Box<dyn Error>> {
+    async fn device_from(&self, client: Client, index: usize) -> Result<Device, Box<dyn Error>> {
+        quiet_room_key_gossip(&client).await;
         let device_id = device_id_of(&client)?;
         Ok(Device {
             index,
@@ -830,6 +831,37 @@ fn prepare_store(root: &Path) -> Result<(), Box<dyn Error>> {
         "matrix-rtc load_test device store; delete this folder to forget every device\n",
     )?;
     Ok(())
+}
+
+/// Stop this client requesting and forwarding Megolm room keys.
+///
+/// The SDK does both automatically (`automatic-room-key-forwarding`, on by
+/// default): a decryption failure fires an `m.room_key_request`, and other
+/// verified devices answer with `m.forwarded_room_key`. That is *correct* for a
+/// real client — it is how a new device catches up on member events sent before
+/// it existed — but this tool exists to measure to-device traffic, and ten
+/// fresh devices failing to decrypt each other's history produce a burst of
+/// exactly the traffic under measurement, at exactly the wrong moment.
+///
+/// So it is switched off here, per client, rather than compiled out of the
+/// library: `matrix-rtc-livekit` keeps the correct default for everyone else.
+///
+/// `olm_machine_for_testing` is the only public route to the `OlmMachine`
+/// (`Encryption::olm_machine` is `pub(crate)`, `Client::base_client` likewise),
+/// which is why this example needs matrix-sdk's `testing` feature.
+///
+/// What it costs: a device can no longer ask for Megolm sessions it missed, so
+/// it sees peers whose member events predate it only when they next re-send —
+/// half of `--sticky-duration-ms`. `--store` avoids that entirely, since a
+/// restored device already holds its sessions.
+async fn quiet_room_key_gossip(client: &Client) {
+    let machine = client.olm_machine_for_testing().await;
+    let Some(machine) = machine.as_ref() else {
+        eprintln!("no olm machine on a logged-in client; room-key gossip stays on");
+        return;
+    };
+    machine.set_room_key_forwarding_enabled(false);
+    machine.set_room_key_requests_enabled(false);
 }
 
 /// Where device `index` keeps its sqlite store and session file under

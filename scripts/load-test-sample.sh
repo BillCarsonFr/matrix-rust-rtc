@@ -247,5 +247,5 @@ args=(
 # orphaned out of that group, so every later Ctrl-C lands nowhere while it keeps
 # printing to the same terminal. `exec` also means no shell is left wrapping it,
 # so the PID you see is the one to signal.
-cargo build --release -p matrix-rtc-livekit --example load_test --features matrix-sdk
+cargo build --release -p matrix-rtc-livekit --example load_test --features matrix-sdk,testing
 exec ./target/release/examples/load_test "${args[@]}" "$@"
