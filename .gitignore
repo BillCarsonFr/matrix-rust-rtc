@@ -43,3 +43,7 @@ mobile/android/matrixrtc/build/
 mobile/ios/generated/
 
 mobile/android/matrixrtc/src/main/java/uniffi/
+
+# Working copy of scripts/load-test-sample.sh — carries the account password
+# and recovery key, so it must never be committed.
+scripts/load-test.sh

@@ -120,11 +120,16 @@ pub async fn connect(
 /// [`MediaKeyBridge::with_provider`] (a [`livekit::e2ee::key_provider::KeyProvider`]
 /// is a cheap shared handle — clone it), so keys signalled by `matrix-rtc-core`
 /// and imported through the bridge reach the frame cryptor of this room.
+///
+/// `auto_subscribe` false makes the connection publish-only: peers' tracks are
+/// never subscribed, so no remote media (and no decoder) exists for them. Only
+/// a load generator wants this — a real client leaves it `true`.
 pub async fn connect_e2ee(
     http: &reqwest::Client,
     config: &LiveKitTransportConfig,
     token_source: &dyn OpenIdTokenSource,
     key_provider: livekit::e2ee::key_provider::KeyProvider,
+    auto_subscribe: bool,
 ) -> Result<LiveKitConnection, Error> {
     use livekit::RoomOptions;
     use livekit::e2ee::{E2eeOptions, EncryptionType};
@@ -149,6 +154,7 @@ pub async fn connect_e2ee(
     // Publisher-side layer control: the SFU tells us which simulcast layers
     // are actually subscribed and unneeded ones stop being encoded.
     options.dynacast = true;
+    options.auto_subscribe = auto_subscribe;
     LiveKitSession::connect_with_options(&sfu_token, options).await
 }
 

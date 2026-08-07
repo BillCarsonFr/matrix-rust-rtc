@@ -137,6 +137,9 @@ required-features = ["matrix-sdk", "testing"]
 # `signal` for the join_and_record example's Ctrl-C hang-up.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Argument parsing for the `load_test` example. A dev-dependency on purpose:
+# examples may use them, so clap never enters the library's dependency graph.
+clap = { version = "4", features = ["derive", "env"] }
 # The dependency tree pulls in rustls with BOTH the `ring` and `aws-lc-rs`
 # crypto backends (livekit/reqwest vs matrix-sdk), so rustls cannot pick a
 # process-level `CryptoProvider` automatically and panics on first TLS use. The
@@ -153,3 +156,9 @@ required-features = ["matrix-sdk"]
 [[example]]
 name = "join_and_record"
 required-features = ["matrix-sdk", "testing"]
+
+# The load generator (see README.md). Publishes a video file from N devices of
+# one account; needs no `testing` feature — its tone generator is local.
+[[example]]
+name = "load_test"
+required-features = ["matrix-sdk"]

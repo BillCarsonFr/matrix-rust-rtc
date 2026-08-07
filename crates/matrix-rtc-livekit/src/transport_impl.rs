@@ -84,6 +84,7 @@ pub struct LiveKitMediaTransport {
     http: reqwest::Client,
     token_source: Arc<dyn OpenIdTokenSource>,
     key_provider: livekit::e2ee::key_provider::KeyProvider,
+    auto_subscribe: bool,
 }
 
 impl LiveKitMediaTransport {
@@ -98,7 +99,16 @@ impl LiveKitMediaTransport {
             http,
             token_source,
             key_provider,
+            auto_subscribe: true,
         }
+    }
+
+    /// Make every connection of this transport publish-only: remote tracks are
+    /// never subscribed, so no remote media flows and no decoder is created.
+    /// See [`crate::connect_e2ee`].
+    pub fn with_auto_subscribe(mut self, auto_subscribe: bool) -> Self {
+        self.auto_subscribe = auto_subscribe;
+        self
     }
 
     /// Typed variant of [`MediaTransport::connect`], for callers that need
@@ -130,6 +140,7 @@ impl LiveKitMediaTransport {
             &config,
             self.token_source.as_ref(),
             self.key_provider.clone(),
+            self.auto_subscribe,
         )
         .await
         .map_err(|error| TransportError::Connect(error.to_string()))?;

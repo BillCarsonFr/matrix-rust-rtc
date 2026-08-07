@@ -101,6 +101,126 @@ bootstraps cross-signing and prints a **recovery key**, and since every run
 logs in a fresh device, subsequent runs need that key passed as
 `RECOVERY_KEY=...` so the new device gets cross-signed.)
 
+## Load testing
+
+[`examples/load_test.rs`](examples/load_test.rs) drives a deployment with N
+virtual participants: it logs in N devices of **one** account, walks them
+through the same join sequence a real client uses, and has each publish a video
+file as its camera track. Run it while watching the same call in Element Web to
+inspect SFU/homeserver/client behaviour.
+
+The easiest way in is
+[`scripts/load-test-sample.sh`](../../scripts/load-test-sample.sh): copy it,
+fill in the block at the top once, then run your copy. `scripts/load-test.sh`
+is git-ignored, so the password and recovery key in it stay out of the
+repository. Extra flags pass straight through and win over the block, so
+one-off tweaks need no edit:
+
+```sh
+cp scripts/load-test-sample.sh scripts/load-test.sh
+$EDITOR scripts/load-test.sh
+./scripts/load-test.sh                               # your defaults
+./scripts/load-test.sh --devices 10 --no-simulcast   # one-off override
+```
+
+Or invoke it directly:
+
+```sh
+cargo run --release -p matrix-rtc-livekit --example load_test \
+    --features matrix-sdk -- \
+    --user loadtest --password secret --recovery-key 'EsT ...' \
+    --room '!room:synapse' --video clip.mp4 --devices 5
+```
+
+Every argument also reads from an environment variable (`MX_USER`,
+`MX_PASSWORD`, `RECOVERY_KEY`, `ROOM_ID`, `HOMESERVER_URL`) — prefer that for
+the secrets. `--help` lists the rest; the ones that matter most are
+`--resolution` / `--fps` / `--clip-seconds`, `--audio`, `--subscribe`, and the
+`--ramp-ms` / `--login-delay-ms` pacing.
+
+Notes:
+
+- **`ffmpeg` must be on `PATH`**, unless the input is already `.y4m` or raw
+  `.yuv`. It is invoked once at startup to decode `--clip-seconds` of the file
+  into memory; every device then loops that same buffer from a different
+  offset. One shared decode keeps the CPU going into encoding, which is what
+  the run is meant to exercise.
+- **The recovery key is required.** Each device is a fresh login, and neither
+  the SDK's identity-based to-device strategy nor the core's MSC4153 policy
+  will exchange media keys with a device that is not cross-signed.
+- **The room must be encrypted.** A member event's sending device is only known
+  from its decryption metadata, so in a cleartext room memberships cannot be
+  mapped to media at all. The tool warns and continues.
+- **Devices are removed on exit** (a plain logout per device). A run killed
+  with `kill -9` leaves them behind; `--purge-devices` deletes every device
+  whose display name carries `--device-prefix` and exits.
+- **Scale is bounded by your machine, not the SFU** — see
+  [How many devices?](#how-many-devices) below.
+- Devices join publish-only by default (`CallOptions::auto_subscribe = false`).
+  `--subscribe` makes them decode every peer as a real client would, at N×N
+  cost.
+- N devices of one account is equivalent to N accounts here: membership is keyed
+  on a random per-join `member_id`, the MSC4195 identity hashes
+  `(user, device, member_id)`, and the core distributes media keys to other
+  devices of our own user like any other peer.
+
+Homeservers with rate limiting may reject a burst of logins or messages;
+`--login-delay-ms` and `--ramp-ms` space them out.
+
+### How many devices?
+
+**Short answer: start at 5, double until the stats line sags, and stay one
+step below that.** The numbers below are derived from the code, not measured —
+treat them as a starting point, and the stats line as the truth.
+
+The binding constraint is almost always **video encoding on the machine
+running the tool**. Every device is a separate peer connection with its own
+encoder set (the LiveKit Rust SDK has no publish-pre-encoded path), and how
+many encoders that is depends on resolution and simulcast —
+`compute_video_encodings` in livekit `src/room/options.rs`:
+
+| `--resolution` | simulcast on | simulcast off |
+| --- | --- | --- |
+| 320x240 (long edge < 480) | 1 | 1 |
+| 640x360 *(default)* | 2 | 1 |
+| 1280x720 | 3 | 1 |
+
+So 10 devices at 640x360 is 20 concurrent VP8 encoders with simulcast on, or
+10 with `--no-simulcast` (which the sample script sets). As a rough budget,
+one encoder per available core is a sane place to begin — a modern laptop
+running the sample script's defaults (640x360, 15 fps, no simulcast) should
+manage somewhere in the low tens; with simulcast on, halve it; at 720p with
+simulcast, halve it again. `--subscribe` adds N×N decoding on top and cuts
+whatever you land on by a lot.
+
+**The measurement that settles it** is the health line printed every 10 s:
+
+```
+  [0] 150 frames/10s, 900 total, 0 errors, 4 members
+```
+
+While `frames/10s` stays near `--fps × 10`, every device is really publishing
+at the rate you asked for. Once it drops, the generator is saturated: the
+extra devices are not producing the load you think they are, and any
+server-side number you read from that run is understating things. That is the
+point to stop adding devices and instead run a second process, or a second
+machine.
+
+Two ceilings that are *not* about your CPU, and that you may actually want to
+hit deliberately:
+
+- **Media-key distribution is quadratic.** Keys go out as individually
+  Olm-encrypted to-device messages, one per recipient device — bringing up N
+  devices costs O(N²) messages. Teardown is worse: the core rotates the key
+  whenever anyone leaves (`matrix-rtc-core/src/encryption/mod.rs`), so each
+  departure makes every survivor re-key and re-send. With a few dozen devices
+  the leave storm at shutdown is heavier than the join ramp was. If the
+  homeserver struggles at the *end* of a run rather than during it, this is
+  why.
+- **One sliding-sync connection per device**, all for the same account, plus N
+  logins during setup. `--login-delay-ms` and `--ramp-ms` pace the setup; the
+  steady-state syncs are unpaced.
+
 ## Module map
 
 | Module | What it does |
@@ -133,6 +253,8 @@ asserts a tone survives an encrypt→SFU→decrypt round trip.
 
 - [`examples/join_and_record.rs`](examples/join_and_record.rs) — the quick
   start, runnable (see above).
+- [`examples/load_test.rs`](examples/load_test.rs) — the load generator: N
+  devices of one account publishing a video file (see above).
 - [`examples/connect.rs`](examples/connect.rs) — the low-level path only:
   token exchange + subscribe-only SFU connect, no membership signalling, no
   E2EE. Useful for poking at an authorisation service.

@@ -18,10 +18,11 @@
 //! LiveKit SFU media session.
 //!
 //! Wraps a connected LiveKit [`Room`] and surfaces its [`RoomEvent`] stream so
-//! the host can react to participants and subscribed tracks. This phase is
-//! **subscribe-only**: the session does not publish local media, which is the
-//! default behaviour of a LiveKit room with `auto_subscribe` enabled and is the
-//! shape a recording/transcription bot needs.
+//! the host can react to participants and subscribed tracks. The session itself
+//! publishes nothing: local media is published through the room handle by the
+//! layer above ([`crate::transport_impl`]), and remote tracks are subscribed
+//! automatically unless the caller passes [`RoomOptions`] with `auto_subscribe`
+//! off (see [`crate::connect_e2ee`]).
 
 use livekit::{Room, RoomEvent, RoomOptions};
 use tokio::sync::mpsc::UnboundedReceiver;

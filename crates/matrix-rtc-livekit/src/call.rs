@@ -125,6 +125,12 @@ pub struct CallOptions {
     /// service. Supply one to control TLS behaviour (e.g. self-signed dev
     /// certs); `None` builds a default client.
     pub http: Option<reqwest::Client>,
+    /// Whether to subscribe to peers' media. `false` joins publish-only: the
+    /// roster still fills from membership signalling, but no remote track is
+    /// ever subscribed, so [`CallEvent::StreamStarted`] and
+    /// [`Call::remote_track`] never produce anything. Only a load generator
+    /// wants this.
+    pub auto_subscribe: bool,
 }
 
 impl Default for CallOptions {
@@ -136,6 +142,7 @@ impl Default for CallOptions {
             encryption_config: None,
             heartbeat_interval: Duration::from_secs(15),
             http: None,
+            auto_subscribe: true,
         }
     }
 }
@@ -310,11 +317,10 @@ impl Call {
             Some(http) => http,
             None => reqwest::Client::new(),
         };
-        let transport = Arc::new(LiveKitMediaTransport::new(
-            http,
-            Arc::new(client.clone()),
-            provider,
-        ));
+        let transport = Arc::new(
+            LiveKitMediaTransport::new(http, Arc::new(client.clone()), provider)
+                .with_auto_subscribe(options.auto_subscribe),
+        );
         let ctx = ConnectionContext {
             room_id: room_id.clone(),
             slot_id: options.slot_id.clone(),
