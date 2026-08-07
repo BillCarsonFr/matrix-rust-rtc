@@ -29,6 +29,7 @@
 //!
 //! Requires the `matrix-sdk` feature.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +45,7 @@ use matrix_sdk::ruma::events::{
     MessageLikeEventType, StateEventType,
 };
 use matrix_sdk::ruma::serde::Raw;
-use matrix_sdk::ruma::{DeviceId, RoomId, TransactionId, UserId};
+use matrix_sdk::ruma::{DeviceId, OwnedUserId, RoomId, TransactionId, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships};
 use matrix_sdk_base::crypto::CollectStrategy;
 use serde_json::Value;
@@ -393,6 +394,9 @@ impl RtcCommandSender for SdkCommandSender {
         let encryption = self.client.encryption();
         let mut devices = Vec::with_capacity(recipients.len());
         let mut unknown = Vec::new();
+        // Users we have already forced a `/keys/query` for in this batch, so a
+        // room full of one user's devices costs one query rather than N.
+        let mut queried: HashSet<OwnedUserId> = HashSet::new();
 
         for recipient in &recipients {
             let user = match UserId::parse(&recipient.user_id) {
@@ -406,7 +410,32 @@ impl RtcCommandSender for SdkCommandSender {
                 }
             };
             let device_id = <&DeviceId>::from(recipient.device_id.as_str());
-            match encryption.get_device(&user, device_id).await {
+
+            let mut found = encryption.get_device(&user, device_id).await;
+
+            // Not in the crypto store yet. That is routine on the *first* key we
+            // ever send a peer, and it is much more likely on the pre-sticky
+            // path: there our membership is an unencrypted state event, so
+            // nothing has forced a `/keys/query` for this user and the media key
+            // is the first thing we ever try to encrypt to them. (On the spec
+            // path the membership is an encrypted room event, whose megolm
+            // pre-share does the query for us — which is why this was invisible
+            // until the state dialect existed.)
+            //
+            // So ask, once per user per batch, instead of reporting the peer
+            // unreachable and waiting for a later rollout to retry.
+            if matches!(found, Ok(None)) && queried.insert(user.clone()) {
+                log::debug!(
+                    "{user}/{device_id} is not in the crypto store; querying keys before \
+                     giving up on delivering a media key to them",
+                );
+                if let Err(error) = encryption.request_user_identity(&user).await {
+                    log::warn!("keys query for {user} failed: {error}");
+                }
+                found = encryption.get_device(&user, device_id).await;
+            }
+
+            match found {
                 Ok(Some(device)) => devices.push(device),
                 // Not an error for the batch: the other recipients still get the
                 // key, and this one is reported unserved so it is retried once
