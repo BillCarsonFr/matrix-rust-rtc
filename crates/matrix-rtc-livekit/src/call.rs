@@ -137,11 +137,13 @@ pub struct CallOptions {
     /// with clients that have not caught up with the 2026 MSC4143 rewrite (the
     /// JS SDK, and so Element Call).
     ///
-    /// Membership events stay MSC4143-valid — the legacy fields ride alongside
-    /// — but media keys go out as `io.element.call.encryption_keys` *instead of*
-    /// the spec type, since a to-device message has only one type. A call with
-    /// this on therefore exchanges keys with legacy peers and not with
-    /// spec-current ones.
+    /// A join stays MSC4143-valid — the legacy fields ride alongside. A leave
+    /// and a media key cannot: a leave becomes the legacy bare-sticky-key
+    /// content (Element Call has no `membership` field, and a padded spec leave
+    /// would read to it as still joined), and keys go out as
+    /// `io.element.call.encryption_keys` *instead of* the spec type, since a
+    /// to-device message has only one type. A call with this on therefore
+    /// exchanges keys with legacy peers and not with spec-current ones.
     ///
     /// Reading the legacy dialect needs no flag and is always on. See
     /// [`crate::compat`], and delete all of it once Element Call catches up.

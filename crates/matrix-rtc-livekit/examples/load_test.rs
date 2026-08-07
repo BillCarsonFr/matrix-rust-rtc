@@ -38,14 +38,20 @@
 //!
 //! Needs `ffmpeg` on `PATH` unless the input is already `.y4m` or raw `.yuv`.
 //!
-//! **Cross-signing is mandatory.** Every run logs in fresh devices, and MSC4153
-//! (enforced by the core, and by the SDK's identity-based to-device strategy)
-//! only lets cross-signed devices exchange media keys. Pass the account's
-//! recovery key; the first run of `join_and_record` against a fresh account
-//! prints one.
+//! **Cross-signing is mandatory.** A run that logs in fresh devices needs them
+//! cross-signed, because MSC4153 (enforced by the core, and by the SDK's
+//! identity-based to-device strategy) only lets cross-signed devices exchange
+//! media keys. Pass the account's recovery key; the first run of
+//! `join_and_record` against a fresh account prints one.
 //!
 //! Devices are deleted on exit. If the process is killed hard, `--purge-devices`
 //! removes whatever it left behind.
+//!
+//! `--store <folder>` changes both of those: devices and their crypto stores
+//! persist between runs, so logins (and the rate limiting that comes with them)
+//! happen once, and a restored device can still decrypt member events sent
+//! before the run began. Devices are then kept on exit, and `--purge-devices`
+//! clears the folder along with them.
 
 use std::error::Error;
 use std::fmt::Write as _;
@@ -63,6 +69,7 @@ use matrix_rtc_media::{
     AudioFrame, AudioSourceConfig, I420Buffer, LocalTrackHandle, PublishOptions, VideoFrame,
     VideoRotation, VideoSourceConfig,
 };
+use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::api::client::uiaa;
 use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
@@ -197,6 +204,25 @@ struct Args {
     #[arg(long, default_value = "rtc-loadtest")]
     device_prefix: String,
 
+    /// Persist each device's session and crypto store under this folder, and
+    /// reuse them on the next run.
+    ///
+    /// Device `i` lives in `<store>/device-i`. A run picks up whatever is
+    /// already there and only logs in for the devices that are missing, so
+    /// re-running with the same `--devices` costs no logins at all — which
+    /// matters because synapse rate-limits them hard (see `--login-delay-ms`).
+    ///
+    /// The bigger win is the crypto store: a restored device keeps its Megolm
+    /// sessions, so it can decrypt member events sent before this run started.
+    /// A fresh device cannot, which is why a peer who joined earlier is
+    /// invisible to it until they re-join.
+    ///
+    /// Implies `--keep-devices`: logging out would invalidate the very session
+    /// being persisted. Use `--purge-devices` to clear both the devices and the
+    /// folder.
+    #[arg(long)]
+    store: Option<PathBuf>,
+
     /// Leave the devices logged in on exit.
     #[arg(long)]
     keep_devices: bool,
@@ -248,6 +274,9 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     }
     if args.devices == 0 {
         return Err("--devices must be at least 1".into());
+    }
+    if let Some(root) = &args.store {
+        prepare_store(root)?;
     }
 
     // Decode once and share: N decoders would compete with the N encoders for
@@ -476,16 +505,38 @@ impl Fleet {
     }
 
     async fn login(&self, args: &Args, index: usize) -> Result<Device, Box<dyn Error>> {
-        let mut builder = Client::builder()
-            .homeserver_url(&args.homeserver)
-            .with_encryption_settings(EncryptionSettings {
-                auto_enable_cross_signing: true,
-                ..EncryptionSettings::default()
-            });
-        if args.insecure_tls {
-            builder = builder.disable_ssl_verification();
+        let store = args
+            .store
+            .as_ref()
+            .map(|root| device_store_dir(root, index));
+
+        // A store we can restore from skips the login *and* the cross-signing
+        // dance below, which is most of a device's startup cost.
+        if let Some(dir) = store.as_deref()
+            && session_file(dir).exists()
+        {
+            match restore_device(args, dir).await {
+                Ok(client) => {
+                    println!("[{index}] restored device {}", device_id_of(&client)?);
+                    return self.device_from(client, index);
+                }
+                // Never fatal: a store whose device was deleted server-side
+                // (--purge-devices, a logout elsewhere, a wiped account) would
+                // otherwise wedge every later run with no way out but rm -rf.
+                Err(error) => eprintln!(
+                    "[{index}] stored session unusable ({error}); logging in fresh instead"
+                ),
+            }
         }
-        let client = builder.build().await?;
+
+        if let Some(dir) = store.as_deref() {
+            // Whatever is in there was just rejected, and a stale sqlite store
+            // must not be carried into a new login.
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
+        }
+
+        let client = build_client(args, store.as_deref()).await?;
         let display_name = format!("{}-{}-{index}", args.device_prefix, self.run_id);
         login_with_retry(&client, args, &display_name).await?;
         client
@@ -509,10 +560,17 @@ impl Fleet {
                 )
             })?;
 
-        let device_id = client
-            .device_id()
-            .ok_or("no device id after login")?
-            .to_owned();
+        if let Some(dir) = store.as_deref() {
+            persist_session(&client, dir)?;
+        }
+
+        self.device_from(client, index)
+    }
+
+    /// Assemble the bookkeeping around a client that is logged in, however it
+    /// got there.
+    fn device_from(&self, client: Client, index: usize) -> Result<Device, Box<dyn Error>> {
+        let device_id = device_id_of(&client)?;
         Ok(Device {
             index,
             client,
@@ -567,7 +625,10 @@ impl Fleet {
             }
             drop(device.sync.take());
 
-            if args.keep_devices {
+            // `--store` implies keeping the device: logging out would revoke
+            // the access token we just persisted, so the next run would restore
+            // a session the homeserver has already forgotten.
+            if args.keep_devices || args.store.is_some() {
                 continue;
             }
             // `logout` deletes this device server-side without the interactive
@@ -596,6 +657,109 @@ async fn sleep_until(deadline: Option<Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
         None => std::future::pending().await,
     }
+}
+
+/// Marker file written at the root of a `--store` folder when this tool creates
+/// it.
+///
+/// It guards the `remove_dir_all` on the fresh-login path: a failed restore
+/// deletes `<store>/device-i`, and pointing `--store` at a home directory
+/// should not hand this tool licence to do that. A folder we did not create,
+/// and that already holds something, is refused rather than adopted.
+const STORE_MARKER: &str = ".matrix-rtc-load-test";
+
+/// Create the `--store` folder if needed, or confirm we are allowed to use an
+/// existing one.
+///
+/// Creating it is deliberate — asking the operator to `mkdir` first buys
+/// nothing — but adopting an arbitrary populated directory is not.
+fn prepare_store(root: &Path) -> Result<(), Box<dyn Error>> {
+    if root.join(STORE_MARKER).exists() {
+        return Ok(());
+    }
+    if root.exists() && root.read_dir()?.next().is_some() {
+        return Err(format!(
+            "{} is not empty and was not created by this tool. Point --store at a new or \
+             empty folder; this one would have subdirectories created and deleted inside it.",
+            root.display(),
+        )
+        .into());
+    }
+    std::fs::create_dir_all(root)?;
+    std::fs::write(
+        root.join(STORE_MARKER),
+        "matrix-rtc load_test device store; delete this folder to forget every device\n",
+    )?;
+    Ok(())
+}
+
+/// Where device `index` keeps its sqlite store and session file under
+/// `--store`.
+fn device_store_dir(root: &Path, index: usize) -> PathBuf {
+    root.join(format!("device-{index}"))
+}
+
+/// The file holding a device's `MatrixSession` (access token, device id).
+///
+/// Kept beside the sqlite store rather than inside it: the SDK owns that
+/// database, and the session is ours to write.
+fn session_file(dir: &Path) -> PathBuf {
+    dir.join("session.json")
+}
+
+/// Build a client, backed by `store` when `--store` is in play and by memory
+/// otherwise.
+async fn build_client(args: &Args, store: Option<&Path>) -> Result<Client, Box<dyn Error>> {
+    let mut builder = Client::builder()
+        .homeserver_url(&args.homeserver)
+        .with_encryption_settings(EncryptionSettings {
+            auto_enable_cross_signing: true,
+            ..EncryptionSettings::default()
+        });
+    if let Some(dir) = store {
+        builder = builder.sqlite_store(dir, None);
+    }
+    if args.insecure_tls {
+        builder = builder.disable_ssl_verification();
+    }
+    Ok(builder.build().await?)
+}
+
+/// Bring a device back from `--store`.
+///
+/// The `whoami` at the end is the point of the whole function: a session file
+/// is just bytes on disk and says nothing about whether the homeserver still
+/// honours the token. One cheap round trip tells us, and its failure is what
+/// the caller turns into a fresh login.
+async fn restore_device(args: &Args, dir: &Path) -> Result<Client, Box<dyn Error>> {
+    let session: MatrixSession =
+        serde_json::from_str(&std::fs::read_to_string(session_file(dir))?)?;
+    let client = build_client(args, Some(dir)).await?;
+    client.restore_session(session).await?;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+    client.whoami().await?;
+    Ok(client)
+}
+
+/// Write this device's session out so the next run can restore it.
+fn persist_session(client: &Client, dir: &Path) -> Result<(), Box<dyn Error>> {
+    let session = client
+        .matrix_auth()
+        .session()
+        .ok_or("no session to persist after a successful login")?;
+    std::fs::write(session_file(dir), serde_json::to_vec_pretty(&session)?)?;
+    Ok(())
+}
+
+/// This client's device id, once it has one.
+fn device_id_of(client: &Client) -> Result<OwnedDeviceId, Box<dyn Error>> {
+    Ok(client
+        .device_id()
+        .ok_or("client has no device id")?
+        .to_owned())
 }
 
 /// Log in, waiting the homeserver out if it rate-limits us.
@@ -829,6 +993,17 @@ async fn purge_devices(args: &Args) -> Result<(), Box<dyn Error>> {
                 .await?;
         }
         println!("purged {} device(s)", stale.len());
+    }
+
+    // Every session under --store now names a device that no longer exists, so
+    // clear the folder too — otherwise the next run restores tokens the
+    // homeserver has forgotten and falls back to a fresh login per device
+    // anyway, having paid for the attempt.
+    if let Some(root) = &args.store
+        && root.exists()
+    {
+        std::fs::remove_dir_all(root)?;
+        println!("cleared the device store at {}", root.display());
     }
 
     // Do not leave the device this purge just created behind.

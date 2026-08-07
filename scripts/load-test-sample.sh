@@ -142,6 +142,28 @@ LOGIN_DELAY_MS=7000
 # matches on.
 DEVICE_PREFIX="rtc-loadtest"
 
+# Persist each device's session and crypto store here, and reuse them next run.
+# Empty = off (every run logs in fresh devices).
+#
+# Two reasons to set it:
+#   * Logins happen once. A fresh run of DEVICES=10 otherwise spends ~50s being
+#     rate-limited through LOGIN_DELAY_MS above; with a store it spends none.
+#   * A restored device keeps its megolm sessions, so it can decrypt member
+#     events sent BEFORE the run started. A fresh device cannot, which is why a
+#     peer already in the call can be invisible until they re-join.
+#
+# Devices are then kept on exit (logging out would revoke the stored token).
+# `--purge-devices` deletes the devices and this folder together.
+#
+# The folder is created if missing; it need not pre-exist. A folder that already
+# has contents and was not created by this tool is refused rather than adopted,
+# since a failed restore deletes <store>/device-N inside it.
+#
+# It holds access tokens and the devices' crypto stores unencrypted, so keep it
+# out of the repository and off shared disks — somewhere like
+# "$HOME/.matrix-rtc-loadtest" rather than a path under this checkout.
+STORE=""
+
 # --- end edit --------------------------------------------------------------
 
 cd "$(dirname "$0")/.."
@@ -178,6 +200,7 @@ args=(
 [[ "$OPEN_SLOT" == "1" ]] && args+=(--open-slot)
 [[ "$LEGACY_ELEMENT_CALL" == "1" ]] && args+=(--legacy-element-call)
 [[ "$INSECURE_TLS" == "1" ]] && args+=(--insecure-tls)
+[[ -n "$STORE" ]] && args+=(--store "$STORE")
 
 # --release matters: a debug build cannot keep the encoders fed and you end up
 # measuring the generator instead of the deployment.

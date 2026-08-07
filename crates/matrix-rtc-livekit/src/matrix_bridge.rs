@@ -126,9 +126,11 @@ impl SdkCommandSender {
     /// dialect, for interoperating with clients that have not caught up with
     /// the 2026 MSC4143 rewrite.
     ///
-    /// Member events stay MSC4143-valid — the legacy fields are added alongside
-    /// — so this costs spec-current peers nothing. Media keys, whose message
-    /// type cannot be two things at once, go out in the legacy dialect *only*.
+    /// A join stays MSC4143-valid — the legacy fields are added alongside — so
+    /// it costs spec-current peers nothing. A leave and a media key cannot be
+    /// expressed in both dialects at once, so both go out in the legacy one
+    /// only; see [`ElementCallDialect::rewrite_member_content`] for why a leave
+    /// has to be the legacy shape rather than a padded spec one.
     ///
     /// Temporary: see [`crate::compat`].
     pub fn with_element_call_compat(client: Client, dialect: ElementCallDialect) -> Self {
@@ -151,7 +153,7 @@ impl SdkCommandSender {
         if let Some(dialect) = &self.compat
             && ElementCallDialect::is_member_event(event_type)
         {
-            dialect.add_member_aliases(content);
+            dialect.rewrite_member_content(content);
         }
     }
 }
