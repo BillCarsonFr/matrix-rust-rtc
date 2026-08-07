@@ -125,7 +125,18 @@ INSECURE_TLS=0
 
 # Pacing, to stay under homeserver rate limits.
 RAMP_MS=500
-LOGIN_DELAY_MS=250
+
+# Gap between logins. Every device is a fresh login, and synapse's `rc_login`
+# defaults to `per_second: 0.17, burst_count: 3` — three logins immediately,
+# then one per ~6 seconds. Exceed that and the homeserver answers 429 "Too many
+# login attempts"; the tool waits it out (5 attempts per device with doubling
+# backoff), so a run survives, but being throttled is slower than pacing right.
+#
+# So DEVICES up to 3 works at any pacing, and beyond that you want >= 6000 here:
+# 10 devices is then roughly a 50-second ramp. Raise it further if a deployment
+# has tightened the limiter. Only a local synapse you control (see demo/backend,
+# which sets every rc_* to 1000/1000) can take the old 250ms.
+LOGIN_DELAY_MS=7000
 
 # Prefix of the device display names created here, and the one --purge-devices
 # matches on.

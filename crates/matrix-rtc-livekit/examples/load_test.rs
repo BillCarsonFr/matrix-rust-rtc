@@ -65,6 +65,7 @@ use matrix_rtc_media::{
 };
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::api::client::uiaa;
+use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::{OwnedDeviceId, RoomId};
 use matrix_sdk::{Client, Room};
@@ -76,6 +77,15 @@ const AUDIO_FRAME_MS: u32 = 10;
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// How long to wait for a room to come down sync after login.
 const ROOM_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many times to attempt one device's login while being rate-limited.
+///
+/// Five attempts with doubling backoff outlast a synapse `rc_login` bucket
+/// several times over; past that the pacing is wrong and saying so beats
+/// retrying for minutes.
+const LOGIN_ATTEMPTS: u32 = 5;
+/// Ceiling for the login backoff, so a misconfigured run fails in a readable
+/// time instead of doubling into the horizon.
+const MAX_LOGIN_BACKOFF: Duration = Duration::from_secs(60);
 /// Settle time after the warm-up messages, before any device joins the call.
 const WARMUP_SETTLE: Duration = Duration::from_secs(2);
 
@@ -476,12 +486,8 @@ impl Fleet {
             builder = builder.disable_ssl_verification();
         }
         let client = builder.build().await?;
-        client
-            .matrix_auth()
-            .login_username(&args.user, &args.password)
-            .initial_device_display_name(&format!("{}-{}-{index}", args.device_prefix, self.run_id))
-            .send()
-            .await?;
+        let display_name = format!("{}-{}-{index}", args.device_prefix, self.run_id);
+        login_with_retry(&client, args, &display_name).await?;
         client
             .encryption()
             .wait_for_e2ee_initialization_tasks()
@@ -590,6 +596,83 @@ async fn sleep_until(deadline: Option<Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
         None => std::future::pending().await,
     }
+}
+
+/// Log in, waiting the homeserver out if it rate-limits us.
+///
+/// Every device here is a fresh login, and synapse's `rc_login` defaults to
+/// `per_second: 0.17, burst_count: 3` — three logins immediately, then one per
+/// roughly six seconds. Without this, the first 429 propagates out of
+/// `login()` and aborts the entire run, discarding the devices that had already
+/// logged in and joined. `--login-delay-ms` is still what paces a healthy run;
+/// this is the safety net for a deployment whose limiter is stricter than the
+/// default, or a `--devices` count that outruns the pacing.
+///
+/// Only rate limiting is retried. A wrong password or an unreachable
+/// homeserver fails on the first attempt, as it should.
+async fn login_with_retry(
+    client: &Client,
+    args: &Args,
+    display_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    // A limiter that just rejected us will reject an immediate retry too, so
+    // never start below a second however tight the configured pacing is.
+    let mut backoff = Duration::from_millis(args.login_delay_ms).max(Duration::from_secs(1));
+
+    for attempt in 1..=LOGIN_ATTEMPTS {
+        let result = client
+            .matrix_auth()
+            .login_username(&args.user, &args.password)
+            .initial_device_display_name(display_name)
+            .send()
+            .await;
+
+        let error = match result {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+
+        let Some(retry_after) = rate_limit_retry_after(&error) else {
+            return Err(error.into());
+        };
+        if attempt == LOGIN_ATTEMPTS {
+            return Err(format!(
+                "still rate-limited after {LOGIN_ATTEMPTS} login attempts ({error}). \
+                 Raise --login-delay-ms, or lower --devices."
+            )
+            .into());
+        }
+
+        // The server's own figure when it gives one; our doubling otherwise.
+        let delay = retry_after.unwrap_or(backoff);
+        eprintln!(
+            "login rate-limited (attempt {attempt}/{LOGIN_ATTEMPTS}); waiting {:.1}s",
+            delay.as_secs_f64(),
+        );
+        tokio::time::sleep(delay).await;
+        backoff = (backoff * 2).min(MAX_LOGIN_BACKOFF);
+    }
+
+    // The loop returns on every path; `1..=LOGIN_ATTEMPTS` is never empty.
+    unreachable!("the login loop always returns")
+}
+
+/// Whether the homeserver rate-limited this request, and for how long it asked
+/// us to wait.
+///
+/// `None` means it was some other failure. `Some(None)` means we were rate
+/// limited but the server named no delay — which is what synapse does for
+/// `M_LIMIT_EXCEEDED` on login, so the caller has to pick its own.
+fn rate_limit_retry_after(error: &matrix_sdk::Error) -> Option<Option<Duration>> {
+    let ErrorKind::LimitExceeded(limit) = error.client_api_error_kind()? else {
+        return None;
+    };
+    Some(match limit.retry_after.as_ref() {
+        Some(RetryAfter::Delay(delay)) => Some(*delay),
+        // An absolute deadline. Our own backoff beats reconciling clocks with
+        // the homeserver for something this coarse.
+        Some(RetryAfter::DateTime(_)) | None => None,
+    })
 }
 
 async fn wait_for_room(client: &Client, room_id: &RoomId) -> Result<Room, Box<dyn Error>> {

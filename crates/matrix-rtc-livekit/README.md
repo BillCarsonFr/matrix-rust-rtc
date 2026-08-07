@@ -159,6 +159,14 @@ Notes:
 - Devices join publish-only by default (`CallOptions::auto_subscribe = false`).
   `--subscribe` makes them decode every peer as a real client would, at N×N
   cost.
+- **Keep simulcast on when a real client is watching.** `--no-simulcast`
+  publishes a single encoding with no rid, so the SFU advertises no layers to
+  choose from. A subscriber using adaptive stream (Element Call, Element Web,
+  any livekit-client app) asks for a specific layer, that request resolves to
+  nothing, and no video is forwarded — a grey tile with *no* decryption errors,
+  since no frames arrive at all. Audio still works, which makes it look like an
+  E2EE fault when it isn't. Reserve `--no-simulcast` for scale runs where
+  nobody renders the participants.
 - N devices of one account is equivalent to N accounts here: membership is keyed
   on a random per-join `member_id`, the MSC4195 identity hashes
   `(user, device, member_id)`, and the core distributes media keys to other
@@ -173,7 +181,17 @@ Notes:
   See [`compat`](src/compat/).
 
 Homeservers with rate limiting may reject a burst of logins or messages;
-`--login-delay-ms` and `--ramp-ms` space them out.
+`--login-delay-ms` and `--ramp-ms` space them out. **Past 3 devices this is not
+optional against a stock Synapse**: `rc_login` defaults to `per_second: 0.17,
+burst_count: 3`, so the first three logins go through and the rest need ~6 s
+each. Exceeding it returns 429 `Too many login attempts`. The tool waits that
+out — five attempts per device with doubling backoff, honouring the server's
+`retry_after` when it sends one — so a run survives a limiter it outruns, but
+pacing it properly is faster than being throttled into it. Use
+`--login-delay-ms 7000` or more for double-digit device counts; only a
+homeserver you control (`demo/backend` sets every `rc_*` to 1000/1000)
+tolerates the tighter default. Errors that are not rate limiting — a wrong
+password, an unreachable homeserver — still fail on the first attempt.
 
 ### How many devices?
 
