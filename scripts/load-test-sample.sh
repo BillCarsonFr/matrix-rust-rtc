@@ -67,9 +67,18 @@ DEVICES=3
 # lets more devices fit on one machine. Set SIMULCAST=1 when the layer
 # selection itself is what you want to exercise — a real client publishes with
 # it on, and the SFU only has layers to choose between when it is.
+#
+# SET SIMULCAST=1 WHENEVER A REAL CLIENT IS WATCHING. Element Call (and any
+# livekit-client subscriber) uses adaptive stream: it picks a layer from the
+# rendered tile size and asks the SFU for it. A publication with no layers to
+# choose from resolves to nothing and the SFU forwards no video at all — the
+# watcher sees a grey tile, with no decryption errors anywhere, because no
+# frames ever arrive. Audio is unaffected, which makes it look like an E2EE
+# problem when it is not. Leave it off only for pure scale runs where nobody is
+# rendering the participants.
 RESOLUTION="640x360"
 FPS=15
-SIMULCAST=0
+SIMULCAST=1
 
 # Seconds of the file to decode up front and then loop.
 CLIP_SECONDS=10
