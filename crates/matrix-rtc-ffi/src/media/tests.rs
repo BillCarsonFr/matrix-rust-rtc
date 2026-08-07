@@ -36,8 +36,9 @@ use super::{MediaFfiError, runtime};
 /// under test here).
 struct NoopCommands;
 
+#[async_trait::async_trait]
 impl CommandSenderCallback for NoopCommands {
-    fn send_sticky_event(
+    async fn send_sticky_event(
         &self,
         _room_id: String,
         _event_type: String,
@@ -47,7 +48,7 @@ impl CommandSenderCallback for NoopCommands {
         Ok(())
     }
 
-    fn send_delayed_event(
+    async fn send_delayed_event(
         &self,
         _room_id: String,
         _event_type: String,
@@ -57,7 +58,7 @@ impl CommandSenderCallback for NoopCommands {
         Ok("delayed-event-1".to_owned())
     }
 
-    fn send_state_event(
+    async fn send_state_event(
         &self,
         _room_id: String,
         _event_type: String,
@@ -67,7 +68,7 @@ impl CommandSenderCallback for NoopCommands {
         Ok(())
     }
 
-    fn restart_delayed_event(
+    async fn restart_delayed_event(
         &self,
         _room_id: String,
         _delay_id: String,
@@ -75,7 +76,7 @@ impl CommandSenderCallback for NoopCommands {
         Ok(())
     }
 
-    fn cancel_delayed_event(
+    async fn cancel_delayed_event(
         &self,
         _room_id: String,
         _delay_id: String,
@@ -83,7 +84,7 @@ impl CommandSenderCallback for NoopCommands {
         Ok(())
     }
 
-    fn send_to_device_message(
+    async fn send_to_device_message(
         &self,
         recipients: Vec<FfiToDeviceRecipient>,
         _message_type: String,
@@ -146,24 +147,30 @@ fn connect_requires_a_joined_slot() {
 #[test]
 fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
     let manager = RtcSessionManagerHandle::new();
-    manager.set_command_sender(Box::new(NoopCommands)).unwrap();
-    manager
-        .join(FfiJoinSessionParams {
-            user_id: "@alice:example.org".to_owned(),
-            device_id: "DEVICE".to_owned(),
-            room_id: "!room:example.org".to_owned(),
-            slot_id: "m.call#ROOM".to_owned(),
-            application: "m.call".to_owned(),
-            transport: Some(FfiTransportConfig {
-                r#type: "livekit".to_owned(),
-                livekit_service_url: Some(DEAD_SFU_URL.to_owned()),
-            }),
-            can_subscribe: Vec::new(),
-            keep_alive_timeout_ms: None,
-            sticky_duration_ms: None,
-            encryption_config: None,
-        })
-        .unwrap();
+    runtime().block_on(async {
+        manager
+            .set_command_sender(Arc::new(NoopCommands))
+            .await
+            .unwrap();
+        manager
+            .join(FfiJoinSessionParams {
+                user_id: "@alice:example.org".to_owned(),
+                device_id: "DEVICE".to_owned(),
+                room_id: "!room:example.org".to_owned(),
+                slot_id: "m.call#ROOM".to_owned(),
+                application: "m.call".to_owned(),
+                transport: Some(FfiTransportConfig {
+                    r#type: "livekit".to_owned(),
+                    livekit_service_url: Some(DEAD_SFU_URL.to_owned()),
+                }),
+                can_subscribe: Vec::new(),
+                keep_alive_timeout_ms: None,
+                sticky_duration_ms: None,
+                encryption_config: None,
+            })
+            .await
+            .unwrap();
+    });
 
     // Everything up to the SFU works — key bridge registration, engine
     // startup, and the (Rust-implemented) foreign token provider call — and
