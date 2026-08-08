@@ -56,6 +56,7 @@ use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use matrix_rtc_bridge::OpenIdTokenSource;
 use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
 use matrix_rtc_media::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
@@ -66,7 +67,7 @@ use matrix_rtc_media::{
 
 use crate::identity::pseudonymous_identity;
 use crate::session::LiveKitSession;
-use crate::token::{MemberClaims, OpenIdTokenSource};
+use crate::token::MemberClaims;
 use crate::{LiveKitTransportConfig, TokenEndpoint, connect_e2ee};
 
 /// Sample rate remote audio is resampled to before crossing the transport

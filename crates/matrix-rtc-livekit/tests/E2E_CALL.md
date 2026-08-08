@@ -40,10 +40,10 @@ matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext au
         │                              │
         │                              ▼
         │                     room.subscribe_to_sticky_events()
-        │                              │  run_sticky_bridge (src/matrix_bridge.rs)
+        │                              │  run_sticky_bridge (bridge: src/sdk.rs)
         ▼                              ▼
  SdkCommandSender ──▶ RtcSessionManager (join → own membership sticky + delayed leave; heartbeat)
- (src/matrix_bridge.rs)   │  └─ EncryptionManager: generates + distributes per-participant keys
+ (bridge: src/sdk.rs)     │  └─ EncryptionManager: generates + distributes per-participant keys
         │                 │        via encrypt_and_send_raw_to_device (to-device, Olm-encrypted)
         │                 └─ MediaKeyBridge (src/keys.rs): received keys ──▶ LiveKit KeyProvider
         ▼                          ▲ (keyed by MSC4195 pseudonymous identity)

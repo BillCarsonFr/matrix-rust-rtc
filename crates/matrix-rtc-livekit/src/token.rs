@@ -22,49 +22,30 @@
 //! `/get_token` endpoint; the service validates the OpenID token against the
 //! homeserver and returns a `{ jwt, url }` pair used to connect to the SFU.
 //!
-//! This crate owns that HTTP exchange (it is LiveKit-service specific), but
-//! delegates obtaining the OpenID token itself to the host's Matrix client via
-//! the [`OpenIdTokenSource`] trait, keeping the crate free of any hard
-//! dependency on a particular Matrix SDK.
+//! This module owns that HTTP exchange (it is LiveKit-service specific), but
+//! obtaining the OpenID token itself is a Client-Server API concern and belongs
+//! to [`matrix_rtc_bridge`]: the host supplies one through
+//! [`OpenIdTokenSource`](matrix_rtc_bridge::OpenIdTokenSource), so nothing here
+//! is wired to a particular Matrix SDK.
 //!
 //! [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use matrix_rtc_bridge::OpenIdToken;
 
 use crate::Error;
 
-/// A Matrix OpenID token, as returned by the Client-Server API
-/// `POST /_matrix/client/v3/user/{userId}/openid/request_token` endpoint.
-///
-/// The whole object is forwarded verbatim to the authorisation service.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OpenIdToken {
-    pub access_token: String,
-    pub token_type: String,
-    pub matrix_server_name: String,
-    pub expires_in: u64,
-}
-
 /// Contents of the `member` field of the `m.rtc.member` event, identifying the
 /// joining membership to the authorisation service.
+///
+/// Stays here rather than in the bridge: these are the `member` claims of the
+/// MSC4195 `/get_token` request body, which no homeserver ever sees.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemberClaims {
     pub id: String,
     pub claimed_user_id: String,
     pub claimed_device_id: String,
-}
-
-/// Source of a Matrix OpenID token.
-///
-/// The host application implements this (typically backed by its Matrix
-/// client) so the transport can acquire a fresh OpenID token when it needs to
-/// fetch an SFU JWT. A default `matrix_sdk::Client` implementation is provided
-/// behind the `matrix-sdk` feature.
-#[async_trait]
-pub trait OpenIdTokenSource: Send + Sync {
-    /// Request a fresh OpenID token for the current account.
-    async fn open_id_token(&self) -> Result<OpenIdToken, Error>;
 }
 
 /// JSON body of a `POST /get_token` request.
@@ -204,28 +185,6 @@ async fn post_for_token(
         token.jwt.len(),
     );
     Ok(token)
-}
-
-/// Default [`OpenIdTokenSource`] backed by a `matrix_sdk::Client`.
-///
-/// Requests a fresh OpenID token for the logged-in account via the
-/// Client-Server API and maps it into [`OpenIdToken`].
-#[cfg(feature = "matrix-sdk")]
-#[async_trait]
-impl OpenIdTokenSource for matrix_sdk::Client {
-    async fn open_id_token(&self) -> Result<OpenIdToken, Error> {
-        let response = self
-            .account()
-            .request_openid_token()
-            .await
-            .map_err(|error| Error::OpenIdToken(error.to_string()))?;
-        Ok(OpenIdToken {
-            access_token: response.access_token,
-            token_type: response.token_type.to_string(),
-            matrix_server_name: response.matrix_server_name.to_string(),
-            expires_in: response.expires_in.as_secs(),
-        })
-    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,86 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+[package]
+name = "matrix-rtc-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Matrix-side bridging for MatrixRTC: SDK-backed membership signalling and pre-2026 Element Call wire compatibility."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror.workspace = true
+async-trait.workspace = true
+log.workspace = true
+
+# Only the `matrix-sdk` half needs an async runtime (the bridge's `Mutex` and the
+# sticky-event broadcast receiver). `compat` is pure JSON and must stay free of
+# it, which is what keeps `cargo test -p matrix-rtc-bridge` a seconds-long build.
+tokio = { workspace = true, optional = true }
+
+# The experimental branch carries MSC4354 sticky-event support that the crates.io
+# release lacks; the whole MatrixRTC signalling path (own membership, keep-alive,
+# peer discovery) rides on it. See `sdk`. Keeps matrix-sdk's default features
+# (e2e-encryption, sqlite, rustls-aws-lc-rs, automatic-room-key-forwarding) and
+# adds sticky events.
+#
+# Key forwarding stays ON deliberately. Without it a freshly logged-in device
+# cannot obtain the Megolm sessions for member events sent before it existed,
+# and simply does not see those peers — the exact failure that makes an
+# in-progress Element Call invisible to a new device. Tools that want the
+# request/forward chatter out of their measurements switch it off per client at
+# runtime instead; see `matrix-rtc-livekit/examples/load_test.rs`.
+#
+# Pinned to rev 3773300 ("Update ruma to the rewritten MSC4143"), which
+# repoints ruma to `BillCarsonFr/ruma@3fc675d`. That ruma models the 2026
+# MSC4143 rewrite — `member.membership`, `leave_reason`, `transports
+# {published, can_subscribe}`, and an `m.rtc.encryption_key` content of
+# `{room_id, member_id, media_key, format}` — matching what `matrix-rtc-core`
+# puts on the wire, so ruma's typed events (e.g. `AnyToDeviceEvent`) can be
+# used on RTC wire content again. Member events are still parsed with
+# `matrix_rtc_core::RawStickyEventContent` (the core must not depend on ruma).
+#
+# The pin also carries 7603577 ("keep encryption info for sticky events"),
+# which makes `StickyLiveEvent` expose `encryption_info().sender_device` — the
+# only source for a member event's sending device now that MSC4143 has dropped
+# `member.claimed_device_id`. See `sdk::snapshot`.
+# `experimental-send-custom-to-device` exposes
+# `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
+# keys as Olm-encrypted to-device messages (see `sdk`). It pulls in
+# `e2e-encryption`, already on via defaults.
+matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
+# Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
+# to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it. Same
+# rev as matrix-sdk so cargo unifies the source; `e2e-encryption` gates the
+# `crypto` re-export.
+matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["e2e-encryption"] }
+
+[features]
+# The SDK-backed half: `sdk` (command sender + sticky/room-state bridge into
+# matrix-rtc-core) and the default `OpenIdTokenSource` impl for
+# `matrix_sdk::Client`. Off by default so `compat` — pure JSON translation with
+# no git dependencies — stays cheap to build and test on its own.
+matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "dep:tokio"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

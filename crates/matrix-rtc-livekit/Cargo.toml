@@ -27,6 +27,12 @@ crate-type = ["rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The Matrix side of the stack: `OpenIdTokenSource` (needed unconditionally, to
+# acquire the token the authorisation service wants) plus, under this crate's
+# `matrix-sdk` feature, the SDK-backed command sender / sticky bridge and the
+# pre-2026 Element Call wire compatibility `call` selects between. Nothing in it
+# knows about LiveKit, which is the point: a second transport reuses it as-is.
+matrix-rtc-bridge = { path = "../matrix-rtc-bridge" }
 # Transport-agnostic media model this crate implements (`transport_impl`).
 matrix-rtc-media = { path = "../matrix-rtc-media" }
 serde = { workspace = true }
@@ -73,47 +79,22 @@ livekit = { version = "0.7", features = [
 ] }
 # Stream combinators for draining the LiveKit audio stream in the media helpers.
 futures-util = "0.3"
-# The experimental branch carries MSC4354 sticky-event support that the crates.io
-# release lacks; the whole MatrixRTC signalling path (own membership, keep-alive,
-# peer discovery) rides on it. See `matrix_bridge`. Keeps matrix-sdk's default
-# features (e2e-encryption, sqlite, rustls-aws-lc-rs, automatic-room-key-
-# forwarding) and adds sticky events.
+# `call` needs the SDK directly — `Client`, `Room`, the to-device event handlers
+# and ruma's `GET /rtc/transports` request type. Everything else Matrix-side is
+# `matrix-rtc-bridge`'s, and the long rationale for this exact pin (MSC4354 sticky
+# support, why room-key forwarding stays on, what rev 3773300's ruma models, and
+# the `encryption_info().sender_device` the pin also carries) lives there, next to
+# the code that depends on it.
 #
-# Key forwarding stays ON deliberately. Without it a freshly logged-in device
-# cannot obtain the Megolm sessions for member events sent before it existed,
-# and simply does not see those peers — the exact failure that makes an
-# in-progress Element Call invisible to a new device. Tools that want the
-# request/forward chatter out of their measurements switch it off per client at
-# runtime instead; see `quiet_room_key_gossip` in `examples/load_test.rs`.
-#
-# Pinned to rev 3773300 ("Update ruma to the rewritten MSC4143"), which
-# repoints ruma to `BillCarsonFr/ruma@3fc675d`. That ruma models the 2026
-# MSC4143 rewrite — `member.membership`, `leave_reason`, `transports
-# {published, can_subscribe}`, and an `m.rtc.encryption_key` content of
-# `{room_id, member_id, media_key, format}` — matching what `matrix-rtc-core`
-# puts on the wire, so ruma's typed events (e.g. `AnyToDeviceEvent`) can be
-# used on RTC wire content again. Member events are still parsed with
-# `matrix_rtc_core::RawStickyEventContent` (the core must not depend on ruma).
-#
-# The pin also carries 7603577 ("keep encryption info for sticky events"),
-# which makes `StickyLiveEvent` expose `encryption_info().sender_device` — the
-# only source for a member event's sending device now that MSC4143 has dropped
-# `member.claimed_device_id`. See `matrix_bridge::snapshot`.
-# `experimental-send-custom-to-device` exposes
-# `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
-# keys as Olm-encrypted to-device messages (see `matrix_bridge`). It pulls in
-# `e2e-encryption`, already on via defaults.
+# The rev MUST stay in lockstep with the bridge's, or cargo resolves two copies of
+# matrix-sdk and the `Client` this crate takes is not the one the bridge's command
+# sender accepts.
 matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
 # Drives sliding sync (which auto-enables the sticky extension under
 # `unstable-msc4354`) plus the encryption sync, so sticky events actually flow.
 # Encryption support rides along via matrix-sdk's default features; ui only needs
 # the sticky feature for unification with matrix-sdk-base.
 matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354"] }
-# Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
-# to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it. Same
-# rev as matrix-sdk so cargo unifies the source; `e2e-encryption` gates the
-# `crypto` re-export.
-matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["e2e-encryption"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # For the `android::initialize_android` re-export's signature; unifies with
@@ -121,11 +102,11 @@ matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev
 jni = "0.21"
 
 [features]
-# Provides a default `OpenIdTokenSource` implementation for `matrix_sdk::Client`,
-# the `matrix_bridge` (SDK-backed command sender + sticky-event bridge into
-# matrix-rtc-core), and the `connect` / `e2e_call` examples. Off by default to
-# keep the base crate light and buildable without the git SDK.
-matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-ui", "dep:matrix-sdk-base"]
+# Turns on the SDK-backed half: the bridge's command sender / sticky bridge and
+# its default `OpenIdTokenSource` for `matrix_sdk::Client`, the `call::Call`
+# facade that composes them with this transport, and the examples / `e2e_call`.
+# Off by default to keep the base crate light and buildable without the git SDK.
+matrix-sdk = ["matrix-rtc-bridge/matrix-sdk", "dep:matrix-sdk", "dep:matrix-sdk-ui"]
 # Exposes the test-only parts of the `media` module (tone generator, Goertzel
 # frequency detector) for examples and integration tests; recording/WAV
 # helpers in that module are shipped API and need no feature. Otherwise the

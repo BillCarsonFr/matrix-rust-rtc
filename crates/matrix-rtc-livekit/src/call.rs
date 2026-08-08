@@ -62,6 +62,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 
+use matrix_rtc_bridge::compat::{
+    self, ElementCallCompat, ElementCallDialect, ElementCallStateDialect, OutboundDialect,
+};
+use matrix_rtc_bridge::{SdkCommandSender, run_sticky_bridge};
 use matrix_rtc_core::{
     EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, ReceivedEncryptionKey,
     RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
@@ -71,13 +75,9 @@ use matrix_rtc_media::{
     MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,
 };
 
-use crate::compat::{
-    self, ElementCallCompat, ElementCallDialect, ElementCallStateDialect, OutboundDialect,
-};
-use crate::matrix_bridge::{SdkCommandSender, run_sticky_bridge};
 use crate::session::LiveKitSession;
 use crate::transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
-use crate::{MediaKeyBridge, TokenEndpoint, msc4195_key_provider};
+use crate::{MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider};
 
 type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
 
@@ -340,7 +340,7 @@ impl Call {
         // rejoin reuses the id, so the core cannot tell a stale participation from
         // the current one, and two slots joined from one device would collide.
         // That generation's SFU identity has no session component at all.
-        let identity_mapper = options.element_call_compat.identity_mapper();
+        let identity_mapper = identity_mapper(options.element_call_compat);
         let membership_id = match options.element_call_compat {
             ElementCallCompat::StateEvents => {
                 compat::element_call_state::participant_identity(&user_id, &device_id)

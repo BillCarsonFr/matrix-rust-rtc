@@ -589,12 +589,12 @@ pub(super) struct TokenProviderAdapter(pub(super) std::sync::Arc<dyn OpenIdToken
 impl matrix_rtc_livekit::OpenIdTokenSource for TokenProviderAdapter {
     async fn open_id_token(
         &self,
-    ) -> Result<matrix_rtc_livekit::OpenIdToken, matrix_rtc_livekit::Error> {
+    ) -> Result<matrix_rtc_livekit::OpenIdToken, matrix_rtc_livekit::OpenIdTokenError> {
         let token = self
             .0
             .get_open_id_token()
             .await
-            .map_err(|error| matrix_rtc_livekit::Error::OpenIdToken(error.to_string()))?;
+            .map_err(|error| matrix_rtc_livekit::OpenIdTokenError(error.to_string()))?;
         Ok(matrix_rtc_livekit::OpenIdToken {
             access_token: token.access_token,
             token_type: token.token_type,

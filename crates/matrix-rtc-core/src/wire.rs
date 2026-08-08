@@ -24,9 +24,10 @@
 //! membership put on the wire as `m.rtc.member` is invisible to peers.
 //!
 //! Bindings must therefore translate on the way out. The `matrix-sdk` host does
-//! it through ruma's alias table (`matrix_bridge::wire_event_type`); the FFI and
-//! WASM bindings hand event types to a native SDK that passes the string
-//! through verbatim, and neither has ruma to ask — they call [`wire_event_type`]
+//! it through ruma's alias table (`matrix-rtc-bridge`'s `sdk::wire_event_type`);
+//! the FFI and WASM bindings hand event types to a native SDK that passes the
+//! string through verbatim, and neither has ruma to ask — they call
+//! [`wire_event_type`]
 //! instead. Keep the two in sync: when ruma flips to the stable ids after FCP,
 //! this table becomes the identity mapping and can go away.
 //!
