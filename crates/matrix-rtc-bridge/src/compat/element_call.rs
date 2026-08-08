@@ -50,7 +50,7 @@
 //!   Where we cannot do better — a member event that reached us unencrypted —
 //!   [`claimed_device_id`] surfaces it so the core has *some* device to bind the
 //!   member to. That claim is never preferred over an authenticated device; see
-//!   `matrix_bridge::snapshot`.
+//!   `sdk::snapshot`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

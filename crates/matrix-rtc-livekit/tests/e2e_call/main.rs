@@ -200,7 +200,7 @@ async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn
 
 /// Log in and start the sync service. Under `unstable-msc4354`, sliding sync
 /// auto-enables the sticky-events extension, so `m.rtc.member` stickies flow
-/// into the base room's sticky store (see `matrix_bridge`).
+/// into the base room's sticky store (see `matrix_rtc_bridge::sdk`).
 ///
 /// Cross-signing is bootstrapped at login: each user is freshly registered
 /// with a single device, so that device self-signs and the MSC4153

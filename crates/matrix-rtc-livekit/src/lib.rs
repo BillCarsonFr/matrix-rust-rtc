@@ -31,15 +31,14 @@
 //! - bridging `matrix-rtc-core`'s media keys into LiveKit frame encryption
 //!   ([`keys`]).
 //!
-//! With the `matrix-sdk` feature, [`matrix_bridge`] connects the core to a
-//! `matrix_sdk::Client`, and [`call::Call`] wraps the whole stack in a
-//! join/leave facade — start there.
+//! Everything Matrix-side — feeding the core from a `matrix_sdk::Client`, and
+//! translating the pre-2026 Element Call wire dialects — belongs to
+//! [`matrix_rtc_bridge`] instead, which knows nothing about LiveKit. With the
+//! `matrix-sdk` feature, [`call::Call`] composes that bridge with this
+//! transport into a join/leave facade — start there.
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
-// Interop with MatrixRTC implementations that predate the 2026 MSC4143
-// rewrite. Scaffolding with a delete-by date; nothing else should depend on it.
-pub mod compat;
 pub mod identity;
 pub mod keys;
 // Audio helpers. Recording a subscribed track and writing WAVs is shipped API
@@ -52,15 +51,25 @@ pub mod transport_impl;
 
 #[cfg(feature = "matrix-sdk")]
 pub mod call;
-#[cfg(feature = "matrix-sdk")]
-pub mod matrix_bridge;
+
+// Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite.
+// Scaffolding with a delete-by date; nothing else should depend on it. Lives in
+// `matrix-rtc-bridge` (it is pure Matrix wire translation, with no LiveKit in
+// it), and is re-exported because `CallOptions::element_call_compat` names
+// `ElementCallCompat` in this crate's own public API.
+pub use matrix_rtc_bridge::compat;
 
 pub use keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
     ParticipantKey, msc4195_key_provider, msc4195_key_provider_options,
 };
 pub use session::{LiveKitConnection, LiveKitSession};
-pub use token::{MemberClaims, OpenIdToken, OpenIdTokenSource, SfuToken};
+pub use token::{MemberClaims, SfuToken};
+// The OpenID token is a Client-Server API concern, so it belongs to the bridge.
+// Re-exported because `LiveKitTransportConfig` and `connect`/`connect_e2ee` name
+// these in this crate's own signatures — a host implementing the token source
+// should not need a second dependency to do it.
+pub use matrix_rtc_bridge::{OpenIdToken, OpenIdTokenError, OpenIdTokenSource};
 pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
 
 /// Android initialisation, re-exported so consumers (e.g. the FFI crate)
@@ -76,8 +85,43 @@ pub mod android {
 
 #[cfg(feature = "matrix-sdk")]
 pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_slot};
+// The SDK-backed bridge itself lives in `matrix-rtc-bridge`; re-exported so a
+// host driving a call keeps one dependency.
 #[cfg(feature = "matrix-sdk")]
-pub use matrix_bridge::{SdkCommandSender, run_sticky_bridge};
+pub use matrix_rtc_bridge::{SdkCommandSender, run_sticky_bridge};
+
+/// The participant-identity derivation a MatrixRTC generation's authorisation
+/// service uses.
+///
+/// One of the two things [`compat`] deliberately cannot own — the other being
+/// [`TokenEndpoint`] — because the modern derivation hashes per MSC4195, which is
+/// a LiveKit document rather than a Matrix wire format. The `compat` module
+/// decides *which generation*; this decides *what that means for an identity*.
+///
+/// Call it once per call and share the returned `Arc`: it has four uses (the core's
+/// encryption manager, the media transport, our own identity, and the key ring —
+/// see `call::Call::join`), and they must not skew. That matters more than it
+/// looks, because a divergence is not an error but a silence: peers appear in the
+/// roster with no media, their keys land under an identity the SFU never assigned,
+/// and nothing anywhere logs a problem.
+pub fn identity_mapper(compat: compat::ElementCallCompat) -> matrix_rtc_core::RtcIdentityMapper {
+    use std::sync::Arc;
+
+    use crate::compat::ElementCallCompat;
+
+    match compat {
+        ElementCallCompat::Off | ElementCallCompat::StickyEvents => {
+            Arc::new(identity::pseudonymous_identity)
+        }
+        // That generation's authorisation service issues the unhashed
+        // `{user}:{device}` string, and has no session component at all.
+        ElementCallCompat::StateEvents => {
+            Arc::new(|user_id: &str, device_id: &str, _member_id: &str| {
+                crate::compat::element_call_state::participant_identity(user_id, device_id)
+            })
+        }
+    }
+}
 
 /// Which authorisation-service dialect to speak.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -207,8 +251,8 @@ pub enum Error {
     Service { status: u16, body: String },
 
     /// Obtaining the Matrix OpenID token from the host failed.
-    #[error("failed to obtain Matrix OpenID token: {0}")]
-    OpenIdToken(String),
+    #[error(transparent)]
+    OpenIdToken(#[from] OpenIdTokenError),
 
     /// Connecting to or operating the LiveKit SFU room failed.
     #[error("LiveKit room error: {0}")]

@@ -23,8 +23,7 @@
 //! Everything here exists for one reason: the only other MatrixRTC
 //! implementation available to test against — Element Call on the JS SDK — still
 //! speaks a pre-2026 wire format. Once it catches up, delete this directory, the
-//! call sites listed below, and
-//! [`CallOptions::element_call_compat`](crate::CallOptions::element_call_compat).
+//! call sites listed below, and `matrix_rtc_livekit::CallOptions::element_call_compat`.
 //! Nothing else should ever grow a dependency on it.
 //!
 //! # Two generations, not one
@@ -70,26 +69,32 @@
 //! choice of token endpoint, and the participant-identity derivation. Each is one
 //! `match` on [`ElementCallCompat`] or [`OutboundDialect`] at the call site.
 //! [`MemberEventRoute`] exists precisely to keep the *decision* here while the
-//! *performing* stays in `matrix_bridge`.
+//! *performing* stays in the `sdk` module.
+//!
+//! The identity derivation is the one that also refuses to be *Matrix*: it
+//! hashes per MSC4195, which is a LiveKit document. So it lives wholly in the
+//! transport crate — `matrix_rtc_livekit::identity_mapper` matches on
+//! [`ElementCallCompat`] there rather than this module reaching for a hash it has
+//! no business knowing.
 //!
 //! # Call sites
 //!
-//! 1. `matrix_bridge::snapshot` — normalises inbound `m.rtc.member` content.
-//! 2. `matrix_bridge::SdkCommandSender` — routes and rewrites outbound events.
-//! 3. `call::register_legacy_key_receiver` — ingests legacy to-device keys.
-//! 4. `matrix_bridge::element_call_state_snapshot` — reads inbound state
-//!    membership.
-//! 5. `matrix_bridge::run_sticky_bridge` — the room-state wake source a
-//!    state-carried membership needs.
-//! 6. `call::Call::join` — mode selection, the member id, and the identity mapper.
-//! 7. `transport_impl` + `token` — the identity derivation and `/sfu/get`.
+//! In this crate:
+//!
+//! 1. `sdk::snapshot` — normalises inbound `m.rtc.member` content.
+//! 2. `sdk::SdkCommandSender` — routes and rewrites outbound events.
+//! 3. `sdk::element_call_state_snapshot` — reads inbound state membership.
+//! 4. `sdk::run_sticky_bridge` — the room-state wake source a state-carried
+//!    membership needs.
+//!
+//! In `matrix-rtc-livekit`:
+//!
+//! 5. `call::register_legacy_key_receiver` — ingests legacy to-device keys.
+//! 6. `call::Call::join` — mode selection and the member id.
+//! 7. `identity_mapper` — the participant-identity derivation (see above).
+//! 8. `transport_impl` + `token` — `/sfu/get`.
 
-use std::sync::Arc;
-
-use matrix_rtc_core::RtcIdentityMapper;
 use serde_json::Value;
-
-use crate::identity;
 
 pub mod element_call;
 pub mod element_call_state;
@@ -138,27 +143,11 @@ impl ElementCallCompat {
     pub fn reads_state_membership(self) -> bool {
         matches!(self, Self::StateEvents)
     }
-
-    /// The participant-identity derivation this generation's authorisation
-    /// service uses.
-    ///
-    /// One value, four uses (see `call::Call::join`), so they cannot skew. That
-    /// matters more than it looks: a divergence here is not an error but a
-    /// silence — peers appear in the roster with no media, their keys land under
-    /// an identity the SFU never assigned, and nothing anywhere logs a problem.
-    pub fn identity_mapper(self) -> RtcIdentityMapper {
-        match self {
-            Self::Off | Self::StickyEvents => Arc::new(identity::pseudonymous_identity),
-            Self::StateEvents => Arc::new(|user_id: &str, device_id: &str, _member_id: &str| {
-                element_call_state::participant_identity(user_id, device_id)
-            }),
-        }
-    }
 }
 
 /// Where a member event goes on the wire, and in what shape.
 ///
-/// The dialect decides; `matrix_bridge` performs. That split is what keeps every
+/// The dialect decides; `sdk` performs. That split is what keeps every
 /// legacy byte inside this module while the ruma request types stay out of it.
 #[derive(Clone, Debug)]
 pub enum MemberEventRoute {

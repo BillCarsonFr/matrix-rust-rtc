@@ -2637,6 +2637,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix-rtc-bridge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "log",
+ "matrix-rtc-core",
+ "matrix-sdk",
+ "matrix-sdk-base",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "matrix-rtc-core"
 version = "0.1.0"
 dependencies = [
@@ -2685,10 +2700,10 @@ dependencies = [
  "jni 0.21.1",
  "livekit",
  "log",
+ "matrix-rtc-bridge",
  "matrix-rtc-core",
  "matrix-rtc-media",
  "matrix-sdk",
- "matrix-sdk-base",
  "matrix-sdk-ui",
  "reqwest 0.12.28",
  "rustls",
