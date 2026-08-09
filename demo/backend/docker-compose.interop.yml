@@ -1,0 +1,149 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# Overlay turning the plain-HTTP backend stack into a TLS one that a browser
+# will accept, and adding Element Web (which ships Element Call embedded). Used
+# by the Element Call interop test. Apply on top of the base file, never alone:
+#
+#   docker compose -f demo/backend/docker-compose.yml \
+#                  -f demo/backend/docker-compose.interop.yml up -d --wait
+#
+# or `make interop-up`. See INTEROP.md.
+#
+# Why any of this is needed: Element Call runs as a widget in an iframe, and
+# WebRTC plus the widget API need a secure context. The base stack is
+# http://localhost only. nginx terminates TLS for a family of *.m.localhost
+# names (which browsers resolve to loopback on their own) using a CA minted at
+# stack-up time.
+
+volumes:
+  # A *separate* homeserver from the base stack's. Both compose files share the
+  # project name, so without this the interop Synapse would boot on a database
+  # created under `server_name: synapse` while its own config says
+  # `synapse.m.localhost` — leaving `@user:synapse` accounts in a homeserver
+  # that answers to a different name. Wiped by `make interop-down`.
+  synapse-interop-data:
+
+services:
+  # Base mints a self-signed cert for Synapse's own federation listener. Here
+  # nginx terminates federation TLS instead, so what we need is a small CA and
+  # one wildcard leaf. Guarded on the *leaf*, not the CA, so that a developer
+  # who prefers mkcert can drop their own pair in first and have this skip
+  # entirely (see INTEROP.md) rather than mint an orphan CA nothing signed.
+  init-certs:
+    command:
+      - -c
+      - |
+        if [ ! -f /certs/m.localhost.key ]; then
+          [ -f /certs/local-ca.key ] || openssl req -x509 -newkey rsa:2048 -nodes \
+            -days 3650 -subj "/CN=matrix-rust-rtc dev CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -keyout /certs/local-ca.key -out /certs/local-ca.crt
+          # 397 days, NOT the CA's 3650: macOS caps TLS *server* certificates
+          # at 398 days and rejects anything longer outright — rustls on macOS
+          # verifies through the platform (Security.framework), which reports
+          # `certificate is not standards compliant: -67901`. The limit applies
+          # to the leaf only, so the CA above stays long-lived. Consequence:
+          # this pair expires after ~13 months; delete ./data/tls and re-run
+          # `make interop-up` to mint a fresh one.
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -days 397 -subj "/CN=*.m.localhost" \
+            -CA /certs/local-ca.crt -CAkey /certs/local-ca.key \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage=serverAuth" \
+            -addext "subjectAltName=DNS:localhost,DNS:m.localhost,DNS:*.m.localhost" \
+            -keyout /certs/m.localhost.key -out /certs/m.localhost.crt
+        fi
+        chmod 0644 /certs/*.crt
+
+  # Same server, different identity: `server_name` becomes a name a browser can
+  # reach over TLS, and the TLS listener moves out to nginx. Compose replaces
+  # the base mount because the container path matches.
+  synapse:
+    volumes:
+      # Both entries override by container path, so this replaces the base
+      # stack's config mount and its `synapse-data` volume rather than adding
+      # to them.
+      - ./synapse/homeserver.interop.yaml:/cfg/homeserver.yaml:ro
+      - synapse-interop-data:/data
+
+  # What lk-jwt hands back to clients in /get_token (and its own RoomService
+  # endpoint) has to be a URL the *browser* can open, so it goes through nginx.
+  # Resolvable in here too: this container shares livekit's network namespace,
+  # which sits on the compose network where the alias lives.
+  auth-service:
+    environment:
+      LIVEKIT_URL: "wss://matrix-rtc.m.localhost/livekit/sfu"
+      # server_name changed above, and `*` is what Element Call's own dev
+      # backend uses — this stack is loopback-only either way.
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: "*"
+
+  # Element Web serves the Element Call widget itself, from its own origin at
+  # /widgets/element-call/index.html (it depends on
+  # @element-hq/element-call-embedded). There is deliberately no element-call
+  # service: the widget under test is the one Element Web ships, which is what
+  # users actually get, and it removes an EW/EC version skew.
+  element-web:
+    # Overridable so CI can pin a digest (stable PR runs) while the nightly
+    # drift run leaves it unset and tracks develop. See INTEROP.md for how to
+    # refresh the pin.
+    image: ${ELEMENT_WEB_IMAGE:-ghcr.io/element-hq/element-web:develop}
+    environment:
+      ELEMENT_WEB_PORT: 8081
+    volumes:
+      - ./element-web/config.json:/app/config.json:ro
+    ports:
+      # Not used by the tests (they go through nginx, because Element Call
+      # needs a secure context); published only so the app can be poked
+      # directly while debugging the stack.
+      - "8081:8081"
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/interop.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./data/tls:/etc/nginx/tls:ro
+    ports:
+      # 8448 stays internal: only lk-jwt's federation OpenID lookup uses it,
+      # and it reaches nginx through the compose network alias.
+      - "443:443"
+    depends_on:
+      init-certs:
+        condition: service_completed_successfully
+      synapse:
+        condition: service_healthy
+      element-web:
+        condition: service_started
+    networks:
+      # The base file declares no networks, so everything is on `default`.
+      # These aliases are what makes `synapse.m.localhost` resolve *inside* the
+      # compose network — which is how lk-jwt reaches the federation API. On
+      # the host the same names come from /etc/hosts (see INTEROP.md).
+      default:
+        aliases:
+          - synapse.m.localhost
+          - matrix-rtc.m.localhost
+          - app.m.localhost
+    # Against 127.0.0.1 rather than a hostname: this only needs to prove nginx
+    # is serving TLS, and the first server block (synapse.m.localhost) answers
+    # /.well-known/matrix/client with a literal 200 regardless of SNI.
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - --no-check-certificate
+        - https://127.0.0.1/.well-known/matrix/client
+      interval: 3s
+      timeout: 5s
+      retries: 20

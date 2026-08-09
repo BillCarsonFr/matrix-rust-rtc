@@ -124,16 +124,16 @@ curl -s -X POST "http://localhost:8008/_matrix/client/v3/join/$ROOM?access_token
 echo "ROOM_ID=$ROOM"
 ```
 
-## Future: Element Web / Element Call + TLS
+## Element Web / Element Call + TLS
 
-Browser clients need TLS end to end. The plan is a compose **overlay**
-(`docker-compose.tls.yml`, applied with `-f docker-compose.yml -f
-docker-compose.tls.yml`) adding nginx + element-web + element-call, with
-`init-certs` grown into a local CA minting per-host certs. The base file stays
-HTTP-only; client-facing URLs are already env-indirected (`LIVEKIT_WS_URL` in a
-`.env` file overrides what lk-jwt hands to clients), and the e2e test reads
-`HOMESERVER_URL` / `LIVEKIT_SERVICE_URL` / `INSECURE_TLS`, so the same test
-binary will run against the TLS overlay unchanged.
+Browser clients need TLS end to end, so testing against Element Call uses a
+compose **overlay** — [`docker-compose.interop.yml`](./docker-compose.interop.yml),
+applied with `-f docker-compose.yml -f docker-compose.interop.yml` (or
+`make interop-up`). It adds nginx and Element Web (which ships Element Call
+embedded), and grows `init-certs` into a local CA. The base file stays
+HTTP-only and is not modified, so everything above keeps working unchanged.
+
+See [INTEROP.md](./INTEROP.md).
 
 ## Troubleshooting
 

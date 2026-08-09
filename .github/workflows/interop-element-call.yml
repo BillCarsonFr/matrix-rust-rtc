@@ -1,0 +1,175 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# A Rust MatrixRTC client and a real Element Call in the same call. See
+# interop/README.md and demo/backend/INTEROP.md.
+#
+# Not on every push: Element Web's `develop` image moves daily and carries the
+# bundled Element Call with it, so an upstream UI change would red every
+# unrelated PR. Instead:
+#   - nightly, unpinned, as the drift signal;
+#   - on demand (workflow_dispatch);
+#   - on a PR carrying the `interop` label, digest-pinned so it is stable.
+
+name: Element Call interop
+
+on:
+  schedule:
+    # 04:20 UTC — after Element Web's nightly develop build has landed.
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+    inputs:
+      element_web_image:
+        description: "Element Web image to test against (blank = develop)"
+        required: false
+        default: ""
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin for label-triggered PR runs, so upstream cannot break a PR that has
+  # nothing to do with interop. The scheduled run leaves this unset and tracks
+  # `develop`, which is the drift signal.
+  #
+  # TODO: replace with a `…@sha256:…` digest on the first green run — a bare
+  # `develop` tag is not actually a pin. See "Element Web / Element Call
+  # versions" in demo/backend/INTEROP.md for the two-command recipe.
+  PINNED_ELEMENT_WEB: ghcr.io/element-hq/element-web:develop
+
+jobs:
+  interop:
+    name: Rust client vs Element Call
+    # Skip PRs that are not asking for it. Scheduled and manual runs always go.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'interop')
+    runs-on: ubuntu-latest
+    # Generous for the same reason as the E2E Call workflow: an uncached build
+    # of the matrix-sdk fork alone is ~25-45 minutes.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Names the browser resolves on its own, but Node and the Rust client do
+      # not. Must precede the stack coming up (wait-ready probes them).
+      - name: Resolve the *.m.localhost names
+        run: |
+          echo "127.0.0.1 synapse.m.localhost matrix-rtc.m.localhost app.m.localhost" \
+            | sudo tee -a /etc/hosts
+
+      # Started first so image pulls and Synapse's first boot overlap the (much
+      # longer) rust build.
+      - name: Start the interop stack
+        env:
+          # Empty on the nightly run => the compose default (`develop`) wins.
+          ELEMENT_WEB_IMAGE: >-
+            ${{ github.event_name == 'pull_request' && env.PINNED_ELEMENT_WEB
+                || inputs.element_web_image }}
+        run: |
+          docker compose -f demo/backend/docker-compose.yml \
+                         -f demo/backend/docker-compose.interop.yml up -d --wait
+
+      # No machine-wide trust install: the suite hands the CA to the Rust peer
+      # as SSL_CERT_FILE and to Node as NODE_EXTRA_CA_CERTS itself (see
+      # interop/helpers/rust-peer.ts and playwright.config.ts, and INTEROP.md
+      # for why that is enough). This step only fails loudly if the stack did
+      # not produce a CA at all, which would otherwise surface much later as an
+      # UnknownIssuer deep inside the peer.
+      - name: Check the stack minted its dev CA
+        run: test -r demo/backend/data/tls/local-ca.crt
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # webrtc-sys's build script shells out to pkg-config for glib-2.0 (the
+      # prebuilt linux libwebrtc links it dynamically).
+      - name: Install webrtc-sys system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      # Same key as the E2E Call workflow: identical tree, and the matrix-sdk
+      # fork build dominates the job either way.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-call
+
+      - name: Build the interop peer
+        run: cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `npm ci` once a lockfile is committed (do that on the first local run —
+      # it pins @playwright/test, which is the only dependency here).
+      - name: Install Playwright dependencies
+        working-directory: interop
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      # Browsers are cached on the exact Playwright version, or a version bump
+      # silently reuses binaries it cannot drive.
+      - name: Get Playwright version
+        working-directory: interop
+        run: |
+          echo "PLAYWRIGHT_VERSION=$(node -p "require('@playwright/test/package.json').version")" \
+            >> "$GITHUB_ENV"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ env.PLAYWRIGHT_VERSION }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: interop
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait for the interop stack
+        run: ./demo/backend/wait-ready.sh --interop
+
+      - name: Run the interop test
+        working-directory: interop
+        run: npx playwright test
+        env:
+          RUST_LOG: info,matrix_rtc_core=debug,matrix_rtc_bridge=debug,matrix_rtc_livekit=debug,livekit=warn,webrtc_sys=warn
+
+      # Always, not only on failure: the lk-jwt logs are the sole visibility
+      # into the OpenID/token hop, and a green run that logs oddities is how
+      # drift gets caught before it breaks anything.
+      - name: Stack logs
+        if: always()
+        run: |
+          docker compose -f demo/backend/docker-compose.yml \
+                         -f demo/backend/docker-compose.interop.yml logs --no-color
+
+      # Traces, videos, the peer's log and the recorded audio all live here.
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-playwright-report
+          path: |
+            interop/playwright-report/
+            interop/test-results/
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f demo/backend/docker-compose.yml \
+                         -f demo/backend/docker-compose.interop.yml down -v

@@ -141,6 +141,31 @@ single integrator, rather than dripped out over several:
 
 ### Added
 
+- **An automated Element Call interop test.** Both compat dialects were
+  validated against real Element Call by hand, once; nothing re-checked them, so
+  a regression in a dialect, an identity derivation or a key binding stayed
+  invisible until somebody repeated a manual call. Now a Rust client and a real
+  Element Call join the same call in CI, and each side asserts it can see,
+  key-exchange with and decrypt media from the other:
+
+  - `demo/backend/docker-compose.interop.yml` — a TLS overlay on the existing
+    backend stack (nginx fronting `*.m.localhost` with a CA minted at up time,
+    plus Element Web). Element Call is a widget in an iframe and needs a secure
+    context, which `http://localhost` cannot give it. Element Web **ships
+    Element Call embedded**, so there is no Element Call service to run — the
+    version under test is the one users get. The base compose file is untouched
+    and `make test-e2e` is unaffected. See `demo/backend/INTEROP.md`.
+  - `crates/matrix-rtc-livekit/examples/interop_peer.rs` — the Rust half, driven
+    over stdin, reporting JSON lines on stdout.
+  - `interop/` — the Playwright suite that owns the browser and drives that
+    peer, parametrised over Element Call's `Compatibility: state events`
+    (`ElementCallCompat::StateEvents`) and `Matrix 2.0` (`StickyEvents`).
+    `ElementCallCompat::Off` has no Element Call counterpart yet and stays
+    `e2e_call`'s job.
+  - `.github/workflows/interop-element-call.yml` — nightly against Element Web
+    `develop` (the drift signal), on demand, and on PRs labelled `interop`
+    against a pinned image.
+
 - **`openSlot(roomId, slotId, applicationType, encryption)` and
   `closeSlot(roomId, slotId)` on the manager handle**, wrapping the core calls the
   native path has always had. A room has no slot until somebody opens one, and a

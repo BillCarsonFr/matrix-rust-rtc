@@ -21,8 +21,14 @@ node_modules/
 
 agent-workspace/
 
-# Runtime state of the local MatrixRTC backend stack
+# Runtime state of the local MatrixRTC backend stack, including the dev CA and
+# TLS keypair the interop overlay mints at up time.
 demo/backend/data/
+
+# Element Call interop test (Playwright) output
+interop/playwright-report/
+interop/test-results/
+interop/blob-report/
 
 .idea/
 
