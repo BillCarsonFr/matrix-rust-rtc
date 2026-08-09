@@ -18,7 +18,7 @@
 
 # Makefile for common development tasks
 
-.PHONY: help setup build-check fmt fmt-check clippy test build-ffi build-mobile build-android build-ios clean backend-up backend-down backend-logs test-e2e
+.PHONY: help setup build-check fmt fmt-check clippy test build-ffi build-mobile build-android build-ios clean backend-up backend-down backend-logs test-e2e interop-up interop-down interop-logs interop-trust test-interop
 
 help:
 	@echo "Matrix RTC Development Commands"
@@ -38,6 +38,13 @@ help:
 	@echo "  make backend-down       Tear the backend stack down"
 	@echo "  make backend-logs       Follow the backend stack logs"
 	@echo "  make test-e2e           Run the e2e call test against the backend stack"
+	@echo ""
+	@echo "Element Call interop (demo/backend/INTEROP.md):"
+	@echo "  make interop-up         Start the backend stack + TLS, Element Web/Call"
+	@echo "  make interop-down       Tear the interop stack down"
+	@echo "  make interop-logs       Follow the interop stack logs"
+	@echo "  make interop-trust      Print how to trust the stack's dev CA"
+	@echo "  make test-interop       Run the Element Call interop test (Playwright)"
 	@echo ""
 	@echo "Build Mobile:"
 	@echo "  make build-mobile       Build both Android AAR and iOS XCFramework (interactive)"
@@ -128,6 +135,48 @@ backend-logs:
 # stack; running them in parallel would double the load and interleave logs.
 test-e2e: backend-up
 	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
+
+# ---- Element Call interop ------------------------------------------------
+# The same base stack plus TLS (nginx + a dev CA) and Element Web, which ships
+# Element Call embedded. A browser needs a secure context for WebRTC and the
+# widget API, which http://localhost cannot give the iframe. See INTEROP.md.
+
+.PHONY: interop-up interop-down interop-logs interop-trust test-interop
+INTEROP_COMPOSE = docker compose -f demo/backend/docker-compose.yml -f demo/backend/docker-compose.interop.yml
+
+interop-up:
+	$(INTEROP_COMPOSE) up -d --wait
+	./demo/backend/wait-ready.sh --interop
+	@$(MAKE) --no-print-directory interop-trust
+
+interop-down:
+	$(INTEROP_COMPOSE) down -v
+
+interop-logs:
+	$(INTEROP_COMPOSE) logs -f
+
+# The test wires the dev CA into the Rust peer (SSL_CERT_FILE) and Node
+# (NODE_EXTRA_CA_CERTS) itself, so the only host-side prerequisite is name
+# resolution. This just says so, rather than installing anything: mutating the
+# machine's trust store is not something a `make` target should do behind your
+# back. See INTEROP.md.
+interop-trust:
+	@echo ""
+	@echo "Interop stack is up. One host-side prerequisite (once per machine):"
+	@echo ""
+	@echo "  /etc/hosts:"
+	@echo "    127.0.0.1 synapse.m.localhost matrix-rtc.m.localhost app.m.localhost"
+	@echo ""
+	@echo "  Element Web: https://app.m.localhost"
+	@echo "  (Your browser will warn on the dev cert; Playwright ignores it.)"
+	@echo ""
+	@echo "  Running the peer or the examples by hand, outside the test:"
+	@echo "    export SSL_CERT_FILE=\"$$PWD/demo/backend/data/tls/local-ca.crt\""
+	@echo ""
+
+test-interop: interop-up
+	cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer
+	cd interop && { [ -f package-lock.json ] && npm ci || npm install; } && npx playwright test
 
 .PHONY: quality-check
 quality-check: fmt-check clippy test build-check

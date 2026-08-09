@@ -128,8 +128,18 @@ path = "tests/e2e_call/main.rs"
 required-features = ["matrix-sdk", "testing"]
 
 [dev-dependencies]
-# `signal` for the join_and_record example's Ctrl-C hang-up.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util", "signal"] }
+# `signal` for the join_and_record example's Ctrl-C hang-up; `io-std` for the
+# interop_peer example, which is driven over stdin by the Playwright suite.
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "time",
+  "test-util",
+  "signal",
+  "io-std",
+  "io-util",
+] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Argument parsing for the `load_test` example. A dev-dependency on purpose:
 # examples may use them, so clap never enters the library's dependency graph.
@@ -154,6 +164,14 @@ required-features = ["matrix-sdk", "testing"]
 # The load generator (see README.md). Publishes a video file from N devices of
 # one account. Its tone generator is local, so `testing` is here for one reason
 # only: reaching the `OlmMachine`.
+# The Rust half of the Element Call interop test (see interop/README.md and
+# demo/backend/INTEROP.md). Driven over stdin by Playwright, which owns the
+# browser running Element Call. `testing` for the tone generator it publishes
+# so Element Call has media to render.
+[[example]]
+name = "interop_peer"
+required-features = ["matrix-sdk", "testing"]
+
 [[example]]
 name = "load_test"
 # `testing` is only for `Client::olm_machine_for_testing`, used to keep room-key

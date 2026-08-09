@@ -1,0 +1,143 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# Synapse for the Element Call interop stack (docker-compose.interop.yml).
+# Same dev homeserver as homeserver.yaml, with two differences and nothing
+# else — keep the rest in sync with that file:
+#
+#   1. `server_name` is a name a browser can reach over TLS, because Element
+#      Web derives user IDs and federation discovery from it.
+#   2. No TLS listener: nginx terminates both 443 and 8448 in front.
+#
+# NOT for production: open registration, disabled rate limits, well-known dev
+# secrets.
+
+# Resolves to nginx inside the compose network (a network alias) and to
+# 127.0.0.1 on the host (/etc/hosts, see INTEROP.md). lk-jwt's federation
+# discovery lands on <server_name>:8448 either way.
+server_name: "synapse.m.localhost"
+public_baseurl: "https://synapse.m.localhost/"
+pid_file: /data/homeserver.pid
+log_config: /cfg/log.config
+
+listeners:
+  # Single plain-HTTP listener; nginx is the only thing that talks to it, and
+  # it serves the federation resource too so the OpenID userinfo endpoint
+  # lk-jwt calls is reachable through the 8448 server block.
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    bind_addresses: ["0.0.0.0"]
+    resources:
+      - names: [client, federation, openid]
+        compress: false
+
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+
+media_store_path: /data/media_store
+# Auto-generated on first start into the (git-ignored) data volume.
+signing_key_path: /data/synapse.signing.key
+report_stats: false
+suppress_key_server_warning: true
+trusted_key_servers: []
+
+# nginx serves /.well-known/matrix/client itself, because that is where the
+# MatrixRTC focus (org.matrix.msc4143.rtc_foci) is advertised.
+serve_server_wellknown: false
+
+# Tests provision throwaway users on the fly. The shared secret additionally
+# enables the admin registration API (/_synapse/admin/v1/register and the
+# register_new_matrix_user CLI) should open registration ever be turned off.
+enable_registration: true
+enable_registration_without_verification: true
+registration_shared_secret: "matrix-rtc-dev-only"
+
+# MSC4140 delayed events (the dead man's switch behind delayed RTC leaves).
+# There is no experimental_features flag for it; setting a maximum delay is
+# what enables the API.
+max_event_delay_duration: 24h
+
+experimental_features:
+  # MSC3266: room summary API (Element Call uses it for knocking/previews).
+  msc3266_enabled: true
+  # MSC4222: state_after in sync, used by current SDKs.
+  msc4222_enabled: true
+  # MSC4354: sticky events — the MatrixRTC signalling backbone.
+  msc4354_enabled: true
+  # MSC4143: the `/rtc_transports` endpoint that advertises `matrix_rtc`
+  # below. Without it the endpoint 404s and clients have nowhere to discover a
+  # focus (our Rust client then needs a hardcoded fallback URL, which is
+  # exactly what this stack exists to avoid).
+  msc4143_enabled: true
+
+# The MatrixRTC focus this homeserver advertises over `/rtc_transports`.
+#
+# Must stay identical to the `org.matrix.msc4143.rtc_foci` entry nginx serves
+# in /.well-known/matrix/client: the two are read by different clients — this
+# one by our Rust client, well-known by Element Call — and they have to name
+# the same authorisation service or the two halves of a call land on different
+# SFUs.
+matrix_rtc:
+  transports:
+    - type: livekit
+      livekit_service_url: "https://matrix-rtc.m.localhost/livekit/jwt"
+
+# Rate limits effectively disabled so automated tests can log in, join, and
+# re-arm delayed events as fast as they like.
+rc_message:
+  per_second: 1000
+  burst_count: 1000
+rc_registration:
+  per_second: 1000
+  burst_count: 1000
+rc_login:
+  address:
+    per_second: 1000
+    burst_count: 1000
+  account:
+    per_second: 1000
+    burst_count: 1000
+  failed_attempts:
+    per_second: 1000
+    burst_count: 1000
+rc_joins:
+  local:
+    per_second: 1000
+    burst_count: 1000
+  remote:
+    per_second: 1000
+    burst_count: 1000
+rc_joins_per_room:
+  per_second: 1000
+  burst_count: 1000
+rc_invites:
+  per_room:
+    per_second: 1000
+    burst_count: 1000
+  per_user:
+    per_second: 1000
+    burst_count: 1000
+  per_issuer:
+    per_second: 1000
+    burst_count: 1000
+# MSC4140 bucket: the 15s RTC heartbeat re-arms a delayed leave, which the
+# default limit (per_second: 1) would throttle across concurrent tests.
+rc_delayed_event_mgmt:
+  per_second: 1000
+  burst_count: 1000
+rc_key_requests:
+  per_second: 1000
+  burst_count: 1000
+rc_admin_redaction:
+  per_second: 1000
+  burst_count: 1000

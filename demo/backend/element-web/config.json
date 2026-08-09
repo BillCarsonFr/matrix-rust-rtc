@@ -1,0 +1,31 @@
+{
+  "default_server_config": {
+    "m.homeserver": {
+      "base_url": "https://synapse.m.localhost",
+      "server_name": "synapse.m.localhost"
+    }
+  },
+  "brand": "Element",
+  "disable_custom_urls": true,
+  "disable_guests": true,
+  "default_federate": false,
+  "default_theme": "light",
+  "default_country_code": "GB",
+  "show_labs_settings": true,
+  "room_directory": { "servers": [] },
+  "features": {
+    "feature_group_calls": true,
+    "feature_video_rooms": true,
+    "feature_element_call_video_rooms": true,
+    "feature_release_announcement": false
+  },
+  "setting_defaults": {
+    "language": "en-GB",
+    "feature_group_calls": true,
+    "breadcrumbs": true
+  },
+  "element_call": {
+    "brand": "Element Call",
+    "participant_limit": 8
+  }
+}
