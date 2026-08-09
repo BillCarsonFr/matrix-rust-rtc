@@ -24,10 +24,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 
-use matrix_rtc_core::RtcIdentityMapper;
-use matrix_rtc_livekit::identity::pseudonymous_identity;
+use matrix_rtc_bridge::compat::ElementCallCompat;
 use matrix_rtc_livekit::{
-    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, msc4195_key_provider,
+    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
+    identity_mapper, msc4195_key_provider,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, OwnMemberClaims,
@@ -91,8 +91,27 @@ async fn build_media_session(
         config.livekit_service_url,
     );
 
+    // Which MatrixRTC generation this room was joined for, read back from the
+    // join rather than taken as a parameter: it decides the participant identity
+    // and the token endpoint, and those disagreeing with the membership we
+    // already published is not an error but a silence — peers sit in the roster
+    // with no media, keys install under an identity the SFU never assigned, and
+    // nothing logs a problem. See `crate::compat`.
+    let compat = manager.element_call_compat_for(&config.room_id);
+    if compat != ElementCallCompat::Off {
+        log::info!(
+            "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
+            config.room_id,
+            config.slot_id,
+        );
+    }
+    // Call it once and share the `Arc`: it has four uses here — the core's
+    // encryption manager, the media transport, our own identity, and the key
+    // ring — and they must not skew.
+    let identity_mapper = identity_mapper(compat);
+
     // Frame encryption: one shared KeyProvider feeds every SFU connection
-    // (keys are indexed by pseudonymous identity, globally unique per
+    // (keys are indexed by the participant identity, globally unique per
     // membership) and the bridge that imports keys the core signals.
     let provider = msc4195_key_provider();
     let bridge = Arc::new(MediaKeyBridge::with_provider(provider.clone()));
@@ -132,15 +151,15 @@ async fn build_media_session(
                     config.room_id, config.slot_id
                 ))
             })?;
-        // Mapper before handler: the replay below derives MSC4195 identities
-        // through it, and installing it second would replay peer keys under the
-        // raw `member_id` fallback — an identity the SFU never uses, which is
+        // Mapper before handler: the replay below derives identities through it,
+        // and installing it second would replay peer keys under the raw
+        // `member_id` fallback — an identity the SFU never uses, which is
         // indistinguishable from importing nothing.
-        let identity_mapper: RtcIdentityMapper =
-            Arc::new(|user_id: &str, device_id: &str, member_id: &str| {
-                pseudonymous_identity(user_id, device_id, member_id)
-            });
-        mgr.set_encryption_identity_mapper(&config.room_id, &config.slot_id, identity_mapper);
+        mgr.set_encryption_identity_mapper(
+            &config.room_id,
+            &config.slot_id,
+            identity_mapper.clone(),
+        );
 
         if !mgr.set_encryption_signal_handler(&config.room_id, &config.slot_id, bridge.clone()) {
             log::warn!(
@@ -156,11 +175,23 @@ async fn build_media_session(
         (memberships, member_id)
     };
 
-    let transport = Arc::new(LiveKitMediaTransport::new(
-        reqwest::Client::new(),
-        Arc::new(TokenProviderAdapter(token_provider)),
-        provider,
-    ));
+    let transport = Arc::new(
+        LiveKitMediaTransport::new(
+            reqwest::Client::new(),
+            Arc::new(TokenProviderAdapter(token_provider)),
+            provider,
+        )
+        // The same mapper the core got, so our own identity, the peers' and the
+        // key ring's all agree.
+        .with_identity_mapper(identity_mapper.clone())
+        .with_token_endpoint(match compat {
+            // Pre-MSC4195 `/sfu/get`, which is also where that generation's
+            // unhashed `{user}:{device}` identity comes from — the endpoint mints
+            // the identity, so the two are one decision, not two.
+            ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+            _ => TokenEndpoint::Msc4195,
+        }),
+    );
     let ctx = ConnectionContext {
         room_id: config.room_id.clone(),
         slot_id: config.slot_id.clone(),
@@ -227,7 +258,7 @@ async fn build_media_session(
     engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
     let events = engine.subscribe_events();
-    let own_identity = pseudonymous_identity(&config.user_id, &config.device_id, &member_id);
+    let own_identity = identity_mapper(&config.user_id, &config.device_id, &member_id);
 
     // Move our sender onto each key we rotate to. Importing a key only fills the
     // provider's ring; the index our frames actually carry lives on the frame
@@ -304,8 +335,13 @@ impl MediaSession {
             .collect()
     }
 
-    /// Our MSC4195 pseudonymous identity on the media plane (the JWT `sub`;
-    /// peers import our media key under it).
+    /// Our participant identity on the media plane (the JWT `sub`; peers import
+    /// our media key under it).
+    ///
+    /// The MSC4195 pseudonymous hash, or — in
+    /// [`FfiElementCallCompat::StateEvents`](crate::FfiElementCallCompat::StateEvents)
+    /// — the plain `{user}:{device}` string that generation's authorisation
+    /// service mints.
     pub fn local_identity(&self) -> String {
         self.own_identity.clone()
     }

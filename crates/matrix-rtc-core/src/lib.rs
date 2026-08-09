@@ -624,6 +624,83 @@ mod tests {
         assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
     }
 
+    /// The way back from "no open slots" to "not my business".
+    ///
+    /// A room of a MatrixRTC generation older than `m.rtc.slot` contains none, so
+    /// a host that fed slot state before learning that must be able to take it
+    /// back — otherwise every member of that room, itself included, stays
+    /// projected out for the rest of the process.
+    #[tokio::test]
+    async fn forgetting_a_room_s_slots_stops_the_condition_being_enforced() {
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        // No slot in the room: everyone is projected out.
+        manager.on_room_slots_received(ROOM_ID, Vec::new()).await;
+        manager
+            .set_current_sticky_state(
+                ROOM_ID,
+                vec![joined_event("@alice:example.org", "m.call#ROOM", "alice-a")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(0));
+
+        manager.forget_room_slots(ROOM_ID).await;
+        assert_eq!(
+            manager.member_count(ROOM_ID, "m.call#ROOM"),
+            Some(1),
+            "an unenforced condition must not keep a live member out",
+        );
+        assert_eq!(
+            manager.slot_state(ROOM_ID, "m.call#ROOM"),
+            None,
+            "the slot is unknown again, not open",
+        );
+
+        // And a session created afterwards is born unenforced too, rather than
+        // inheriting the forgotten "no slots".
+        manager
+            .set_current_sticky_state(
+                ROOM_ID,
+                vec![
+                    joined_event("@alice:example.org", "m.call#ROOM", "alice-a"),
+                    joined_event("@bob:example.org", "m.call#OTHER", "bob-a"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.member_count(ROOM_ID, "m.call#OTHER"), Some(1));
+    }
+
+    /// Forgetting one room's slots leaves every other room's alone.
+    #[tokio::test]
+    async fn forgetting_slots_is_scoped_to_its_room() {
+        const OTHER_ROOM: &str = "!other:example.org";
+        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+        manager
+            .on_room_slots_received(
+                OTHER_ROOM,
+                vec![RawSlotEvent {
+                    room_id: OTHER_ROOM.to_owned(),
+                    ..open_call_slot()
+                }],
+            )
+            .await;
+
+        manager.forget_room_slots(ROOM_ID).await;
+
+        assert_eq!(manager.slot_state(ROOM_ID, "m.call#ROOM"), None);
+        assert!(
+            manager
+                .slot_state(OTHER_ROOM, "m.call#ROOM")
+                .is_some_and(|state| state.is_open()),
+        );
+    }
+
     /// A slot in one room says nothing about the same slot id in another.
     #[tokio::test]
     async fn slot_state_is_scoped_to_its_room() {

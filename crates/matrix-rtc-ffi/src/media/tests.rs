@@ -68,6 +68,17 @@ impl CommandSenderCallback for NoopCommands {
         Ok(())
     }
 
+    async fn send_delayed_state_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _state_key: String,
+        _content_json: String,
+        _delay_ms: u64,
+    ) -> Result<String, CommandSenderError> {
+        Ok("delayed-state-event-1".to_owned())
+    }
+
     async fn restart_delayed_event(
         &self,
         _room_id: String,
@@ -167,6 +178,7 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
                 keep_alive_timeout_ms: None,
                 sticky_duration_ms: None,
                 encryption_config: None,
+                element_call_compat: None,
             })
             .await
             .unwrap();

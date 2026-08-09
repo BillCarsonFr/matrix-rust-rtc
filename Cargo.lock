@@ -2677,6 +2677,7 @@ dependencies = [
  "futures",
  "jni 0.21.1",
  "log",
+ "matrix-rtc-bridge",
  "matrix-rtc-core",
  "matrix-rtc-livekit",
  "matrix-rtc-media",

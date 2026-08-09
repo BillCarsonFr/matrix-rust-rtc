@@ -93,6 +93,17 @@
 //! 6. `call::Call::join` — mode selection and the member id.
 //! 7. `identity_mapper` — the participant-identity derivation (see above).
 //! 8. `transport_impl` + `token` — `/sfu/get`.
+//!
+//! In `matrix-rtc-ffi`, which reaches the same dialects from a host that owns its
+//! own Matrix stack (see that crate's `compat` module):
+//!
+//! 9. `compat` — the FFI-shaped mode, the raw-JSON ingestion, and the two
+//!    identifiers the mode changes.
+//! 10. `commands::FfiCommandSender` — routes and rewrites outbound events, per
+//!     room.
+//! 11. `RtcSessionManagerHandle::{join, leave, set_current_membership,
+//!     receive_legacy_encryption_key}` — mode selection, and both inbound halves.
+//! 12. `media::session` — the identity derivation and token endpoint again.
 
 use serde_json::Value;
 

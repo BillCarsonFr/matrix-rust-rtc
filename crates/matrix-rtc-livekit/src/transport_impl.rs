@@ -127,10 +127,11 @@ impl LiveKitMediaTransport {
 
     /// Substitute the participant-identity derivation.
     ///
-    /// A builder rather than a `new` parameter so the FFI media session, which
-    /// installs the MSC4195 derivation of its own, stays untouched — legacy
-    /// interop is a native dev/test concern and has no business on the mobile
-    /// surface. Temporary; see [`crate::compat`].
+    /// A builder rather than a `new` parameter: the MSC4195 derivation is the
+    /// default and every spec-current caller leaves it alone. Both callers that
+    /// do substitute it — `Call::join` and the FFI media session — pass the same
+    /// `Arc` they gave the core's encryption manager, which is the point: the
+    /// derivation sites must not skew. Temporary; see [`crate::compat`].
     pub fn with_identity_mapper(mut self, identity_mapper: RtcIdentityMapper) -> Self {
         self.identity_mapper = identity_mapper;
         self
