@@ -111,6 +111,12 @@ single integrator, rather than dripped out over several:
   Implement it as `update_delayed_event` with `UpdateAction.Restart` (MSC4140's
   "heartbeat ping"). Do *not* implement it as cancel-then-reschedule; see
   Fixed below for why.
+- **`CommandSenderCallback.sendDelayedStateEvent(roomId, eventType, stateKey,
+  contentJson, delayMs)` is new.** It is only ever called in
+  `ElementCallCompat.STATE_EVENTS`, where the membership is room state and so its
+  dead man's switch has to be too — the message-like `sendDelayedEvent` has no
+  state key to send it under. Hosts not doing Element Call interop can implement
+  it as a thrown `SendError`; the SDK will not reach it. See Added below.
 - **The SDK now owns the `member.id`.** `FfiJoinSessionParams.membershipId` and
   `MediaSessionConfig.memberId` are gone; `join` returns the id it generated, and
   `connect_media_session` reads it from the join. Drop both fields and use the
@@ -134,6 +140,68 @@ single integrator, rather than dripped out over several:
   loads fine through JNA); harmless to call either way.
 
 ### Added
+
+- **`openSlot(roomId, slotId, applicationType, encryption)` and
+  `closeSlot(roomId, slotId)` on the manager handle**, wrapping the core calls the
+  native path has always had. A room has no slot until somebody opens one, and a
+  host that reports slot state projects every member out of a room that has none —
+  so in a room where no other client opens slots, this is what makes a call
+  possible at all. That includes every room whose other participant is Element
+  Call: no generation of it publishes `m.rtc.slot`. `encryption` is the new
+  `FfiSlotEncryption` (`PerMember`, or `Other { encryptionType }`), required in an
+  encrypted room and forbidden elsewhere. A `slotId` that does not start with
+  `{applicationType}#` is refused here rather than by the homeserver, which would
+  accept a slot every client then treats as closed.
+
+- **Element Call interop over the FFI**, so an Android or iOS host can be tested
+  against Element Call rather than only against another Rust client. Both
+  generations, selected per join with
+  `FfiJoinSessionParams.elementCallCompat: FfiElementCallCompat?`
+  (`OFF` / `STICKY_EVENTS` / `STATE_EVENTS`, `null` meaning `OFF`).
+
+  Chosen once and remembered for the room, because it is one decision rather
+  than a wire-format flag: it also fixes the `member.id` the session joins with,
+  how an inbound media key is bound to a membership, the SFU participant
+  identity, and which authorisation-service endpoint mints the token. The media
+  session reads it back from the join rather than taking it again — those two
+  disagreeing is not an error but a silence, a fully connected call in which
+  nothing decrypts.
+
+  The outbound half needs no host change: memberships, the delayed leave and
+  media keys are rewritten (or re-routed to room state) inside the binding. The
+  inbound half does, because reading a legacy membership means parsing a content
+  that states its transports somewhere else, its membership nowhere at all, and —
+  a generation earlier — is not a sticky event:
+
+  - `setCurrentMembership(roomId, memberEvents, legacyStateEvents)` takes raw
+    event content and does the parsing in Rust. Both sources in one call, because
+    it replaces the room's whole membership: fed separately, each call would wipe
+    the other's members and the roster would flicker between the two halves of
+    the call. Spec-current hosts keep using `setCurrentStickyState`.
+  - `receiveLegacyEncryptionKey(sender, contentJson, wasEncrypted,
+    senderDeviceId, senderIsCrossSigned)` ingests
+    `io.element.call.encryption_keys`. Easily forgotten, and expensive to forget:
+    the roster fills in, everything looks joined, and every remote tile stays
+    black.
+  - In `STATE_EVENTS` only: implement `sendDelayedStateEvent` (see Breaking).
+
+  Slots need no host handling. Element Call publishes no `m.rtc.slot` in either
+  generation, so the truthful "no slots" a host feeds would resolve the session
+  closed and project out every member, itself included. In `STATE_EVENTS` the
+  mode absorbs it: the join calls the new
+  `RtcSessionManager::forget_room_slots(room_id)` — the way back from
+  `on_room_slots_received`, which was otherwise irreversible, since an empty slot
+  list means "no open slots" rather than "I have nothing to say" — and later slot
+  updates for that room are ignored. The condition returns to unenforced, which
+  is the honest answer for a generation that predates the concept. `STICKY_EVENTS`
+  keeps it enforced, because those rooms are otherwise spec-shaped and a slot in
+  one is meaningful; a host feeding slot state there needs the slot opened, as
+  the native tools do with `--open-slot`.
+
+  The translation itself is `matrix-rtc-bridge`'s `compat`, unchanged and shared
+  with the native path; `matrix-rtc-ffi` gained a dependency on that crate
+  (without its `matrix-sdk` feature — pure JSON, no git dependencies, so the slim
+  mobile artifact is unaffected).
 
 - **Interop with *pre-sticky* Element Call — membership as room state
   (`matrix-rtc-livekit`'s `compat::element_call_state`).** One generation older

@@ -865,6 +865,26 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         self.refresh().await;
     }
 
+    /// Returns this session's slot to [`SlotKnowledge::Unsupplied`], so the
+    /// open-slot condition stops being enforced.
+    ///
+    /// Not the same as being told the slot is open: "unknowable" and "open" agree
+    /// on today's outcome and disagree about what a later `m.rtc.slot` means. The
+    /// caller is saying it can no longer speak for this room's slots, not that it
+    /// has seen one.
+    pub(crate) async fn forget_slot_state(&mut self) {
+        if self.slot == SlotKnowledge::Unsupplied {
+            return;
+        }
+        log::info!(
+            "[{}] slot state: {:?} -> Unsupplied (no longer enforced)",
+            self.log_tag,
+            self.slot,
+        );
+        self.slot = SlotKnowledge::Unsupplied;
+        self.refresh().await;
+    }
+
     /// Sets the slot state on a session that has no members yet.
     ///
     /// Used when a session is created after its room state was already known;

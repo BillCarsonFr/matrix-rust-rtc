@@ -22,9 +22,13 @@
 //!
 //! DTOs are used to decouple core logic from FFI-specific types.
 
+use matrix_rtc_bridge::compat::{MemberEventRoute, OutboundDialect};
 use matrix_rtc_core::{CommandError, RtcCommandSender, wire_event_type};
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::compat::FfiElementCallCompat;
 
 /// The sole conversion from a core event-type string to the wire type.
 ///
@@ -117,6 +121,22 @@ pub struct FfiJoinSessionParams {
     pub sticky_duration_ms: Option<u64>,
     /// Optional encryption configuration
     pub encryption_config: Option<FfiEncryptionConfig>,
+    /// Render this session for an older MatrixRTC generation, to interoperate
+    /// with Element Call builds that predate the 2026 MSC4143 rewrite. Unset (or
+    /// `Off`) is spec-current, and is what every non-interop join wants.
+    ///
+    /// This is one decision, not a wire-format flag: it also fixes the
+    /// `member.id` we join with, how an inbound media key is bound, the SFU
+    /// participant identity and the token endpoint. It is remembered for the room
+    /// until the next join, so the media session picks it up on its own rather
+    /// than being told again — those two disagreeing produces no error, just a
+    /// connected call in which nothing decrypts.
+    ///
+    /// Reading the 2025 sticky dialect needs no mode and is always on. The other
+    /// halves of interop are host obligations; see [`crate::compat`] for the list
+    /// per mode.
+    #[uniffi(default = None)]
+    pub element_call_compat: Option<FfiElementCallCompat>,
 }
 
 /// FFI-friendly leave session parameters.
@@ -189,7 +209,8 @@ impl FfiJoinSessionParams {
         };
 
         format!(
-            "[{}/{}] user={} device={} application={} transport={} keep_alive={:?}ms encryption={}",
+            "[{}/{}] user={} device={} application={} transport={} keep_alive={:?}ms \
+             encryption={} element_call_compat={:?}",
             self.room_id,
             self.slot_id,
             self.user_id,
@@ -198,6 +219,7 @@ impl FfiJoinSessionParams {
             transport,
             self.keep_alive_timeout_ms,
             self.encryption_config.is_some(),
+            self.element_call_compat.unwrap_or_default(),
         )
     }
 
@@ -315,8 +337,11 @@ pub trait CommandSenderCallback: Send + Sync {
 
     /// Called when a state event needs to be sent.
     ///
-    /// Used for `m.rtc.slot`. Sending room state usually needs a raised power
-    /// level, so return an error if the homeserver rejects it.
+    /// Used for `m.rtc.slot`, and — in
+    /// [`FfiElementCallCompat::StateEvents`](crate::FfiElementCallCompat::StateEvents)
+    /// — for the membership itself, as `org.matrix.msc3401.call.member`. Sending
+    /// room state usually needs a raised power level, so return an error if the
+    /// homeserver rejects it.
     ///
     /// # Arguments
     /// * `room_id` - The room ID where the event should be sent
@@ -333,6 +358,41 @@ pub trait CommandSenderCallback: Send + Sync {
         state_key: String,
         content_json: String,
     ) -> Result<(), CommandSenderError>;
+
+    /// Called when a delayed **state** event needs to be scheduled.
+    ///
+    /// Only ever called in
+    /// [`FfiElementCallCompat::StateEvents`](crate::FfiElementCallCompat::StateEvents),
+    /// where the membership is room state and so its dead man's switch has to be
+    /// too. Implement it by throwing
+    /// [`CommandSenderError::SendError`] in every other mode if you like — the
+    /// SDK will not reach it.
+    ///
+    /// Worth knowing what it buys, because it is more than the sticky path gets:
+    /// a delayed sticky leave clears nothing from the sticky map, so crash
+    /// cleanup there rides on the entry's TTL. A delayed state event with `{}`
+    /// content genuinely empties our membership, which is what MSC4140 was built
+    /// for and what this generation of Element Call relies on — without it a
+    /// crashed client is a permanent ghost in the call, since room state has no
+    /// TTL to lapse.
+    ///
+    /// matrix-rust-sdk: the MSC4140 delayed **state** send
+    /// (`PUT /rooms/{roomId}/state/{eventType}/{stateKey}?org.matrix.msc4140.delay=…`).
+    /// Note the state key, which the message-like `sendDelayedEvent` has no room
+    /// for — that is the whole reason this is a second method.
+    ///
+    /// # Returns
+    /// Return Ok(delay_id) with the MSC4140 delay ID on success, or Err on
+    /// failure. The id is what `restartDelayedEvent` and `cancelDelayedEvent`
+    /// take, exactly as for the message-like variant.
+    async fn send_delayed_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content_json: String,
+        delay_ms: u64,
+    ) -> Result<String, CommandSenderError>;
 
     /// Called periodically to restart a scheduled delayed event's timer.
     ///
@@ -433,6 +493,20 @@ pub struct FfiToDeviceDelivery {
 /// based on the native callback's return value.
 pub struct FfiCommandSender {
     callback: Arc<dyn CommandSenderCallback>,
+    /// The outbound dialect each room's session speaks, registered by
+    /// [`RtcSessionManagerHandle::join`](crate::RtcSessionManagerHandle::join)
+    /// and empty for every spec-current room — which is the common case, and
+    /// costs one uncontended lock and a miss.
+    ///
+    /// Keyed by room rather than by `(room, slot)` because a to-device media key
+    /// names only its room: the core's key content carries `room_id` and nothing
+    /// that identifies a slot. Two slots of one room joined in different modes is
+    /// therefore not expressible, which is no loss — the mode exists to talk to a
+    /// generation of Element Call that has one call per room.
+    ///
+    /// A `std::sync::Mutex` on purpose: it is only ever held to clone a dialect
+    /// out or to insert one, never across an await.
+    dialects: Mutex<HashMap<String, OutboundDialect>>,
 }
 
 impl FfiCommandSender {
@@ -441,7 +515,56 @@ impl FfiCommandSender {
     /// Returns an `Arc<FfiCommandSender>` for thread-safe sharing with the core.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(callback: Arc<dyn CommandSenderCallback>) -> Arc<FfiCommandSender> {
-        Arc::new(Self { callback })
+        Arc::new(Self {
+            callback,
+            dialects: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Make every later send for `room_id` speak `dialect`.
+    ///
+    /// Replaces any previous one: a rejoin in a different mode is the whole point
+    /// of setting this per join.
+    pub(crate) fn set_dialect(&self, room_id: &str, dialect: OutboundDialect) {
+        match self.dialects.lock() {
+            Ok(mut dialects) => {
+                dialects.insert(room_id.to_owned(), dialect);
+            }
+            // Only reachable if a previous holder panicked while holding it,
+            // which for a map insert means the process is already in trouble.
+            // Carrying on spec-current is the safe reading of "we don't know".
+            Err(error) => log::error!("could not register the outbound dialect: {error}"),
+        }
+    }
+
+    /// Forget `room_id`'s dialect, after a leave has been rendered in it.
+    pub(crate) fn clear_dialect(&self, room_id: &str) {
+        if let Ok(mut dialects) = self.dialects.lock() {
+            dialects.remove(room_id);
+        }
+    }
+
+    /// The dialect for `room_id`, or [`OutboundDialect::None`] — an unregistered
+    /// room is a spec-current one.
+    fn dialect(&self, room_id: &str) -> OutboundDialect {
+        self.dialects
+            .lock()
+            .ok()
+            .and_then(|dialects| dialects.get(room_id).cloned())
+            .unwrap_or(OutboundDialect::None)
+    }
+
+    /// The dialect a to-device message is rendered in.
+    ///
+    /// A media key names its room inside the content, which is the only routing
+    /// information a to-device send has — the signature carries recipients, not a
+    /// room.
+    fn dialect_for_content(&self, content: &Value) -> OutboundDialect {
+        content
+            .get("room_id")
+            .and_then(Value::as_str)
+            .map(|room_id| self.dialect(room_id))
+            .unwrap_or(OutboundDialect::None)
     }
 }
 
@@ -475,20 +598,61 @@ impl RtcCommandSender for FfiCommandSender {
         content: Value,
         duration_ms: u64,
     ) -> Result<(), CommandError> {
-        let content_json = serde_json::to_string(&content)
-            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        // Anything that is not a membership routes straight through in every
+        // mode; the legacy generations differ about memberships, not about
+        // everything. See `matrix_rtc_bridge::compat`.
+        match self
+            .dialect(&room_id)
+            .route_member_event(event_type, content)
+        {
+            MemberEventRoute::Sticky {
+                event_type,
+                content,
+            } => {
+                let content_json = serde_json::to_string(&content)
+                    .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        let wire_event_type = wire_type(event_type);
-        let what = format!("sticky [{room_id}] type={wire_event_type}");
-        trace_command_content(&what, &content_json);
+                let wire_event_type = wire_type(event_type);
+                let what = format!("sticky [{room_id}] type={wire_event_type}");
+                trace_command_content(&what, &content_json);
 
-        log_command(
-            &what,
-            self.callback
-                .send_sticky_event(room_id, wire_event_type, content_json, duration_ms)
-                .await
-                .map_err(CommandError::from),
-        )
+                log_command(
+                    &what,
+                    self.callback
+                        .send_sticky_event(room_id, wire_event_type, content_json, duration_ms)
+                        .await
+                        .map_err(CommandError::from),
+                )
+            }
+            // `duration_ms` is dropped on purpose: room state has no TTL, and in
+            // this dialect the lifetime is stated inside the content instead
+            // (`created_ts` + `expires`). The core's periodic re-send still fires
+            // and is harmless — the dialect pins `created_ts`, so the content is
+            // byte-identical and moves nothing a peer reads.
+            //
+            // The type is already the legacy wire id, so it does *not* go through
+            // `wire_type`: that table is the core's own alias map, and this type
+            // is not the core's.
+            MemberEventRoute::State {
+                event_type,
+                state_key,
+                content,
+            } => {
+                let content_json = serde_json::to_string(&content)
+                    .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+                let what = format!("state [{room_id}] type={event_type} state_key={state_key}");
+                trace_command_content(&what, &content_json);
+
+                log_command(
+                    &what,
+                    self.callback
+                        .send_state_event(room_id, event_type.to_owned(), state_key, content_json)
+                        .await
+                        .map_err(CommandError::from),
+                )
+            }
+        }
     }
 
     async fn send_delayed_event(
@@ -498,20 +662,61 @@ impl RtcCommandSender for FfiCommandSender {
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
-        let content_json = serde_json::to_string(&content)
-            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        // The delayed leave is a member event like any other, and a peer that
+        // cannot read it is a peer we stay visible to forever — so it goes
+        // through the same routing as the join it is paired with.
+        match self
+            .dialect(&room_id)
+            .route_member_event(event_type, content)
+        {
+            MemberEventRoute::Sticky {
+                event_type,
+                content,
+            } => {
+                let content_json = serde_json::to_string(&content)
+                    .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
-        let wire_event_type = wire_type(event_type);
-        let what = format!("delayed [{room_id}] type={wire_event_type} delay={delay_ms}ms");
-        trace_command_content(&what, &content_json);
+                let wire_event_type = wire_type(event_type);
+                let what = format!("delayed [{room_id}] type={wire_event_type} delay={delay_ms}ms");
+                trace_command_content(&what, &content_json);
 
-        log_command(
-            &what,
-            self.callback
-                .send_delayed_event(room_id, wire_event_type, content_json, delay_ms)
-                .await
-                .map_err(CommandError::from),
-        )
+                log_command(
+                    &what,
+                    self.callback
+                        .send_delayed_event(room_id, wire_event_type, content_json, delay_ms)
+                        .await
+                        .map_err(CommandError::from),
+                )
+            }
+            MemberEventRoute::State {
+                event_type,
+                state_key,
+                content,
+            } => {
+                let content_json = serde_json::to_string(&content)
+                    .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+                let what = format!(
+                    "delayed state [{room_id}] type={event_type} state_key={state_key} \
+                     delay={delay_ms}ms"
+                );
+                trace_command_content(&what, &content_json);
+
+                log_command(
+                    &what,
+                    self.callback
+                        .send_delayed_state_event(
+                            room_id,
+                            event_type.to_owned(),
+                            state_key,
+                            content_json,
+                            delay_ms,
+                        )
+                        .await
+                        .map_err(CommandError::from),
+                )
+            }
+        }
     }
 
     async fn restart_delayed_event(
@@ -551,6 +756,15 @@ impl RtcCommandSender for FfiCommandSender {
         message_type: String,
         content: Value,
     ) -> Result<Vec<matrix_rtc_core::ToDeviceDelivery>, CommandError> {
+        // Unlike a member event, a to-device message cannot carry both dialects
+        // at once — the type is one or the other — so in compat mode the media
+        // key goes out in the legacy dialect alone, and is exchanged with legacy
+        // peers rather than spec-current ones.
+        let (message_type, content) = self
+            .dialect_for_content(&content)
+            .rewrite_key_message(&message_type, &content)
+            .unwrap_or((message_type, content));
+
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
@@ -630,6 +844,10 @@ mod tests {
         sent_types: Mutex<Vec<String>>,
         sticky_duration_ms: Mutex<Option<u64>>,
         to_device: Mutex<Vec<ToDeviceSend>>,
+        /// Every sticky and state send in full, for the compat tests: which
+        /// carrier a membership took, and under what content, is the whole
+        /// question there and the event type alone cannot answer it.
+        sends: Mutex<Vec<Send>>,
     }
 
     #[derive(Clone)]
@@ -639,9 +857,44 @@ mod tests {
         content: serde_json::Value,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Carrier {
+        Sticky,
+        State,
+        DelayedSticky,
+        DelayedState,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Send {
+        carrier: Carrier,
+        event_type: String,
+        state_key: Option<String>,
+        content: serde_json::Value,
+    }
+
     impl MockCommandSenderCallback {
         fn record(&self, event_type: &str) {
             self.sent_types.lock().unwrap().push(event_type.to_owned());
+        }
+
+        fn record_send(
+            &self,
+            carrier: Carrier,
+            event_type: &str,
+            state_key: Option<String>,
+            content_json: &str,
+        ) {
+            self.sends.lock().unwrap().push(Send {
+                carrier,
+                event_type: event_type.to_owned(),
+                state_key,
+                content: serde_json::from_str(content_json).unwrap_or(serde_json::Value::Null),
+            });
+        }
+
+        fn sends(&self) -> Vec<Send> {
+            self.sends.lock().unwrap().clone()
         }
 
         fn sent_types(&self) -> Vec<String> {
@@ -669,10 +922,11 @@ mod tests {
             &self,
             _room_id: String,
             event_type: String,
-            _content_json: String,
+            content_json: String,
             duration_ms: u64,
         ) -> Result<(), CommandSenderError> {
             self.record(&event_type);
+            self.record_send(Carrier::Sticky, &event_type, None, &content_json);
             *self.sticky_duration_ms.lock().unwrap() = Some(duration_ms);
             Ok(())
         }
@@ -681,10 +935,11 @@ mod tests {
             &self,
             room_id: String,
             event_type: String,
-            _content_json: String,
+            content_json: String,
             _delay_ms: u64,
         ) -> Result<String, CommandSenderError> {
             self.record(&event_type);
+            self.record_send(Carrier::DelayedSticky, &event_type, None, &content_json);
             Ok(format!("event-{}-{}", room_id, event_type))
         }
 
@@ -692,11 +947,30 @@ mod tests {
             &self,
             _room_id: String,
             event_type: String,
-            _state_key: String,
-            _content_json: String,
+            state_key: String,
+            content_json: String,
         ) -> Result<(), CommandSenderError> {
             self.record(&event_type);
+            self.record_send(Carrier::State, &event_type, Some(state_key), &content_json);
             Ok(())
+        }
+
+        async fn send_delayed_state_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            state_key: String,
+            content_json: String,
+            _delay_ms: u64,
+        ) -> Result<String, CommandSenderError> {
+            self.record(&event_type);
+            self.record_send(
+                Carrier::DelayedState,
+                &event_type,
+                Some(state_key),
+                &content_json,
+            );
+            Ok(format!("delayed-state-{}-{}", room_id, event_type))
         }
 
         async fn restart_delayed_event(
@@ -782,6 +1056,19 @@ mod tests {
         ) -> Result<(), CommandSenderError> {
             (**self)
                 .send_state_event(room_id, event_type, state_key, content_json)
+                .await
+        }
+
+        async fn send_delayed_state_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            state_key: String,
+            content_json: String,
+            delay_ms: u64,
+        ) -> Result<String, CommandSenderError> {
+            (**self)
+                .send_delayed_state_event(room_id, event_type, state_key, content_json, delay_ms)
                 .await
         }
 
@@ -927,6 +1214,7 @@ mod tests {
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             encryption_config: None,
+            element_call_compat: None,
         }
     }
 
@@ -1060,6 +1348,382 @@ mod tests {
             sent[0].pointer("/member_id").and_then(|v| v.as_str()),
             Some(second.as_str()),
             "the key must be advertised under the member id this join published",
+        );
+    }
+
+    /// A host can open the slot its own call needs — the reason this is exported
+    /// at all is that no generation of Element Call publishes one, so in an
+    /// interop room nobody else will.
+    #[tokio::test]
+    async fn opening_and_closing_a_slot_publishes_the_state_a_peer_reads() {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Arc::new(mock.clone()))
+            .await
+            .expect("the mock sender should be accepted");
+
+        manager
+            .open_slot(
+                "!room:example.org".to_owned(),
+                "m.call#ROOM".to_owned(),
+                "m.call".to_owned(),
+                Some(crate::FfiSlotEncryption::PerMember),
+            )
+            .await
+            .expect("open");
+        manager
+            .close_slot("!room:example.org".to_owned(), "m.call#ROOM".to_owned())
+            .await
+            .expect("close");
+
+        let sends = mock.sends();
+        assert_eq!(sends.len(), 2);
+        // The unstable id, and the slot id as the state key: a peer matches on
+        // both, and `m.rtc.slot` on the wire is a slot nobody sees.
+        assert_eq!(sends[0].event_type, "org.matrix.msc4143.rtc.slot");
+        assert_eq!(sends[0].state_key.as_deref(), Some("m.call#ROOM"));
+        assert_eq!(
+            sends[0].content,
+            serde_json::json!({
+                "status": "open",
+                "application": { "type": "m.call" },
+                "encryption": { "type": "m.per_member" },
+            }),
+        );
+        assert_eq!(
+            sends[1].content.get("status").unwrap(),
+            &serde_json::json!("closed"),
+        );
+    }
+
+    /// MSC4143 makes the slot id the state key and requires it to start with
+    /// `{application}#`. A homeserver would accept anything; every client would
+    /// then treat the slot as closed, which is indistinguishable from the call
+    /// never starting.
+    #[tokio::test]
+    async fn a_slot_id_that_contradicts_its_application_is_refused() {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Arc::new(mock.clone()))
+            .await
+            .expect("the mock sender should be accepted");
+
+        let result = manager
+            .open_slot(
+                "!room:example.org".to_owned(),
+                "m.call#ROOM".to_owned(),
+                "m.something.else".to_owned(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(mock.sends().is_empty(), "nothing should have been sent");
+    }
+
+    // --- Element Call compatibility ------------------------------------------
+    //
+    // The dialects themselves are tested exhaustively in
+    // `matrix_rtc_bridge::compat`. What is tested here is the binding: that a
+    // mode chosen on `join` reaches every send it has to, including the two the
+    // join itself makes, and that it reaches no other room.
+
+    fn compat_join(compat: FfiElementCallCompat) -> FfiJoinSessionParams {
+        FfiJoinSessionParams {
+            element_call_compat: Some(compat),
+            keep_alive_timeout_ms: Some(30_000),
+            ..join_params()
+        }
+    }
+
+    async fn compat_manager() -> (
+        Arc<MockCommandSenderCallback>,
+        Arc<crate::RtcSessionManagerHandle>,
+    ) {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Arc::new(mock.clone()))
+            .await
+            .expect("the mock sender should be accepted");
+        (mock, manager)
+    }
+
+    /// The 2025 dialect is additive, and has to be: one event on the wire serves
+    /// both readers, so joining in this mode costs a spec-current peer nothing.
+    #[tokio::test]
+    async fn a_sticky_compat_join_is_readable_by_both_generations() {
+        let (mock, manager) = compat_manager().await;
+
+        let member_id = manager
+            .join(compat_join(FfiElementCallCompat::StickyEvents))
+            .await
+            .expect("join");
+
+        let membership = mock
+            .sends()
+            .into_iter()
+            .find(|send| send.carrier == Carrier::Sticky)
+            .expect("the membership should still be a sticky event");
+        assert_eq!(membership.event_type, "org.matrix.msc4143.rtc.member");
+        assert_eq!(
+            membership.content.pointer("/member/id").unwrap(),
+            &serde_json::json!(member_id),
+            "the MSC4143 fields must survive the rewrite",
+        );
+        // Without these two, Element Call cannot learn our device and so cannot
+        // address a media key to us at all: it runs as a widget, and the widget
+        // API gives it no decryption metadata to read one from.
+        assert_eq!(
+            membership.content.pointer("/member/user_id").unwrap(),
+            &serde_json::json!("@alice:example.org"),
+        );
+        assert_eq!(
+            membership.content.pointer("/member/device_id").unwrap(),
+            &serde_json::json!("DEVICE"),
+        );
+        // Where that generation looks for our SFU.
+        assert_eq!(
+            membership
+                .content
+                .pointer("/rtc_transports/0/livekit_service_url")
+                .unwrap(),
+            &serde_json::json!("https://sfu.example.org"),
+        );
+    }
+
+    /// The pre-sticky dialect changes the *carrier*, so nothing about this join
+    /// is a sticky event — and the member id stops being random, because in that
+    /// generation it is also the `membershipID` and the SFU identity.
+    #[tokio::test]
+    async fn a_pre_sticky_join_publishes_room_state() {
+        let (mock, manager) = compat_manager().await;
+
+        let member_id = manager
+            .join(compat_join(FfiElementCallCompat::StateEvents))
+            .await
+            .expect("join");
+        assert_eq!(member_id, "@alice:example.org:DEVICE");
+
+        let sends = mock.sends();
+        assert!(
+            sends.iter().all(|send| send.carrier != Carrier::Sticky),
+            "a pre-sticky membership must not also go out as a sticky event",
+        );
+
+        let membership = sends
+            .iter()
+            .find(|send| send.carrier == Carrier::State)
+            .expect("the membership should be room state");
+        assert_eq!(membership.event_type, "org.matrix.msc3401.call.member");
+        // The leading underscore is not decoration: Synapse rejects a state key
+        // that looks like a user id from anyone but that user.
+        assert_eq!(
+            membership.state_key.as_deref(),
+            Some("_@alice:example.org_DEVICE_m.call"),
+        );
+        assert_eq!(
+            membership.content.get("membershipID").unwrap(),
+            &serde_json::json!(member_id),
+        );
+        assert_eq!(
+            membership.content.get("device_id").unwrap(),
+            &serde_json::json!("DEVICE"),
+        );
+
+        // The dead man's switch, which in this generation genuinely empties the
+        // membership — room state has no TTL to lapse, so without it a crashed
+        // client is a permanent ghost in the call.
+        let delayed = sends
+            .iter()
+            .find(|send| send.carrier == Carrier::DelayedState)
+            .expect("the delayed leave should be a delayed state event");
+        assert_eq!(delayed.state_key, membership.state_key);
+        assert_eq!(
+            delayed.content,
+            serde_json::json!({}),
+            "an empty content is this dialect's leave",
+        );
+    }
+
+    /// A pre-sticky room has no `m.rtc.slot` — the concept postdates that
+    /// generation — so the host feeding its room state truthfully says "no slots",
+    /// which would resolve the session closed and project out every member, us
+    /// included. The mode has to absorb that; it is not something a host should
+    /// have to special-case, and a host that gets it wrong sees an empty call
+    /// with nothing in the log to explain it.
+    ///
+    /// Both orderings, because both happen: slot state usually arrives with sync
+    /// (before the user joins) and keeps arriving afterwards.
+    #[tokio::test]
+    async fn a_pre_sticky_join_stops_slot_state_emptying_the_call() {
+        let (_mock, manager) = compat_manager().await;
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+        let peer = || {
+            vec![joined_sticky(
+                "@carl:example.org",
+                "CARLDEV",
+                "@carl:example.org:CARLDEV",
+            )]
+        };
+
+        // Fed before the join, when nothing yet knows the room's generation.
+        manager
+            .on_room_slots_received(room_id.clone(), Vec::new())
+            .await
+            .expect("room slots");
+        manager
+            .set_current_sticky_state(room_id.clone(), peer())
+            .await
+            .expect("carl's membership");
+        assert_eq!(
+            manager
+                .member_count(room_id.clone(), slot_id.clone())
+                .await
+                .unwrap(),
+            Some(0),
+            "with slot state supplied and no slot in it, the session is closed",
+        );
+
+        manager
+            .join(compat_join(FfiElementCallCompat::StateEvents))
+            .await
+            .expect("join");
+        manager
+            .set_current_sticky_state(room_id.clone(), peer())
+            .await
+            .expect("carl's membership");
+        assert_eq!(
+            manager
+                .member_count(room_id.clone(), slot_id.clone())
+                .await
+                .unwrap(),
+            Some(1),
+            "joining in this mode must take back the slot state fed earlier",
+        );
+
+        // And the host keeps feeding it, every sync, for the rest of the call.
+        manager
+            .on_room_slots_received(room_id.clone(), Vec::new())
+            .await
+            .expect("room slots");
+        assert_eq!(
+            manager.member_count(room_id, slot_id).await.unwrap(),
+            Some(1),
+            "later slot updates must be ignored too",
+        );
+    }
+
+    /// A mode is per join, not per process: a later spec-current join in the same
+    /// room must not inherit the dialect a previous one installed.
+    #[tokio::test]
+    async fn a_leave_forgets_the_dialect() {
+        let (mock, manager) = compat_manager().await;
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+
+        manager
+            .join(compat_join(FfiElementCallCompat::StateEvents))
+            .await
+            .expect("join");
+        manager
+            .leave(
+                room_id.clone(),
+                slot_id.clone(),
+                FfiLeaveSessionParams { leave_reason: None },
+            )
+            .await
+            .expect("leave");
+
+        // The leave itself still had to be rendered in the dialect it is a leave
+        // *in*, or the peers we joined for would never see us go.
+        assert!(
+            mock.sends()
+                .iter()
+                .filter(|send| send.carrier == Carrier::State)
+                .any(|send| send.content == serde_json::json!({})),
+            "the leave should have emptied our state membership",
+        );
+
+        manager.join(join_params()).await.expect("rejoin");
+        assert!(
+            mock.sends()
+                .iter()
+                .any(|send| send.carrier == Carrier::Sticky
+                    && send.event_type == "org.matrix.msc4143.rtc.member"),
+            "a spec-current rejoin must go back to a sticky membership",
+        );
+    }
+
+    /// A to-device message names its room only inside the content, so that is
+    /// what decides the dialect — and it must decide it for that room alone.
+    #[tokio::test]
+    async fn a_media_key_takes_the_dialect_of_its_own_room() {
+        let (mock, sender) = mock_sender();
+        sender.set_dialect(
+            "!legacy:example.org",
+            crate::compat::outbound_dialect(
+                matrix_rtc_bridge::compat::ElementCallCompat::StickyEvents,
+                "@alice:example.org",
+                "DEVICE",
+                "!legacy:example.org",
+                "m.call#ROOM",
+            ),
+        );
+
+        let key = |room_id: &str| {
+            serde_json::json!({
+                "room_id": room_id,
+                "member_id": "MEMBER",
+                "media_key": { "index": 0, "key": "AAAA" },
+            })
+        };
+        let recipients = vec![matrix_rtc_core::ToDeviceRecipient::new(
+            "@bob:example.org",
+            "BOBDEV",
+        )];
+
+        sender
+            .send_to_device_message(
+                recipients.clone(),
+                matrix_rtc_core::KEY_MESSAGE_TYPE.to_owned(),
+                key("!legacy:example.org"),
+            )
+            .await
+            .unwrap();
+        sender
+            .send_to_device_message(
+                recipients,
+                matrix_rtc_core::KEY_MESSAGE_TYPE.to_owned(),
+                key("!modern:example.org"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.sent_types(),
+            [
+                // A to-device message has one type, so a key is sent in one
+                // dialect or the other — never both.
+                "io.element.call.encryption_keys",
+                "org.matrix.msc4143.rtc.encryption_key",
+            ],
+        );
+        let sent = mock.to_device_for("@bob:example.org", "BOBDEV");
+        assert_eq!(
+            sent[0].pointer("/keys/key").unwrap(),
+            &serde_json::json!("AAAA"),
+            "the legacy key message states its key under `keys`",
+        );
+        assert_eq!(
+            sent[0].pointer("/member/id").unwrap(),
+            &serde_json::json!("MEMBER"),
+        );
+        assert_eq!(
+            sent[1].pointer("/media_key/key").unwrap(),
+            &serde_json::json!("AAAA"),
+            "the unregistered room must be left spec-current",
         );
     }
 }

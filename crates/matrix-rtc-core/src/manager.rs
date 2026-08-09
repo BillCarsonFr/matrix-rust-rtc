@@ -398,6 +398,38 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         self.push_slot_state(room_id).await;
     }
 
+    /// Forgets a room's `m.rtc.slot` state, so the open-slot condition stops
+    /// being enforced there.
+    ///
+    /// The way back from [`Self::on_room_slots_received`], and the only one: that
+    /// call is otherwise irreversible, because an empty slot list means "no open
+    /// slots" rather than "I have nothing to say". This is the second statement,
+    /// and it restores the [`SlotKnowledge::Unsupplied`] a room starts in.
+    ///
+    /// It exists for rooms where the condition is not merely unknown but
+    /// *inapplicable* — a MatrixRTC generation older than `m.rtc.slot` itself, in
+    /// which no client publishes one and reporting "no slots" would resolve every
+    /// session closed and project every member out, the caller included. A host
+    /// that simply has not fetched the state yet should say nothing at all rather
+    /// than call this.
+    ///
+    /// [`SlotKnowledge::Unsupplied`]: crate::SlotKnowledge::Unsupplied
+    pub async fn forget_room_slots(&mut self, room_id: &str) {
+        let known = self.rooms_with_slot_state.remove(room_id);
+        self.slots.retain(|key, _| key.room_id != room_id);
+        if !known {
+            return;
+        }
+
+        log::info!("[{room_id}] slot state forgotten; the open-slot condition is not enforced");
+        for (key, session) in self.sessions.iter_mut() {
+            if key.room_id != room_id {
+                continue;
+            }
+            session.forget_slot_state().await;
+        }
+    }
+
     /// Reports whether a room is end-to-end encrypted.
     ///
     /// MSC4143 requires RTC encryption in encrypted rooms and forbids it

@@ -27,17 +27,20 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::watch;
 
+use matrix_rtc_bridge::compat::ElementCallCompat;
 use matrix_rtc_core::{
     EventConversionError, JoinedMembership as CoreJoinedMembership, RawStickyEvent,
     RtcSessionManager,
 };
 mod commands;
+pub mod compat;
 mod logging;
 mod runtime;
 pub use commands::{
     CommandSenderCallback, CommandSenderError, FfiCommandSender, FfiJoinSessionParams,
     FfiLeaveSessionParams, FfiToDeviceDelivery, FfiToDeviceRecipient, FfiTransportConfig,
 };
+pub use compat::{FfiElementCallCompat, LegacyStateMemberEvent, RawMemberEvent};
 pub use logging::{
     RtcLogConfig, RtcLogLevel, RtcLogRecord, RtcLogSink, dropped_log_record_count, log_event,
     setup_logging,
@@ -124,6 +127,35 @@ impl SlotEvent {
             slot_id: self.slot_id,
             content,
         })
+    }
+}
+
+/// The RTC encryption mechanism an `m.rtc.slot` prescribes for its members.
+///
+/// Its presence is what turns RTC encryption on for the slot; its absence turns
+/// it off. MSC4143 requires it in an encrypted room and forbids it elsewhere, and
+/// a slot that gets this wrong resolves *closed* for every client — which reads
+/// as the call simply never starting.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSlotEncryption {
+    /// MSC4143 `m.per_member`: each member distributes its own media key. The
+    /// only mechanism this SDK implements, and what an encrypted room wants.
+    PerMember,
+    /// A mechanism named by string. Opening a slot with one this SDK does not
+    /// implement means it cannot join that slot itself; it is here so a host can
+    /// still publish one rather than being unable to express it.
+    Other { encryption_type: String },
+}
+
+impl From<FfiSlotEncryption> for matrix_rtc_core::SlotEncryption {
+    fn from(value: FfiSlotEncryption) -> Self {
+        matrix_rtc_core::SlotEncryption {
+            encryption_type: match value {
+                FfiSlotEncryption::PerMember => "m.per_member".to_owned(),
+                FfiSlotEncryption::Other { encryption_type } => encryption_type,
+            },
+            extra: std::collections::BTreeMap::new(),
+        }
     }
 }
 
@@ -228,6 +260,20 @@ pub struct RtcSessionManagerHandle {
     /// the entry stops its task. A `std::sync::Mutex` on purpose: it is only
     /// ever held for a map insert or remove, never across an await.
     heartbeats: Mutex<HashMap<(String, String), HeartbeatDriver>>,
+    /// The command sender installed by
+    /// [`set_command_sender`](Self::set_command_sender), kept so a join can
+    /// register the outbound dialect it must render its sends in. The manager
+    /// holds the same `Arc`.
+    command_sender: Mutex<Option<Arc<FfiCommandSender>>>,
+    /// Which Element Call generation each room was joined for, by room id.
+    ///
+    /// One reading, three consumers: the outbound dialect above, how an inbound
+    /// legacy media key is bound to a membership, and the media session's SFU
+    /// identity and token endpoint. The media layer looks it up here rather than
+    /// being told it again, because the two disagreeing is not an error but a
+    /// silence — a connected call in which nothing decrypts. Empty for every
+    /// spec-current room. See [`crate::compat`].
+    element_call_compat: Mutex<HashMap<String, ElementCallCompat>>,
 }
 
 /// How often the keep-alive is driven.
@@ -300,6 +346,8 @@ impl RtcSessionManagerHandle {
         Arc::new(Self {
             inner: Arc::new(TokioMutex::new(RtcSessionManager::new())),
             heartbeats: Mutex::new(HashMap::new()),
+            command_sender: Mutex::new(None),
+            element_call_compat: Mutex::new(HashMap::new()),
         })
     }
 
@@ -317,6 +365,13 @@ impl RtcSessionManagerHandle {
     ) -> Result<(), MatrixRtcFfiError> {
         log::info!("manager: command sender installed");
         let command_sender = FfiCommandSender::new(callback);
+        // The same `Arc` the manager gets: a join registers its outbound dialect
+        // on it, and a sender the handle could not reach would render every
+        // compat send spec-current with nothing to say so.
+        match lock_mutex(&self.command_sender) {
+            Ok(mut slot) => *slot = Some(command_sender.clone()),
+            Err(error) => log::error!("manager: could not retain the command sender: {error}"),
+        }
         let mut manager = self.inner.lock().await;
         manager.set_command_sender(command_sender);
         Ok(())
@@ -362,6 +417,13 @@ impl RtcSessionManagerHandle {
     /// room; until then it cannot be evaluated and is not enforced. Any slot in
     /// the room not present in `slots` is treated as closed, so always pass the
     /// full set — an empty list included.
+    ///
+    /// **Ignored for a room joined in [`FfiElementCallCompat::StateEvents`]**,
+    /// and the join forgets anything already supplied: that generation predates
+    /// `m.rtc.slot` entirely, so its rooms contain none, and "no slots" would
+    /// resolve every session closed and project out every member including us.
+    /// Feed slots unconditionally and let the mode decide — there is nothing for
+    /// a host to special-case.
     pub async fn on_room_slots_received(
         &self,
         room_id: String,
@@ -372,6 +434,17 @@ impl RtcSessionManagerHandle {
             slots.iter().map(|slot| &slot.slot_id).collect::<Vec<_>>(),
         );
 
+        if self
+            .element_call_compat_for(&room_id)
+            .reads_state_membership()
+        {
+            log::debug!(
+                "manager: [{room_id}] ignoring the slot state: the room was joined in a \
+                 MatrixRTC generation that predates m.rtc.slot",
+            );
+            return Ok(());
+        }
+
         let mapped = slots
             .into_iter()
             .map(|slot| slot.into_core(&room_id))
@@ -381,6 +454,75 @@ impl RtcSessionManagerHandle {
         let mut manager = self.inner.lock().await;
         manager.on_room_slots_received(&room_id, mapped).await;
         Ok(())
+    }
+
+    /// Opens a slot, by publishing its `m.rtc.slot` state event.
+    ///
+    /// A room has no slot until somebody opens one, and a host that reports its
+    /// slot state ([`Self::on_room_slots_received`]) will project every member
+    /// out of a room that has none — so in a room where no other client opens
+    /// slots, this is what makes a call possible at all. That includes every room
+    /// whose other participant is Element Call: no generation of it publishes
+    /// `m.rtc.slot`.
+    ///
+    /// `slot_id` must start with `{application_type}#` — MSC4143 makes the slot
+    /// id the state key and requires that shape, and a slot that ignores it is
+    /// one every client treats as closed. Rejected here rather than at the
+    /// homeserver, which would accept it.
+    ///
+    /// `encryption` must be [`FfiSlotEncryption::PerMember`] in an encrypted room
+    /// and `null` elsewhere; the mismatch resolves the slot closed for everyone.
+    ///
+    /// Publishing room state usually needs a raised power level, so a rejection
+    /// by the homeserver surfaces here.
+    ///
+    /// Nothing to do with the compatibility modes: in
+    /// [`FfiElementCallCompat::StateEvents`] the open-slot condition is not
+    /// enforced at all, so a slot opened for such a room changes nothing.
+    pub async fn open_slot(
+        &self,
+        room_id: String,
+        slot_id: String,
+        application_type: String,
+        encryption: Option<FfiSlotEncryption>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        log::info!(
+            "manager: [{room_id}/{slot_id}] opening slot: application={application_type} \
+             encryption={encryption:?}",
+        );
+
+        let manager = self.inner.lock().await;
+        manager
+            .open_slot(
+                room_id,
+                slot_id,
+                application_type,
+                encryption.map(Into::into),
+            )
+            .await
+            .map_err(|error| {
+                log::warn!("manager: could not open the slot: {error}");
+                MatrixRtcFfiError::InvalidInput(error.to_string())
+            })
+    }
+
+    /// Closes a slot, by setting its `m.rtc.slot` status to `closed`.
+    ///
+    /// Every member of it becomes left as soon as clients apply the new state —
+    /// this ends the call for everyone, not just for us. Leaving is
+    /// [`Self::leave`].
+    pub async fn close_slot(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<(), MatrixRtcFfiError> {
+        log::info!("manager: [{room_id}/{slot_id}] closing slot");
+
+        let manager = self.inner.lock().await;
+        manager.close_slot(room_id, slot_id).await.map_err(|error| {
+            log::warn!("manager: could not close the slot: {error}");
+            MatrixRtcFfiError::InvalidInput(error.to_string())
+        })
     }
 
     /// Sets the users currently joined to a room.
@@ -535,13 +677,23 @@ impl RtcSessionManagerHandle {
         // Kept for the keep-alive driver, which outlives `params`.
         let room_id = params.room_id.clone();
         let slot_id = params.slot_id.clone();
+        let user_id = params.user_id.clone();
+        let device_id = params.device_id.clone();
+        let compat = compat::resolve(params.element_call_compat);
 
         let mut core_params = params.into_core().map_err(|e| {
             log::warn!("manager: join rejected before it started: {e}");
             MatrixRtcFfiError::InvalidInput(e.to_string())
         })?;
-        let member_id = matrix_rtc_core::generate_member_id();
+        // Not always a fresh id: see `compat::member_id` for the one generation
+        // where a fresh one makes us mark ourselves departed on our own join.
+        let member_id = compat::member_id(compat, &user_id, &device_id);
         core_params.membership_id = Some(member_id.clone());
+
+        // Before the join, not after: the join itself sends the membership (and
+        // arms the delayed leave), so a dialect registered afterwards would let
+        // exactly the two events that announce us go out spec-current.
+        self.set_element_call_compat(&room_id, &user_id, &device_id, &slot_id, compat);
 
         // Hold the guard across the join, rather than swapping a placeholder
         // `RtcSessionManager::new()` in and unlocking for the duration. That
@@ -556,6 +708,15 @@ impl RtcSessionManagerHandle {
         // handle: the command sender only sends events outward. If that ever
         // changes, this becomes a deadlock rather than lost state.
         let mut manager = self.inner.lock().await;
+
+        // Slots fed before this join were fed before anything knew the room
+        // belonged to a generation that has none, and "no slots" is what closes
+        // a session and projects out every member. Later feeds are ignored by
+        // `on_room_slots_received`; this undoes the earlier ones, and must run
+        // before the join so the session is created already unenforced.
+        if compat.reads_state_membership() {
+            manager.forget_room_slots(&room_id).await;
+        }
 
         let result = {
             manager.join(core_params).await.map_err(|e| {
@@ -678,6 +839,10 @@ impl RtcSessionManagerHandle {
         // taken the membership machine any later beat is a no-op.
         self.stop_heartbeat(&room_id, &slot_id);
 
+        // Kept for the compat cleanup below, which happens after the leave has
+        // been rendered in the dialect it is a leave *in*.
+        let left_room = room_id.clone();
+
         // Held across the leave, for the reasons in `join` above. It matters
         // most here: losing the manager to a placeholder mid-leave would drop
         // the very state needed to depart, leaving the membership live until the
@@ -696,9 +861,243 @@ impl RtcSessionManagerHandle {
 
         if result.is_ok() {
             log::info!("manager: leave succeeded");
+            // Only now: the leave itself had to be rendered in the dialect it is
+            // a leave *in*, or the peers we joined for would never see it.
+            self.clear_element_call_compat(&left_room);
         }
 
         result
+    }
+
+    /// Apply the **complete** current membership for one room, from raw event
+    /// content, across every MatrixRTC generation the room contains.
+    ///
+    /// The counterpart of [`Self::set_current_sticky_state`] for hosts talking to
+    /// pre-2026 Element Call, and it replaces rather than merges for the same
+    /// reason: a member does not only leave by sending a leave, and a lapsed
+    /// entry produces no event to feed in.
+    ///
+    /// Both sources go in **one** call because both are replaced by it. Fed
+    /// separately, each call would wipe the other's members and the roster would
+    /// flicker between the two halves of the call. A room with no pre-sticky
+    /// members passes an empty list — the usual case, and cheap.
+    ///
+    /// - `member_events` — the room's live `m.rtc.member` sticky events, content
+    ///   verbatim. The pre-2026 sticky normalisation runs on every one of them
+    ///   and is safe for spec-current content (it only ever fills in a modern
+    ///   field that is absent), so a mixed room needs no sorting by the host.
+    /// - `legacy_state_events` — the room's `org.matrix.msc3401.call.member`
+    ///   **room state**, for [`FfiElementCallCompat::StateEvents`]. Translated to
+    ///   MSC4143 memberships here, including the expiry that generation states in
+    ///   its content rather than having the homeserver enforce.
+    ///
+    /// A sticky membership wins over a state one with the same key: an Element
+    /// Call build mid-transition can write both, and the same human twice in the
+    /// roster means two receive streams and two key exchanges for one peer.
+    pub async fn set_current_membership(
+        &self,
+        room_id: String,
+        member_events: Vec<RawMemberEvent>,
+        legacy_state_events: Vec<LegacyStateMemberEvent>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        log::debug!(
+            "manager: [{room_id}] current membership in: {} sticky + {} pre-sticky state event(s)",
+            member_events.len(),
+            legacy_state_events.len(),
+        );
+
+        let mut current: Vec<RawStickyEvent> = member_events
+            .into_iter()
+            .filter_map(|event| compat::to_core_member_event(&room_id, event))
+            .collect();
+        let from_sticky = current.len();
+
+        if !legacy_state_events.is_empty() {
+            let seen: Vec<String> = current
+                .iter()
+                .map(|event| event.content.sticky_key.clone())
+                .collect();
+            current.extend(
+                compat::to_core_state_memberships(&room_id, legacy_state_events)
+                    .into_iter()
+                    .filter(|event| !seen.contains(&event.content.sticky_key)),
+            );
+        }
+
+        log::debug!(
+            "manager: [{room_id}] {from_sticky} sticky + {} pre-sticky membership(s) applied",
+            current.len() - from_sticky,
+        );
+
+        let mut manager = self.inner.lock().await;
+        manager
+            .set_current_sticky_state(&room_id, current)
+            .await
+            .map_err(map_conversion_error)
+    }
+
+    /// Feeds a decrypted pre-2026 `io.element.call.encryption_keys` to-device
+    /// message to every session of its room.
+    ///
+    /// The legacy counterpart of [`Self::receive_encryption_key`], taking the
+    /// content raw because the two generations disagree about where the key, the
+    /// index and the owning membership live. Without it a legacy peer's media
+    /// never becomes decryptable, and it is the half of interop most easily
+    /// forgotten: the roster fills in, everything looks joined, and every remote
+    /// tile stays black.
+    ///
+    /// Feed **every** message of that type; which mode the room was joined in
+    /// decides how the key is bound, and this call knows it already.
+    ///
+    /// `sender` is the to-device event's sender (homeserver-stamped, so the one
+    /// identity in the event worth trusting), and `sender_device_id` the device
+    /// Olm decryption attributed it to. A key that arrived in the clear is
+    /// discarded by the core, as MSC4143 requires — pass `was_encrypted` honestly
+    /// rather than smoothing it over.
+    pub async fn receive_legacy_encryption_key(
+        &self,
+        sender: String,
+        content_json: String,
+        was_encrypted: bool,
+        sender_device_id: Option<String>,
+        sender_is_cross_signed: bool,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let content: serde_json::Value = serde_json::from_str(&content_json).map_err(|error| {
+            log::warn!("manager: a legacy encryption key is not JSON: {error}");
+            MatrixRtcFfiError::InvalidInput(format!("invalid key message content: {error}"))
+        })?;
+
+        let room_id = content
+            .get("room_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let compat = self.element_call_compat_for(&room_id);
+
+        let Some(key) =
+            compat::parse_legacy_key(compat, &sender, sender_device_id.as_deref(), &content)
+        else {
+            // Not an error the host can act on — the message is simply unusable —
+            // but silence here reads as a key that never arrived, which is the
+            // hardest interop failure to diagnose.
+            log::warn!(
+                "manager: [{room_id}] ignoring a legacy encryption key from {sender}: it is \
+                 missing a required field, or names no device to bind it to. That peer's media \
+                 will not decrypt.",
+            );
+            return Ok(());
+        };
+
+        log::debug!(
+            "manager: [{}] legacy encryption key in: member={} index={} len={} encrypted={} \
+             sender={sender}/{sender_device_id:?} cross_signed={sender_is_cross_signed}",
+            key.room_id,
+            key.member_id,
+            key.key_index,
+            key.key_b64.len(),
+            was_encrypted,
+        );
+
+        let received = FfiReceivedEncryptionKey {
+            room_id: key.room_id,
+            member_id: key.member_id,
+            key_b64: key.key_b64,
+            key_index: key.key_index,
+            was_encrypted,
+            sender_user_id: Some(sender),
+            sender_device_id,
+            sender_is_cross_signed,
+        }
+        .into_core()?;
+
+        let manager = self.inner.lock().await;
+        manager
+            .receive_encryption_key(received)
+            .await
+            .map_err(|error| {
+                log::warn!("manager: legacy encryption key rejected: {error}");
+                MatrixRtcFfiError::InvalidInput(error.to_string())
+            })
+    }
+}
+
+/// The compat bookkeeping a join installs and a leave clears.
+///
+/// Not exported: hosts choose the mode once, on
+/// [`FfiJoinSessionParams::element_call_compat`], and everything else reads it
+/// back from here. A second way to set it would be a second way for the four
+/// derivations it feeds to disagree.
+impl RtcSessionManagerHandle {
+    /// Record the mode for `room_id` and install the outbound dialect it implies.
+    fn set_element_call_compat(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        device_id: &str,
+        slot_id: &str,
+        compat: ElementCallCompat,
+    ) {
+        match lock_mutex(&self.element_call_compat) {
+            Ok(mut modes) => {
+                if compat == ElementCallCompat::Off {
+                    // A rejoin can turn compat off, and a stale entry would keep
+                    // rendering our sends for a generation we are no longer
+                    // talking to.
+                    modes.remove(room_id);
+                } else {
+                    log::info!(
+                        "manager: [{room_id}/{slot_id}] joining in Element Call compatibility \
+                         mode {compat:?}",
+                    );
+                    modes.insert(room_id.to_owned(), compat);
+                }
+            }
+            Err(error) => log::error!("manager: could not record the compat mode: {error}"),
+        }
+
+        let dialect = compat::outbound_dialect(compat, user_id, device_id, room_id, slot_id);
+        match lock_mutex(&self.command_sender) {
+            Ok(sender) => match sender.as_ref() {
+                Some(sender) => sender.set_dialect(room_id, dialect),
+                // Joining without a command sender fails in the core a moment
+                // later; say which half was missing while it is still obvious.
+                None if compat != ElementCallCompat::Off => log::warn!(
+                    "manager: [{room_id}] compat mode {compat:?} was requested before a command \
+                     sender was installed; sends cannot be rendered for it",
+                ),
+                None => {}
+            },
+            Err(error) => log::error!("manager: could not install the outbound dialect: {error}"),
+        }
+    }
+
+    /// Forget `room_id`'s mode and dialect.
+    ///
+    /// Per room, so leaving one slot forgets it for the room's other sessions
+    /// too. Same reasoning as the sender's dialect map: this exists to talk to a
+    /// generation of Element Call with one call per room, and a room-keyed
+    /// to-device key cannot be told two slots apart anyway.
+    fn clear_element_call_compat(&self, room_id: &str) {
+        if let Ok(mut modes) = lock_mutex(&self.element_call_compat) {
+            modes.remove(room_id);
+        }
+        if let Ok(sender) = lock_mutex(&self.command_sender)
+            && let Some(sender) = sender.as_ref()
+        {
+            sender.clear_dialect(room_id);
+        }
+    }
+
+    /// The generation `room_id` was joined for, or [`ElementCallCompat::Off`].
+    ///
+    /// `pub(crate)` for the media layer, which derives its SFU identity and picks
+    /// its token endpoint from this rather than from a second host-supplied
+    /// value — see the field's docs.
+    pub(crate) fn element_call_compat_for(&self, room_id: &str) -> ElementCallCompat {
+        lock_mutex(&self.element_call_compat)
+            .ok()
+            .and_then(|modes| modes.get(room_id).copied())
+            .unwrap_or_default()
     }
 }
 
@@ -1006,6 +1405,166 @@ mod tests {
             None,
             "and then only on change"
         );
+    }
+
+    /// One room, three generations, one roster: a spec-current peer, a 2025
+    /// Element Call peer, and a pre-sticky one carried in room state.
+    ///
+    /// The point of the single entry point. Fed as two calls, each would replace
+    /// the other's members and the roster would flicker between the two halves of
+    /// the call.
+    #[tokio::test]
+    async fn membership_from_every_generation_lands_in_one_roster() {
+        let manager = RtcSessionManagerHandle::new();
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+
+        let spec = RawMemberEvent {
+            sender: "@alice:example.org".to_owned(),
+            sender_device_id: Some("ALICEDEV".to_owned()),
+            was_encrypted: Some(true),
+            event_type: "m.rtc.member".to_owned(),
+            content_json: serde_json::json!({
+                "slot_id": "m.call#ROOM",
+                "msc4354_sticky_key": "alice-a",
+                "application": { "type": "m.call" },
+                "member": { "id": "alice-a", "membership": "join" },
+                "transports": {
+                    "published": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
+                    "can_subscribe": ["livekit"],
+                },
+            })
+            .to_string(),
+        };
+        // No `membership`, no `transports` — that generation states neither.
+        let legacy_sticky = RawMemberEvent {
+            sender: "@bob:example.org".to_owned(),
+            sender_device_id: Some("BOBDEV".to_owned()),
+            was_encrypted: Some(true),
+            event_type: "m.rtc.member".to_owned(),
+            content_json: serde_json::json!({
+                "slot_id": "m.call#ROOM",
+                "msc4354_sticky_key": "bob-a",
+                "application": { "type": "m.call" },
+                "member": { "id": "bob-a", "user_id": "@bob:example.org", "device_id": "BOBDEV" },
+                "rtc_transports": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
+                "versions": [],
+            })
+            .to_string(),
+        };
+        let pre_sticky = LegacyStateMemberEvent {
+            sender: "@carl:example.org".to_owned(),
+            state_key: "_@carl:example.org_CARLDEV_m.call".to_owned(),
+            origin_server_ts: matrix_rtc_bridge::compat::element_call_state::now_ms(),
+            content_json: serde_json::json!({
+                "application": "m.call",
+                "call_id": "",
+                "device_id": "CARLDEV",
+                "expires": 14_400_000_u64,
+                "membershipID": "@carl:example.org:CARLDEV",
+                "foci_preferred": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
+            })
+            .to_string(),
+        };
+
+        manager
+            .set_current_membership(room_id.clone(), vec![spec, legacy_sticky], vec![pre_sticky])
+            .await
+            .expect("the membership should be accepted");
+
+        let subscription = manager
+            .subscribe_membership_snapshots(room_id, slot_id)
+            .await
+            .unwrap()
+            .expect("the member events should have created the session");
+        let mut joined = subscription
+            .next_snapshot()
+            .unwrap()
+            .expect("the first call reports the current roster");
+        joined.sort_by(|a, b| a.sender.cmp(&b.sender));
+
+        assert_eq!(
+            joined
+                .iter()
+                .map(|member| member.sender.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "@alice:example.org",
+                "@bob:example.org",
+                "@carl:example.org"
+            ],
+        );
+        // Every one of them must be bound to a device, or no media key can travel
+        // in either direction and they are in the roster with nothing else.
+        assert_eq!(
+            joined
+                .iter()
+                .map(|member| member.sender_device_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("ALICEDEV"), Some("BOBDEV"), Some("CARLDEV")],
+        );
+        // And to a transport, lifted out of whichever shape stated it.
+        assert!(
+            joined
+                .iter()
+                .all(|member| member.transports.len() == 1 && member.can_subscribe == ["livekit"]),
+            "every generation's SFU must survive the translation: {joined:?}",
+        );
+    }
+
+    /// A sticky membership wins over a state one for the same member: an Element
+    /// Call build mid-transition can write both, and the same human twice in the
+    /// roster means two receive streams and two key exchanges for one peer.
+    #[tokio::test]
+    async fn a_sticky_membership_supersedes_the_state_one_for_the_same_member() {
+        let manager = RtcSessionManagerHandle::new();
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+
+        let sticky = RawMemberEvent {
+            sender: "@carl:example.org".to_owned(),
+            sender_device_id: Some("CARLDEV".to_owned()),
+            was_encrypted: Some(true),
+            event_type: "m.rtc.member".to_owned(),
+            content_json: serde_json::json!({
+                "slot_id": "m.call#ROOM",
+                "msc4354_sticky_key": "@carl:example.org:CARLDEV",
+                "application": { "type": "m.call" },
+                "member": { "id": "@carl:example.org:CARLDEV", "membership": "join" },
+                "transports": {
+                    "published": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
+                    "can_subscribe": ["livekit"],
+                },
+            })
+            .to_string(),
+        };
+        let same_member_in_state = LegacyStateMemberEvent {
+            sender: "@carl:example.org".to_owned(),
+            state_key: "_@carl:example.org_CARLDEV_m.call".to_owned(),
+            origin_server_ts: matrix_rtc_bridge::compat::element_call_state::now_ms(),
+            content_json: serde_json::json!({
+                "application": "m.call",
+                "device_id": "CARLDEV",
+                "expires": 14_400_000_u64,
+                "membershipID": "@carl:example.org:CARLDEV",
+            })
+            .to_string(),
+        };
+
+        manager
+            .set_current_membership(room_id.clone(), vec![sticky], vec![same_member_in_state])
+            .await
+            .expect("the membership should be accepted");
+
+        let joined = manager
+            .subscribe_membership_snapshots(room_id, slot_id)
+            .await
+            .unwrap()
+            .expect("a session")
+            .next_snapshot()
+            .unwrap()
+            .expect("a roster");
+        assert_eq!(joined.len(), 1, "carl should appear once: {joined:?}");
+        // The sticky one, which is the one carrying a transport.
+        assert_eq!(joined[0].transports.len(), 1);
     }
 
     /// A panic inside one handle method must not disable the handle forever.
