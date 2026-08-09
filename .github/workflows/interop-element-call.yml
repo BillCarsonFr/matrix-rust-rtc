@@ -10,25 +10,16 @@
 # A Rust MatrixRTC client and a real Element Call in the same call. See
 # interop/README.md and demo/backend/INTEROP.md.
 #
-# Not on every push: Element Web's `develop` image moves daily and carries the
-# bundled Element Call with it, so an upstream UI change would red every
-# unrelated PR. Instead:
-#   - nightly, unpinned, as the drift signal;
-#   - on demand (workflow_dispatch);
-#   - on a PR carrying the `interop` label, digest-pinned so it is stable.
+# On PRs it runs only with the `interop` label, so it does not add ~15 minutes
+# to every unrelated PR.
 
 name: Element Call interop
 
 on:
   schedule:
-    # 04:20 UTC — after Element Web's nightly develop build has landed.
+    # Catches drift the pins cannot: the base stack runs `synapse:latest`.
     - cron: "20 4 * * *"
   workflow_dispatch:
-    inputs:
-      element_web_image:
-        description: "Element Web image to test against (blank = develop)"
-        required: false
-        default: ""
   pull_request:
     types: [opened, synchronize, reopened, labeled]
 
@@ -37,14 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pin for label-triggered PR runs, so upstream cannot break a PR that has
-  # nothing to do with interop. The scheduled run leaves this unset and tracks
-  # `develop`, which is the drift signal.
-  #
-  # TODO: replace with a `…@sha256:…` digest on the first green run — a bare
-  # `develop` tag is not actually a pin. See "Element Web / Element Call
-  # versions" in demo/backend/INTEROP.md for the two-command recipe.
-  PINNED_ELEMENT_WEB: ghcr.io/element-hq/element-web:develop
+  COMPOSE_FILES: -f demo/backend/docker-compose.yml -f demo/backend/docker-compose.interop.yml
 
 jobs:
   interop:
@@ -70,14 +54,7 @@ jobs:
       # Started first so image pulls and Synapse's first boot overlap the (much
       # longer) rust build.
       - name: Start the interop stack
-        env:
-          # Empty on the nightly run => the compose default (`develop`) wins.
-          ELEMENT_WEB_IMAGE: >-
-            ${{ github.event_name == 'pull_request' && env.PINNED_ELEMENT_WEB
-                || inputs.element_web_image }}
-        run: |
-          docker compose -f demo/backend/docker-compose.yml \
-                         -f demo/backend/docker-compose.interop.yml up -d --wait
+        run: docker compose $COMPOSE_FILES up -d --wait
 
       # No machine-wide trust install: the suite hands the CA to the Rust peer
       # as SSL_CERT_FILE and to Node as NODE_EXTRA_CA_CERTS itself (see
@@ -153,9 +130,7 @@ jobs:
       # drift gets caught before it breaks anything.
       - name: Stack logs
         if: always()
-        run: |
-          docker compose -f demo/backend/docker-compose.yml \
-                         -f demo/backend/docker-compose.interop.yml logs --no-color
+        run: docker compose $COMPOSE_FILES logs --no-color
 
       # Traces, videos, the peer's log and the recorded audio all live here.
       - name: Upload the Playwright report
@@ -170,6 +145,4 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: |
-          docker compose -f demo/backend/docker-compose.yml \
-                         -f demo/backend/docker-compose.interop.yml down -v
+        run: docker compose $COMPOSE_FILES down -v

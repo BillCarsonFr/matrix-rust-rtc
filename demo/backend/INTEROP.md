@@ -160,21 +160,14 @@ The Element Call under test is whichever version Element Web bundles. That is
 deliberate: it is what users actually get, and it removes any Element
 Web/Element Call version skew from the test.
 
-CI pins the image by digest for label-triggered PR runs and leaves it floating
-for the nightly drift run, via the `ELEMENT_WEB_IMAGE` variable:
+`docker-compose.interop.yml` pins an Element Web release, and the Element Call
+under test is the one that release bundles — `v1.12.25` ships
+`@element-hq/element-call-embedded` 0.22.0. Which version a release bundles is
+in `apps/web/package.json` of the [element-web
+repo](https://github.com/element-hq/element-web) at that tag.
 
-```sh
-ELEMENT_WEB_IMAGE=ghcr.io/element-hq/element-web:develop@sha256:… make interop-up
-```
-
-To refresh the pin:
-
-```sh
-docker pull ghcr.io/element-hq/element-web:develop
-docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/element-hq/element-web:develop
-```
-
-and update the default in `.github/workflows/interop-element-call.yml`.
+Bump the pin by hand, and run the interop test on the change: a new Element Call
+is exactly what this test exists to catch.
 
 ## Troubleshooting
 

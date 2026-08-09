@@ -92,10 +92,8 @@ services:
   # service: the widget under test is the one Element Web ships, which is what
   # users actually get, and it removes an EW/EC version skew.
   element-web:
-    # Overridable so CI can pin a digest (stable PR runs) while the nightly
-    # drift run leaves it unset and tracks develop. See INTEROP.md for how to
-    # refresh the pin.
-    image: ${ELEMENT_WEB_IMAGE:-ghcr.io/element-hq/element-web:develop}
+    # The Element Call under test is the one this release bundles.
+    image: ghcr.io/element-hq/element-web:v1.12.25
     environment:
       ELEMENT_WEB_PORT: 8081
     volumes:
