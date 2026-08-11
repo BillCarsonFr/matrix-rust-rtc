@@ -1511,9 +1511,9 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             .decode(&received.key_b64)
             .map_err(|e| CommandError::SendError(format!("Failed to decode key: {}", e)))?;
 
-        if key_bytes.len() != 32 {
+        if key_bytes.len() != 32 && key_bytes.len() != 16 {
             log::warn!(
-                "[{}/{}] Received key with unexpected length: {} (expected 32)",
+                "[{}/{}] Received key with unexpected length: {} (expected 32 or 16)",
                 self.room_id,
                 self.slot_id,
                 key_bytes.len()

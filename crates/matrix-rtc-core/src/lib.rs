@@ -50,7 +50,7 @@ pub use event::{
 pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
 pub use manager::RtcSessionManager;
 pub use own_membership::{
-    KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
+    KeepAlive, KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
 };
 pub use session::{
     ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,

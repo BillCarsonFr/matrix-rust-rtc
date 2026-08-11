@@ -31,6 +31,7 @@ use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
+use crate::own_membership::KeepAlive;
 use crate::session::{CallMembershipEvent, JoinedMembership, RtcSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
@@ -261,6 +262,28 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             Some(session) => session.heartbeat().await,
             None => false,
         }
+    }
+
+    /// A handle on one session's keep-alive, beatable without holding whatever
+    /// lock the host keeps over this manager.
+    ///
+    /// This is the one a periodic heartbeat task should take, and [`Self::
+    /// heartbeat`] is for hosts that beat from a call they already make into the
+    /// manager. Both do the same work; the difference is what can delay it. Every
+    /// membership change this manager applies distributes media keys to every
+    /// member from inside the call that delivered the change — awaited, so the
+    /// host's lock is held throughout — and a heartbeat that has to wait for that
+    /// eventually waits past the delayed leave's deadline. The homeserver then
+    /// publishes our leave while we are still in the call, which every peer
+    /// answers with a key rotation to everyone: the fan-out that delayed the beat
+    /// begets a bigger one. See [`KeepAlive`].
+    ///
+    /// `None` if the session does not exist or has not joined.
+    ///
+    /// [`Self::heartbeat`]: Self::heartbeat
+    pub fn keep_alive(&self, room_id: &str, slot_id: &str) -> Option<KeepAlive<T>> {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions.get(&key).and_then(RtcSession::keep_alive)
     }
 
     /// Returns the number of tracked sessions.

@@ -231,7 +231,7 @@ cd "$(dirname "$0")/.."
 # Log filter, used only when RUST_LOG is not already set — so
 # `RUST_LOG=debug ./scripts/load-test.sh` still overrides it wholesale.
 #
-# Ours at debug, and four SDK subsystems silenced because they are pure noise
+# Ours at debug, and five SDK subsystems silenced because they are pure noise
 # for this tool rather than because they are unimportant:
 #
 #   event_cache        "missing target event id from the redaction event"
@@ -241,9 +241,14 @@ cd "$(dirname "$0")/.."
 #                      a run mints and deletes devices every time
 #   gossiping          "Received a forwarded room key that we didn't request" —
 #                      our own devices sharing keys with each other
+#   machine            "Received an unexpected encrypted to-device event" — the
+#                      crypto machine's catch-all for a decrypted olm event it
+#                      has no handler for: one per encrypted to-device message
+#                      we send ourselves. Kept at error, not off, since the
+#                      target also reports real decryption failures.
 #
 # Drop a line to see one of them again, or use RUST_LOG=debug for everything.
-: "${RUST_LOG:=warn,matrix_rtc_core=debug,matrix_rtc_media=debug,matrix_rtc_livekit=debug,matrix_sdk::event_cache=off,matrix_sdk::latest_events=off,matrix_sdk_crypto::identities::manager=off,matrix_sdk_crypto::gossiping=off}"
+: "${RUST_LOG:=warn,matrix_rtc_core=debug,matrix_rtc_media=debug,matrix_rtc_livekit=debug,matrix_sdk::event_cache=off,matrix_sdk::latest_events=off,matrix_sdk_crypto::identities::manager=off,matrix_sdk_crypto::gossiping=off,matrix_sdk_crypto::machine=error}"
 export RUST_LOG
 
 if [[ -z "$RECOVERY_KEY" ]]; then

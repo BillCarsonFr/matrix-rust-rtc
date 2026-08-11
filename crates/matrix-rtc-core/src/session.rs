@@ -32,7 +32,7 @@ use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdenti
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
-use crate::own_membership::{OwnMembershipMachine, transport_to_json};
+use crate::own_membership::{KeepAlive, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -160,7 +160,11 @@ pub struct RtcSession<T: RtcCommandSender> {
     /// Command sender for sending events to the Matrix room.
     command_sender: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
-    own_membership_machine: Option<OwnMembershipMachine<T>>,
+    ///
+    /// Behind an `Arc` so [`Self::keep_alive`] can hand the keep-alive out on its
+    /// own: a host's heartbeat task must not have to queue behind whatever lock
+    /// guards this session to beat. See [`KeepAlive`].
+    own_membership_machine: Option<Arc<OwnMembershipMachine<T>>>,
     /// Identity of the current join, or `None` while not joined.
     own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
@@ -392,7 +396,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         machine.join(transports).await?;
 
         // Store the machine
-        self.own_membership_machine = Some(machine);
+        self.own_membership_machine = Some(Arc::new(machine));
         self.own_participation = Some(OwnParticipation {
             user_id: params.user_id.clone(),
             device_id: params.device_id.clone(),
@@ -578,6 +582,23 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             log::debug!("[{}] heartbeat ignored: not joined", self.log_tag);
             false
         }
+    }
+
+    /// A handle on this session's keep-alive, beatable without going through the
+    /// session (or the lock a host keeps over its manager).
+    ///
+    /// Prefer this to [`Self::heartbeat`] for a periodic task: the two do the
+    /// same thing, but this one cannot be starved by a key distribution running
+    /// under the same lock — which is the difference between a beat that is late
+    /// and a delayed leave that fires. [`KeepAlive`] has the full argument.
+    ///
+    /// `None` while not joined. Take it after the join and hold it for the life
+    /// of the task; it does not follow a later rejoin, which mints a new
+    /// `member.id` and therefore a new machine.
+    pub fn keep_alive(&self) -> Option<KeepAlive<T>> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| KeepAlive::new(machine.clone()))
     }
 
     /// Returns the number of currently tracked joined members.

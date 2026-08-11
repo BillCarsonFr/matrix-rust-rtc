@@ -858,6 +858,21 @@ async fn feed_room_state(
 /// Both halves run every tick because both can change at any time — a slot can
 /// close, a member can leave the room — and MSC4143 requires clients to respect
 /// the latest state.
+///
+/// Both halves also hold the manager lock across a media-key distribution, and
+/// that is not incidental: a roster the core has not seen before makes it write a
+/// key to every member — an Olm encryption per recipient and an HTTP round trip —
+/// before the call that delivered the roster returns. The core owns no scheduler
+/// (it is driven from synchronous host calls, so it cannot hand the send to a
+/// task), which is why the lock is held for the length of the fan-out rather than
+/// for the length of the state update.
+///
+/// What that costs is bounded to whoever else wants this lock. The heartbeat used
+/// to, and starving it is how a healthy device gets marked as departed and the
+/// whole call rotates — see [`matrix_rtc_core::KeepAlive`], which is how it no
+/// longer needs the lock at all. The key pump still does, so an inbound key can
+/// wait behind an outbound fan-out; that only delays decrypting one peer, and it
+/// resolves on its own.
 async fn tick(
     room: &Room,
     manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
