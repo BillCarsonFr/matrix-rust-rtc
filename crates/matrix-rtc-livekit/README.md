@@ -171,6 +171,17 @@ Notes:
   useless. The cost is one extra membership send per device every half of it,
   and it must stay well above twice the 15 s heartbeat or memberships lapse
   between beats.
+- **`--leave-rotation-grace-ms` collapses a burst of departures into one key
+  rotation.** Every departure forces a new key, and every rotation is a
+  to-device send to each remaining device, so N devices dropping together — the
+  end of a run, a network blip, a batch of sticky entries lapsing — costs O(N²)
+  sends when each is answered on its own. Non-zero holds the rotation back until
+  the current key is that old, so the whole burst is retired by one key. Default
+  `0` rotates immediately, matching the library. The trade is forward secrecy on
+  leave: a departed device can still decrypt the run's media until the rotation
+  lands. Nothing schedules the deferred rotation — it rides the next membership
+  state push — so values below the sync cadence buy less than they look like they
+  do.
 - **Scale is bounded by your machine, not the SFU** — see
   [How many devices?](#how-many-devices) below.
 - Devices join publish-only by default (`CallOptions::auto_subscribe = false`).

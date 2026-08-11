@@ -927,7 +927,7 @@ fn keep_bridging<T>(result: Result<T, RecvError>) -> bool {
 /// event to announce it, so in a room that has gone quiet nothing would prompt us
 /// to notice. Far below that dialect's four-hour default, and only ever paid in a
 /// mode that runs against a test deployment.
-const STATE_MEMBERSHIP_POLL: Duration = Duration::from_secs(30);
+const STATE_MEMBERSHIP_POLL: Duration = Duration::from_secs(900);
 
 /// Feed a room's live membership into `manager` until the room is dropped.
 ///

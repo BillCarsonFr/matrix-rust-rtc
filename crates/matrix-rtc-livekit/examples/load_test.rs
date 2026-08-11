@@ -78,7 +78,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_core::{EncryptionConfig, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, open_slot};
 use matrix_rtc_media::{
@@ -255,10 +255,62 @@ struct Args {
     ///
     /// The cost is signalling: the heartbeat re-sends each membership once it
     /// is halfway to expiring, so this many milliseconds means one extra send
-    /// per device every half of it. Keep it well above twice the heartbeat
-    /// interval (15s), or memberships lapse between beats.
+    /// per device every half of it. Keep it well above twice
+    /// `--heartbeat-interval-ms`, or the refresh never gets a chance to run
+    /// before the entry lapses and every membership flaps once per beat.
     #[arg(long, default_value_t = 120_000)]
     sticky_duration_ms: u64,
+
+    /// Hold back the key rotation a departure forces until the current key is at
+    /// least this old, so a burst of leaves costs one rotation instead of one per
+    /// leaver.
+    ///
+    /// This is the setting a large run stresses hardest: every rotation is a
+    /// to-device send to every remaining device, so N devices dropping together —
+    /// the end of a run, a shared network blip, a batch of sticky entries lapsing
+    /// — costs O(N²) sends when each is answered on its own. Non-zero collapses
+    /// the burst onto one key.
+    ///
+    /// `0` (the default, and the library's) rotates immediately. Raising it trades
+    /// forward secrecy on leave: a departed device can still decrypt this run's
+    /// media until the rotation lands. Nothing schedules the deferred rotation —
+    /// it rides the next state push — so values below the sync cadence buy less
+    /// than they look like they do.
+    #[arg(long, default_value_t = 0)]
+    leave_rotation_grace_ms: u64,
+
+    /// Reuse the current key for a joiner while the key is younger than this,
+    /// sending it to the joiner alone instead of rotating for everyone.
+    ///
+    /// The join-side twin of `--leave-rotation-grace-ms`, and the setting a ramp
+    /// stresses hardest. A joiner met by a key older than this takes the
+    /// rotate branch, and a rotation goes to **every** member: one join then
+    /// costs N sends per device, N² across the fleet, where reusing the key
+    /// costs one send per device. A ramp of N devices spaced further apart than
+    /// this therefore pays O(N³) to-device messages for what O(N²) would buy —
+    /// with the whole fleet in one process, that is both the send and the
+    /// receive side of every one of them.
+    ///
+    /// Raise it above the ramp spacing (`--ramp-ms` × devices, roughly) and a
+    /// whole ramp settles on one key. The trade is MSC4143's: a member that
+    /// joined N milliseconds ago can decrypt up to N milliseconds of media from
+    /// before it arrived. `10000` is the library and MSC4143 default.
+    #[arg(long, default_value_t = 10_000)]
+    key_rotation_grace_ms: u64,
+
+    /// How often each device restarts its dead man's switch (MSC4140 delayed
+    /// leave) and refreshes its membership.
+    ///
+    /// The switch fires 300s after the last restart, and a fired switch is a
+    /// *real* departure: every other member sees it, rotates at once, and sends
+    /// to everyone — then the device reappears on its next membership refresh
+    /// and the fleet pays a second full fan-out. Under load the heartbeat
+    /// competes for its session's lock with exactly that fan-out, so a 150s
+    /// interval (the library default) leaves only one missed beat of margin
+    /// before a device flaps. Well below that here, so a starved beat costs
+    /// nothing but a retry.
+    #[arg(long, default_value_t = 30_000)]
+    heartbeat_interval_ms: u64,
 
     /// Publish the `m.rtc.slot` state event first. Needs the power level for
     /// it, and is unnecessary when a real client already opened the call.
@@ -787,6 +839,15 @@ impl Fleet {
                 auto_subscribe: args.subscribe,
                 element_call_compat: args.element_call_compat.into(),
                 sticky_duration_ms: Some(args.sticky_duration_ms),
+                heartbeat_interval: Duration::from_millis(args.heartbeat_interval_ms),
+                // Everything but the two rotation grace periods stays at the
+                // library's policy — notably the MSC4153 cross-signing
+                // requirement, which these devices satisfy.
+                encryption_config: Some(EncryptionConfig {
+                    leave_rotation_grace_period_ms: args.leave_rotation_grace_ms,
+                    key_rotation_grace_period_ms: args.key_rotation_grace_ms,
+                    ..EncryptionConfig::default()
+                }),
                 ..CallOptions::default()
             },
         )

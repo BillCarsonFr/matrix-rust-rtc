@@ -232,6 +232,39 @@ pub struct EncryptionConfig {
     /// Default: 10000ms (10 seconds).
     pub key_rotation_grace_period_ms: u64,
 
+    /// Grace period (ms) before a *departure* forces a rotation.
+    ///
+    /// A member leaving always costs a new key, and MSC4143 has no grace period
+    /// for it. When several leave at once — a big call emptying out, a partition
+    /// dropping a group of devices, a sticky batch expiring — every membership
+    /// update that reaches us mints and distributes its own key, one to-device
+    /// send per remaining member each time. Holding the rotation back until the
+    /// current key is at least this old collapses the burst: the first departure
+    /// rotates as it always did, and every departure landing inside the window
+    /// of that fresh key is answered by a single rotation once it closes.
+    ///
+    /// Measured against the *age of the current key*, not against when the
+    /// departure arrived, exactly like [`Self::key_rotation_grace_period_ms`]. A
+    /// lone member leaving a call whose key is older than this therefore still
+    /// rotates immediately — the deferral only ever applies to a key we just
+    /// minted, which is what a burst looks like.
+    ///
+    /// The cost is forward secrecy on leave: for as long as a rotation is
+    /// deferred we keep encrypting with a key the departed member holds, so it
+    /// can still decrypt our media. `0` — the default — rotates immediately,
+    /// which is the conservative choice and what this crate did before the knob
+    /// existed. Raise it deliberately.
+    ///
+    /// There is no timer behind this. A deferred rotation is carried out by the
+    /// next membership update the session sees (see
+    /// [`EncryptionManager::rotation_due`]), so the effective delay is this value
+    /// rounded up to however often the consumer pushes state — 30s in
+    /// `matrix-rtc-bridge`. Values below that granularity buy less than they
+    /// look like they do.
+    ///
+    /// [`EncryptionManager::rotation_due`]: crate::encryption::EncryptionManager::rotation_due
+    pub leave_rotation_grace_period_ms: u64,
+
     /// Whether to manage media keys (default: true).
     ///
     /// If false, the encryption manager will not distribute keys or signal
@@ -255,6 +288,9 @@ impl Default for EncryptionConfig {
         Self {
             delay_before_use_ms: 5000,            // MSC4143 default
             key_rotation_grace_period_ms: 10_000, // MSC4143 default
+            // Not in MSC4143: departures rotate at once unless a consumer opts
+            // into trading forward secrecy on leave for fewer rotations.
+            leave_rotation_grace_period_ms: 0,
             manage_media_keys: true,
             require_cross_signed_sender: true,
         }
@@ -387,6 +423,10 @@ mod tests {
 
         assert_eq!(config.delay_before_use_ms, 5000);
         assert_eq!(config.key_rotation_grace_period_ms, 10_000);
+        assert_eq!(
+            config.leave_rotation_grace_period_ms, 0,
+            "a departure must rotate immediately unless a consumer opts out"
+        );
         assert!(config.manage_media_keys);
     }
 

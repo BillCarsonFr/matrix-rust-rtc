@@ -146,8 +146,42 @@ INSECURE_TLS=0
 # for the next attempt; two minutes does not.
 #
 # Costs one extra membership send per device every half of this. Keep it well
-# above twice the 15s heartbeat, or memberships lapse between beats.
+# above twice HEARTBEAT_INTERVAL_MS below, or the refresh never gets a chance to
+# run before the entry lapses and every membership flaps once per beat.
 STICKY_DURATION_MS=120000
+
+# Time window in which multiple leaves result in 2 key rotations instead of N
+LEAVE_ROTATION_GRACE_MS=20000
+
+# The same collapsing for JOINS, and the single biggest lever on how much
+# to-device traffic a ramp costs.
+#
+# A joiner met by a key younger than this gets the current key and nobody else
+# is written to: one to-device message per device. A joiner met by an older key
+# rotates it, and a rotation goes to EVERY member: N messages per device, N x N
+# across the fleet — and this process is on both ends of all of them, so each
+# one is an Olm encrypt, an Olm decrypt and two crypto-store writes. At 100
+# devices that is ~10k messages for a single join.
+#
+# So keep it above the ramp: RAMP_MS x DEVICES is how long the fleet takes to
+# arrive, and anything shorter means the ramp rotates every few joins instead of
+# settling on one key. Raise it with DEVICES.
+#
+# The trade is MSC4143's: a device that joined N ms ago can decrypt up to N ms of
+# media from before it arrived. Fine for a load run, and the library default
+# stays 10000 for real clients.
+KEY_ROTATION_GRACE_MS=30000
+
+# How often each device restarts its dead man's switch (MSC4140 delayed leave)
+# and refreshes its membership.
+#
+# The switch fires 300s after the last restart, and a fired switch is a REAL
+# departure: every other device sees it, rotates immediately, and sends to
+# everyone — then the device reappears at its next membership refresh and the
+# fleet pays a second full fan-out. Under load the heartbeat competes for its
+# session's lock with exactly that fan-out, so the library's 150s default leaves
+# only one missed beat of margin before devices start flapping. 30s gives ten.
+HEARTBEAT_INTERVAL_MS=30000
 
 # Pacing, to stay under homeserver rate limits.
 RAMP_MS=500
@@ -238,6 +272,9 @@ args=(
     --login-delay-ms "$LOGIN_DELAY_MS"
     --device-prefix "$DEVICE_PREFIX"
     --sticky-duration-ms "$STICKY_DURATION_MS"
+    --leave-rotation-grace-ms "$LEAVE_ROTATION_GRACE_MS"
+    --key-rotation-grace-ms "$KEY_ROTATION_GRACE_MS"
+    --heartbeat-interval-ms "$HEARTBEAT_INTERVAL_MS"
 )
 [[ "$SIMULCAST" == "0" ]] && args+=(--no-simulcast)
 [[ "$AUDIO" == "1" ]] && args+=(--audio)

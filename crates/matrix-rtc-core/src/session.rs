@@ -883,6 +883,24 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                     describe_exclusions(&excluded),
                 );
             }
+
+            // A rotation deferred by `leave_rotation_grace_period_ms` waits on
+            // time, not on the roster, and the roster it is waiting in may never
+            // move again — the last departure of a burst can be the last event of
+            // the call. The core owns no timers (it is driven from synchronous
+            // host calls), so the wait is resolved here instead: every state push
+            // reaches `refresh`, including the periodic re-assertions of unchanged
+            // state, and those are what carry a due rotation over the line. The
+            // check is a mutex and a clock read, so running it on each one is free.
+            if let Some(ref encryption_manager) = self.encryption_manager
+                && encryption_manager.rotation_due()
+            {
+                log::info!(
+                    "[{}] membership unchanged, but a deferred key rotation is due",
+                    self.log_tag,
+                );
+                let _ = encryption_manager.on_memberships_update().await;
+            }
             return;
         }
 

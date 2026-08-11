@@ -34,7 +34,7 @@
 //!
 //! To handle rapid join/leave scenarios efficiently:
 //!
-//! - When a participant **leaves** OR **membership changes**: Always rotate the key
+//! - When a participant **leaves** OR **membership changes**: Rotate the key
 //!   (all remaining participants get the new key)
 //! - When **new joiners** arrive and the current key is young (< `key_rotation_grace_period_ms`):
 //!   Reuse the current key, send only to the new participant(s)
@@ -42,6 +42,25 @@
 //!   Rotate the key (all participants get the new key)
 //!
 //! This prevents expensive key rotations when users quickly join in a row.
+//!
+//! # Deferring a departure's rotation
+//!
+//! A burst of departures is the mirror image of a burst of joins, and by default
+//! it is not collapsed: each membership update carrying a leave mints and
+//! distributes its own key. `leave_rotation_grace_period_ms` (default `0`) opts
+//! into collapsing it, by the same key-age test the joiner path uses — the first
+//! departure rotates, and the ones landing inside the fresh key's window are
+//! answered together when it closes.
+//!
+//! The deferral is deliberately **state-based**, not a timer: the departed
+//! members stay in the key's `shared_with` until a rotation clears them, so every
+//! rollout re-derives that a rotation is owed. Only the deadline is stored, and
+//! [`EncryptionManager::rotation_due`] exposes it so the session can drive the
+//! rollout on a state push where the roster did not move. Nothing here schedules
+//! anything, for the same reason `delayBeforeUse` does not (below).
+//!
+//! The trade is forward secrecy on leave: while a rotation is held back we keep
+//! encrypting with a key the departed member holds.
 //!
 //! # Key Usage Delay (MSC4143: delayBeforeUse)
 //!
@@ -128,6 +147,7 @@
 //! manager.set_config(EncryptionConfig {
 //!     delay_before_use_ms: 5000,
 //!     key_rotation_grace_period_ms: 10000,
+//!     leave_rotation_grace_period_ms: 0,
 //!     manage_media_keys: true,
 //!     require_cross_signed_sender: true,
 //! });
@@ -340,6 +360,17 @@ pub struct EncryptionManager<T: RtcCommandSender> {
     /// distribute to — so in a solo call every membership update re-signalled the
     /// same index, and each one reached the transport as a fresh key import.
     signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+
+    /// When a departure-triggered rotation we held back becomes due, in epoch
+    /// milliseconds. `None` when we owe no rotation.
+    ///
+    /// Only a deadline is stored, never the departures themselves: who left is
+    /// re-derived on every rollout from the roster against the current key's
+    /// `shared_with`, and the deferring path leaves `shared_with` alone, so a
+    /// departed member stays in it and keeps reading as "left" until a rotation
+    /// actually drops it. The deadline is the one thing that cannot be derived —
+    /// it says whether the wait is over.
+    deferred_rotation_due_ms: Arc<Mutex<Option<u64>>>,
 }
 
 /// What we last told the app about our own key, and when.
@@ -397,6 +428,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             key_buffer: Arc::new(Mutex::new(OutdatedKeyFilter::default())),
             keys_without_membership: Arc::new(Mutex::new(Vec::new())),
             signalled_key: Arc::new(Mutex::new(None)),
+            deferred_rotation_due_ms: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -620,6 +652,11 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         *self.inbound_keys.write().unwrap() = HashMap::new();
         *self.next_key_index.lock().unwrap() = 0;
         *self.signalled_key.lock().unwrap() = None;
+        // A rotation owed to a call we are no longer in is owed to nobody, and a
+        // session outlives its `leave()`: leaving the deadline behind would have
+        // the next join's first unchanged-roster refresh roll out a key for
+        // departures from the previous call.
+        *self.deferred_rotation_due_ms.lock().unwrap() = None;
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -687,6 +724,24 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         // Ensure key distribution
         self.ensure_key_distribution().await
+    }
+
+    /// Whether a rotation held back by
+    /// [`EncryptionConfig::leave_rotation_grace_period_ms`] has come due.
+    ///
+    /// The deferral has no timer of its own — see the field docs for why the core
+    /// owns no schedulers — so the consumer has to offer it a chance to run.
+    /// Sessions already call [`Self::on_memberships_update`] whenever the roster
+    /// moves; this is what tells them to call it when the roster *hasn't* moved,
+    /// which is precisely the situation a deferred rotation is waiting in.
+    ///
+    /// Cheap and non-blocking: one mutex and a clock read, no roster diffing. Safe
+    /// to consult on every state push.
+    pub fn rotation_due(&self) -> bool {
+        self.deferred_rotation_due_ms
+            .lock()
+            .unwrap()
+            .is_some_and(|due_ms| self.timestamp_ms() >= due_ms)
     }
 
     /// Checks keys that arrived before their membership was known.
@@ -876,11 +931,60 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 .any(|holder| holder.member_id == participant.member_id)
         });
 
+        let key_age = self.timestamp_ms().saturating_sub(current_key.creation_ts);
+
+        // Departures cost a new key. Whether we mint it *now* is the question a
+        // burst makes expensive: N updates each carrying a departure produce N
+        // rotations, each a to-device send to everyone still here.
+        //
+        // `leave_rotation_grace_period_ms` collapses them by measuring the same
+        // key age the joiner path measures. The first departure of a burst meets
+        // an old key and rotates at once; the rest meet the key it just minted,
+        // and are held until it leaves its window — at which point one rotation
+        // retires every one of them. Nothing about *which* members left is
+        // recorded: they stay in `shared_with` (only a rotation clears it), so the
+        // diff above re-derives them on every rollout until one happens.
+        //
+        // The trade is explicit in the config docs: a held-back rotation is time
+        // in which a departed member can still decrypt us. Default `0` keeps the
+        // rotate-immediately behaviour.
+        let departures = !left.is_empty() || any_membership_changed;
+        let defer_departures = departures && key_age < self.config.leave_rotation_grace_period_ms;
+
+        {
+            let mut due = self.deferred_rotation_due_ms.lock().unwrap();
+            if defer_departures {
+                // Keyed off the key's own creation, so re-deriving it on every
+                // subsequent rollout in the burst lands on the same deadline
+                // instead of pushing it further out each time.
+                let deadline = current_key.creation_ts + self.config.leave_rotation_grace_period_ms;
+                if *due != Some(deadline) {
+                    log::info!(
+                        "[{}/{}] Deferring rotation for {} departure(s) (membership changed: \
+                         {}): key index {} is {}ms old, holding it until {}ms",
+                        self.room_id,
+                        self.slot_id,
+                        left.len(),
+                        any_membership_changed,
+                        current_key.key_index,
+                        key_age,
+                        self.config.leave_rotation_grace_period_ms,
+                    );
+                }
+                *due = Some(deadline);
+            } else if !departures {
+                // Nobody is owed a rotation any more. Reached when a rotation for
+                // another reason (a joiner past the grace period) already retired
+                // the departed members.
+                *due = None;
+            }
+        }
+
         let to_distribute_to: Vec<ParticipantDeviceInfo>;
         let mut use_new_key = false;
         let outbound_key_to_use: OutboundEncryptionKey;
 
-        if !left.is_empty() || any_membership_changed {
+        if departures && !defer_departures {
             // Someone left or membership changed, we need to rotate the key
             log::info!(
                 "[{}/{}] Key rotation needed: {} left, membership changed: {}",
@@ -894,9 +998,6 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             outbound_key_to_use = self.create_new_outbound_key();
         } else if !joined.is_empty() {
             // New joiners
-            let now = self.timestamp_ms();
-            let key_age = now.saturating_sub(current_key.creation_ts);
-
             if key_age < self.config.key_rotation_grace_period_ms {
                 // Current key is still fresh, just distribute to new joiners
                 log::debug!(
@@ -921,6 +1022,17 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 to_distribute_to = current_participants.clone();
                 outbound_key_to_use = self.create_new_outbound_key();
             }
+        } else if defer_departures {
+            // Departures, held back, and nobody new to serve the current key to.
+            // The rotation stays owed; `rotation_due` is what brings us back once
+            // the window closes, since no further membership change need ever come.
+            log::debug!(
+                "[{}/{}] Departure rotation still deferred and no new joiners, \
+                 nothing to distribute",
+                self.room_id,
+                self.slot_id
+            );
+            return Ok(());
         } else {
             // No changes, nothing to do
             log::debug!(
@@ -987,6 +1099,13 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 new_key.shared_with = served.clone();
                 *guard = Some(new_key);
             }
+
+            // Whatever the reason for this rotation, it retired every member who
+            // had left: the new key's `shared_with` holds only who we just served.
+            // Clearing here rather than only on the departure branch covers the
+            // case where a joiner past `key_rotation_grace_period_ms` rotates
+            // while a departure was still being held back.
+            *self.deferred_rotation_due_ms.lock().unwrap() = None;
 
             // Signal the new key immediately, telling the consumer how long to
             // wait before encrypting with it (delayBeforeUse). The wait used to
@@ -1629,6 +1748,7 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
             key_buffer: self.key_buffer.clone(),
             keys_without_membership: self.keys_without_membership.clone(),
             signalled_key: self.signalled_key.clone(),
+            deferred_rotation_due_ms: self.deferred_rotation_due_ms.clone(),
         }
     }
 }
@@ -1647,6 +1767,7 @@ mod tests {
     use crate::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
+    use std::time::Duration;
 
     const ROOM_ID: &str = "!room:example.org";
     const SLOT_ID: &str = "m.call#ROOM";
@@ -1909,6 +2030,212 @@ mod tests {
             manager.get_outbound_key().map(|key| key.key_index),
             Some(sent_to_carol[0] as u8),
             "we must encrypt with exactly the index carol was handed"
+        );
+    }
+
+    /// A peer under a given user, device and member id.
+    fn peer(user_id: &str, device_id: &str, member_id: &str) -> JoinedMembership {
+        JoinedMembership {
+            sender: user_id.to_string(),
+            origin: EventOrigin::encrypted(Some(device_id.to_string())),
+            sticky_key: member_id.to_string(),
+            member_id: member_id.to_string(),
+            ..bob_membership()
+        }
+    }
+
+    /// Every key index a rollout put on the wire, in order.
+    fn sent_key_indices(sender: &MockCommandSender) -> Vec<u64> {
+        sender
+            .to_device_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, _, _, content)| {
+                content
+                    .pointer("/media_key/index")
+                    .and_then(|index| index.as_u64())
+            })
+            .collect()
+    }
+
+    /// A burst of departures — a partition dropping a group of devices, a sticky
+    /// batch expiring — arrives as one membership update per leaver. Rotating on
+    /// each costs a fresh key and a to-device send to everyone still present, per
+    /// update, and it is the shape `leave_rotation_grace_period_ms` exists to
+    /// collapse: one rotation retires the whole burst.
+    #[tokio::test]
+    async fn departures_inside_the_leave_grace_period_collapse_into_one_rotation() {
+        const GRACE_MS: u64 = 400;
+
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+
+        // All three hold index 0.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(sent_key_indices(&sender), vec![0, 0, 0]);
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Bob then carol drop out, each in its own update, both inside the window
+        // of the key they were just handed.
+        for departed in ["bob-a", "carol-a"] {
+            memberships
+                .lock()
+                .unwrap()
+                .retain(|member| member.member_id != departed);
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(0),
+            "both departures are inside the window, so the key must not have moved yet"
+        );
+        assert!(
+            sent_key_indices(&sender).is_empty(),
+            "a deferred rotation must put nothing on the wire, got {:?}",
+            sent_key_indices(&sender),
+        );
+        assert!(
+            !manager.rotation_due(),
+            "the window has not closed, so nothing is owed yet"
+        );
+
+        // The window closes. No further membership change is coming — the last
+        // departure can be the last thing that happens in a call — so what brings
+        // us back is the consumer asking whether a rotation has come due.
+        tokio::time::sleep(Duration::from_millis(GRACE_MS + 150)).await;
+        assert!(
+            manager.rotation_due(),
+            "the deferred rotation should be due once the window closes"
+        );
+
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "two departures must cost exactly one rotation, not one each"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![1],
+            "only dave is left to receive the rotated key"
+        );
+        assert!(
+            !manager.rotation_due(),
+            "the rotation settled the debt, or every later state push rolls out again"
+        );
+    }
+
+    /// The window is measured against the age of the current key, exactly as the
+    /// joiner path measures it. So it only ever holds back a rotation for a key we
+    /// just minted — which is what a burst looks like — and the ordinary case of
+    /// one member leaving a call that has been running for a while pays no
+    /// latency, and no extra time in which the leaver can still decrypt us.
+    #[tokio::test]
+    async fn a_departure_from_a_key_past_the_window_rotates_without_waiting() {
+        const GRACE_MS: u64 = 150;
+
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        // The key ages past the window before anyone leaves.
+        tokio::time::sleep(Duration::from_millis(GRACE_MS + 100)).await;
+        sender.to_device_messages.lock().unwrap().clear();
+
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "bob-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "a departure from a key older than the window must rotate on the spot"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![1],
+            "and the rotated key goes to whoever is left"
+        );
+        assert!(!manager.rotation_due(), "nothing was deferred");
+    }
+
+    /// A session outlives its `leave()`, so a rotation owed to a call we have hung
+    /// up on must not survive into the next one — the first unchanged-roster push
+    /// after rejoining would otherwise roll out a key for departures from a call
+    /// that is over.
+    #[tokio::test]
+    async fn leaving_the_call_drops_a_deferred_rotation() {
+        const GRACE_MS: u64 = 150;
+
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "bob-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        tokio::time::sleep(Duration::from_millis(GRACE_MS + 100)).await;
+        assert!(manager.rotation_due(), "the deferral should be pending");
+
+        manager.leave();
+        assert!(
+            !manager.rotation_due(),
+            "a rotation owed to a call we left is owed to nobody"
         );
     }
 

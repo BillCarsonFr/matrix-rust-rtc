@@ -348,6 +348,90 @@ mod tests {
         );
     }
 
+    /// A rotation deferred by `leave_rotation_grace_period_ms` is waiting on the
+    /// clock, not on the roster — and the departure that triggered it can be the
+    /// last thing that ever happens in the call, so no further membership change
+    /// is guaranteed to come and collect it. What carries it over the line is the
+    /// re-assertion of unchanged state every host performs periodically (every 30s
+    /// in `matrix-rtc-bridge`), which means `refresh` must not swallow the due
+    /// rotation along with the rest of that no-op.
+    #[tokio::test]
+    async fn a_deferred_rotation_lands_on_an_unchanged_state_push() {
+        const GRACE_MS: u64 = 400;
+
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        let mut params = JoinSessionParams::new(
+            "@alice:example.org".to_owned(),
+            "ALICEDEV".to_owned(),
+            ROOM_ID.to_owned(),
+            "m.call#ROOM".to_owned(),
+            "m.call".to_owned(),
+            RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://example.com/jwt".to_owned(),
+            }),
+        );
+        params.membership_id = Some("alice-a".to_owned());
+        params.encryption_config = Some(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join(params).await.expect("join should succeed");
+
+        let bob = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+            ..joined_event("@bob:example.org", "m.call#ROOM", "bob-a")
+        };
+        let carol = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_owned())),
+            ..joined_event("@carol:example.org", "m.call#ROOM", "carol-a")
+        };
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![bob.clone(), carol])
+            .await
+            .unwrap();
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Carol's sticky entry lapses. The key she holds was minted moments ago,
+        // so the rotation is held back and nothing goes out.
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![bob.clone()])
+            .await
+            .unwrap();
+        assert!(
+            sender
+                .to_device_messages_for("@bob:example.org", "BOBDEV")
+                .is_empty(),
+            "the rotation was inside the window and should have been deferred"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(GRACE_MS + 150)).await;
+
+        // The same state again: the roster has not moved, and this is the only
+        // thing that ever will happen again in this call.
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![bob])
+            .await
+            .unwrap();
+
+        let sent = sender.to_device_messages_for("@bob:example.org", "BOBDEV");
+        assert_eq!(
+            sent.len(),
+            1,
+            "the deferred rotation never reached bob, so carol can still decrypt \
+             everything we send: {sent:?}"
+        );
+        assert_eq!(
+            sent[0]
+                .1
+                .pointer("/media_key/index")
+                .and_then(|v| v.as_u64()),
+            Some(1),
+            "the rotation should hand bob the next index"
+        );
+    }
+
     /// MSC4143 requires a fresh `member.id` per join, so the previous
     /// participation of this very device is not a peer — it is us, one call ago.
     /// Leaving it in the roster gives the media layer a phantom member to open a
