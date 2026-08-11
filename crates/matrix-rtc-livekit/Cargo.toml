@@ -95,6 +95,7 @@ matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "3
 # Encryption support rides along via matrix-sdk's default features; ui only needs
 # the sticky feature for unification with matrix-sdk-base.
 matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354"] }
+rlimit = "0.11.0"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # For the `android::initialize_android` re-export's signature; unifies with

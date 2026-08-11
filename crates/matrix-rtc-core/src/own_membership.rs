@@ -653,6 +653,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// Schedules a delayed leave event to clean up our membership if we disconnect.
     ///
     /// This is used internally by join() and heartbeat().
+    /// comment: not used by join
     ///
     /// # Returns
     ///

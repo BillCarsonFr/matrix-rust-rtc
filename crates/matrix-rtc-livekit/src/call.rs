@@ -179,7 +179,7 @@ impl Default for CallOptions {
             application: "m.call".to_owned(),
             livekit_service_url_fallback: None,
             encryption_config: None,
-            heartbeat_interval: Duration::from_secs(15),
+            heartbeat_interval: Duration::from_secs(150),
             sticky_duration_ms: None,
             http: None,
             auto_subscribe: true,
