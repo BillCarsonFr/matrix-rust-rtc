@@ -309,8 +309,13 @@ struct Args {
     /// interval (the library default) leaves only one missed beat of margin
     /// before a device flaps. Well below that here, so a starved beat costs
     /// nothing but a retry.
-    #[arg(long, default_value_t = 30_000)]
+    #[arg(long, default_value_t = 150_000)]
     heartbeat_interval_ms: u64,
+
+    /// How long after the last heartbeat the dead man's switch fires (the
+    /// MSC4140 delayed leave's timeout).
+    #[arg(long, default_value_t = 400_000)]
+    keep_alive_timeout_ms: u64,
 
     /// Publish the `m.rtc.slot` state event first. Needs the power level for
     /// it, and is unnecessary when a real client already opened the call.
@@ -840,6 +845,7 @@ impl Fleet {
                 element_call_compat: args.element_call_compat.into(),
                 sticky_duration_ms: Some(args.sticky_duration_ms),
                 heartbeat_interval: Duration::from_millis(args.heartbeat_interval_ms),
+                keep_alive_timeout_ms: Some(args.keep_alive_timeout_ms),
                 // Everything but the two rotation grace periods stays at the
                 // library's policy — notably the MSC4153 cross-signing
                 // requirement, which these devices satisfy.

@@ -175,13 +175,26 @@ KEY_ROTATION_GRACE_MS=30000
 # How often each device restarts its dead man's switch (MSC4140 delayed leave)
 # and refreshes its membership.
 #
-# The switch fires 300s after the last restart, and a fired switch is a REAL
-# departure: every other device sees it, rotates immediately, and sends to
-# everyone — then the device reappears at its next membership refresh and the
-# fleet pays a second full fan-out. Under load the heartbeat competes for its
-# session's lock with exactly that fan-out, so the library's 150s default leaves
-# only one missed beat of margin before devices start flapping. 30s gives ten.
+# The switch fires KEEP_ALIVE_TIMEOUT_MS after the last restart, and a fired
+# switch is a REAL departure: every other device sees it, rotates immediately,
+# and sends to everyone — then the device reappears at its next membership
+# refresh and the fleet pays a second full fan-out. Under load the heartbeat
+# competes for its session's lock with exactly that fan-out, so the library's
+# 150s default leaves only one missed beat of margin before devices start
+# flapping. 30s gives ten.
 HEARTBEAT_INTERVAL_MS=30000
+
+# How long after the last heartbeat the dead man's switch fires.
+#
+# The deadline HEARTBEAT_INTERVAL_MS keeps pushing back. Only the ratio of the
+# two matters: it is how many beats a device may miss before the switch fires
+# and costs the fleet the two fan-outs above. 300000 against the 30s beat here
+# is ten.
+#
+# Raising it also lengthens how long a run that is killed rather than left
+# cleanly keeps its delayed leaves pending — though ghosts outlive that anyway,
+# for STICKY_DURATION_MS above, which the switch does not clear.
+KEEP_ALIVE_TIMEOUT_MS=150000
 
 # Pacing, to stay under homeserver rate limits.
 RAMP_MS=500
@@ -280,6 +293,7 @@ args=(
     --leave-rotation-grace-ms "$LEAVE_ROTATION_GRACE_MS"
     --key-rotation-grace-ms "$KEY_ROTATION_GRACE_MS"
     --heartbeat-interval-ms "$HEARTBEAT_INTERVAL_MS"
+    --keep-alive-timeout-ms "$KEEP_ALIVE_TIMEOUT_MS"
 )
 [[ "$SIMULCAST" == "0" ]] && args+=(--no-simulcast)
 [[ "$AUDIO" == "1" ]] && args+=(--audio)

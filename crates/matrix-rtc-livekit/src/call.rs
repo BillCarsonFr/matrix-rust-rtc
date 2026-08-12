@@ -124,6 +124,12 @@ pub struct CallOptions {
     pub encryption_config: Option<EncryptionConfig>,
     /// How often to refresh the dead man's switch delayed leave.
     pub heartbeat_interval: Duration,
+    /// How long after the last refresh the dead man's switch fires, i.e. the
+    /// MSC4140 delayed leave's timeout. `None` keeps the core's default of 300
+    /// seconds.
+    ///
+    /// The twin of [`heartbeat_interval`](Self::heartbeat_interval)
+    pub keep_alive_timeout_ms: Option<u64>,
     /// How long the homeserver keeps our membership in the sticky map. `None`
     /// keeps the core's default of an hour.
     ///
@@ -180,6 +186,7 @@ impl Default for CallOptions {
             livekit_service_url_fallback: None,
             encryption_config: None,
             heartbeat_interval: Duration::from_secs(150),
+            keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             http: None,
             auto_subscribe: true,
@@ -378,6 +385,7 @@ impl Call {
         );
         params.membership_id = Some(membership_id.clone());
         params.encryption_config = options.encryption_config.clone();
+        params.keep_alive_timeout_ms = options.keep_alive_timeout_ms;
         params.sticky_duration_ms = options.sticky_duration_ms;
         let (memberships, keep_alive) = {
             let mut mgr = manager.lock().await;
