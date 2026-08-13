@@ -94,7 +94,7 @@ use matrix_sdk::ruma::events::room::message::{
 };
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedDeviceId, RoomId};
 use matrix_sdk::{Client, Room};
-use matrix_sdk_ui::sync_service::SyncService;
+use matrix_sdk_ui::sync_service::{State as SyncState, SyncService};
 use tokio::signal::unix::{SignalKind, signal};
 
 /// Clap-facing mirror of [`ElementCallCompat`], which lives in a crate that
@@ -142,6 +142,11 @@ const QUIT_COMMANDS: [&str; 4] = [":q", ":quit", "q", "quit"];
 const WARMUP_SETTLE: Duration = Duration::from_secs(2);
 /// Prefix of a control message in the room. Anything else is chatter.
 const COMMAND_PREFIX: &str = "!load_test";
+/// How long to wait before restarting a sync that stopped on an error.
+///
+/// A store failure or a homeserver that keeps rejecting the connection would
+/// otherwise have the watchdog restarting in a hot loop.
+const SYNC_RESTART_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -597,7 +602,9 @@ struct Device {
     index: usize,
     client: Client,
     device_id: OwnedDeviceId,
-    sync: Option<SyncService>,
+    /// Aborts [`spawn_sync_watch`]'s task; dropped before `sync` is.
+    sync_watch: Option<AbortOnDrop>,
+    sync: Option<Arc<SyncService>>,
     /// The call's room as this device sees it; set once it came down sync.
     room: Option<Room>,
     call: Option<Call>,
@@ -606,8 +613,9 @@ struct Device {
     pumps: Vec<AbortOnDrop>,
 }
 
-/// Aborts the wrapped capture task on drop, so a device going away never
-/// leaves a pump pushing frames into a dead publication.
+/// Aborts the wrapped task on drop, so a device going away never leaves a pump
+/// pushing frames into a dead publication, nor a watchdog restarting a sync
+/// nobody is listening to any more.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -737,8 +745,24 @@ impl Fleet {
         assert_eq!(index, self.devices.len(), "devices are appended in order");
 
         let mut device = self.login(args, index).await?;
-        let sync = SyncService::builder(device.client.clone()).build().await?;
+        let sync = Arc::new(
+            SyncService::builder(device.client.clone())
+                // Without this, a sliding sync that hits any error at all —
+                // an expired position, a 5xx, a store failure — stops for
+                // good: the supervisor sets `State::Error` and exits. Offline
+                // mode makes it wait for the homeserver to come back instead.
+                .with_offline_mode()
+                .build()
+                .await?,
+        );
         sync.start().await;
+        // Even with offline mode there are terminal states, and a device that
+        // stops syncing is invisible from the outside: its call keeps running
+        // on the LiveKit connection, so the stats line stays healthy while the
+        // device hears nothing from the room. For device 0 that means the
+        // control channel dies silently, and `!load_test device_count` stops
+        // working with nothing in the output to say why.
+        device.sync_watch = Some(AbortOnDrop(spawn_sync_watch(index, &sync)));
         device.sync = Some(sync);
         let room = wait_for_room(&device.client, room_id).await?;
         println!("[{index}] logged in as device {}", device.device_id);
@@ -968,6 +992,7 @@ impl Fleet {
             index,
             client,
             device_id,
+            sync_watch: None,
             sync: None,
             room: None,
             call: None,
@@ -1031,6 +1056,8 @@ impl Fleet {
                     Err(error) => eprintln!("[{}] leave failed: {error}", device.index),
                 }
             }
+            // Watchdog first: it must not restart a sync we are shutting down.
+            drop(device.sync_watch.take());
             drop(device.sync.take());
 
             // `--store` implies keeping the device: logging out would revoke
@@ -1278,6 +1305,55 @@ fn rate_limit_retry_after(error: &matrix_sdk::Error) -> Option<Option<Duration>>
     })
 }
 
+/// Restart this device's sync whenever it stops, and say so.
+///
+/// `SyncService` has terminal states: on an error it reports one and its
+/// supervisor task exits, and nothing brings it back. That is the right default
+/// for an app that can show the user an error; here it means a device quietly
+/// goes deaf for the rest of the run — fatal for device 0, whose sync *is* the
+/// control channel, and misleading for the others, whose membership then stops
+/// being refreshed while their media keeps flowing.
+///
+/// Restarting is safe: `start()` is a no-op while the service is running, and
+/// the room event handlers live on the `Client`, so they survive a restart. A
+/// restarted sliding sync may replay recent timeline, which is what the
+/// `origin_server_ts` filter in [`listen_for_commands`] is there for.
+///
+/// `tokio::spawn`, not `spawn_local`: this must keep working when the `LocalSet`
+/// every device's signalling shares is saturated, which is exactly when a sync
+/// is most likely to have fallen over.
+fn spawn_sync_watch(index: usize, sync: &Arc<SyncService>) -> tokio::task::JoinHandle<()> {
+    let mut states = sync.state();
+    // Weak, so this task cannot keep a device's sync alive past `shutdown`.
+    let sync = Arc::downgrade(sync);
+    tokio::spawn(async move {
+        while let Some(state) = states.next().await {
+            let reason = match state {
+                SyncState::Error(error) => format!("error: {error}"),
+                SyncState::Terminated => "terminated".to_owned(),
+                // The SDK is already retrying; nothing to do but report it,
+                // since a fleet that stops hearing the room looks identical to
+                // one nobody is talking to.
+                SyncState::Offline => {
+                    eprintln!("[{index}] sync went offline; the SDK is retrying");
+                    continue;
+                }
+                // `Idle` is either the pre-start state or our own `stop()`, and
+                // `Running` is the good case.
+                SyncState::Idle | SyncState::Running => continue,
+            };
+            eprintln!(
+                "[{index}] sync stopped ({reason}); restarting in {}s",
+                SYNC_RESTART_DELAY.as_secs()
+            );
+            tokio::time::sleep(SYNC_RESTART_DELAY).await;
+            // Gone means the device was torn down while we waited.
+            let Some(sync) = sync.upgrade() else { return };
+            sync.start().await;
+        }
+    })
+}
+
 async fn wait_for_room(client: &Client, room_id: &RoomId) -> Result<Room, Box<dyn Error>> {
     let deadline = Instant::now() + ROOM_SYNC_TIMEOUT;
     loop {
@@ -1307,7 +1383,10 @@ async fn wait_for_room(client: &Client, room_id: &RoomId) -> Result<Room, Box<dy
 /// In an encrypted room a command decrypts only if its megolm key has arrived;
 /// the key is shared when the message is sent, but over to-device traffic that
 /// can lag it. A command that draws no acknowledgement within a few seconds
-/// was lost to that race — send it again.
+/// was lost to that race — send it again. Device 0 cannot ask for a key it
+/// missed, because [`quiet_room_key_gossip`] turns key requests off, so a
+/// command that stays unacknowledged across several retries is waiting on the
+/// sender to rotate its megolm session rather than on this tool.
 fn listen_for_commands(
     client: &Client,
     room_id: &RoomId,
@@ -1339,14 +1418,26 @@ fn listen_for_commands(
                         }
                     }
                 };
-                if let Err(error) = room
-                    .send(RoomMessageEventContent::text_plain(format!(
-                        "load_test: {reply}"
-                    )))
-                    .await
-                {
-                    eprintln!("could not acknowledge a command: {error}");
-                }
+                // Spawned, not awaited: the SDK runs event handler futures
+                // *inside* the sync loop, so anything slow here stops this
+                // device seeing further room events. And this send is slow —
+                // every scale-up adds devices to our own user, which
+                // invalidates the megolm session, so the acknowledgement first
+                // claims keys for and fans out to the whole fleet; on a
+                // homeserver this tool has been hammering it can also sit in
+                // the SDK's unlimited 429 retry. Awaiting it here made each
+                // command make the next one later, until they stopped landing
+                // at all.
+                tokio::spawn(async move {
+                    if let Err(error) = room
+                        .send(RoomMessageEventContent::text_plain(format!(
+                            "load_test: {reply}"
+                        )))
+                        .await
+                    {
+                        eprintln!("could not acknowledge a command: {error}");
+                    }
+                });
             }
         },
     );
