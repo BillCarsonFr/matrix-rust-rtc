@@ -271,6 +271,35 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
     }
 
+    /// When a coalesced key rotation falls due, if one is owed.
+    ///
+    /// `None` while nothing is owed, or when not joined.
+    pub fn key_rotation_due_at_ms(&self) -> Option<u64> {
+        self.encryption_manager
+            .as_ref()
+            .and_then(|manager| manager.rotation_due_at_ms())
+    }
+
+    /// Performs a key rotation coalesced into a fresh key's window, if one is owed
+    /// and due.
+    ///
+    /// See `RtcSessionManager::flush_due_key_rotation` for why this is the
+    /// consumer's to call. Returns `false` if the session has not joined.
+    pub async fn flush_due_key_rotation(&self) -> bool {
+        match &self.encryption_manager {
+            Some(manager) => {
+                if let Err(error) = manager.flush_due_rotation().await {
+                    log::warn!(
+                        "[{}] a deferred key rotation failed: {error:?}",
+                        self.log_tag,
+                    );
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Installs the identity mapper used to derive the RTC-backend participant
     /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
     ///
@@ -562,6 +591,23 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         if let Some(machine) = self.own_membership_machine.as_ref() {
             log::trace!("[{}] heartbeat", self.log_tag);
             machine.heartbeat().await;
+
+            // A rotation coalesced into a key's `delayBeforeUse` window needs
+            // somebody to come back for it once the window closes, and in a call
+            // whose roster has gone quiet nothing else will. This tick is the only
+            // periodic one the core is given, so it doubles as that collector: the
+            // rotation lands within one heartbeat of falling due rather than
+            // waiting for the next membership change. A consumer that wants it on
+            // time can drive `EncryptionManager::flush_due_rotation` from
+            // `rotation_due_at_ms()` instead.
+            if let Some(encryption_manager) = self.encryption_manager.as_ref()
+                && let Err(error) = encryption_manager.flush_due_rotation().await
+            {
+                log::warn!(
+                    "[{}] a deferred key rotation failed: {error:?}",
+                    self.log_tag,
+                );
+            }
             true
         } else {
             log::debug!("[{}] heartbeat ignored: not joined", self.log_tag);

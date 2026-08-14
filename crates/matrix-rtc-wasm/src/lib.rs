@@ -348,6 +348,10 @@ pub struct WasmEncryptionConfig {
     pub delay_before_use_ms: u64,
     #[serde(default = "default_key_rotation_grace_period_ms")]
     pub key_rotation_grace_period_ms: u64,
+    /// Longest a key may be used before it is replaced regardless of membership
+    /// (default: 5400000ms, 1h30).
+    #[serde(default = "default_max_key_lifetime_ms")]
+    pub max_key_lifetime_ms: u64,
     #[serde(default = "default_manage_media_keys")]
     pub manage_media_keys: bool,
     /// Whether to discard keys from devices that are not cross-signed
@@ -362,6 +366,9 @@ fn default_delay_before_use_ms() -> u64 {
 fn default_key_rotation_grace_period_ms() -> u64 {
     10000
 }
+fn default_max_key_lifetime_ms() -> u64 {
+    90 * 60 * 1000
+}
 fn default_manage_media_keys() -> bool {
     true
 }
@@ -374,6 +381,7 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
         EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms,
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms,
+            max_key_lifetime_ms: value.max_key_lifetime_ms,
             manage_media_keys: value.manage_media_keys,
             require_cross_signed_sender: value.require_cross_signed_sender,
         }

@@ -228,6 +228,7 @@ pub struct Call {
     slot_id: String,
     heartbeat: AbortOnDrop,
     key_pump: AbortOnDrop,
+    rotation_pump: AbortOnDrop,
     _sticky_bridge: AbortOnDrop,
     _key_handler: EventHandlerDropGuard,
     _legacy_key_handler: EventHandlerDropGuard,
@@ -412,6 +413,28 @@ impl Call {
         };
 
         let key_pump = AbortOnDrop(spawn_key_pump(manager.clone(), key_rx));
+
+        // Rotations the core coalesced into a key's `delayBeforeUse` window fall
+        // due the moment that window closes, and the bridge's scheduled
+        // installation is the only thing that knows when that is. Route it back:
+        // the bridge notifies from a plain `tokio` task, which cannot touch the
+        // `!Send` manager, so it sends on a channel that a `spawn_local` pump
+        // drains — the same shape the receive path uses.
+        //
+        // Without this the rotation still happens, on the next heartbeat; the
+        // point of wiring it is that a member who left during the window is locked
+        // out when the window ends rather than up to a heartbeat later.
+        let (switch_tx, switch_rx) = unbounded_channel::<()>();
+        bridge.set_switch_complete_listener(Box::new(move || {
+            let _ = switch_tx.send(());
+        }));
+        let rotation_pump = AbortOnDrop(spawn_rotation_pump(
+            manager.clone(),
+            room_id.clone(),
+            options.slot_id.clone(),
+            switch_rx,
+        ));
+
         let heartbeat = AbortOnDrop(spawn_heartbeat(
             manager.clone(),
             room_id.clone(),
@@ -573,6 +596,7 @@ impl Call {
             slot_id: options.slot_id,
             heartbeat,
             key_pump,
+            rotation_pump,
             _sticky_bridge: sticky_bridge,
             _key_handler: key_handler,
             _legacy_key_handler: legacy_key_handler,
@@ -720,12 +744,16 @@ impl Call {
             connection,
             heartbeat,
             key_pump,
+            rotation_pump,
             room_id,
             slot_id,
             ..
         } = self;
         drop(heartbeat);
         drop(key_pump);
+        // Nothing left to rotate for once we are leaving, and the core drops its
+        // encryption manager as part of the leave below.
+        drop(rotation_pump);
 
         // Step logs bracket every await so a wedged teardown pinpoints itself.
         log::debug!("[{room_id}] leave: sending matrix leave (membership + delayed-event cancel)");
@@ -963,6 +991,80 @@ fn register_legacy_key_receiver(
 
 /// Drain received peer keys into the (`!Send`) manager. Runs until the
 /// channel closes or the task is aborted.
+/// Perform a coalesced key rotation at the instant it falls due.
+///
+/// Two things wake this up, because neither alone is enough:
+///
+/// - The bridge, whenever a key comes into use. That is where a rotation *becomes*
+///   owed (a member left while the key was fresh), but it is not when the rotation
+///   is due — freshness outlasts `delayBeforeUse`, so there is usually nothing to
+///   do yet.
+/// - A timer, set from the deadline the core reports. This is the wake-up that
+///   actually performs the rotation.
+///
+/// The core decides whether anything is owed, so a wake-up with nothing due costs a
+/// lock and a comparison. `RtcSession::heartbeat` flushes too, so a stall here
+/// makes the rotation late rather than lost.
+fn spawn_rotation_pump(
+    manager: Manager,
+    room_id: String,
+    slot_id: String,
+    mut switch_rx: UnboundedReceiver<()>,
+) -> JoinHandle<()> {
+    tokio::task::spawn_local(async move {
+        loop {
+            // How long until the next owed rotation, if any. Recomputed on every
+            // pass: the flush below may itself mint a key whose window a later
+            // change gets coalesced into.
+            let due_in = {
+                let manager = manager.lock().await;
+                manager
+                    .key_rotation_due_at_ms(&room_id, &slot_id)
+                    .map(|due_at| Duration::from_millis(due_at.saturating_sub(matrix_rtc_now_ms())))
+            };
+
+            match due_in {
+                // Nothing owed: wait for the bridge to tell us a key came into use,
+                // which is the only thing that can make one owed.
+                None => {
+                    if switch_rx.recv().await.is_none() {
+                        return;
+                    }
+                }
+                // Owed: race the deadline against further news from the bridge, so
+                // a key coming into use in the meantime is not ignored.
+                Some(delay) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        received = switch_rx.recv() => {
+                            if received.is_none() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            manager
+                .lock()
+                .await
+                .flush_due_key_rotation(&room_id, &slot_id)
+                .await;
+        }
+    })
+}
+
+/// Wall-clock milliseconds, to compare against the deadlines the core reports.
+///
+/// The core reads the same clock (`EncryptionManager::set_clock` is not installed
+/// here, so it is the system one).
+fn matrix_rtc_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn spawn_key_pump(manager: Manager, mut key_rx: UnboundedReceiver<ReceivedKey>) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
         while let Some(received) = key_rx.recv().await {

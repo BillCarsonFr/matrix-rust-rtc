@@ -82,6 +82,11 @@ pub struct FfiEncryptionConfig {
     pub delay_before_use_ms: Option<u64>,
     /// Grace period (ms) for key rotation (default: 10000ms).
     pub key_rotation_grace_period_ms: Option<u64>,
+    /// Longest a key may be used before it is replaced regardless of membership
+    /// (default: 5400000ms, 1h30). Bounds how much of a long call one recovered
+    /// key can decrypt.
+    #[uniffi(default = None)]
+    pub max_key_lifetime_ms: Option<u64>,
     /// Whether to manage media keys (default: true).
     pub manage_media_keys: Option<bool>,
     /// Whether to discard keys from devices that are not cross-signed
@@ -183,6 +188,7 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
         matrix_rtc_core::EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms.unwrap_or(5000),
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
+            max_key_lifetime_ms: value.max_key_lifetime_ms.unwrap_or(90 * 60 * 1000),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
             require_cross_signed_sender: value.require_cross_signed_sender.unwrap_or(true),
         }

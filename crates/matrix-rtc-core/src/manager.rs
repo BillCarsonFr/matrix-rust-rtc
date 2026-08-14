@@ -198,6 +198,21 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// Safe to call repeatedly: re-assert the full state whenever the host's
     /// sticky map changes. Passing an empty list clears the room.
+    ///
+    /// # One call, at most one key rotation
+    ///
+    /// Everything the state says is applied before the roster is republished, so
+    /// a change of any size costs at most one rotation — three people hanging up
+    /// together mint one key between them, not three. Key rotation has no
+    /// debounce of its own and cannot have one (the core owns no timer), so this
+    /// batching is the only thing standing between a busy call and a key per
+    /// event.
+    ///
+    /// Two consequences for hosts: pass the state **whole**, and do not fan one
+    /// snapshot out into several calls. Splitting it is not merely slower — each
+    /// call is a complete state, so a partial one reads as everybody missing from
+    /// it having left, which rotates the key and re-sends it to every remaining
+    /// member.
     pub async fn set_current_sticky_state(
         &mut self,
         room_id: &str,
@@ -324,6 +339,44 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
         match self.sessions.get(&key) {
             Some(session) => session.replay_encryption_keys().await,
+            None => false,
+        }
+    }
+
+    /// When a coalesced key rotation falls due for one session, if one is owed.
+    ///
+    /// A consumer with a scheduler drives [`Self::flush_due_key_rotation`] from
+    /// this. The deadline is the end of the current key's freshness, which is
+    /// *later* than the end of its `delayBeforeUse` — so a consumer that only
+    /// reacts to a key coming into use will find nothing due yet and has to come
+    /// back at this instant.
+    pub fn key_rotation_due_at_ms(&self, room_id: &str, slot_id: &str) -> Option<u64> {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get(&key)
+            .and_then(|session| session.key_rotation_due_at_ms())
+    }
+
+    /// Performs a key rotation that was coalesced into a fresh key's window, if one
+    /// is owed and the window has closed.
+    ///
+    /// Membership changes arriving while a rotation is still propagating do not
+    /// each mint a key — they are answered by one rotation at the end of the
+    /// window (see `EncryptionManager::flush_due_rotation`). Nothing inside the
+    /// core can perform it: it holds no timer, so the consumer that *does* enforce
+    /// `delayBeforeUse` is the one positioned to call this the moment the window
+    /// ends. `matrix-rtc-livekit`'s `MediaKeyBridge` drives it from the same
+    /// scheduled wake-up that installs the key.
+    ///
+    /// A consumer that does not is not left broken, only late: [`Self::heartbeat`]
+    /// performs any owed rotation too, so it lands within one heartbeat instead.
+    ///
+    /// Cheap and idempotent — a no-op unless a rotation is actually due. Returns
+    /// `false` if the session does not exist or has not joined.
+    pub async fn flush_due_key_rotation(&self, room_id: &str, slot_id: &str) -> bool {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        match self.sessions.get(&key) {
+            Some(session) => session.flush_due_key_rotation().await,
             None => false,
         }
     }

@@ -222,15 +222,42 @@ pub struct EncryptionConfig {
     /// it is used for encryption. Default: 5000ms (5 seconds).
     pub delay_before_use_ms: u64,
 
-    /// Grace period (ms) for key rotation (MSC4143: keyRotationGracePeriod).
-    ///
-    /// If a new participant joins within this period after the current key was
-    /// created, the current key is reused instead of rotating. This prevents
-    /// expensive key rotations when users quickly join in a row.
-    ///
-    /// Must be greater than `delay_before_use_ms` to have an effect.
+    /// How long a key counts as **fresh** (MSC4143: keyRotationGracePeriod).
     /// Default: 10000ms (10 seconds).
+    ///
+    /// While fresh, a key is handed to arriving members rather than replaced —
+    /// which is what keeps a bulk join from costing a rotation per arrival — and a
+    /// departure inside the window is answered by a single rotation at its end
+    /// rather than one each.
+    ///
+    /// The two costs it trades against each other: an arrival can read up to this
+    /// much of the call from before they joined, and a member who leaves stays
+    /// readable for up to this much plus `delay_before_use_ms`. Against that, it is
+    /// what bounds key traffic in a call whose roster keeps moving, to one rotation
+    /// per period.
+    ///
+    /// Values below `delay_before_use_ms` have no effect: a key that has not come
+    /// into use yet is certainly fresh.
     pub key_rotation_grace_period_ms: u64,
+
+    /// Longest a key may be used before it is replaced regardless of membership.
+    /// Default: 5_400_000ms (1h30).
+    ///
+    /// Without a cap, one key protects a whole call: a 25-hour meeting encrypts 25
+    /// hours of media under a single key, and anything that recovers it recovers all
+    /// of them. Expiring keys bounds that to this interval.
+    ///
+    /// What it protects against is a key extracted at a point in time — a memory
+    /// dump, a leaked log, a key pulled off a device that has since been secured —
+    /// against ciphertext a colluding SFU recorded. It does *not* help against a
+    /// device that stays compromised: that device is sent every later key too.
+    ///
+    /// Cheap: a settled call spends one rotation per period, so `n * (n - 1)`
+    /// to-device messages every 1h30.
+    ///
+    /// Must exceed `key_rotation_grace_period_ms` to mean anything; a shorter value
+    /// is raised to it.
+    pub max_key_lifetime_ms: u64,
 
     /// Whether to manage media keys (default: true).
     ///
@@ -255,6 +282,7 @@ impl Default for EncryptionConfig {
         Self {
             delay_before_use_ms: 5000,            // MSC4143 default
             key_rotation_grace_period_ms: 10_000, // MSC4143 default
+            max_key_lifetime_ms: 90 * 60 * 1000,  // 1h30
             manage_media_keys: true,
             require_cross_signed_sender: true,
         }

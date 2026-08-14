@@ -39,7 +39,7 @@ pub use encryption::types::{
     OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,
 };
 pub use encryption::{
-    DiscardedKey, EncryptionKeySignalHandler, EncryptionManager, KEY_MESSAGE_TYPE,
+    DiscardedKey, EncryptionKeySignalHandler, EncryptionManager, KEY_MESSAGE_TYPE, RtcClock,
     RtcIdentityMapper,
 };
 pub use error::{CommandError, JoinError, LeaveError};
