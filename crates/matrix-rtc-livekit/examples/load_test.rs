@@ -78,6 +78,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+// `join_all`, not `tokio::spawn`: `Call::join` drives `!Send` futures, so a
+// batch of joins has to be concurrent *on this task* rather than spread over
+// the runtime's threads.
+use futures_util::future::join_all;
 use matrix_rtc_core::{EncryptionConfig, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, open_slot};
@@ -237,12 +241,50 @@ struct Args {
     #[arg(long)]
     subscribe: bool,
 
-    /// Gap between successive call joins.
-    #[arg(long, default_value_t = 500)]
+    /// How many devices join the call at once.
+    ///
+    /// Joining is mostly waiting — the transport handshake, the SFU token
+    /// exchange, the first key send — so running a batch concurrently costs one
+    /// device's latency for the whole batch instead of the sum. Raise it for a
+    /// faster ramp; lower it to space the joins out and watch them arrive.
+    ///
+    /// The ceiling is local: every join in flight is a libwebrtc connection
+    /// being negotiated on this machine, and they all share the one `LocalSet`
+    /// thread that drives signalling.
+    #[arg(long, default_value_t = 8)]
+    join_concurrency: usize,
+
+    /// Gap between successive join batches.
+    ///
+    /// `0` (the default) runs the batches back to back. Pacing here is not
+    /// needed to protect the homeserver — it is a knob for stretching a ramp out
+    /// when the point of the run is to watch devices arrive one at a time.
+    ///
+    /// Note the interaction with `--key-rotation-grace-ms`: a ramp that finishes
+    /// inside that window settles on one media key, where a slow ramp pays a
+    /// rotation per joiner. Spacing a ramp out is therefore not free.
+    #[arg(long, default_value_t = 0)]
     ramp_ms: u64,
 
-    /// Gap between successive logins, to stay under homeserver rate limits.
-    #[arg(long, default_value_t = 250)]
+    /// How many devices log in at once.
+    ///
+    /// Same reasoning as `--join-concurrency`, over the slower half: a login is
+    /// a round trip, the cross-signing recovery is several more, and the first
+    /// sync is a wait. Serialised, that is seconds per device of idling.
+    ///
+    /// Lower it (with `--login-delay-ms`) for a homeserver whose login limiter
+    /// is tight — synapse's `rc_login` default is three logins then one per six
+    /// seconds, which no amount of concurrency gets past.
+    #[arg(long, default_value_t = 32)]
+    login_concurrency: usize,
+
+    /// Gap between successive login batches, to stay under homeserver rate
+    /// limits.
+    ///
+    /// `0` (the default) assumes a limiter provisioned for this, which is the
+    /// normal case for a deployment being load-tested. [`login_with_retry`]
+    /// remains the safety net whatever this is set to.
+    #[arg(long, default_value_t = 0)]
     login_delay_ms: u64,
 
     /// Seconds to keep publishing; 0 runs until Ctrl-C.
@@ -625,7 +667,18 @@ impl Drop for AbortOnDrop {
 }
 
 struct Fleet {
+    /// The fleet proper, where `devices[i].index == i` always holds. Both the
+    /// join loop and `--store` depend on that: the latter keys each device's
+    /// sqlite store on its index, so a device can never be renumbered.
     devices: Vec<Device>,
+    /// Devices that logged in during a batch where an earlier index failed.
+    ///
+    /// They cannot go in `devices` without leaving a hole at the failed index
+    /// and breaking the invariant above, and they cannot simply be dropped —
+    /// dropping a `Client` does not log its device out, so they would survive
+    /// the run as ghosts only `--purge-devices` could clear. So they are parked
+    /// here for [`Fleet::shutdown`] to log out with the rest.
+    stranded: Vec<Device>,
     run_id: String,
     /// Whether a warm-up message went out since the last settle. The next join
     /// batch then waits [`WARMUP_SETTLE`] first, so the key exchange the
@@ -643,6 +696,7 @@ impl Fleet {
             .as_nanos();
         Self {
             devices: Vec::with_capacity(args.devices),
+            stranded: Vec::new(),
             run_id: format!("{nanos:x}"),
             needs_settle: false,
         }
@@ -730,9 +784,9 @@ impl Fleet {
         Ok(())
     }
 
-    /// Log device `index` in, start its sync, and send its warm-up message —
-    /// unless it is already there. Devices are only ever appended, so `index`
-    /// is either present or the next one.
+    /// Log device `index` in and record it — unless it is already there.
+    /// Devices are only ever appended, so `index` is either present or the next
+    /// one.
     async fn ensure_device(
         &mut self,
         args: &Args,
@@ -744,6 +798,23 @@ impl Fleet {
         }
         assert_eq!(index, self.devices.len(), "devices are appended in order");
 
+        let device = self.build_device(args, room_id, index).await?;
+        self.devices.push(device);
+        self.needs_settle = true;
+        Ok(())
+    }
+
+    /// Log device `index` in, start its sync, and send its warm-up message.
+    ///
+    /// Takes `&self` and returns the device rather than recording it, so a whole
+    /// batch of these can be in flight at once — `&mut self` would serialise
+    /// them, and the wait here is nearly all network.
+    async fn build_device(
+        &self,
+        args: &Args,
+        room_id: &RoomId,
+        index: usize,
+    ) -> Result<Device, Box<dyn Error>> {
         let mut device = self.login(args, index).await?;
         let sync = Arc::new(
             SyncService::builder(device.client.clone())
@@ -777,9 +848,47 @@ impl Fleet {
         )))
         .await?;
         device.room = Some(room);
-        self.devices.push(device);
-        self.needs_settle = true;
-        Ok(())
+        Ok(device)
+    }
+
+    /// Log in every device in `indices` at once, and append them in order.
+    ///
+    /// Partial failure is the interesting case. The successes are kept whatever
+    /// happens — a device that logged in exists server-side and must be logged
+    /// out on shutdown — but only the run up to the first failed index can go in
+    /// `devices` without renumbering the ones behind it. The rest are
+    /// [`Fleet::stranded`], and the first error is returned once they are all
+    /// safely parked.
+    async fn login_batch(
+        &mut self,
+        args: &Args,
+        room_id: &RoomId,
+        indices: std::ops::Range<usize>,
+    ) -> Result<(), Box<dyn Error>> {
+        let first = indices.start;
+        assert_eq!(first, self.devices.len(), "devices are appended in order");
+
+        let results = join_all(indices.map(|index| self.build_device(args, room_id, index))).await;
+
+        let mut contiguous = true;
+        let mut failure = None;
+        for result in results {
+            match result {
+                Ok(device) if contiguous => self.devices.push(device),
+                Ok(device) => self.stranded.push(device),
+                Err(error) => {
+                    contiguous = false;
+                    failure = failure.or(Some(error));
+                }
+            }
+        }
+        if self.devices.len() > first {
+            self.needs_settle = true;
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Devices currently in the call. Joins fill from the bottom and leaves
@@ -795,10 +904,14 @@ impl Fleet {
     ///
     /// Scaling down only leaves the calls; the devices stay logged in and
     /// syncing, so the next scale-up pays neither logins nor their rate
-    /// limits. Scaling up re-checks `targets` between the slow steps and bails
-    /// out early when the target moved again — the caller re-reads it and
-    /// reconciles anew, so a `device_count 0` does not wait behind the rest of
-    /// a fifty-device ramp.
+    /// limits.
+    ///
+    /// Scaling up runs in batches of `--login-concurrency` then
+    /// `--join-concurrency`, and re-checks `targets` between them, bailing out
+    /// early when the target moved again — the caller re-reads it and reconciles
+    /// anew, so a `device_count 0` does not wait behind the rest of a
+    /// fifty-device ramp. The batch is therefore also the granularity at which a
+    /// scale-up can be interrupted: a wide one ramps faster but reacts later.
     async fn reconcile(
         &mut self,
         args: &Args,
@@ -819,9 +932,12 @@ impl Fleet {
         println!("scaling up: {active} -> {target} device(s) in the call");
 
         while self.devices.len() < target {
-            let index = self.devices.len();
-            tokio::time::sleep(Duration::from_millis(args.login_delay_ms)).await;
-            self.ensure_device(args, room_id, index).await?;
+            let first = self.devices.len();
+            let last = target.min(first + args.login_concurrency.max(1));
+            if args.login_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(args.login_delay_ms)).await;
+            }
+            self.login_batch(args, room_id, first..last).await?;
             if targets.has_changed().unwrap_or(false) {
                 println!("device count changed mid scale-up; rebalancing");
                 return Ok(());
@@ -832,11 +948,15 @@ impl Fleet {
             self.needs_settle = false;
         }
 
-        for index in active..target {
-            if index > active {
+        let mut first = active;
+        while first < target {
+            let last = target.min(first + args.join_concurrency.max(1));
+            if first > active && args.ramp_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(args.ramp_ms)).await;
             }
-            self.join_device(args, clip, http, target, index).await?;
+            self.join_batch(args, clip, http, target, first..last)
+                .await?;
+            first = last;
             if targets.has_changed().unwrap_or(false) {
                 println!("device count changed mid scale-up; rebalancing");
                 return Ok(());
@@ -845,66 +965,66 @@ impl Fleet {
         Ok(())
     }
 
-    /// Join device `index` to the call and start publishing.
-    async fn join_device(
+    /// Join every device in `indices` to the call at once.
+    ///
+    /// A partial failure needs none of [`Fleet::login_batch`]'s care: the
+    /// devices already exist and keep their indices, so the successes are simply
+    /// recorded — leaving a hole in the joined set that the returned error is
+    /// about to end the run over anyway.
+    async fn join_batch(
         &mut self,
         args: &Args,
         clip: &Arc<Clip>,
         http: &reqwest::Client,
         total: usize,
-        index: usize,
+        indices: std::ops::Range<usize>,
     ) -> Result<(), Box<dyn Error>> {
-        let room = self.devices[index]
-            .room
-            .clone()
-            .expect("every logged-in device has its room");
-        let call = Call::join(
-            &room,
-            CallOptions {
-                slot_id: args.slot_id.clone(),
-                application: args.application.clone(),
-                livekit_service_url_fallback: Some(args.livekit_url.clone()),
-                http: Some(http.clone()),
-                auto_subscribe: args.subscribe,
-                element_call_compat: args.element_call_compat.into(),
-                sticky_duration_ms: Some(args.sticky_duration_ms),
-                heartbeat_interval: Duration::from_millis(args.heartbeat_interval_ms),
-                keep_alive_timeout_ms: Some(args.keep_alive_timeout_ms),
-                // Everything but the two rotation grace periods stays at the
-                // library's policy — notably the MSC4153 cross-signing
-                // requirement, which these devices satisfy.
-                encryption_config: Some(EncryptionConfig {
-                    leave_rotation_grace_period_ms: args.leave_rotation_grace_ms,
-                    key_rotation_grace_period_ms: args.key_rotation_grace_ms,
-                    ..EncryptionConfig::default()
-                }),
-                ..CallOptions::default()
-            },
-        )
-        .await?;
+        // Everything the joins touch is cloned out first: holding `&self`
+        // across the fan-out would rule out writing the results back.
+        let inputs: Vec<_> = indices
+            .map(|index| {
+                let device = &self.devices[index];
+                (
+                    index,
+                    device
+                        .room
+                        .clone()
+                        .expect("every logged-in device has its room"),
+                    device.captured.clone(),
+                    device.errors.clone(),
+                )
+            })
+            .collect();
 
-        let device = &mut self.devices[index];
-        let video = spawn_video_pump(
-            &call,
-            args,
-            clip.clone(),
-            index,
-            total,
-            device.captured.clone(),
-            device.errors.clone(),
-        )
-        .await?;
-        device.pumps.push(video);
-        if args.audio {
-            let audio = spawn_audio_pump(&call, args, index, device.errors.clone()).await?;
-            device.pumps.push(audio);
+        let results = join_all(inputs.iter().map(|(index, room, captured, errors)| {
+            join_device(
+                args,
+                clip,
+                http,
+                room.clone(),
+                total,
+                *index,
+                captured.clone(),
+                errors.clone(),
+            )
+        }))
+        .await;
+
+        let mut failure = None;
+        for ((index, ..), result) in inputs.iter().zip(results) {
+            match result {
+                Ok((call, pumps)) => {
+                    let device = &mut self.devices[*index];
+                    device.call = Some(call);
+                    device.pumps = pumps;
+                }
+                Err(error) => failure = failure.or(Some(error)),
+            }
         }
-        println!(
-            "[{index}] joined as {} and publishing",
-            call.local_identity()
-        );
-        device.call = Some(call);
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Take device `index` out of the call, keeping it logged in and syncing
@@ -1045,7 +1165,10 @@ impl Fleet {
         let mut captured = 0;
         let mut errors = 0;
 
-        for device in &mut self.devices {
+        // `stranded` alongside the fleet proper: those devices exist on the
+        // homeserver exactly like the rest, and skipping them here is what turns
+        // a failed scale-up into ghosts only `--purge-devices` can clear.
+        for device in self.devices.iter_mut().chain(self.stranded.iter_mut()) {
             device.pumps.clear();
             captured += device.captured.load(Ordering::Relaxed);
             errors += device.errors.load(Ordering::Relaxed);
@@ -1081,9 +1204,74 @@ impl Fleet {
         println!(
             "summary: {left}/{} calls left cleanly, {captured} frames captured, {errors} capture \
              errors, {removed} devices removed",
-            self.devices.len()
+            self.devices.len() + self.stranded.len()
         );
     }
+}
+
+/// Join one device to the call and start publishing.
+///
+/// A free function taking what it needs, rather than a `Fleet` method: reaching
+/// `&mut self.devices[index]` would let only one of these run at a time, and a
+/// join is nearly all waiting — transport handshake, SFU token exchange, the
+/// first key send. The caller records the returned call and pumps against the
+/// device once the whole batch is back.
+#[allow(clippy::too_many_arguments)]
+async fn join_device(
+    args: &Args,
+    clip: &Arc<Clip>,
+    http: &reqwest::Client,
+    room: Room,
+    total: usize,
+    index: usize,
+    captured: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+) -> Result<(Call, Vec<AbortOnDrop>), Box<dyn Error>> {
+    let call = Call::join(
+        &room,
+        CallOptions {
+            slot_id: args.slot_id.clone(),
+            application: args.application.clone(),
+            livekit_service_url_fallback: Some(args.livekit_url.clone()),
+            http: Some(http.clone()),
+            auto_subscribe: args.subscribe,
+            element_call_compat: args.element_call_compat.into(),
+            sticky_duration_ms: Some(args.sticky_duration_ms),
+            heartbeat_interval: Duration::from_millis(args.heartbeat_interval_ms),
+            keep_alive_timeout_ms: Some(args.keep_alive_timeout_ms),
+            // Everything but the two rotation grace periods stays at the
+            // library's policy — notably the MSC4153 cross-signing
+            // requirement, which these devices satisfy.
+            encryption_config: Some(EncryptionConfig {
+                leave_rotation_grace_period_ms: args.leave_rotation_grace_ms,
+                key_rotation_grace_period_ms: args.key_rotation_grace_ms,
+                ..EncryptionConfig::default()
+            }),
+            ..CallOptions::default()
+        },
+    )
+    .await?;
+
+    let mut pumps = vec![
+        spawn_video_pump(
+            &call,
+            args,
+            clip.clone(),
+            index,
+            total,
+            captured,
+            errors.clone(),
+        )
+        .await?,
+    ];
+    if args.audio {
+        pumps.push(spawn_audio_pump(&call, args, index, errors).await?);
+    }
+    println!(
+        "[{index}] joined as {} and publishing",
+        call.local_identity()
+    );
+    Ok((call, pumps))
 }
 
 /// Resolve when `deadline` passes, or never if there is none.
@@ -1234,9 +1422,13 @@ fn device_id_of(client: &Client) -> Result<OwnedDeviceId, Box<dyn Error>> {
 /// `per_second: 0.17, burst_count: 3` — three logins immediately, then one per
 /// roughly six seconds. Without this, the first 429 propagates out of
 /// `login()` and aborts the entire run, discarding the devices that had already
-/// logged in and joined. `--login-delay-ms` is still what paces a healthy run;
-/// this is the safety net for a deployment whose limiter is stricter than the
-/// default, or a `--devices` count that outruns the pacing.
+/// logged in and joined. `--login-concurrency` and `--login-delay-ms` are what
+/// pace a healthy run; this is the safety net for a deployment whose limiter is
+/// stricter than they assume.
+///
+/// Note that a batch of concurrent logins all hit the limiter at once and then
+/// all back off together, so the pacing knobs are the fix for a tight limiter —
+/// this only keeps the run alive while someone reaches for them.
 ///
 /// Only rate limiting is retried. A wrong password or an unreachable
 /// homeserver fails on the first attempt, as it should.
@@ -1268,7 +1460,7 @@ async fn login_with_retry(
         if attempt == LOGIN_ATTEMPTS {
             return Err(format!(
                 "still rate-limited after {LOGIN_ATTEMPTS} login attempts ({error}). \
-                 Raise --login-delay-ms, or lower --devices."
+                 Lower --login-concurrency, raise --login-delay-ms, or lower --devices."
             )
             .into());
         }

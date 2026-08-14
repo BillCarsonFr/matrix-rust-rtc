@@ -86,6 +86,11 @@ pub struct FfiEncryptionConfig {
     /// of leaves into one rotation (default: 0, rotate immediately). Non-zero
     /// values keep a departed member able to decrypt us for that long.
     pub leave_rotation_grace_period_ms: Option<u64>,
+    /// Participant count (ourselves included) at which key rotation stops
+    /// (default: 30). Joiners are still served the current key; the index stops
+    /// moving and departures no longer rotate it, so a member who left keeps a
+    /// live key until the call drops back under the limit.
+    pub key_rotation_participant_limit: Option<u32>,
     /// Whether to manage media keys (default: true).
     pub manage_media_keys: Option<bool>,
     /// Whether to discard keys from devices that are not cross-signed
@@ -188,6 +193,9 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms.unwrap_or(5000),
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             leave_rotation_grace_period_ms: value.leave_rotation_grace_period_ms.unwrap_or(0),
+            key_rotation_participant_limit: value
+                .key_rotation_participant_limit
+                .map_or(30, |limit| limit as usize),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
             require_cross_signed_sender: value.require_cross_signed_sender.unwrap_or(true),
         }

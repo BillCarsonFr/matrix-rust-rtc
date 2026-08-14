@@ -265,6 +265,32 @@ pub struct EncryptionConfig {
     /// [`EncryptionManager::rotation_due`]: crate::encryption::EncryptionManager::rotation_due
     pub leave_rotation_grace_period_ms: u64,
 
+    /// Participant count at which key rotation stops.
+    ///
+    /// Counted over the whole call, ourselves included. At or above this many
+    /// participants we stop minting new keys altogether: the key index stays put
+    /// for the rest of the call, a departure no longer costs a rotation, and no
+    /// grace period applies because there is nothing to defer.
+    ///
+    /// What does *not* stop is distribution. A member arriving over the limit is
+    /// sent the current key in one to-device message and can decrypt from their
+    /// first frame — and since every member already present holds that same key,
+    /// nobody else hears from us at all. That is the point of the limit: a
+    /// rotation is a message to every other member, so it costs O(N) per
+    /// membership change in a call where changes arrive at a rate that also grows
+    /// with N, while serving a joiner costs exactly one message however large the
+    /// call is.
+    ///
+    /// The price is forward secrecy: over the limit, a departed member keeps a key
+    /// that stays live, so it can decrypt our media until the call drops back
+    /// under the limit. It does not lose *confidentiality* against non-members —
+    /// the key is still only ever sent to members. Rotation resumes below the
+    /// limit, and the first rollout after it retires every member who left
+    /// meanwhile in a single rotation.
+    ///
+    /// Default: 30.
+    pub key_rotation_participant_limit: usize,
+
     /// Whether to manage media keys (default: true).
     ///
     /// If false, the encryption manager will not distribute keys or signal
@@ -291,6 +317,10 @@ impl Default for EncryptionConfig {
             // Not in MSC4143: departures rotate at once unless a consumer opts
             // into trading forward secrecy on leave for fewer rotations.
             leave_rotation_grace_period_ms: 0,
+            // Not in MSC4143 either: past this many participants the O(N) cost of
+            // a rotation is what breaks first, so we stop paying it and keep only
+            // the O(1) part — handing an arriving member the current key.
+            key_rotation_participant_limit: 30,
             manage_media_keys: true,
             require_cross_signed_sender: true,
         }

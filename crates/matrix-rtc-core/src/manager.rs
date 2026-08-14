@@ -238,7 +238,11 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             batches.entry(key).or_default();
         }
 
+        // Own target, so a caller that wants the rest of this module at debug can
+        // still silence this one line: it fires per sticky-state sync per room,
+        // which drowns everything else out under a load test.
         log::debug!(
+            target: "matrix_rtc_core::manager::sticky_routing",
             "[{room_id}] current sticky state routed to {} session(s): {}",
             batches.len(),
             describe_batches(&batches),

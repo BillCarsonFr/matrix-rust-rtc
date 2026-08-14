@@ -353,6 +353,12 @@ pub struct WasmEncryptionConfig {
     /// any other value leaves a departed member able to decrypt us for that long.
     #[serde(default)]
     pub leave_rotation_grace_period_ms: u64,
+    /// Participant count (ourselves included) at which key rotation stops:
+    /// joiners are still served the current key, but the index stops moving and
+    /// departures no longer rotate it. Rotation resumes below the limit.
+    /// Defaults to 30.
+    #[serde(default = "default_key_rotation_participant_limit")]
+    pub key_rotation_participant_limit: usize,
     #[serde(default = "default_manage_media_keys")]
     pub manage_media_keys: bool,
     /// Whether to discard keys from devices that are not cross-signed
@@ -367,6 +373,9 @@ fn default_delay_before_use_ms() -> u64 {
 fn default_key_rotation_grace_period_ms() -> u64 {
     10000
 }
+fn default_key_rotation_participant_limit() -> usize {
+    30
+}
 fn default_manage_media_keys() -> bool {
     true
 }
@@ -380,6 +389,7 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms,
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms,
             leave_rotation_grace_period_ms: value.leave_rotation_grace_period_ms,
+            key_rotation_participant_limit: value.key_rotation_participant_limit,
             manage_media_keys: value.manage_media_keys,
             require_cross_signed_sender: value.require_cross_signed_sender,
         }
