@@ -404,7 +404,25 @@ pub struct EncryptionManager<T: RtcCommandSender> {
     /// record every other path reads a departure from. Keeping the debt here is
     /// what stops the leaver's key from staying live for the rest of the call.
     departure_owed_from_suspension: Arc<Mutex<bool>>,
+
+    /// When we last re-served our key to a member that appeared to have
+    /// restarted, by member id, in epoch milliseconds.
+    ///
+    /// A cooldown, not a record: the re-serve is triggered by a peer's own key
+    /// traffic (see [`Self::add_key_to_participant`]), and a peer minting keys in
+    /// a loop would otherwise have us send one message per rekey, to it, forever.
+    /// Bounded by the roster — only members we hold keys from can appear — and
+    /// cleared on `leave`.
+    restart_reserved_at_ms: Arc<Mutex<HashMap<String, u64>>>,
 }
+
+/// How long after re-serving our key to an apparently-restarted member we will
+/// do it again for that member.
+///
+/// Generous on purpose. The signal it throttles is a genuine restart, which for
+/// any one peer is rare; anything faster is a peer misbehaving, and the cost of
+/// answering it late is nothing — their next rollout re-sends to us anyway.
+const RESTART_RESERVE_COOLDOWN_MS: u64 = 30_000;
 
 /// What we last told the app about our own key, and when.
 ///
@@ -463,6 +481,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             signalled_key: Arc::new(Mutex::new(None)),
             deferred_rotation_due_ms: Arc::new(Mutex::new(None)),
             departure_owed_from_suspension: Arc::new(Mutex::new(false)),
+            restart_reserved_at_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -692,6 +711,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // departures from the previous call.
         *self.deferred_rotation_due_ms.lock().unwrap() = None;
         *self.departure_owed_from_suspension.lock().unwrap() = false;
+        self.restart_reserved_at_ms.lock().unwrap().clear();
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -899,6 +919,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 user_id: m.sender.clone(),
                 device_id: m.origin.sender_device_id().unwrap_or_default().to_owned(),
                 member_id: m.member_id.clone(),
+                joined_at: m.joined_at,
             })
             .collect();
 
@@ -939,23 +960,30 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let current_key = current_key.unwrap();
         let already_shared_with = current_key.shared_with.clone();
 
-        // Find participants who left (were previously shared with but are no longer present)
+        // Find participations who left (were previously shared with but are no
+        // longer present).
+        //
+        // The comparison is `is_same_participation`, not `member_id`: a device
+        // that leaves and rejoins keeps its member id in the pre-2026 state
+        // dialect, and matching on the id alone would put the returner on
+        // neither side of this diff — present, apparently already served, and
+        // never handed the key they discarded when they left.
         let left: Vec<&ParticipantDeviceInfo> = already_shared_with
             .iter()
             .filter(|x| {
                 !current_participants
                     .iter()
-                    .any(|o| o.member_id == x.member_id)
+                    .any(|o| o.is_same_participation(x))
             })
             .collect();
 
-        // Find new participants (present now but not previously shared with)
+        // Find new participations (present now but not previously shared with)
         let joined: Vec<&ParticipantDeviceInfo> = current_participants
             .iter()
             .filter(|x| {
                 !already_shared_with
                     .iter()
-                    .any(|o| o.member_id == x.member_id)
+                    .any(|o| o.is_same_participation(x))
             })
             .collect();
 
@@ -983,7 +1011,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let outgoing_key_is_live = current_participants.iter().any(|participant| {
             already_shared_with
                 .iter()
-                .any(|holder| holder.member_id == participant.member_id)
+                .any(|holder| holder.is_same_participation(participant))
         });
 
         let key_age = self.timestamp_ms().saturating_sub(current_key.creation_ts);
@@ -1008,28 +1036,28 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // Over the limit a departure buys no rotation — but it must still be
         // *recorded*, and `shared_with` is the only record of who holds the key.
         // Left alone it would keep naming the leaver for the rest of the call,
-        // and then a member coming back under the same id reads as neither an
-        // arrival nor a departure and is never handed the key they no longer
-        // have. Member ids are fresh per join in MSC4143, but not everywhere: the
-        // pre-2026 Element Call generation derives them from user+device (see
-        // `compat`), and a sticky entry that lapses and is re-sent looks
-        // identical either way.
+        // and a rejoin that arrives in the *same* update as the departure would
+        // then find the key already accounted to them.
         //
         // So drop them as holders here, and remember the rotation they are owed
         // in `departure_owed_from_suspension` — by the time we are under the limit
         // and can afford it, `left` no longer names anyone.
+        //
+        // Dropped by participation and not by member id: where the two differ,
+        // the departed participation and the one that replaced it share an id,
+        // and retaining on the id alone would discard the arrival we are about to
+        // record as served.
         if rotation_suspended && departures_now {
             *self.departure_owed_from_suspension.lock().unwrap() = true;
 
-            let departed: Vec<&str> = left
-                .iter()
-                .map(|participant| participant.member_id.as_str())
-                .collect();
-            if !departed.is_empty() {
+            if !left.is_empty() {
                 let mut guard = self.outbound_key.write().unwrap();
                 if let Some(ref mut key) = *guard {
-                    key.shared_with
-                        .retain(|holder| !departed.contains(&holder.member_id.as_str()));
+                    key.shared_with.retain(|holder| {
+                        !left
+                            .iter()
+                            .any(|departed| departed.is_same_participation(holder))
+                    });
                 }
             }
         }
@@ -1185,12 +1213,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         let unreached: Vec<&str> = to_distribute_to
             .iter()
-            .map(|participant| participant.member_id.as_str())
-            .filter(|member_id| {
+            .filter(|target| {
                 !served
                     .iter()
-                    .any(|participant| participant.member_id == *member_id)
+                    .any(|participant| participant.is_same_participation(target))
             })
+            .map(|target| target.member_id.as_str())
             .collect();
 
         // One line per rollout saying how it went as a whole: per-recipient
@@ -1280,7 +1308,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                         if !key
                             .shared_with
                             .iter()
-                            .any(|x| x.member_id == recipient.member_id)
+                            .any(|x| x.is_same_participation(recipient))
                         {
                             key.shared_with.push(recipient.clone());
                         }
@@ -1350,6 +1378,10 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let mut addressed = Vec::with_capacity(targets.len());
 
         for target in targets {
+            // Matched on the member id alone, deliberately. The sticky map is
+            // keyed by `sticky_key`, which MSC4143 requires to equal `member.id`,
+            // so at most one participation per member id can be live at a time
+            // and there is nothing here for a participation to disambiguate.
             let Some(membership) = memberships.iter().find(|m| m.member_id == target.member_id)
             else {
                 log::warn!(
@@ -1782,6 +1814,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // the older one last silently downgrades us to a key the sender has
         // stopped using.
         let map_key = key.member_id.clone();
+        let mut restarted = false;
         {
             let mut guard = self.inbound_keys.write().unwrap();
             let held = guard.entry(map_key).or_default();
@@ -1808,13 +1841,102 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                         key.key_index,
                     );
                     *existing = key.clone();
+                    // Within one participation a sender never reuses an index:
+                    // `next_key_index` only moves forward, so an index carries one
+                    // key for that participation's whole life. Material replacing
+                    // material at an index we already hold therefore means the
+                    // member *restarted* — a fresh key ring under the same member
+                    // id, which is what a rejoin looks like wherever member ids
+                    // are not minted per join.
+                    //
+                    // The only false positive is an index wrapping after 256
+                    // rotations, which costs one redundant message and cannot
+                    // happen above `key_rotation_participant_limit`.
+                    restarted = true;
                 }
                 None => held.push(key.clone()),
+            }
+
+            if restarted {
+                // Everything else under this member id belongs to the
+                // participation that just ended and can never decrypt anything
+                // again. Retiring it here rather than from the roster is what
+                // makes it safe: the key we were just handed is the one entry we
+                // keep, so there is no window in which a freshly arrived key is
+                // thrown away by a rollout reacting to the same rejoin.
+                held.retain(|existing| existing.key_index == key.key_index);
             }
         }
 
         // Signal to application
+        let member_id = key.member_id.clone();
         self.signal_inbound_key_to_app(key, rtc_backend_id).await;
+
+        if restarted {
+            self.reserve_key_to_restarted_member(&member_id).await;
+        }
+    }
+
+    /// Re-sends our key to a member whose key traffic says they restarted.
+    ///
+    /// The roster diff in `rollout_outbound_key` is the primary way a rejoin is
+    /// noticed, but it can only see one where the membership gives it something
+    /// to see — a fresh `member.id`, or a `joined_at` that moved. A dialect that
+    /// offers neither leaves a leave-and-rejoin byte-identical to no change at
+    /// all, and above `key_rotation_participant_limit` nothing else will ever
+    /// re-send: rotation is suspended, so only arrivals are served, and the
+    /// returner does not read as one.
+    ///
+    /// Their own key is the signal that survives all of that. It is also
+    /// guaranteed to arrive: a rejoining member starts with an empty
+    /// `shared_with`, so its first rollout sends to *everyone*.
+    ///
+    /// Dropping them as a holder is all this does — the rollout it then kicks off
+    /// sees them as newly joined and serves them the standing key, one message,
+    /// no rotation, through exactly the same path an ordinary arrival takes.
+    async fn reserve_key_to_restarted_member(&self, member_id: &str) {
+        if !self.config.manage_media_keys {
+            return;
+        }
+
+        let now = self.timestamp_ms();
+        {
+            let mut cooldown = self.restart_reserved_at_ms.lock().unwrap();
+            if let Some(last) = cooldown.get(member_id)
+                && now.saturating_sub(*last) < RESTART_RESERVE_COOLDOWN_MS
+            {
+                return;
+            }
+            cooldown.insert(member_id.to_owned(), now);
+        }
+
+        {
+            let mut guard = self.outbound_key.write().unwrap();
+            let Some(ref mut key) = *guard else { return };
+            let held = key.shared_with.len();
+            key.shared_with
+                .retain(|holder| holder.member_id != member_id);
+            if key.shared_with.len() == held {
+                // We never served them in the first place, so there is nothing
+                // for this to repair and no reason to spend a rollout on it.
+                return;
+            }
+        }
+
+        log::info!(
+            "[{}/{}] member {} restarted their key ring; re-serving our key to them",
+            self.room_id,
+            self.slot_id,
+            member_id,
+        );
+
+        if let Err(error) = self.ensure_key_distribution().await {
+            log::warn!(
+                "[{}/{}] failed to re-serve our key to member {member_id}: {error:?}",
+                self.room_id,
+                self.slot_id,
+            );
+        }
     }
 
     /// Signals an inbound key to the application layer.
@@ -1879,6 +2001,7 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
             signalled_key: self.signalled_key.clone(),
             deferred_rotation_due_ms: self.deferred_rotation_due_ms.clone(),
             departure_owed_from_suspension: self.departure_owed_from_suspension.clone(),
+            restart_reserved_at_ms: self.restart_reserved_at_ms.clone(),
         }
     }
 }
@@ -1913,6 +2036,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some("device456".to_string())),
             sticky_key: "bob-device456-uuid".to_string(),
             member_id: "bob-device456-uuid".to_string(),
+            joined_at: None,
             application: Some("m.call".to_string()),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
@@ -2363,6 +2487,255 @@ mod tests {
         assert!(
             !manager.rotation_due(),
             "a suspended rotation must not ask the consumer for rollouts it will decline"
+        );
+    }
+
+    /// The same peer, rejoining: same user, device and member id, a new start.
+    fn rejoined(peer: &JoinedMembership, joined_at: u64) -> JoinedMembership {
+        JoinedMembership {
+            joined_at: Some(joined_at),
+            ..peer.clone()
+        }
+    }
+
+    /// The headline case. A device that leaves and rejoins fast enough that the
+    /// two land in a *single* membership update, under a member id that repeats
+    /// across joins.
+    ///
+    /// The sibling test below feeds the leave and the return as two separate
+    /// updates, which is what lets the suspended-departure path drop the leaver
+    /// from `shared_with` and read the return as an arrival. Real syncs make no
+    /// such promise: `set_current_state` replaces the roster from a snapshot, so
+    /// an intermediate state the server never surfaced does not exist for the
+    /// peer. With the two collapsed and the member id unchanged, the returner is
+    /// in both `shared_with` and the roster — nothing is `joined`, nothing is
+    /// `left`, and above the participant limit no rotation ever comes to cover
+    /// it up. `joined_at` is the only thing that says a rejoin happened.
+    #[tokio::test]
+    async fn a_collapsed_rejoin_under_a_stable_member_id_is_served_the_current_key() {
+        let sender = Arc::new(MockCommandSender::new());
+        let dave = peer("@dave:example.org", "DAVEDEV", "@dave:example.org:DAVEDEV");
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            rejoined(&dave, 1_000),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        let index_before = manager
+            .get_outbound_key()
+            .map(|key| key.key_index)
+            .expect("we hold a key");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Dave parts and rejoins between two syncs. Same member id, same device;
+        // only the participation's start moved.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.sender != "@dave:example.org");
+        memberships.lock().unwrap().push(rejoined(&dave, 2_000));
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@dave:example.org".to_string(), "DAVEDEV".to_string())],
+            "the returner must be handed the key, and nobody else disturbed"
+        );
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(index_before),
+            "and serving them must still not cost a rotation"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![index_before as u64],
+            "they must get the key we are actually encrypting with, not a new one"
+        );
+    }
+
+    /// The regression the fix could easily become: a membership re-sent to extend
+    /// its lifetime keeps its `created_ts`, so re-assertions must stay silent.
+    ///
+    /// Every member re-asserts on a timer, and in a call over the participant
+    /// limit those are the only updates left. Reading one as a rejoin would put a
+    /// to-device message on the wire per member per tick — the quadratic traffic
+    /// the limit exists to avoid, reintroduced by its own fix.
+    #[tokio::test]
+    async fn a_re_assertion_of_an_unchanged_participation_puts_nothing_on_the_wire() {
+        let sender = Arc::new(MockCommandSender::new());
+        let dave = peer("@dave:example.org", "DAVEDEV", "@dave:example.org:DAVEDEV");
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            rejoined(&dave, 1_000),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for _ in 0..3 {
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        assert!(
+            to_device_recipients(&sender).is_empty(),
+            "an unchanged roster must not distribute anything, got {:?}",
+            to_device_recipients(&sender),
+        );
+    }
+
+    /// A peer that states no start is *unknown*, never *different*.
+    ///
+    /// This is the spec-current path, where `member.id` is fresh per join and
+    /// nothing needs a tie-breaker. Treating an absent value as a difference
+    /// would make every such peer look like it rejoined on every update.
+    #[tokio::test]
+    async fn a_roster_that_states_no_start_behaves_exactly_as_before() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            to_device_recipients(&sender).len(),
+            4,
+            "the first rollout serves everyone"
+        );
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for _ in 0..3 {
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        assert!(
+            to_device_recipients(&sender).is_empty(),
+            "with no start stated, an unchanged roster is still unchanged, got {:?}",
+            to_device_recipients(&sender),
+        );
+    }
+
+    /// The backstop, for dialects that give the roster diff nothing to see.
+    ///
+    /// A sender never reuses a key index within one participation, so material
+    /// replacing material at an index we already hold means that member restarted
+    /// — and their own key is the one signal that arrives whatever the membership
+    /// says. It is guaranteed, too: a rejoiner starts with an empty `shared_with`
+    /// and so sends its first key to everybody.
+    #[tokio::test]
+    async fn a_member_rekeying_an_index_we_hold_is_served_our_key_again() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        // Bob's first participation, at index 0, and then a rotation to index 1.
+        for (material, index) in [(vec![1u8; 32], 0), (vec![2u8; 32], 1)] {
+            manager
+                .receive_key(bob_key(material, index))
+                .await
+                .expect("bob's key should be accepted");
+        }
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Bob restarts: a fresh key ring, so index 0 again with new material.
+        manager
+            .receive_key(bob_key(vec![3u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@bob:example.org".to_string(), "device456".to_string())],
+            "the restarted member must be re-served our key"
+        );
+
+        let held = manager.get_inbound_keys("bob-device456-uuid");
+        assert_eq!(
+            held.iter().map(|key| key.key_index).collect::<Vec<_>>(),
+            vec![0],
+            "the previous participation's other indices decrypt nothing and must go"
+        );
+        assert_eq!(
+            held[0].key,
+            vec![3u8; 32],
+            "and the key we keep must be the one that just arrived"
+        );
+    }
+
+    /// The re-serve is driven by a peer's own key traffic, so it needs a limit: a
+    /// peer rekeying in a loop must not cost us one message per rekey forever.
+    #[tokio::test]
+    async fn a_repeated_rekey_from_the_same_member_is_only_answered_once() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for material in [vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]] {
+            manager
+                .receive_key(bob_key(material, 0))
+                .await
+                .expect("bob's key should be accepted");
+        }
+
+        assert_eq!(
+            to_device_recipients(&sender).len(),
+            1,
+            "three rekeys inside the cooldown must buy exactly one re-serve, got {:?}",
+            to_device_recipients(&sender),
         );
     }
 

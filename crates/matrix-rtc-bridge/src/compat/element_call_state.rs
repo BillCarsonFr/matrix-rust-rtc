@@ -212,6 +212,35 @@ struct Parsed<'a> {
     /// `origin_server_ts`. Taking the minimum is also what stops a peer with a
     /// fast clock from looking alive longer than it is.
     joined_at: u64,
+    /// `content.created_ts`, or the event's own stamp when none is stated —
+    /// **unclamped**, unlike [`Self::joined_at`], which is `self.
+    /// participation_start.min(origin_server_ts)`.
+    ///
+    /// The core's discriminator between one participation of a member id and the
+    /// next (see `JoinedMembership::joined_at`). In this dialect the member id is
+    /// `{user}:{device}` and therefore the same string for every join a device
+    /// ever makes, so this is the *only* thing that can tell a rejoin from the
+    /// membership it replaced.
+    ///
+    /// That job needs a value pinned for the life of a participation, and the two
+    /// halves each buy one part of it:
+    ///
+    /// - *Unclamped*, because the minimum with `origin_server_ts` is what makes
+    ///   `joined_at` unusable here: a sender whose clock runs ahead has the
+    ///   minimum pick the event stamp even though it pinned its `created_ts`
+    ///   (`a_created_ts_after_the_event_is_clamped_to_the_event`), and the event
+    ///   stamp moves whenever the homeserver treats a re-assertion as a new
+    ///   event. Every re-assertion would then read as a rejoin, and every peer
+    ///   would answer it with a key — per member, per tick, in exactly the large
+    ///   calls `key_rotation_participant_limit` exists to keep quiet. The clamp is
+    ///   right for judging expiry and wrong for judging identity.
+    /// - *Falling back to the event*, because a first join cannot state a
+    ///   `created_ts` — it does not know one yet
+    ///   (`a_first_join_expires_from_origin_server_ts`) — and a participation with
+    ///   no value at all is one the core cannot discriminate at all. The
+    ///   re-assertion that follows states the first event's stamp, so the two
+    ///   agree and the participation still reads as unchanged.
+    participation_start: u64,
     /// `content["m.call.intent"]`, if stated.
     intent: Option<&'a Value>,
     /// `foci_preferred[0]`, verbatim.
@@ -267,6 +296,22 @@ pub fn translate_state_memberships(
                 "member": { "id": member.member_id, "membership": "join" },
                 "application": application,
             });
+
+            // Carried through under its own name rather than folded into the
+            // member object. In this dialect `member.id` is `{user}:{device}` and
+            // therefore identical across every join a device makes, so this is
+            // what tells the core that a membership it already holds has been
+            // replaced by a *new* participation of the same member — without it,
+            // a leave and rejoin is byte-identical to no change at all and the
+            // returner is never re-sent the media key.
+            //
+            // Always stated, even where the event was not: a participation the
+            // core cannot put a start on is one it cannot discriminate, and the
+            // event's own stamp is the best answer available. See
+            // `Parsed::participation_start`.
+            if let Some(object) = content.as_object_mut() {
+                object.insert("created_ts".to_owned(), json!(member.participation_start));
+            }
 
             // The focus object goes through **verbatim**: `RawRtcTransport`
             // flattens what it does not know, so `livekit_alias` rides along
@@ -344,11 +389,17 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
         return None;
     };
 
-    // See `Parsed::joined_at` for why this is a minimum rather than a preference.
-    let joined_at = match object.get("created_ts").and_then(Value::as_u64) {
-        Some(created_ts) => created_ts.min(event.origin_server_ts),
-        None => event.origin_server_ts,
-    };
+    // See `Parsed::participation_start` for why the unclamped value is kept
+    // alongside, and `Parsed::joined_at` for why this one is a minimum rather
+    // than a preference. Taking the minimum *of* the fallback is the same
+    // computation as before: with a stated `created_ts` it is
+    // `min(created_ts, origin_server_ts)`, and without one it is
+    // `min(origin_server_ts, origin_server_ts)`.
+    let participation_start = object
+        .get("created_ts")
+        .and_then(Value::as_u64)
+        .unwrap_or(event.origin_server_ts);
+    let joined_at = participation_start.min(event.origin_server_ts);
     let expires = object
         .get("expires")
         .and_then(Value::as_u64)
@@ -395,6 +446,7 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
         slot_id,
         application_type: application_type.to_owned(),
         joined_at,
+        participation_start,
         intent: object.get("m.call.intent"),
         own_focus: object
             .get("foci_preferred")
@@ -705,6 +757,10 @@ mod tests {
                 "msc4354_sticky_key": "@alice:example.io:V5cP8FErcB",
                 "member": { "id": "@alice:example.io:V5cP8FErcB", "membership": "join" },
                 "application": { "type": "m.call", "m.call.intent": "video" },
+                // Carried through so the core can tell one participation of this
+                // member id from the next — in this dialect the id is
+                // `{user}:{device}` and repeats across every join.
+                "created_ts": 1749000000000u64,
                 "transports": {
                     "published": [{
                         "type": "livekit",
@@ -714,6 +770,44 @@ mod tests {
                     "can_subscribe": ["livekit"]
                 }
             })
+        );
+    }
+
+    /// A first join cannot state a `created_ts`, so it gets the event's own
+    /// stamp. That is the value its own re-assertions will then state, so the
+    /// participation still reads as unchanged across the transition — and a
+    /// member with no start at all would be one the core could not discriminate.
+    #[test]
+    fn a_join_that_states_no_created_ts_falls_back_to_the_event() {
+        let membership = translate_values(
+            &[("a", CREATED, join_with(&[("created_ts", Value::Null)]))],
+            NOW,
+        )
+        .pop()
+        .expect("a live join");
+
+        assert_eq!(membership.content["created_ts"], json!(CREATED));
+    }
+
+    /// The identity half is deliberately *not* clamped, unlike the expiry half.
+    ///
+    /// A sender whose clock runs ahead has `min(created_ts, origin_server_ts)`
+    /// pick the event stamp — which moves whenever the homeserver treats a
+    /// re-assertion as a new event, while the participation has not changed. Every
+    /// re-assertion would then read as a rejoin, and every peer would answer it
+    /// with a media key.
+    #[test]
+    fn a_skewed_created_ts_is_carried_unclamped() {
+        let skewed = join_with(&[("created_ts", json!(NOW + 60_000))]);
+        let membership = translate_values(&[("a", NOW - 1_000, skewed)], NOW)
+            .pop()
+            .expect("a live join");
+
+        assert_eq!(
+            membership.content["created_ts"],
+            json!(NOW + 60_000),
+            "the pinned value is what identifies the participation, however \
+             the clamp judges its lifetime"
         );
     }
 

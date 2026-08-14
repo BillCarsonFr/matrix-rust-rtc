@@ -1285,6 +1285,7 @@ mod tests {
             sticky_key: member_id.to_owned(),
             application_type: Some("m.call".to_owned()),
             member_id: Some(member_id.to_owned()),
+            created_ts: None,
             membership: Some("join".to_owned()),
             leave_reason: None,
             transports_json: None,

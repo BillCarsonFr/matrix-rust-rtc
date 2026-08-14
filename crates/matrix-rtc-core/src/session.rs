@@ -1278,6 +1278,22 @@ pub struct JoinedMembership {
     pub sticky_key: String,
     /// `member.id` — identifies this participation, unique per join.
     pub member_id: String,
+    /// When this participation began, if the sender states it.
+    ///
+    /// The tie-breaker for dialects where `member_id` does *not* change per join.
+    /// MSC4143 mints a fresh `member.id` every time, so there this is `None` and
+    /// nothing needs it. The pre-2026 state dialect derives the member id from
+    /// user+device, where it is the same string for every join that device ever
+    /// makes — so without this, a leave and an immediate rejoin produce a
+    /// byte-identical membership, `refresh` discards the update as unchanged, and
+    /// the returner is never handed the key they threw away on the way out.
+    ///
+    /// Stated by the sender and pinned for the life of one participation, so a
+    /// membership re-sent to extend its lifetime carries the same value; a
+    /// rejoin carries a new one. A sender that states nothing leaves this `None`,
+    /// which means *unknown*, not *different* — see
+    /// `ParticipantDeviceInfo::is_same_participation`.
+    pub joined_at: Option<u64>,
     /// Application type from `content.application.type`.
     pub application: Option<String>,
     /// Transports this member publishes on (`content.transports.published`).

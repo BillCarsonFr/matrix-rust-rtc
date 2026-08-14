@@ -1771,6 +1771,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some("DEVICE".to_owned())),
             sticky_key: member_id.to_owned(),
             member_id: member_id.to_owned(),
+            joined_at: None,
             application: Some("m.call".to_owned()),
             transports: vec![RtcTransport::LiveKit(LiveKitTransport {
                 livekit_service_url: focus.to_owned(),

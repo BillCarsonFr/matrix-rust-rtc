@@ -671,6 +671,14 @@ struct WasmStickyEventContent {
     sticky_key: String,
     application: Option<WasmApplication>,
     member: Option<WasmMember>,
+    /// `content.created_ts`, when the sender states one.
+    ///
+    /// Not an MSC4143 field. Spec-current member ids are fresh per join and
+    /// already distinguish one participation from the next; this is read only for
+    /// dialects whose member ids repeat across joins, where it is the only thing
+    /// that tells a rejoin from the membership it replaced.
+    #[serde(default)]
+    created_ts: Option<u64>,
     #[serde(default)]
     transports: Option<WasmTransports>,
     #[serde(default)]
@@ -755,6 +763,7 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                     extra: std::collections::BTreeMap::new(),
                 },
                 member,
+                created_ts: value.content.created_ts,
                 transports: value
                     .content
                     .transports

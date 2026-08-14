@@ -33,16 +33,40 @@ pub struct ParticipantDeviceInfo {
     /// Device ID of the participant
     pub device_id: String,
     /// The `member.id` from the `m.rtc.member` event (MSC4143)
-    /// This is globally unique per member instance
+    /// This is globally unique per member instance (with sticky events. with state events it is not unique. It will be the same for each join)
     pub member_id: String,
+    /// When this participation began, if the membership stated it.
+    ///
+    /// Carried from `JoinedMembership::joined_at`, and only ever consulted
+    /// through [`Self::is_same_participation`].
+    pub joined_at: Option<u64>,
 }
 
 impl ParticipantDeviceInfo {
-    /// Creates a map key for this participant using the member_id.
+    /// Whether these two describe the *same participation*, rather than merely
+    /// the same member.
     ///
-    /// MSC4143 uses member_id as the primary key for participants.
-    pub fn map_key(&self) -> String {
-        self.member_id.clone()
+    /// The distinction is the whole point. Every roster diff in key distribution
+    /// asks "is this the party I already sent my key to", and `member_id` answers
+    /// that only where MSC4143 mints a fresh one per join. The pre-2026 state
+    /// dialect derives it from user+device (see `compat`), so a device that
+    /// leaves and rejoins keeps its id — and the rejoin then reads as no change
+    /// at all: the returner is in both `shared_with` and the roster, so nothing
+    /// is `joined`, nothing is `left`, and the key they discarded on the way out
+    /// is never re-sent. Above `key_rotation_participant_limit` no rotation
+    /// happens to cover that up, so it is permanent.
+    ///
+    /// An absent `joined_at` means *unknown*, never *different*. Treating it as a
+    /// difference would be far worse than the bug: a sender that states nothing
+    /// would look like it rejoined on every membership update, and every peer
+    /// would re-send to it forever. So an unknown on either side falls back to
+    /// the member id alone, which is exactly today's behaviour.
+    pub fn is_same_participation(&self, other: &Self) -> bool {
+        self.member_id == other.member_id
+            && match (self.joined_at, other.joined_at) {
+                (Some(ours), Some(theirs)) => ours == theirs,
+                _ => true,
+            }
     }
 }
 
@@ -436,15 +460,49 @@ impl OutdatedKeyFilter {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_participant_device_info_map_key() {
-        let info = ParticipantDeviceInfo {
+    fn participant(member_id: &str, joined_at: Option<u64>) -> ParticipantDeviceInfo {
+        ParticipantDeviceInfo {
             user_id: "@alice:example.org".to_string(),
             device_id: "device123".to_string(),
-            member_id: "xyzABCDEF0123".to_string(),
-        };
+            member_id: member_id.to_string(),
+            joined_at,
+        }
+    }
 
-        assert_eq!(info.map_key(), "xyzABCDEF0123");
+    #[test]
+    fn a_participation_is_told_from_another_by_member_id() {
+        assert!(
+            participant("xyzABCDEF0123", None)
+                .is_same_participation(&participant("xyzABCDEF0123", None))
+        );
+        assert!(
+            !participant("xyzABCDEF0123", None).is_same_participation(&participant("other", None))
+        );
+    }
+
+    /// The whole reason the field exists: where the member id repeats across
+    /// joins, this is the only thing that says a rejoin happened.
+    #[test]
+    fn a_repeated_member_id_with_a_new_start_is_a_different_participation() {
+        assert!(
+            !participant("@alice:example.org:device123", Some(1_000))
+                .is_same_participation(&participant("@alice:example.org:device123", Some(2_000)))
+        );
+        assert!(
+            participant("@alice:example.org:device123", Some(1_000))
+                .is_same_participation(&participant("@alice:example.org:device123", Some(1_000))),
+            "a membership re-sent to extend its lifetime keeps its start and must not \
+             read as a rejoin"
+        );
+    }
+
+    /// An unknown start means *unknown*, never *different* — a sender that states
+    /// none would otherwise look like it rejoined on every single update, and
+    /// every peer would re-send its key forever.
+    #[test]
+    fn an_unstated_start_never_makes_two_participations_differ() {
+        assert!(participant("bob-a", None).is_same_participation(&participant("bob-a", Some(1))));
+        assert!(participant("bob-a", Some(1)).is_same_participation(&participant("bob-a", None)));
     }
 
     #[test]
