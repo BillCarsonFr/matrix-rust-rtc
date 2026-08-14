@@ -107,6 +107,19 @@ pub type KeyImportListener = Box<dyn Fn(&ParticipantKey) + Send + Sync>;
 /// Notified when the core refuses a key, so the reason can reach the host.
 pub type KeyDiscardListener = Box<dyn Fn(DiscardedKey) + Send + Sync>;
 
+/// Notified when a key's MSC4143 `delayBeforeUse` has elapsed and it has been
+/// installed — the moment our own rotation actually takes over.
+///
+/// Exists so the core can be told the window is over. Membership changes that
+/// arrive during a rotation's window are coalesced into one rotation at the end
+/// of it, and the core owns no timer to reach that instant with; this bridge
+/// already schedules exactly it. Wire this to
+/// `RtcSessionManager::flush_due_key_rotation`.
+///
+/// Runs on the scheduled task, so it must not block. Sending on a channel is the
+/// intended shape — the core is often `!Send` and cannot be touched from here.
+pub type SwitchCompleteListener = Box<dyn Fn() + Send + Sync>;
+
 /// Switches our own outgoing frames to a new key index.
 ///
 /// Installing a key only fills the provider's *ring*; the sender keeps stamping
@@ -134,6 +147,8 @@ pub struct MediaKeyBridge {
     provider: Option<KeyProvider>,
     listener: Arc<Mutex<Option<KeyImportListener>>>,
     discard_listener: Arc<Mutex<Option<KeyDiscardListener>>>,
+    /// Told when a delayed key has come into use (see [`SwitchCompleteListener`]).
+    switch_listener: Arc<Mutex<Option<SwitchCompleteListener>>>,
     /// Our own MSC4195 identity and how to re-index our sender; `None` until the
     /// room is connected. See [`LocalKeyIndexHook`].
     local_sender: Arc<Mutex<Option<(String, LocalKeyIndexHook)>>>,
@@ -175,6 +190,19 @@ impl MediaKeyBridge {
             .discard_listener
             .lock()
             .expect("key bridge discard listener mutex poisoned") = Some(listener);
+    }
+
+    /// Register a callback for the end of a key's `delayBeforeUse` window (see
+    /// [`SwitchCompleteListener`]). Replaces any previous listener.
+    ///
+    /// Without it the bridge still honours the delay; what is lost is the core's
+    /// chance to perform a rotation it coalesced into the window at the instant the
+    /// window ends, leaving that to the session heartbeat.
+    pub fn set_switch_complete_listener(&self, listener: SwitchCompleteListener) {
+        *self
+            .switch_listener
+            .lock()
+            .expect("key bridge switch listener mutex poisoned") = Some(listener);
     }
 
     /// Tell the bridge which identity is ours and how to switch our sender to a
@@ -346,9 +374,26 @@ impl EncryptionKeySignalHandler for MediaKeyBridge {
         let keys = Arc::clone(&self.keys);
         let listener = Arc::clone(&self.listener);
         let local_sender = Arc::clone(&self.local_sender);
+        let switch_listener = Arc::clone(&self.switch_listener);
         handle.spawn(async move {
             tokio::time::sleep(Duration::from_millis(use_after_ms)).await;
             Self::apply(provider.as_ref(), &keys, &listener, &local_sender, key);
+
+            // The window the core asked us to wait out has just closed, and this
+            // task is the only thing that knew when that would be. A rotation may
+            // have been coalesced into it — every membership change since the
+            // signal was folded into one rotation owed at exactly this instant —
+            // so tell whoever can perform it.
+            //
+            // Only reached for a delayed key, which is only ever our own outbound
+            // one: inbound keys are signalled usable immediately.
+            if let Some(notify) = switch_listener
+                .lock()
+                .expect("key bridge switch listener mutex poisoned")
+                .as_ref()
+            {
+                notify();
+            }
         });
     }
 
@@ -519,6 +564,69 @@ mod tests {
             Some(4),
             "the key should have been applied once the delay elapsed"
         );
+    }
+
+    /// The end of a delay has to be reported, and only once it has arrived.
+    ///
+    /// This is the core's only way to reach that instant — it holds no timer — and
+    /// it is when a rotation coalesced into the window falls due. Reporting early
+    /// would have the core rotate while the previous one is still propagating,
+    /// which is the burst behaviour the coalescing exists to avoid; not reporting
+    /// at all leaves the owed rotation to the session heartbeat.
+    #[tokio::test]
+    async fn the_end_of_a_delay_is_reported_once_it_elapses() {
+        let bridge = MediaKeyBridge::new();
+        let switches = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&switches);
+        bridge.set_switch_complete_listener(Box::new(move || {
+            *counter.lock().unwrap() += 1;
+        }));
+
+        bridge
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![7u8; 32],
+                key_index: 4,
+                rtc_backend_identity: "p".to_owned(),
+                use_after_ms: 60,
+            })
+            .await;
+        assert_eq!(
+            *switches.lock().unwrap(),
+            0,
+            "the window is still open, so nothing has switched yet"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            *switches.lock().unwrap(),
+            1,
+            "the delay elapsed and the key was installed, so the window is over"
+        );
+    }
+
+    /// A key usable at once opens no window, so there is nothing to report the end
+    /// of — and a spurious report would have the core collect a rotation that is
+    /// not owed.
+    #[tokio::test]
+    async fn an_undelayed_key_reports_no_switch() {
+        let bridge = MediaKeyBridge::new();
+        let switches = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&switches);
+        bridge.set_switch_complete_listener(Box::new(move || {
+            *counter.lock().unwrap() += 1;
+        }));
+
+        bridge
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![7u8; 32],
+                key_index: 4,
+                rtc_backend_identity: "p".to_owned(),
+                use_after_ms: 0,
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*switches.lock().unwrap(), 0);
     }
 
     /// Rotations keep index order: the delay is a constant, so deadlines are

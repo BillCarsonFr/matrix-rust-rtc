@@ -32,23 +32,78 @@
 //!
 //! # Key Distribution Strategy (MSC4143)
 //!
-//! To handle rapid join/leave scenarios efficiently:
+//! A rotation is not free: every member present has to be sent the new key, so
+//! the traffic of one is proportional to the size of the call, and a policy that
+//! rotates per event is quadratic in a busy one. What the rules below are for is
+//! keeping the count down without letting anybody read what they should not.
 //!
-//! - When a participant **leaves** OR **membership changes**: Always rotate the key
-//!   (all remaining participants get the new key)
-//! - When **new joiners** arrive and the current key is young (< `key_rotation_grace_period_ms`):
-//!   Reuse the current key, send only to the new participant(s)
-//! - When **new joiners** arrive and the current key is old:
-//!   Rotate the key (all participants get the new key)
+//! Every key is minted with an **expiry**, and rotating is nothing more than that
+//! expiry arriving. Membership changes do not decide to rotate; they bring the
+//! expiry forward:
 //!
-//! This prevents expensive key rotations when users quickly join in a row.
+//! | event | effect on the expiry |
+//! |---|---|
+//! | minted | `creation + max_key_lifetime_ms` |
+//! | a member holding it leaves, or their participation changes | `min(expiry, creation + grace)` |
+//! | a member arrives and the key is no longer fresh | `now` |
+//! | a member arrives and the key is still fresh | none — just send them the key |
+//!
+//! The departure rule needs no test for whether the key is fresh, which is what
+//! makes this one instant rather than several rules: `min(expiry, creation + grace)`
+//! lands in the future while the key is fresh (deferring, and coalescing every later
+//! change into the same instant) and in the past once it has settled (rotating now).
+//! It is idempotent, so a second leaver recomputes the same deadline.
+//!
+//! The asymmetry between the last two rows is the point. A joiner handed the current
+//! key gains the past it has already encrypted, bounded by how old the key is — so
+//! while it is young, sharing it is cheap, and a bulk join costs one rotation rather
+//! than one per arrival. A leaver keeps the *future* of everything their key goes on
+//! encrypting, which grows without end — so their key must always be retired; only
+//! *when* is negotiable. An arrival therefore never leaves a rotation owed.
+//!
+//! Deferring to the end of freshness makes a burst cost two rotations however large
+//! it is: the one that minted the key, and the one that expires it. Anchoring that
+//! deadline to the key's own age rather than to the last change is what bounds it —
+//! a call with a leaver every few seconds would otherwise push it back for ever. It
+//! also caps a churning call at one rotation per grace period.
+//!
+//! The lifetime cap is what a quiet call relies on: without it one key would encrypt
+//! a whole meeting, and anything that later recovered it would recover all of them.
+//!
+//! [`EncryptionManager::flush_due_rotation`] performs a deferred rotation and a
+//! consumer has to drive it, because the core owns no timer.
+//!
+//! Membership changes that arrive *together* are cheaper still: a rollout sees a
+//! whole roster, so any number of simultaneous changes cost one rotation between
+//! them. Hosts should feed complete state rather than event by event — see
+//! `RtcSessionManager::set_current_sticky_state`.
+//!
+//! `KEY_ROTATION.md` at the repository root states the whole trade, with the costs
+//! measured.
 //!
 //! # Key Usage Delay (MSC4143: delayBeforeUse)
 //!
-//! When a new key is distributed, it is NOT immediately used for encryption:
-//! peers need `delay_before_use_ms` to receive it first. The first key is an
-//! exception — it is signaled immediately on the first `on_memberships_update()`
-//! call to ensure the transport is listening.
+//! A newly distributed key is not necessarily used for encryption at once: the
+//! members who hold the outgoing one need `delay_before_use_ms` to install its
+//! replacement, and until they have, whatever we stamp with the new key is
+//! undecryptable to them.
+//!
+//! Every rotation therefore waits, including one caused by a departure — which
+//! does leave the member who left able to decrypt for up to
+//! `delay_before_use_ms` after they are gone. That is a deliberate trade, not an
+//! oversight: switching the moment somebody hangs up freezes video for everyone
+//! still in the call while the replacement key travels, and a few seconds
+//! readable to someone who has already left costs less than a call that stutters
+//! whenever the roster moves.
+//!
+//! Whoever *arrives* at a rotation is handed the outgoing key as well as its
+//! replacement. Without it the wait would blind them completely — they hold
+//! nothing else — turning every join into an established call into a
+//! `delay_before_use_ms` media blackout.
+//!
+//! Two cases carry no delay at all: the first key, signalled on the first
+//! `on_memberships_update()` so the transport is listening, and a rotation whose
+//! outgoing key no member present holds.
 //!
 //! This module does not *wait*, it only says how long to wait: the delay travels
 //! to the consumer as [`KeyMaterialSignal::use_after_ms`], and the media layer
@@ -124,12 +179,12 @@
 //!     get_memberships,
 //! );
 //!
-//! // Configure (optional)
+//! // Configure (optional). Spread the defaults rather than listing every field,
+//! // so a new policy knob does not break every caller that only cares about one.
 //! manager.set_config(EncryptionConfig {
 //!     delay_before_use_ms: 5000,
 //!     key_rotation_grace_period_ms: 10000,
-//!     manage_media_keys: true,
-//!     require_cross_signed_sender: true,
+//!     ..EncryptionConfig::default()
 //! });
 //!
 //! // Join the session (creates first key)
@@ -170,6 +225,22 @@ use types::*;
 
 /// Closure type for getting current memberships, wrapped for thread-safety.
 type GetMembershipsFn = Arc<Mutex<Box<dyn Fn() -> Vec<JoinedMembership> + Send>>>;
+
+/// The default clock: wall-clock milliseconds since the Unix epoch.
+fn system_clock() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Source of "now", in epoch milliseconds.
+///
+/// Every timing decision the manager makes — the key-rotation grace period, the
+/// `delayBeforeUse` still owed on a replay — is a comparison against this, so
+/// swapping it is what lets those decisions be exercised without waiting in real
+/// time. See [`EncryptionManager::set_clock`].
+pub type RtcClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 use crate::commands::{RtcCommandSender, ToDeviceRecipient};
 use crate::error::CommandError;
@@ -331,6 +402,24 @@ pub struct EncryptionManager<T: RtcCommandSender> {
     /// Keys that arrived before their membership was known (waiting for RTC membership)
     keys_without_membership: Arc<Mutex<Vec<PendingInboundKey>>>,
 
+    /// Where "now" comes from (see [`RtcClock`]).
+    clock: RtcClock,
+
+    /// The key we are still encrypting with while the current one waits out its
+    /// `delayBeforeUse`, and the instant that wait ends.
+    ///
+    /// `Some` exactly while a switch is in flight, which is the window
+    /// [`Self::rollout_outbound_key`] coalesces rotations into.
+    superseded_key: Arc<RwLock<Option<SupersededKey>>>,
+
+    /// When a rotation deferred into the current switch window falls due.
+    ///
+    /// Set when a membership change that warrants a new key arrives while one is
+    /// already propagating; cleared by the rotation that answers it. See
+    /// [`Self::flush_due_rotation`], which is what makes it happen in a call
+    /// where nothing else moves.
+    rotation_due_at: Arc<Mutex<Option<u64>>>,
+
     /// Our outbound key as last signalled to the app, so the same rotation is
     /// not installed twice and a replay can honour the remaining
     /// `delayBeforeUse`.
@@ -340,6 +429,20 @@ pub struct EncryptionManager<T: RtcCommandSender> {
     /// distribute to — so in a solo call every membership update re-signalled the
     /// same index, and each one reached the transport as a fresh key import.
     signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+}
+
+/// A key that has been replaced but is still what we encrypt with, because its
+/// replacement is inside its `delayBeforeUse`.
+///
+/// Kept so that a member arriving mid-switch can be handed the key that is
+/// actually on the wire. Without it they would hold only the pending one and
+/// decrypt nothing until the window closed.
+#[derive(Clone, Debug)]
+struct SupersededKey {
+    key: Vec<u8>,
+    key_index: u8,
+    /// When its replacement takes over.
+    in_use_until_ms: u64,
 }
 
 /// What we last told the app about our own key, and when.
@@ -396,8 +499,22 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             next_key_index: Arc::new(Mutex::new(0)),
             key_buffer: Arc::new(Mutex::new(OutdatedKeyFilter::default())),
             keys_without_membership: Arc::new(Mutex::new(Vec::new())),
+            clock: Arc::new(system_clock),
+            superseded_key: Arc::new(RwLock::new(None)),
+            rotation_due_at: Arc::new(Mutex::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Replaces the source of "now" (see [`RtcClock`]).
+    ///
+    /// The manager's timing rules are pure comparisons against this value, and
+    /// the intervals they compare against are seconds long: a test that had to
+    /// pass real time to cross a grace period would be slow and would race the
+    /// boundary it is checking. Tests therefore drive a clock they advance
+    /// themselves.
+    pub fn set_clock(&mut self, clock: RtcClock) {
+        self.clock = clock;
     }
 
     /// Sets the configuration.
@@ -524,10 +641,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
     /// Gets the current timestamp in milliseconds.
     fn timestamp_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        (self.clock)()
     }
 
     /// Generates a new secure random 32-byte key.
@@ -620,6 +734,8 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         *self.inbound_keys.write().unwrap() = HashMap::new();
         *self.next_key_index.lock().unwrap() = 0;
         *self.signalled_key.lock().unwrap() = None;
+        *self.superseded_key.write().unwrap() = None;
+        *self.rotation_due_at.lock().unwrap() = None;
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -876,59 +992,174 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 .any(|holder| holder.member_id == participant.member_id)
         });
 
-        let to_distribute_to: Vec<ParticipantDeviceInfo>;
-        let mut use_new_key = false;
-        let outbound_key_to_use: OutboundEncryptionKey;
+        // Kept past the branch below, which may consume `current_key`.
+        let joined_participants: Vec<ParticipantDeviceInfo> =
+            joined.iter().copied().cloned().collect();
+
+        let now = self.timestamp_ms();
+        let key_age = now.saturating_sub(current_key.creation_ts);
+
+        // How long a key counts as *fresh*: young enough that handing it to a
+        // newcomer leaks only a little of the past, and young enough that replacing
+        // it would throw away most of its life.
+        //
+        // `delay_before_use_ms` is a floor because a key that has not even come
+        // into use yet is certainly fresh — a grace period shorter than the
+        // propagation delay would have us abandon keys that were distributed to
+        // every member and never encrypted a frame.
+        let freshness_ms = self
+            .config
+            .key_rotation_grace_period_ms
+            .max(self.config.delay_before_use_ms);
+        let key_is_fresh = key_age < freshness_ms;
+
+        // When this key must be gone. Every rotation decision is an adjustment to
+        // this one instant, and the rotation itself is just "it has arrived" — so
+        // there is no separate notion of a key being dirty, only of expiring sooner.
+        //
+        // It starts at the lifetime cap, set when the key was minted, and is only
+        // ever brought forward.
+        let lifetime_ms = self.config.max_key_lifetime_ms.max(freshness_ms);
+        let mut expires_at = current_key.creation_ts.saturating_add(lifetime_ms);
+        let mut reason = (now >= expires_at).then(|| {
+            format!(
+                "the key has reached its maximum lifetime ({}ms)",
+                self.config.max_key_lifetime_ms,
+            )
+        });
 
         if !left.is_empty() || any_membership_changed {
-            // Someone left or membership changed, we need to rotate the key
-            log::info!(
-                "[{}/{}] Key rotation needed: {} left, membership changed: {}",
+            // A member who holds this key is gone, so it has to be replaced — but
+            // not necessarily this instant. Pulling the expiry back to the end of
+            // freshness does both cases at once: while the key is fresh that is in
+            // the future, which defers and coalesces every other change until then;
+            // once it has settled that is in the past, which rotates now.
+            //
+            // Anchoring to the key's own age rather than to the departure is what
+            // bounds the wait — a call with a leaver every few seconds would
+            // otherwise push the deadline back for ever and never rotate at all —
+            // and it makes a burst cost two rotations however large it is: the one
+            // that minted this key, and the one that expires it.
+            //
+            // The members who left are not forgotten by deferring: they stay in
+            // `shared_with` (only served recipients are ever added to it), so every
+            // later rollout still sees them in `left` and keeps the expiry pulled
+            // in. Nothing has to remember *why* a rotation is owed, only when.
+            expires_at = expires_at.min(current_key.creation_ts.saturating_add(freshness_ms));
+            reason = reason.or_else(|| {
+                Some(if left.is_empty() {
+                    "a member's participation changed".to_owned()
+                } else {
+                    format!("{} member(s) who held the key have left", left.len())
+                })
+            });
+        } else if !joined.is_empty() && !key_is_fresh {
+            // An arrival is a reason to rotate only once the key has settled:
+            // re-sharing it would hand over more of the call than the freshness
+            // window allows. While it is fresh a newcomer is simply sent it, which
+            // is what keeps a bulk join to one rotation — and, unlike a departure,
+            // leaves nothing owed afterwards.
+            expires_at = now;
+            reason = reason.or_else(|| {
+                Some(format!(
+                    "a member arrived and the key is {key_age}ms old (fresh for {freshness_ms}ms)"
+                ))
+            });
+        }
+
+        let rotating = now >= expires_at;
+        match (&reason, rotating) {
+            (Some(reason), true) => {
+                log::info!("[{}/{}] rotating: {reason}", self.room_id, self.slot_id)
+            }
+            (Some(reason), false) => log::info!(
+                "[{}/{}] rotation deferred to +{}ms ({reason}): key index {} is still fresh \
+                 ({key_age}ms of {freshness_ms}ms)",
                 self.room_id,
                 self.slot_id,
-                left.len(),
-                any_membership_changed
-            );
-            use_new_key = true;
-            to_distribute_to = current_participants.clone();
-            outbound_key_to_use = self.create_new_outbound_key();
-        } else if !joined.is_empty() {
-            // New joiners
-            let now = self.timestamp_ms();
-            let key_age = now.saturating_sub(current_key.creation_ts);
+                expires_at.saturating_sub(now),
+                current_key.key_index,
+            ),
+            (None, _) => {}
+        }
 
-            if key_age < self.config.key_rotation_grace_period_ms {
-                // Current key is still fresh, just distribute to new joiners
-                log::debug!(
-                    "[{}/{}] New joiners detected, but key is recent enough (age:{}ms < {}ms), keeping it",
-                    self.room_id,
-                    self.slot_id,
-                    key_age,
-                    self.config.key_rotation_grace_period_ms
-                );
-                to_distribute_to = joined.into_iter().cloned().collect();
-                outbound_key_to_use = current_key;
-            } else {
-                // Key is too old, rotate it
-                log::debug!(
-                    "[{}/{}] New joiners detected, but key is old (age:{}ms >= {}ms), rotating",
-                    self.room_id,
-                    self.slot_id,
-                    key_age,
-                    self.config.key_rotation_grace_period_ms
-                );
-                use_new_key = true;
-                to_distribute_to = current_participants.clone();
-                outbound_key_to_use = self.create_new_outbound_key();
-            }
+        // What a consumer's timer should fire on, describing the key this rollout
+        // leaves in place — a fresh one expires on its own lifetime, not on the
+        // deadline that just retired its predecessor.
+        //
+        // Always set, because every key expires: a scheduler always has a next
+        // wake-up, and an owed rotation is simply one whose instant has not come yet.
+        *self.rotation_due_at.lock().unwrap() = Some(if rotating {
+            now.saturating_add(lifetime_ms)
         } else {
-            // No changes, nothing to do
+            expires_at
+        });
+
+        if !rotating && joined_participants.is_empty() {
+            // Nothing to rotate to and nobody waiting for what we already have.
             log::debug!(
-                "[{}/{}] No membership changes, no distribution needed",
+                "[{}/{}] no distribution needed{}",
                 self.room_id,
-                self.slot_id
+                self.slot_id,
+                if reason.is_some() {
+                    ", rotation deferred"
+                } else {
+                    ""
+                },
             );
             return Ok(());
+        }
+
+        // How long we go on encrypting with the key we already have (MSC4143
+        // `delayBeforeUse`), so that members who hold it keep decrypting while its
+        // replacement propagates.
+        //
+        // Skipped when the key we are leaving behind is not live for anyone present
+        // (see `outgoing_key_is_live`): there is no continuity to protect, and
+        // waiting would only extend how long the arriving member has nothing it can
+        // decrypt.
+        //
+        // A departure gets the same delay as an arrival, which does mean a member
+        // who has left can go on decrypting for up to `delay_before_use_ms` after
+        // they left. That is deliberate, and not a bug to be fixed: switching the
+        // instant they go freezes video for everyone remaining while the
+        // replacement key travels, and a few seconds readable to someone who just
+        // hung up is a far better trade than a call that stutters every time
+        // somebody leaves.
+        let use_after_ms = match (rotating, outgoing_key_is_live) {
+            (true, true) => self.config.delay_before_use_ms,
+            _ => 0,
+        };
+
+        // What will be on the wire once this rollout settles, when that is not what
+        // the rollout is about to hand out — during a switch window, the key we are
+        // still encrypting with rather than the one in `outbound_key`. `None` when
+        // the two coincide and an arrival needs nothing extra.
+        let key_still_in_use = match (rotating, use_after_ms) {
+            // Switching at once: what we distribute is what we will use.
+            (true, 0) => None,
+            _ => self.key_in_use(now),
+        };
+
+        let to_distribute_to: Vec<ParticipantDeviceInfo>;
+        let use_new_key = rotating;
+        let outbound_key_to_use: OutboundEncryptionKey;
+
+        if rotating {
+            to_distribute_to = current_participants.clone();
+            outbound_key_to_use = self.create_new_outbound_key();
+        } else {
+            // Either the key is inside its grace period, or a rotation is owed and
+            // waiting: serve whoever does not hold what we have.
+            log::debug!(
+                "[{}/{}] keeping key index {} (age {key_age}ms) for {} arrival(s)",
+                self.room_id,
+                self.slot_id,
+                current_key.key_index,
+                joined_participants.len(),
+            );
+            to_distribute_to = joined_participants.clone();
+            outbound_key_to_use = current_key;
         }
 
         // Send the key to every recipient in one call, and record only the
@@ -979,6 +1210,55 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             );
         }
 
+        // Whoever has just arrived holds only what this rollout sent them, and what
+        // we encrypt with is not necessarily that: a rotation waits out its
+        // `delayBeforeUse` first, and during that wait the key on the wire is the
+        // one it replaced. Unless the arrival is given *that* key too, they decrypt
+        // nothing until the window closes — a media blackout of
+        // `delay_before_use_ms` on every join into an established call, landing on
+        // the member least able to explain it.
+        //
+        // Handing it over widens what an arrival can read by the length of the
+        // window. The grace period already makes the same concession and for
+        // longer, by giving an arrival a key the call has been using for up to
+        // `key_rotation_grace_period_ms`.
+        //
+        // Restricted to the arrivals this rollout actually reached: a member the
+        // send could not be delivered to holds neither key, and a second
+        // undeliverable message buys them nothing. It also keeps a member we can
+        // never reach — who stays in `joined` for good, never being recorded as
+        // holding anything — from adding a send to every rollout for the rest of
+        // the call.
+        if let Some((in_use_index, in_use_key)) = &key_still_in_use
+            && *in_use_index != outbound_key_to_use.key_index
+        {
+            let arrivals_served: Vec<ParticipantDeviceInfo> = joined_participants
+                .iter()
+                .filter(|arrival| {
+                    served
+                        .iter()
+                        .any(|recipient| recipient.member_id == arrival.member_id)
+                })
+                .cloned()
+                .collect();
+            if !arrivals_served.is_empty() {
+                log::debug!(
+                    "[{}/{}] also handing key index {in_use_index} to {} arrival(s): it is what \
+                     we are encrypting with until index {} takes over",
+                    self.room_id,
+                    self.slot_id,
+                    arrivals_served.len(),
+                    outbound_key_to_use.key_index,
+                );
+                self.send_key_to_participants(
+                    &general_purpose::STANDARD.encode(in_use_key),
+                    *in_use_index,
+                    &arrivals_served,
+                )
+                .await;
+            }
+        }
+
         // Update or store the outbound key
         if use_new_key {
             {
@@ -989,25 +1269,15 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             }
 
             // Signal the new key immediately, telling the consumer how long to
-            // wait before encrypting with it (delayBeforeUse). The wait used to
-            // happen here, as a `tokio::time::sleep` — but this runs on the
-            // caller's task, which for the FFI is a *synchronous* host call, so
-            // it blocked a host thread for the whole delay (and panicked
-            // outright when that thread had no runtime installed). Timing
-            // belongs where a scheduler already exists: the media layer.
+            // wait before encrypting with it (`use_after_ms`, decided above). The
+            // wait used to happen here, as a `tokio::time::sleep` — but this runs
+            // on the caller's task, which for the FFI is a *synchronous* host call,
+            // so it blocked a host thread for the whole delay (and panicked
+            // outright when that thread had no runtime installed). Timing belongs
+            // where a scheduler already exists: the media layer.
             //
-            // The delay is skipped when the key we are leaving behind is not live
-            // for anyone present (see `outgoing_key_is_live`): there is no
-            // continuity to protect, and waiting would only extend how long the
-            // arriving member has nothing it can decrypt.
-            //
-            // The first key carries no delay either — it is signalled on the first
+            // The first key carries no delay — it is signalled on the first
             // `on_memberships_update()` so the transport is listening.
-            let use_after_ms = if outgoing_key_is_live {
-                self.config.delay_before_use_ms
-            } else {
-                0
-            };
             log::debug!(
                 "[{}/{}] Signalling key index {}, usable in {}ms ({})",
                 self.room_id,
@@ -1020,6 +1290,18 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                     "nobody present holds the key we are replacing"
                 },
             );
+            // Remember what stays on the wire for the length of the delay, and
+            // until when. This is the window later rollouts coalesce into, and the
+            // key a member arriving inside it has to be handed.
+            *self.superseded_key.write().unwrap() = match (use_after_ms, key_still_in_use) {
+                (0, _) | (_, None) => None,
+                (delay, Some((in_use_index, in_use_key))) => Some(SupersededKey {
+                    key: in_use_key,
+                    key_index: in_use_index,
+                    in_use_until_ms: now.saturating_add(delay),
+                }),
+            };
+
             self.signal_key_to_app(&outbound_key_to_use, use_after_ms)
                 .await;
         } else {
@@ -1054,6 +1336,64 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         );
 
         Ok(())
+    }
+
+    /// The key we are encrypting with at `now`, and its index.
+    ///
+    /// Not always the one in `outbound_key`: a rotation is stored there as soon as
+    /// it is made, but MSC4143 has us go on using its predecessor until
+    /// `delayBeforeUse` has elapsed.
+    fn key_in_use(&self, now: u64) -> Option<(u8, Vec<u8>)> {
+        if let Some(superseded) = self.superseded_key.read().unwrap().as_ref()
+            && now < superseded.in_use_until_ms
+        {
+            return Some((superseded.key_index, superseded.key.clone()));
+        }
+        self.outbound_key
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|key| (key.key_index, key.key.clone()))
+    }
+
+    /// When a rotation deferred into the current switch window falls due, if one
+    /// is owed.
+    ///
+    /// A consumer with a scheduler can use this to drive
+    /// [`Self::flush_due_rotation`] at the instant it comes up. One that only
+    /// ticks periodically can ignore it and call the flush on its own cadence —
+    /// the rotation happens late in that case, not never.
+    pub fn rotation_due_at_ms(&self) -> Option<u64> {
+        *self.rotation_due_at.lock().unwrap()
+    }
+
+    /// Performs a rotation that was deferred into a switch window, once it is due.
+    ///
+    /// A membership change arriving while a key is still propagating does not
+    /// rotate — it records that a rotation is owed when that key comes into use
+    /// (see [`Self::rollout_outbound_key`]). Something has to come back for it:
+    /// the deferral is what keeps a burst of departures from costing a key each,
+    /// and if nothing ever collected on it, a member who left during the window
+    /// would keep the key they hold until the roster happened to move again.
+    ///
+    /// A no-op when nothing is owed or the window has not closed, so it is safe to
+    /// call on any tick a consumer already has.
+    pub async fn flush_due_rotation(&self) -> Result<(), CommandError> {
+        let Some(due_at) = self.rotation_due_at_ms() else {
+            return Ok(());
+        };
+        let now = self.timestamp_ms();
+        if now < due_at {
+            return Ok(());
+        }
+
+        log::info!(
+            "[{}/{}] performing the rotation deferred to {due_at} ({}ms ago)",
+            self.room_id,
+            self.slot_id,
+            now.saturating_sub(due_at),
+        );
+        self.ensure_key_distribution().await
     }
 
     /// Creates a new outbound key.
@@ -1628,6 +1968,9 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
             next_key_index: self.next_key_index.clone(),
             key_buffer: self.key_buffer.clone(),
             keys_without_membership: self.keys_without_membership.clone(),
+            clock: self.clock.clone(),
+            superseded_key: self.superseded_key.clone(),
+            rotation_due_at: self.rotation_due_at.clone(),
             signalled_key: self.signalled_key.clone(),
         }
     }
@@ -1653,6 +1996,30 @@ mod tests {
     const USER_ID: &str = "@alice:example.org";
     const DEVICE_ID: &str = "device123";
     const MEMBER_ID: &str = "alice-device123-uuid";
+
+    /// A clock the test advances by hand, so a grace period or a `delayBeforeUse`
+    /// window can be crossed without waiting for it.
+    #[derive(Clone)]
+    struct TestClock(Arc<Mutex<u64>>);
+
+    impl TestClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(1_700_000_000_000)))
+        }
+
+        fn now(&self) -> u64 {
+            *self.0.lock().unwrap()
+        }
+
+        fn advance(&self, ms: u64) {
+            *self.0.lock().unwrap() += ms;
+        }
+
+        fn as_rtc_clock(&self) -> RtcClock {
+            let now = self.0.clone();
+            Arc::new(move || *now.lock().unwrap())
+        }
+    }
 
     fn bob_membership() -> JoinedMembership {
         JoinedMembership {
@@ -1843,6 +2210,8 @@ mod tests {
         let mut manager = manager_over(sender.clone(), memberships.clone());
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
         manager.join().await.expect("join should succeed");
 
         // Bob is in the call and gets index 0.
@@ -1858,6 +2227,10 @@ mod tests {
             .and_then(|index| index.as_u64())
             .expect("the key message carries an index");
 
+        // The call settles, so bob's departure is answered at once rather than
+        // being coalesced into the freshness of the key he was just given.
+        clock.advance(EncryptionConfig::default().key_rotation_grace_period_ms);
+
         // Bob leaves. Nobody is left.
         memberships.lock().unwrap().clear();
         manager
@@ -1871,9 +2244,9 @@ mod tests {
              left stays readable to them"
         );
 
-        // Carol arrives while that key is still inside its grace period, so it is
-        // reused rather than rotated again — and it is exactly what we encrypt
-        // with, so she decrypts from her first frame.
+        // Carol arrives while that key is still fresh, so it is reused rather than
+        // rotated again — and it is exactly what we encrypt with, so she decrypts
+        // from her first frame.
         let carol = JoinedMembership {
             sender: "@carol:example.org".to_string(),
             origin: EventOrigin::encrypted(Some("CAROLDEV".to_string())),
@@ -1924,11 +2297,17 @@ mod tests {
         let mut manager = manager_over(sender.clone(), memberships.clone());
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
-        // No grace period, so an arrival always rotates rather than reusing.
+        // No grace period, so an arrival rotates as soon as the key has settled.
+        // "Settled" is still at least `delay_before_use_ms` — a key that has not
+        // come into use cannot meaningfully be replaced — which is what every
+        // `clock.advance` below waits out.
         manager.set_config(EncryptionConfig {
             key_rotation_grace_period_ms: 0,
             ..EncryptionConfig::default()
         });
+        let settled = EncryptionConfig::default().delay_before_use_ms;
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
         manager.join().await.expect("join should succeed");
 
         // Bob is here and holds our key.
@@ -1936,6 +2315,7 @@ mod tests {
             .on_memberships_update()
             .await
             .expect("update should succeed");
+        clock.advance(settled);
 
         // Carol joins alongside him. Bob can decrypt what we are stamping, so the
         // rotation must wait for her to install it before we switch.
@@ -1966,11 +2346,13 @@ mod tests {
 
         // Now everyone leaves and, later, carol arrives alone. The key we hold
         // reached nobody who is present, so there is nothing to keep alive.
+        clock.advance(settled);
         memberships.lock().unwrap().clear();
         manager
             .on_memberships_update()
             .await
             .expect("update should succeed");
+        clock.advance(settled);
         *memberships.lock().unwrap() = vec![carol];
         manager
             .on_memberships_update()
@@ -1988,6 +2370,245 @@ mod tests {
             0,
             "nobody present holds the outgoing key, so waiting only keeps the \
              arriving member undecryptable for longer"
+        );
+    }
+
+    /// A departure keeps `delayBeforeUse`, and the leaver keeps reading for its
+    /// duration.
+    ///
+    /// Switching the instant somebody hangs up would freeze every remaining
+    /// member's video while the replacement key travels. Continuity wins: the
+    /// members who hold the outgoing key keep decrypting, and the cost is that the
+    /// member who just left decrypts along with them until the delay expires.
+    ///
+    /// This test exists to keep that from being "fixed" — the exposure is chosen,
+    /// and the thing to protect is that it stays *bounded* by the delay.
+    #[tokio::test]
+    async fn a_departure_keeps_the_delay_that_protects_the_members_who_stay() {
+        let carol = JoinedMembership {
+            sender: "@carol:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_string())),
+            sticky_key: "carol-a".to_string(),
+            member_id: "carol-a".to_string(),
+            ..bob_membership()
+        };
+        let memberships = Arc::new(Mutex::new(vec![bob_membership(), carol]));
+        let mut manager = manager_over(Arc::new(MockCommandSender::new()), memberships.clone());
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.expect("join should succeed");
+
+        // Bob and carol both hold our key.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        // The call settles, so the departure below rotates rather than being
+        // coalesced into the freshness of the key it would replace.
+        clock.advance(EncryptionConfig::default().key_rotation_grace_period_ms);
+
+        // Carol leaves. Bob is still here and still holds the outgoing key.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|membership| membership.member_id != "carol-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            handler
+                .signals
+                .lock()
+                .unwrap()
+                .last()
+                .expect("the rotation should have been signalled")
+                .use_after_ms,
+            EncryptionConfig::default().delay_before_use_ms,
+            "bob is still in the call and still holds the outgoing key; switching early to lock \
+             carol out would stall his video while the replacement reaches him"
+        );
+    }
+
+    /// A departure pulls the key's expiry in, and something has to collect it —
+    /// nothing in the core can.
+    ///
+    /// Deferring is what keeps a burst of departures from costing a key each, but it
+    /// only holds together if something comes back when the expiry arrives. If a
+    /// quiet roster meant the rotation never happened, the members who left would
+    /// keep the key they hold indefinitely — strictly worse than rotating per
+    /// departure.
+    #[tokio::test]
+    async fn a_departure_pulls_the_expiry_in_and_it_is_collected_then() {
+        let carol = JoinedMembership {
+            sender: "@carol:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_string())),
+            sticky_key: "carol-a".to_string(),
+            member_id: "carol-a".to_string(),
+            ..bob_membership()
+        };
+        let memberships = Arc::new(Mutex::new(vec![bob_membership(), carol]));
+        let mut manager = manager_over(Arc::new(MockCommandSender::new()), memberships.clone());
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.expect("join should succeed");
+
+        // Bob and carol hold our key.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        let lifetime = EncryptionConfig::default().max_key_lifetime_ms;
+        assert_eq!(
+            manager.rotation_due_at_ms(),
+            Some(clock.now() + lifetime),
+            "with nobody gone, the key expires on its lifetime cap and nothing sooner"
+        );
+
+        // Bob leaves while the key is fresh, so the rotation is owed, not made.
+        let held = manager.get_outbound_key().expect("we hold a key").key_index;
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|membership| membership.member_id != "bob-device456-uuid");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(held),
+            "the key is fresh, so bob's departure is answered when it expires"
+        );
+
+        // Carol leaves too, inside the same window: still one rotation owed.
+        clock.advance(100);
+        memberships.lock().unwrap().clear();
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(held),
+            "carol left inside the same window, so she is coalesced into the same rotation"
+        );
+        let due_at = manager
+            .rotation_due_at_ms()
+            .expect("a key always has an expiry");
+        assert!(
+            due_at < clock.now() + lifetime,
+            "carol's departure must pull the expiry in from the lifetime cap"
+        );
+
+        // Collecting early changes nothing; collecting once due rotates.
+        manager
+            .flush_due_rotation()
+            .await
+            .expect("flush should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(held),
+            "the expiry has not arrived yet"
+        );
+
+        clock.advance(due_at - clock.now() + 1);
+        manager
+            .flush_due_rotation()
+            .await
+            .expect("flush should succeed");
+        assert_ne!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(held),
+            "the owed rotation must happen once the expiry arrives, or carol keeps the key she \
+             holds for as long as the roster stays still"
+        );
+        assert_eq!(
+            manager.rotation_due_at_ms(),
+            Some(clock.now() + lifetime),
+            "the replacement is nobody's dirty key, so it expires on the lifetime cap again"
+        );
+    }
+
+    /// An arrival that rotates must still leave the newcomer able to decrypt.
+    ///
+    /// The rotation is delayed to keep the members already present decrypting, so
+    /// for the length of the delay we go on encrypting with a key the newcomer was
+    /// never sent — which is a media blackout on every join into an established
+    /// call unless they are handed that key too.
+    #[tokio::test]
+    async fn an_arrival_is_handed_the_key_we_keep_encrypting_with() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        // No grace period, so an arrival rotates as soon as the key has settled —
+        // which is still at least `delay_before_use_ms`, waited out below.
+        manager.set_config(EncryptionConfig {
+            key_rotation_grace_period_ms: 0,
+            ..EncryptionConfig::default()
+        });
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        clock.advance(EncryptionConfig::default().delay_before_use_ms);
+
+        let index_in_use = manager.get_outbound_key().expect("we hold a key").key_index;
+
+        // Carol arrives. Bob holds the key in use, so the rotation waits — and
+        // what we keep stamping frames with meanwhile is that same key.
+        memberships.lock().unwrap().push(JoinedMembership {
+            sender: "@carol:example.org".to_string(),
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_string())),
+            sticky_key: "carol-a".to_string(),
+            member_id: "carol-a".to_string(),
+            ..bob_membership()
+        });
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        let signal = handler
+            .signals
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the rotation should have been signalled");
+        assert_eq!(
+            signal.use_after_ms,
+            EncryptionConfig::default().delay_before_use_ms,
+            "bob holds the outgoing key, so the switch waits for him"
+        );
+
+        let sent_to_carol: Vec<u64> = sender
+            .to_device_messages_for("@carol:example.org", "CAROLDEV")
+            .into_iter()
+            .filter_map(|(_, content)| {
+                content
+                    .pointer("/media_key/index")
+                    .and_then(|index| index.as_u64())
+            })
+            .collect();
+        assert!(
+            sent_to_carol.contains(&(signal.key_index as u64)),
+            "carol needs the key we are rotating to, got {sent_to_carol:?}"
+        );
+        assert!(
+            sent_to_carol.contains(&(index_in_use as u64)),
+            "carol also needs the key we go on encrypting with for the next {}ms, or she \
+             decrypts nothing until it elapses; got {sent_to_carol:?}",
+            signal.use_after_ms,
         );
     }
 
