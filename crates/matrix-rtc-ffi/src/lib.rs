@@ -76,6 +76,15 @@ pub struct StickyEvent {
     pub sticky_key: String,
     pub application_type: Option<String>,
     pub member_id: Option<String>,
+    /// `content.created_ts`, when the sender states one.
+    ///
+    /// Not an MSC4143 field, and hosts speaking the spec-current dialect should
+    /// leave it `None`: there `member_id` is fresh per join and already tells one
+    /// participation from the next. It exists for dialects whose member ids are
+    /// derived from user+device and therefore repeat across joins, where it is
+    /// the only thing that distinguishes a rejoin from the membership it
+    /// replaced. See `JoinedMembership::joined_at`.
+    pub created_ts: Option<u64>,
     /// MSC4143 `member.membership`: "join" or "leave".
     pub membership: Option<String>,
     pub leave_reason: Option<FfiLeaveReason>,
@@ -244,6 +253,9 @@ pub struct JoinedMembership {
     pub sender_device_id: Option<String>,
     pub sticky_key: String,
     pub member_id: String,
+    /// When this participation began, if the membership stated it. `None` in the
+    /// spec-current dialect, where `member_id` is already per-join.
+    pub joined_at: Option<u64>,
     pub application: Option<String>,
     /// Transports this member publishes media on (MSC4143).
     pub transports: Vec<FfiRtcTransport>,
@@ -1171,6 +1183,7 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
             sticky_key: event.sticky_key,
             application,
             member,
+            created_ts: event.created_ts,
             transports,
             leave_reason: event.leave_reason.map(Into::into),
         },
@@ -1189,6 +1202,7 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         sender_device_id: member.origin.sender_device_id().map(str::to_owned),
         sticky_key: member.sticky_key,
         member_id: member.member_id,
+        joined_at: member.joined_at,
         application: member.application,
         transports: member.transports.iter().map(Into::into).collect(),
         can_subscribe: member.can_subscribe,
@@ -1316,6 +1330,7 @@ mod tests {
             sticky_key: "alice-device-a".to_owned(),
             application_type: Some("m.call".to_owned()),
             member_id: Some("alice-device-a".to_owned()),
+            created_ts: None,
             membership: Some("join".to_owned()),
             leave_reason: None,
             transports_json: Some(

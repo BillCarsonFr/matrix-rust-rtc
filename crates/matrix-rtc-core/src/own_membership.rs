@@ -164,6 +164,80 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     last_sticky: Arc<Mutex<Option<SentSticky>>>,
 }
 
+/// A standalone handle on one session's keep-alive, for the caller's periodic
+/// [`heartbeat`](KeepAlive::heartbeat).
+///
+/// Exists so a host's heartbeat task does not have to reach the session through
+/// whatever lock guards its [`RtcSessionManager`], because the two contend at
+/// exactly the wrong moment. A membership change makes the session distribute
+/// media keys to every member — an Olm encryption per recipient and an HTTP
+/// round trip, all of it awaited inside the manager call that delivered the
+/// change — so a host holding one lock over the manager cannot beat during it.
+/// Miss enough beats and the homeserver fires the delayed leave: MSC4140 does
+/// not care that we are still in the call, and every peer sees a *real*
+/// departure, rotates its key at once and writes to everyone. The fan-out that
+/// starved the heartbeat thereby causes a second, larger one, which starves the
+/// next beat further. A 100-device load run walks straight into it.
+///
+/// So this hands the heartbeat the machine directly. It is a clone of the
+/// session's own machine, not a copy of its state, so a beat through it is the
+/// same beat the session would have made — and only the keep-alive is reachable
+/// through it, since a background task has no business joining or leaving.
+///
+/// Cheap to clone and safe to hold for the life of the join. It keeps the
+/// machine alive on its own, so a beat after the session is gone is harmless: an
+/// already-left machine has no delay to restart and no sticky entry to refresh,
+/// and does nothing.
+///
+/// [`RtcSessionManager`]: crate::RtcSessionManager
+pub struct KeepAlive<T: RtcCommandSender> {
+    machine: Arc<OwnMembershipMachine<T>>,
+}
+
+// Hand-written for the same reason as `Clone` below: the machine holds a command
+// sender that is not `Debug`.
+impl<T: RtcCommandSender> std::fmt::Debug for KeepAlive<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeepAlive")
+            .field("room_id", &self.machine.room_id)
+            .field("slot_id", &self.machine.slot_id)
+            .field("sticky_key", &self.machine.sticky_key)
+            .finish()
+    }
+}
+
+// Derived `Clone` would demand `T: Clone`, which no command sender is: the
+// machine is behind an `Arc` precisely so the sender need not be.
+impl<T: RtcCommandSender> Clone for KeepAlive<T> {
+    fn clone(&self) -> Self {
+        Self {
+            machine: self.machine.clone(),
+        }
+    }
+}
+
+impl<T: RtcCommandSender + 'static> KeepAlive<T> {
+    /// Wraps one session's machine. Called by the session, which owns the `Arc`
+    /// this shares.
+    pub(crate) fn new(machine: Arc<OwnMembershipMachine<T>>) -> Self {
+        Self { machine }
+    }
+
+    /// One beat: pushes the delayed leave's timer back out and refreshes the
+    /// membership if its sticky entry is nearing expiry.
+    ///
+    /// Fire-and-forget, like [`OwnMembershipMachine::heartbeat`] — a failed beat
+    /// is retried by the next one.
+    pub async fn heartbeat(&self) {
+        self.machine.heartbeat().await;
+    }
+
+    /// Our `member.id` for the join this handle beats for.
+    pub fn sticky_key(&self) -> &str {
+        self.machine.sticky_key()
+    }
+}
+
 /// The membership event we last put in the sticky map, and when.
 #[derive(Debug, Clone)]
 struct SentSticky {
@@ -513,6 +587,27 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// should not break the application - we'll retry on the next heartbeat.
     pub async fn heartbeat(&self) {
         let room_id = self.room_id.clone();
+
+        // A beat is only ever owed while we are actually joined, and saying so up
+        // front is what keeps a beat from racing a leave.
+        //
+        // It never used to be able to: a host beat through its session manager,
+        // so the lock over it ordered the two. `KeepAlive` deliberately takes the
+        // heartbeat off that lock — the fan-out under it is exactly what must not
+        // delay a beat — so the ordering has to come from the state instead.
+        // `leave` records `Leaving` before it sends anything, and without this a
+        // beat could re-publish the membership it is retiring, or re-arm the
+        // switch it is cancelling, and leave a ghost standing for a whole sticky
+        // lifetime.
+        //
+        // `Joining` is excluded for a duller reason: `join` arms the delayed leave
+        // itself, so there is nothing to tend until it finishes.
+        let state = self.state();
+        if state != OwnMembershipState::Joined {
+            log::trace!("[{room_id}] Heartbeat skipped: membership is {state:?}, not joined");
+            return;
+        }
+
         log::trace!("[{}] Heartbeat: restarting keep-alive", room_id);
 
         // Two independent clocks expire our membership, and the heartbeat tends
@@ -520,11 +615,10 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         self.refresh_sticky_if_due().await;
 
         let Some(event_id) = self.delayed_event_id() else {
-            // Nothing armed (not joined, or a previous re-arm failed). Arming
-            // one is the safe move: without it a crash leaves a ghost behind.
-            if self.state() == OwnMembershipState::Joined
-                && let Err(error) = self.schedule_delayed_leave().await
-            {
+            // Nothing armed, so a previous arm or re-arm failed — we are joined,
+            // which the check above established. Arming one is the safe move:
+            // without it a crash leaves a ghost behind.
+            if let Err(error) = self.schedule_delayed_leave().await {
                 log::warn!("[{room_id}] Failed to arm a delayed leave: {error:?}");
             }
             return;
@@ -653,6 +747,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// Schedules a delayed leave event to clean up our membership if we disconnect.
     ///
     /// This is used internally by join() and heartbeat().
+    /// comment: not used by join
     ///
     /// # Returns
     ///
@@ -1204,6 +1299,59 @@ mod tests {
             mock_sender.sticky_events.lock().unwrap().len(),
             after_leave,
             "refreshing after a leave would resurrect the membership"
+        );
+    }
+
+    /// A beat that lands while a leave is in flight must do nothing at all.
+    ///
+    /// The heartbeat runs off the host's manager lock (see [`KeepAlive`]), so
+    /// nothing but the membership state orders it against a leave. A beat that
+    /// went ahead here would re-publish the membership the leave is retiring, and
+    /// the ghost would stand for a whole sticky lifetime.
+    #[tokio::test]
+    async fn heartbeat_does_nothing_while_a_leave_is_in_flight() {
+        let mock_sender = Arc::new(MockCommandSender::new());
+        // Due for a refresh the instant it is joined, so a beat that ignored the
+        // state would certainly send one.
+        let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        // Exactly what `leave` records before it sends anything.
+        *machine.state.lock().unwrap() = OwnMembershipState::Leaving;
+
+        let before = mock_sender.sticky_events.lock().unwrap().len();
+        machine.heartbeat().await;
+
+        assert_eq!(
+            mock_sender.sticky_events.lock().unwrap().len(),
+            before,
+            "a beat racing a leave must not re-publish the membership",
+        );
+    }
+
+    /// The handle a host's heartbeat task holds beats the machine it came from.
+    #[tokio::test]
+    async fn a_keep_alive_handle_beats_the_session_it_came_from() {
+        let mock_sender = Arc::new(MockCommandSender::new());
+        let machine = Arc::new(test_machine_with_sticky_duration(mock_sender.clone(), 0));
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        let keep_alive = KeepAlive::new(machine.clone());
+        assert_eq!(keep_alive.sticky_key(), machine.sticky_key());
+
+        let before = mock_sender.sticky_events.lock().unwrap().len();
+        keep_alive.heartbeat().await;
+
+        assert_eq!(
+            mock_sender.sticky_events.lock().unwrap().len(),
+            before + 1,
+            "the handle should have refreshed the due sticky membership",
         );
     }
 

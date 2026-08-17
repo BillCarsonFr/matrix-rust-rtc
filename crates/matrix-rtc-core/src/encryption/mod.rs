@@ -34,7 +34,7 @@
 //!
 //! To handle rapid join/leave scenarios efficiently:
 //!
-//! - When a participant **leaves** OR **membership changes**: Always rotate the key
+//! - When a participant **leaves** OR **membership changes**: Rotate the key
 //!   (all remaining participants get the new key)
 //! - When **new joiners** arrive and the current key is young (< `key_rotation_grace_period_ms`):
 //!   Reuse the current key, send only to the new participant(s)
@@ -42,6 +42,46 @@
 //!   Rotate the key (all participants get the new key)
 //!
 //! This prevents expensive key rotations when users quickly join in a row.
+//!
+//! # Deferring a departure's rotation
+//!
+//! A burst of departures is the mirror image of a burst of joins, and by default
+//! it is not collapsed: each membership update carrying a leave mints and
+//! distributes its own key. `leave_rotation_grace_period_ms` (default `0`) opts
+//! into collapsing it, by the same key-age test the joiner path uses — the first
+//! departure rotates, and the ones landing inside the fresh key's window are
+//! answered together when it closes.
+//!
+//! The deferral is deliberately **state-based**, not a timer: the departed
+//! members stay in the key's `shared_with` until a rotation clears them, so every
+//! rollout re-derives that a rotation is owed. Only the deadline is stored, and
+//! [`EncryptionManager::rotation_due`] exposes it so the session can drive the
+//! rollout on a state push where the roster did not move. Nothing here schedules
+//! anything, for the same reason `delayBeforeUse` does not (below).
+//!
+//! The trade is forward secrecy on leave: while a rotation is held back we keep
+//! encrypting with a key the departed member holds.
+//!
+//! # Suspending rotation in a large call
+//!
+//! Both grace periods only collapse bursts; a rotation still costs one to-device
+//! message per other member, and the membership changes that trigger one arrive
+//! more often the larger the call is. `key_rotation_participant_limit` (default
+//! `30`) puts a ceiling on that: at or above that many participants — ourselves
+//! included — the key index stops moving for the rest of the call, and no
+//! departure rotates it.
+//!
+//! Distribution continues. An arriving member is sent the current key and
+//! decrypts immediately, and because every member already present holds it, that
+//! one message is the whole cost of a join. A member who leaves is dropped from
+//! the key's `shared_with` right away even though nothing rotates — otherwise a
+//! return under the same member id would read as no change at all and never be
+//! served — and the rotation they are owed is remembered separately, so the first
+//! rollout back under the limit pays for every departure that happened meanwhile
+//! in one go.
+//!
+//! The price is forward secrecy: over the limit, a member who left keeps a key
+//! that stays live until the call shrinks again.
 //!
 //! # Key Usage Delay (MSC4143: delayBeforeUse)
 //!
@@ -128,6 +168,8 @@
 //! manager.set_config(EncryptionConfig {
 //!     delay_before_use_ms: 5000,
 //!     key_rotation_grace_period_ms: 10000,
+//!     leave_rotation_grace_period_ms: 0,
+//!     key_rotation_participant_limit: 30,
 //!     manage_media_keys: true,
 //!     require_cross_signed_sender: true,
 //! });
@@ -340,7 +382,47 @@ pub struct EncryptionManager<T: RtcCommandSender> {
     /// distribute to — so in a solo call every membership update re-signalled the
     /// same index, and each one reached the transport as a fresh key import.
     signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+
+    /// When a departure-triggered rotation we held back becomes due, in epoch
+    /// milliseconds. `None` when we owe no rotation.
+    ///
+    /// Only a deadline is stored, never the departures themselves: who left is
+    /// re-derived on every rollout from the roster against the current key's
+    /// `shared_with`, and the deferring path leaves `shared_with` alone, so a
+    /// departed member stays in it and keeps reading as "left" until a rotation
+    /// actually drops it. The deadline is the one thing that cannot be derived —
+    /// it says whether the wait is over.
+    deferred_rotation_due_ms: Arc<Mutex<Option<u64>>>,
+
+    /// Whether a member left while rotation was suspended by
+    /// [`EncryptionConfig::key_rotation_participant_limit`], so a rotation is owed
+    /// the moment the call is small enough to afford one.
+    ///
+    /// This one *cannot* be re-derived, which is why it is stored. A suspended
+    /// rollout drops the departed from the key's `shared_with` — see there for
+    /// why a returning member is invisible otherwise — and that is the same
+    /// record every other path reads a departure from. Keeping the debt here is
+    /// what stops the leaver's key from staying live for the rest of the call.
+    departure_owed_from_suspension: Arc<Mutex<bool>>,
+
+    /// When we last re-served our key to a member that appeared to have
+    /// restarted, by member id, in epoch milliseconds.
+    ///
+    /// A cooldown, not a record: the re-serve is triggered by a peer's own key
+    /// traffic (see [`Self::add_key_to_participant`]), and a peer minting keys in
+    /// a loop would otherwise have us send one message per rekey, to it, forever.
+    /// Bounded by the roster — only members we hold keys from can appear — and
+    /// cleared on `leave`.
+    restart_reserved_at_ms: Arc<Mutex<HashMap<String, u64>>>,
 }
+
+/// How long after re-serving our key to an apparently-restarted member we will
+/// do it again for that member.
+///
+/// Generous on purpose. The signal it throttles is a genuine restart, which for
+/// any one peer is rare; anything faster is a peer misbehaving, and the cost of
+/// answering it late is nothing — their next rollout re-sends to us anyway.
+const RESTART_RESERVE_COOLDOWN_MS: u64 = 30_000;
 
 /// What we last told the app about our own key, and when.
 ///
@@ -397,12 +479,28 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             key_buffer: Arc::new(Mutex::new(OutdatedKeyFilter::default())),
             keys_without_membership: Arc::new(Mutex::new(Vec::new())),
             signalled_key: Arc::new(Mutex::new(None)),
+            deferred_rotation_due_ms: Arc::new(Mutex::new(None)),
+            departure_owed_from_suspension: Arc::new(Mutex::new(false)),
+            restart_reserved_at_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Sets the configuration.
     pub fn set_config(&mut self, config: EncryptionConfig) {
         self.config = config;
+    }
+
+    /// Changes [`EncryptionConfig::key_rotation_participant_limit`] on a manager
+    /// that has already joined, leaving the rest of the configuration — notably
+    /// the `manage_media_keys` the session negotiated at join — alone.
+    ///
+    /// Nothing is rolled out here. Whether rotation is suspended is decided
+    /// afresh from the roster on every key rollout, so the new limit takes effect
+    /// at the next membership update: raising it above the current participant
+    /// count retires, in one rotation, every member who left while it was
+    /// suspended.
+    pub fn set_key_rotation_participant_limit(&mut self, limit: usize) {
+        self.config.key_rotation_participant_limit = limit;
     }
 
     /// Sets the handler for key material signals.
@@ -620,6 +718,13 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         *self.inbound_keys.write().unwrap() = HashMap::new();
         *self.next_key_index.lock().unwrap() = 0;
         *self.signalled_key.lock().unwrap() = None;
+        // A rotation owed to a call we are no longer in is owed to nobody, and a
+        // session outlives its `leave()`: leaving the deadline behind would have
+        // the next join's first unchanged-roster refresh roll out a key for
+        // departures from the previous call.
+        *self.deferred_rotation_due_ms.lock().unwrap() = None;
+        *self.departure_owed_from_suspension.lock().unwrap() = false;
+        self.restart_reserved_at_ms.lock().unwrap().clear();
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -687,6 +792,24 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         // Ensure key distribution
         self.ensure_key_distribution().await
+    }
+
+    /// Whether a rotation held back by
+    /// [`EncryptionConfig::leave_rotation_grace_period_ms`] has come due.
+    ///
+    /// The deferral has no timer of its own — see the field docs for why the core
+    /// owns no schedulers — so the consumer has to offer it a chance to run.
+    /// Sessions already call [`Self::on_memberships_update`] whenever the roster
+    /// moves; this is what tells them to call it when the roster *hasn't* moved,
+    /// which is precisely the situation a deferred rotation is waiting in.
+    ///
+    /// Cheap and non-blocking: one mutex and a clock read, no roster diffing. Safe
+    /// to consult on every state push.
+    pub fn rotation_due(&self) -> bool {
+        self.deferred_rotation_due_ms
+            .lock()
+            .unwrap()
+            .is_some_and(|due_ms| self.timestamp_ms() >= due_ms)
     }
 
     /// Checks keys that arrived before their membership was known.
@@ -809,8 +932,29 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 user_id: m.sender.clone(),
                 device_id: m.origin.sender_device_id().unwrap_or_default().to_owned(),
                 member_id: m.member_id.clone(),
+                joined_at: m.joined_at,
             })
             .collect();
+
+        // Rotation is the part of key management that does not scale with the
+        // roster: a new key has to reach every other member, so one costs O(N)
+        // to-device messages in a call where the membership changes that trigger
+        // them also arrive at a rate growing with N. Serving an arriving member
+        // the key we already hold costs exactly one message at any size.
+        //
+        // So past `key_rotation_participant_limit` we keep the cheap half and drop
+        // the expensive one: the key index stays put for as long as the call is
+        // large, departures stop costing anything, and joiners are still served.
+        // Everyone already present holds that key, so a large call converges on
+        // one message per join and nothing else.
+        //
+        // The price is forward secrecy — see the config docs. Nothing about the
+        // suspension is recorded: departed members stay in `shared_with` (only a
+        // rotation clears it), so the first rollout after the call drops back
+        // under the limit re-derives all of them from the diff above and retires
+        // them in one rotation.
+        let participant_count = current_participants.len() + 1;
+        let rotation_suspended = participant_count >= self.config.key_rotation_participant_limit;
 
         let current_key = {
             let guard = self.outbound_key.read().unwrap();
@@ -829,23 +973,30 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let current_key = current_key.unwrap();
         let already_shared_with = current_key.shared_with.clone();
 
-        // Find participants who left (were previously shared with but are no longer present)
+        // Find participations who left (were previously shared with but are no
+        // longer present).
+        //
+        // The comparison is `is_same_participation`, not `member_id`: a device
+        // that leaves and rejoins keeps its member id in the pre-2026 state
+        // dialect, and matching on the id alone would put the returner on
+        // neither side of this diff — present, apparently already served, and
+        // never handed the key they discarded when they left.
         let left: Vec<&ParticipantDeviceInfo> = already_shared_with
             .iter()
             .filter(|x| {
                 !current_participants
                     .iter()
-                    .any(|o| o.member_id == x.member_id)
+                    .any(|o| o.is_same_participation(x))
             })
             .collect();
 
-        // Find new participants (present now but not previously shared with)
+        // Find new participations (present now but not previously shared with)
         let joined: Vec<&ParticipantDeviceInfo> = current_participants
             .iter()
             .filter(|x| {
                 !already_shared_with
                     .iter()
-                    .any(|o| o.member_id == x.member_id)
+                    .any(|o| o.is_same_participation(x))
             })
             .collect();
 
@@ -873,14 +1024,104 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let outgoing_key_is_live = current_participants.iter().any(|participant| {
             already_shared_with
                 .iter()
-                .any(|holder| holder.member_id == participant.member_id)
+                .any(|holder| holder.is_same_participation(participant))
         });
+
+        let key_age = self.timestamp_ms().saturating_sub(current_key.creation_ts);
+
+        // Departures cost a new key. Whether we mint it *now* is the question a
+        // burst makes expensive: N updates each carrying a departure produce N
+        // rotations, each a to-device send to everyone still here.
+        //
+        // `leave_rotation_grace_period_ms` collapses them by measuring the same
+        // key age the joiner path measures. The first departure of a burst meets
+        // an old key and rotates at once; the rest meet the key it just minted,
+        // and are held until it leaves its window — at which point one rotation
+        // retires every one of them. Nothing about *which* members left is
+        // recorded: they stay in `shared_with` (only a rotation clears it), so the
+        // diff above re-derives them on every rollout until one happens.
+        //
+        // The trade is explicit in the config docs: a held-back rotation is time
+        // in which a departed member can still decrypt us. Default `0` keeps the
+        // rotate-immediately behaviour.
+        let departures_now = !left.is_empty() || any_membership_changed;
+
+        // Over the limit a departure buys no rotation — but it must still be
+        // *recorded*, and `shared_with` is the only record of who holds the key.
+        // Left alone it would keep naming the leaver for the rest of the call,
+        // and a rejoin that arrives in the *same* update as the departure would
+        // then find the key already accounted to them.
+        //
+        // So drop them as holders here, and remember the rotation they are owed
+        // in `departure_owed_from_suspension` — by the time we are under the limit
+        // and can afford it, `left` no longer names anyone.
+        //
+        // Dropped by participation and not by member id: where the two differ,
+        // the departed participation and the one that replaced it share an id,
+        // and retaining on the id alone would discard the arrival we are about to
+        // record as served.
+        if rotation_suspended && departures_now {
+            *self.departure_owed_from_suspension.lock().unwrap() = true;
+
+            if !left.is_empty() {
+                let mut guard = self.outbound_key.write().unwrap();
+                if let Some(ref mut key) = *guard {
+                    key.shared_with.retain(|holder| {
+                        !left
+                            .iter()
+                            .any(|departed| departed.is_same_participation(holder))
+                    });
+                }
+            }
+        }
+
+        // A departure we could not answer while suspended is still owed once the
+        // call is small enough, where nothing in the roster diff remembers it.
+        let departures = departures_now
+            || (!rotation_suspended && *self.departure_owed_from_suspension.lock().unwrap());
+
+        // Over the participant limit no departure rotates at all, so there is
+        // nothing for the grace period to hold back either.
+        let defer_departures = departures
+            && !rotation_suspended
+            && key_age < self.config.leave_rotation_grace_period_ms;
+
+        {
+            let mut due = self.deferred_rotation_due_ms.lock().unwrap();
+            if defer_departures {
+                // Keyed off the key's own creation, so re-deriving it on every
+                // subsequent rollout in the burst lands on the same deadline
+                // instead of pushing it further out each time.
+                let deadline = current_key.creation_ts + self.config.leave_rotation_grace_period_ms;
+                if *due != Some(deadline) {
+                    log::info!(
+                        "[{}/{}] Deferring rotation for {} departure(s) (membership changed: \
+                         {}): key index {} is {}ms old, holding it until {}ms",
+                        self.room_id,
+                        self.slot_id,
+                        left.len(),
+                        any_membership_changed,
+                        current_key.key_index,
+                        key_age,
+                        self.config.leave_rotation_grace_period_ms,
+                    );
+                }
+                *due = Some(deadline);
+            } else if !departures || rotation_suspended {
+                // Nobody is owed a rotation any more. Reached when a rotation for
+                // another reason (a joiner past the grace period) already retired
+                // the departed members — or when we are over the participant limit,
+                // where a standing deadline would have `rotation_due` ask for a
+                // rollout on every state push that we would then decline to act on.
+                *due = None;
+            }
+        }
 
         let to_distribute_to: Vec<ParticipantDeviceInfo>;
         let mut use_new_key = false;
         let outbound_key_to_use: OutboundEncryptionKey;
 
-        if !left.is_empty() || any_membership_changed {
+        if departures && !defer_departures && !rotation_suspended {
             // Someone left or membership changed, we need to rotate the key
             log::info!(
                 "[{}/{}] Key rotation needed: {} left, membership changed: {}",
@@ -894,10 +1135,22 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             outbound_key_to_use = self.create_new_outbound_key();
         } else if !joined.is_empty() {
             // New joiners
-            let now = self.timestamp_ms();
-            let key_age = now.saturating_sub(current_key.creation_ts);
-
-            if key_age < self.config.key_rotation_grace_period_ms {
+            if rotation_suspended {
+                // Over the limit the key is not rotated for anything, however old
+                // it is: the joiners get it, and the members who already hold it
+                // get nothing.
+                log::debug!(
+                    "[{}/{}] {} participants (rotation limit {}): serving key index {} to {} joiner(s) without rotating",
+                    self.room_id,
+                    self.slot_id,
+                    participant_count,
+                    self.config.key_rotation_participant_limit,
+                    current_key.key_index,
+                    joined.len(),
+                );
+                to_distribute_to = joined.into_iter().cloned().collect();
+                outbound_key_to_use = current_key;
+            } else if key_age < self.config.key_rotation_grace_period_ms {
                 // Current key is still fresh, just distribute to new joiners
                 log::debug!(
                     "[{}/{}] New joiners detected, but key is recent enough (age:{}ms < {}ms), keeping it",
@@ -921,6 +1174,32 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 to_distribute_to = current_participants.clone();
                 outbound_key_to_use = self.create_new_outbound_key();
             }
+        } else if defer_departures {
+            // Departures, held back, and nobody new to serve the current key to.
+            // The rotation stays owed; `rotation_due` is what brings us back once
+            // the window closes, since no further membership change need ever come.
+            log::debug!(
+                "[{}/{}] Departure rotation still deferred and no new joiners, \
+                 nothing to distribute",
+                self.room_id,
+                self.slot_id
+            );
+            return Ok(());
+        } else if departures && rotation_suspended {
+            // Members left a call that is over the limit, and nobody arrived. The
+            // key they hold stays live — that is the trade — and no message goes
+            // out. `shared_with` still names them, so the first rollout once the
+            // call is small enough again rotates them out.
+            log::debug!(
+                "[{}/{}] {} participants (rotation limit {}): {} departure(s) not rotating key index {}",
+                self.room_id,
+                self.slot_id,
+                participant_count,
+                self.config.key_rotation_participant_limit,
+                left.len(),
+                current_key.key_index,
+            );
+            return Ok(());
         } else {
             // No changes, nothing to do
             log::debug!(
@@ -947,12 +1226,12 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 
         let unreached: Vec<&str> = to_distribute_to
             .iter()
-            .map(|participant| participant.member_id.as_str())
-            .filter(|member_id| {
+            .filter(|target| {
                 !served
                     .iter()
-                    .any(|participant| participant.member_id == *member_id)
+                    .any(|participant| participant.is_same_participation(target))
             })
+            .map(|target| target.member_id.as_str())
             .collect();
 
         // One line per rollout saying how it went as a whole: per-recipient
@@ -987,6 +1266,16 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 new_key.shared_with = served.clone();
                 *guard = Some(new_key);
             }
+
+            // Whatever the reason for this rotation, it retired every member who
+            // had left: the new key's `shared_with` holds only who we just served.
+            // Clearing here rather than only on the departure branch covers the
+            // case where a joiner past `key_rotation_grace_period_ms` rotates
+            // while a departure was still being held back.
+            *self.deferred_rotation_due_ms.lock().unwrap() = None;
+            // Including a departure that happened while we were over the limit:
+            // this rotation is the payment for it.
+            *self.departure_owed_from_suspension.lock().unwrap() = false;
 
             // Signal the new key immediately, telling the consumer how long to
             // wait before encrypting with it (delayBeforeUse). The wait used to
@@ -1032,7 +1321,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                         if !key
                             .shared_with
                             .iter()
-                            .any(|x| x.member_id == recipient.member_id)
+                            .any(|x| x.is_same_participation(recipient))
                         {
                             key.shared_with.push(recipient.clone());
                         }
@@ -1102,6 +1391,10 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let mut addressed = Vec::with_capacity(targets.len());
 
         for target in targets {
+            // Matched on the member id alone, deliberately. The sticky map is
+            // keyed by `sticky_key`, which MSC4143 requires to equal `member.id`,
+            // so at most one participation per member id can be live at a time
+            // and there is nothing here for a participation to disambiguate.
             let Some(membership) = memberships.iter().find(|m| m.member_id == target.member_id)
             else {
                 log::warn!(
@@ -1392,9 +1685,9 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             .decode(&received.key_b64)
             .map_err(|e| CommandError::SendError(format!("Failed to decode key: {}", e)))?;
 
-        if key_bytes.len() != 32 {
+        if key_bytes.len() != 32 && key_bytes.len() != 16 {
             log::warn!(
-                "[{}/{}] Received key with unexpected length: {} (expected 32)",
+                "[{}/{}] Received key with unexpected length: {} (expected 32 or 16)",
                 self.room_id,
                 self.slot_id,
                 key_bytes.len()
@@ -1534,6 +1827,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // the older one last silently downgrades us to a key the sender has
         // stopped using.
         let map_key = key.member_id.clone();
+        let mut restarted = false;
         {
             let mut guard = self.inbound_keys.write().unwrap();
             let held = guard.entry(map_key).or_default();
@@ -1560,13 +1854,102 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                         key.key_index,
                     );
                     *existing = key.clone();
+                    // Within one participation a sender never reuses an index:
+                    // `next_key_index` only moves forward, so an index carries one
+                    // key for that participation's whole life. Material replacing
+                    // material at an index we already hold therefore means the
+                    // member *restarted* — a fresh key ring under the same member
+                    // id, which is what a rejoin looks like wherever member ids
+                    // are not minted per join.
+                    //
+                    // The only false positive is an index wrapping after 256
+                    // rotations, which costs one redundant message and cannot
+                    // happen above `key_rotation_participant_limit`.
+                    restarted = true;
                 }
                 None => held.push(key.clone()),
+            }
+
+            if restarted {
+                // Everything else under this member id belongs to the
+                // participation that just ended and can never decrypt anything
+                // again. Retiring it here rather than from the roster is what
+                // makes it safe: the key we were just handed is the one entry we
+                // keep, so there is no window in which a freshly arrived key is
+                // thrown away by a rollout reacting to the same rejoin.
+                held.retain(|existing| existing.key_index == key.key_index);
             }
         }
 
         // Signal to application
+        let member_id = key.member_id.clone();
         self.signal_inbound_key_to_app(key, rtc_backend_id).await;
+
+        if restarted {
+            self.reserve_key_to_restarted_member(&member_id).await;
+        }
+    }
+
+    /// Re-sends our key to a member whose key traffic says they restarted.
+    ///
+    /// The roster diff in `rollout_outbound_key` is the primary way a rejoin is
+    /// noticed, but it can only see one where the membership gives it something
+    /// to see — a fresh `member.id`, or a `joined_at` that moved. A dialect that
+    /// offers neither leaves a leave-and-rejoin byte-identical to no change at
+    /// all, and above `key_rotation_participant_limit` nothing else will ever
+    /// re-send: rotation is suspended, so only arrivals are served, and the
+    /// returner does not read as one.
+    ///
+    /// Their own key is the signal that survives all of that. It is also
+    /// guaranteed to arrive: a rejoining member starts with an empty
+    /// `shared_with`, so its first rollout sends to *everyone*.
+    ///
+    /// Dropping them as a holder is all this does — the rollout it then kicks off
+    /// sees them as newly joined and serves them the standing key, one message,
+    /// no rotation, through exactly the same path an ordinary arrival takes.
+    async fn reserve_key_to_restarted_member(&self, member_id: &str) {
+        if !self.config.manage_media_keys {
+            return;
+        }
+
+        let now = self.timestamp_ms();
+        {
+            let mut cooldown = self.restart_reserved_at_ms.lock().unwrap();
+            if let Some(last) = cooldown.get(member_id)
+                && now.saturating_sub(*last) < RESTART_RESERVE_COOLDOWN_MS
+            {
+                return;
+            }
+            cooldown.insert(member_id.to_owned(), now);
+        }
+
+        {
+            let mut guard = self.outbound_key.write().unwrap();
+            let Some(ref mut key) = *guard else { return };
+            let held = key.shared_with.len();
+            key.shared_with
+                .retain(|holder| holder.member_id != member_id);
+            if key.shared_with.len() == held {
+                // We never served them in the first place, so there is nothing
+                // for this to repair and no reason to spend a rollout on it.
+                return;
+            }
+        }
+
+        log::info!(
+            "[{}/{}] member {} restarted their key ring; re-serving our key to them",
+            self.room_id,
+            self.slot_id,
+            member_id,
+        );
+
+        if let Err(error) = self.ensure_key_distribution().await {
+            log::warn!(
+                "[{}/{}] failed to re-serve our key to member {member_id}: {error:?}",
+                self.room_id,
+                self.slot_id,
+            );
+        }
     }
 
     /// Signals an inbound key to the application layer.
@@ -1629,6 +2012,9 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
             key_buffer: self.key_buffer.clone(),
             keys_without_membership: self.keys_without_membership.clone(),
             signalled_key: self.signalled_key.clone(),
+            deferred_rotation_due_ms: self.deferred_rotation_due_ms.clone(),
+            departure_owed_from_suspension: self.departure_owed_from_suspension.clone(),
+            restart_reserved_at_ms: self.restart_reserved_at_ms.clone(),
         }
     }
 }
@@ -1647,6 +2033,7 @@ mod tests {
     use crate::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
+    use std::time::Duration;
 
     const ROOM_ID: &str = "!room:example.org";
     const SLOT_ID: &str = "m.call#ROOM";
@@ -1662,6 +2049,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some("device456".to_string())),
             sticky_key: "bob-device456-uuid".to_string(),
             member_id: "bob-device456-uuid".to_string(),
+            joined_at: None,
             application: Some("m.call".to_string()),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
@@ -1909,6 +2297,731 @@ mod tests {
             manager.get_outbound_key().map(|key| key.key_index),
             Some(sent_to_carol[0] as u8),
             "we must encrypt with exactly the index carol was handed"
+        );
+    }
+
+    /// A peer under a given user, device and member id.
+    fn peer(user_id: &str, device_id: &str, member_id: &str) -> JoinedMembership {
+        JoinedMembership {
+            sender: user_id.to_string(),
+            origin: EventOrigin::encrypted(Some(device_id.to_string())),
+            sticky_key: member_id.to_string(),
+            member_id: member_id.to_string(),
+            ..bob_membership()
+        }
+    }
+
+    /// Every key index a rollout put on the wire, in order.
+    fn sent_key_indices(sender: &MockCommandSender) -> Vec<u64> {
+        sender
+            .to_device_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, _, _, content)| {
+                content
+                    .pointer("/media_key/index")
+                    .and_then(|index| index.as_u64())
+            })
+            .collect()
+    }
+
+    /// A burst of departures — a partition dropping a group of devices, a sticky
+    /// batch expiring — arrives as one membership update per leaver. Rotating on
+    /// each costs a fresh key and a to-device send to everyone still present, per
+    /// update, and it is the shape `leave_rotation_grace_period_ms` exists to
+    /// collapse: one rotation retires the whole burst.
+    #[tokio::test]
+    async fn departures_inside_the_leave_grace_period_collapse_into_one_rotation() {
+        const GRACE_MS: u64 = 400;
+
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+
+        // All three hold index 0.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(sent_key_indices(&sender), vec![0, 0, 0]);
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Bob then carol drop out, each in its own update, both inside the window
+        // of the key they were just handed.
+        for departed in ["bob-a", "carol-a"] {
+            memberships
+                .lock()
+                .unwrap()
+                .retain(|member| member.member_id != departed);
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(0),
+            "both departures are inside the window, so the key must not have moved yet"
+        );
+        assert!(
+            sent_key_indices(&sender).is_empty(),
+            "a deferred rotation must put nothing on the wire, got {:?}",
+            sent_key_indices(&sender),
+        );
+        assert!(
+            !manager.rotation_due(),
+            "the window has not closed, so nothing is owed yet"
+        );
+
+        // The window closes. No further membership change is coming — the last
+        // departure can be the last thing that happens in a call — so what brings
+        // us back is the consumer asking whether a rotation has come due.
+        tokio::time::sleep(Duration::from_millis(GRACE_MS + 150)).await;
+        assert!(
+            manager.rotation_due(),
+            "the deferred rotation should be due once the window closes"
+        );
+
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "two departures must cost exactly one rotation, not one each"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![1],
+            "only dave is left to receive the rotated key"
+        );
+        assert!(
+            !manager.rotation_due(),
+            "the rotation settled the debt, or every later state push rolls out again"
+        );
+    }
+
+    /// Over `key_rotation_participant_limit` the key index stops moving: a
+    /// departure costs nothing, and an arrival costs exactly one message — the
+    /// current key — with no rotation for the members who already hold it.
+    #[tokio::test]
+    async fn over_the_participant_limit_a_joiner_gets_the_current_key_and_nobody_rotates() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        // Three participants — bob, carol and us — is the limit exactly, so one
+        // more arrival suspends rotation. No joiner grace period, so anything
+        // below the limit would rotate on every arrival.
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            key_rotation_grace_period_ms: 0,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+
+        // Under the limit with no joiner grace period: bob and carol arriving
+        // rotates index 0 out, and both are handed index 1.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(sent_key_indices(&sender), vec![1, 1]);
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Dave takes the call to the limit. He is served the key we already hold,
+        // and bob and carol — who hold it too — hear nothing.
+        memberships
+            .lock()
+            .unwrap()
+            .push(peer("@dave:example.org", "DAVEDEV", "dave-a"));
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "an arrival over the limit must not rotate, however old the key is"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![1],
+            "the joiner gets exactly one message, carrying the live key index"
+        );
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@dave:example.org".to_string(), "DAVEDEV".to_string())],
+            "the members who already hold that key must not be re-sent it"
+        );
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Carol leaves while the call is still at the limit, replaced by erin.
+        // Normally a departure always rotates; here the key stands, so erin is
+        // handed the same index carol keeps.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "carol-a");
+        memberships
+            .lock()
+            .unwrap()
+            .push(peer("@erin:example.org", "ERINDEV", "erin-a"));
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "a departure over the limit must not cost a rotation"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![1],
+            "only the arriving member is served, and with the standing key"
+        );
+        assert!(
+            !manager.rotation_due(),
+            "a suspended rotation must not ask the consumer for rollouts it will decline"
+        );
+    }
+
+    /// The same peer, rejoining: same user, device and member id, a new start.
+    fn rejoined(peer: &JoinedMembership, joined_at: u64) -> JoinedMembership {
+        JoinedMembership {
+            joined_at: Some(joined_at),
+            ..peer.clone()
+        }
+    }
+
+    /// The headline case. A device that leaves and rejoins fast enough that the
+    /// two land in a *single* membership update, under a member id that repeats
+    /// across joins.
+    ///
+    /// The sibling test below feeds the leave and the return as two separate
+    /// updates, which is what lets the suspended-departure path drop the leaver
+    /// from `shared_with` and read the return as an arrival. Real syncs make no
+    /// such promise: `set_current_state` replaces the roster from a snapshot, so
+    /// an intermediate state the server never surfaced does not exist for the
+    /// peer. With the two collapsed and the member id unchanged, the returner is
+    /// in both `shared_with` and the roster — nothing is `joined`, nothing is
+    /// `left`, and above the participant limit no rotation ever comes to cover
+    /// it up. `joined_at` is the only thing that says a rejoin happened.
+    #[tokio::test]
+    async fn a_collapsed_rejoin_under_a_stable_member_id_is_served_the_current_key() {
+        let sender = Arc::new(MockCommandSender::new());
+        let dave = peer("@dave:example.org", "DAVEDEV", "@dave:example.org:DAVEDEV");
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            rejoined(&dave, 1_000),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        let index_before = manager
+            .get_outbound_key()
+            .map(|key| key.key_index)
+            .expect("we hold a key");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Dave parts and rejoins between two syncs. Same member id, same device;
+        // only the participation's start moved.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.sender != "@dave:example.org");
+        memberships.lock().unwrap().push(rejoined(&dave, 2_000));
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@dave:example.org".to_string(), "DAVEDEV".to_string())],
+            "the returner must be handed the key, and nobody else disturbed"
+        );
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(index_before),
+            "and serving them must still not cost a rotation"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![index_before as u64],
+            "they must get the key we are actually encrypting with, not a new one"
+        );
+    }
+
+    /// The regression the fix could easily become: a membership re-sent to extend
+    /// its lifetime keeps its `created_ts`, so re-assertions must stay silent.
+    ///
+    /// Every member re-asserts on a timer, and in a call over the participant
+    /// limit those are the only updates left. Reading one as a rejoin would put a
+    /// to-device message on the wire per member per tick — the quadratic traffic
+    /// the limit exists to avoid, reintroduced by its own fix.
+    #[tokio::test]
+    async fn a_re_assertion_of_an_unchanged_participation_puts_nothing_on_the_wire() {
+        let sender = Arc::new(MockCommandSender::new());
+        let dave = peer("@dave:example.org", "DAVEDEV", "@dave:example.org:DAVEDEV");
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            rejoined(&dave, 1_000),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for _ in 0..3 {
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        assert!(
+            to_device_recipients(&sender).is_empty(),
+            "an unchanged roster must not distribute anything, got {:?}",
+            to_device_recipients(&sender),
+        );
+    }
+
+    /// A peer that states no start is *unknown*, never *different*.
+    ///
+    /// This is the spec-current path, where `member.id` is fresh per join and
+    /// nothing needs a tie-breaker. Treating an absent value as a difference
+    /// would make every such peer look like it rejoined on every update.
+    #[tokio::test]
+    async fn a_roster_that_states_no_start_behaves_exactly_as_before() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            to_device_recipients(&sender).len(),
+            4,
+            "the first rollout serves everyone"
+        );
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for _ in 0..3 {
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        assert!(
+            to_device_recipients(&sender).is_empty(),
+            "with no start stated, an unchanged roster is still unchanged, got {:?}",
+            to_device_recipients(&sender),
+        );
+    }
+
+    /// The backstop, for dialects that give the roster diff nothing to see.
+    ///
+    /// A sender never reuses a key index within one participation, so material
+    /// replacing material at an index we already hold means that member restarted
+    /// — and their own key is the one signal that arrives whatever the membership
+    /// says. It is guaranteed, too: a rejoiner starts with an empty `shared_with`
+    /// and so sends its first key to everybody.
+    #[tokio::test]
+    async fn a_member_rekeying_an_index_we_hold_is_served_our_key_again() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        // Bob's first participation, at index 0, and then a rotation to index 1.
+        for (material, index) in [(vec![1u8; 32], 0), (vec![2u8; 32], 1)] {
+            manager
+                .receive_key(bob_key(material, index))
+                .await
+                .expect("bob's key should be accepted");
+        }
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Bob restarts: a fresh key ring, so index 0 again with new material.
+        manager
+            .receive_key(bob_key(vec![3u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@bob:example.org".to_string(), "device456".to_string())],
+            "the restarted member must be re-served our key"
+        );
+
+        let held = manager.get_inbound_keys("bob-device456-uuid");
+        assert_eq!(
+            held.iter().map(|key| key.key_index).collect::<Vec<_>>(),
+            vec![0],
+            "the previous participation's other indices decrypt nothing and must go"
+        );
+        assert_eq!(
+            held[0].key,
+            vec![3u8; 32],
+            "and the key we keep must be the one that just arrived"
+        );
+    }
+
+    /// The re-serve is driven by a peer's own key traffic, so it needs a limit: a
+    /// peer rekeying in a loop must not cost us one message per rekey forever.
+    #[tokio::test]
+    async fn a_repeated_rekey_from_the_same_member_is_only_answered_once() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for material in [vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]] {
+            manager
+                .receive_key(bob_key(material, 0))
+                .await
+                .expect("bob's key should be accepted");
+        }
+
+        assert_eq!(
+            to_device_recipients(&sender).len(),
+            1,
+            "three rekeys inside the cooldown must buy exactly one re-serve, got {:?}",
+            to_device_recipients(&sender),
+        );
+    }
+
+    /// A member who leaves and comes back while the call is over the limit must
+    /// be handed the key again — they no longer have it.
+    ///
+    /// Nothing rotates over the limit, and `shared_with` is otherwise only ever
+    /// cleared by a rotation, so the leaver would stay recorded as a holder of the
+    /// live key. Under a member id that is fresh per join that merely leaks a
+    /// ghost; under one derived from user+device (pre-2026 Element Call), or a
+    /// sticky entry that lapses and is re-sent, the return is invisible and the
+    /// member spends the rest of the call unable to decrypt us.
+    #[tokio::test]
+    async fn a_return_under_the_same_member_id_over_the_limit_is_served_again() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        // Five participants including us, so a single departure leaves us over
+        // the limit and nothing rotates.
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "dave-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        memberships
+            .lock()
+            .unwrap()
+            .push(peer("@dave:example.org", "DAVEDEV", "dave-a"));
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@dave:example.org".to_string(), "DAVEDEV".to_string())],
+            "the returning member must be handed the key, and nobody else disturbed"
+        );
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(0),
+            "and serving them must still not cost a rotation"
+        );
+    }
+
+    /// The departure that happened while we were over the limit is still owed a
+    /// rotation once the call can afford one — even though the leaver was dropped
+    /// from `shared_with` at the time, so the roster diff no longer remembers it.
+    #[tokio::test]
+    async fn a_departure_over_the_limit_is_rotated_out_once_the_call_shrinks() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Erin leaves, still over the limit: no rotation, and she stops counting
+        // as a holder of the key.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "erin-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(0),
+            "a departure over the limit must not rotate"
+        );
+
+        // Dave leaves too, taking us under the limit. Erin's departure is paid
+        // for here, by the same rotation as dave's.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "dave-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "the key both leavers hold must be retired once we are under the limit"
+        );
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![
+                ("@bob:example.org".to_string(), "BOBDEV".to_string()),
+                ("@carol:example.org".to_string(), "CAROLDEV".to_string()),
+            ],
+            "and the members still present must get the rotated key"
+        );
+    }
+
+    /// Dropping back under the limit resumes rotation, and since the suspension
+    /// recorded nothing, the departures accumulated during it are retired by a
+    /// single rotation that reaches everyone still present.
+    #[tokio::test]
+    async fn falling_back_under_the_participant_limit_retires_the_departed_in_one_rotation() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+
+        // Four participants including us: at the limit, so all three hold index 0
+        // and it stays there.
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(sent_key_indices(&sender), vec![0, 0, 0]);
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Carol and dave leave in one update, taking the call under the limit.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id == "bob-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "resuming must retire the key the departed members hold, exactly once"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![1],
+            "the rotated key goes to whoever is left, and to nobody twice"
+        );
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@bob:example.org".to_string(), "BOBDEV".to_string())],
+        );
+    }
+
+    /// The window is measured against the age of the current key, exactly as the
+    /// joiner path measures it. So it only ever holds back a rotation for a key we
+    /// just minted — which is what a burst looks like — and the ordinary case of
+    /// one member leaving a call that has been running for a while pays no
+    /// latency, and no extra time in which the leaver can still decrypt us.
+    #[tokio::test]
+    async fn a_departure_from_a_key_past_the_window_rotates_without_waiting() {
+        const GRACE_MS: u64 = 150;
+
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        // The key ages past the window before anyone leaves.
+        tokio::time::sleep(Duration::from_millis(GRACE_MS + 100)).await;
+        sender.to_device_messages.lock().unwrap().clear();
+
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "bob-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "a departure from a key older than the window must rotate on the spot"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![1],
+            "and the rotated key goes to whoever is left"
+        );
+        assert!(!manager.rotation_due(), "nothing was deferred");
+    }
+
+    /// A session outlives its `leave()`, so a rotation owed to a call we have hung
+    /// up on must not survive into the next one — the first unchanged-roster push
+    /// after rejoining would otherwise roll out a key for departures from a call
+    /// that is over.
+    #[tokio::test]
+    async fn leaving_the_call_drops_a_deferred_rotation() {
+        const GRACE_MS: u64 = 150;
+
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "bob-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        tokio::time::sleep(Duration::from_millis(GRACE_MS + 100)).await;
+        assert!(manager.rotation_due(), "the deferral should be pending");
+
+        manager.leave();
+        assert!(
+            !manager.rotation_due(),
+            "a rotation owed to a call we left is owed to nobody"
         );
     }
 

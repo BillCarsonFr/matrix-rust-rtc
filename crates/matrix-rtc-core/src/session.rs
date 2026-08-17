@@ -32,7 +32,7 @@ use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdenti
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
-use crate::own_membership::{OwnMembershipMachine, transport_to_json};
+use crate::own_membership::{KeepAlive, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -128,6 +128,17 @@ struct OwnParticipation {
     member_id: String,
 }
 
+/// Whether recording a membership event logs the change it made.
+///
+/// Incremental updates log per event, because each one is genuinely news. The
+/// batch path re-records the whole roster on every sticky tick, so it stays
+/// silent and logs a single diff against the previous set instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventLogging {
+    PerEvent,
+    Silent,
+}
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession<T: RtcCommandSender> {
     /// Member events that are join-shaped and still sticky. These are
@@ -149,7 +160,11 @@ pub struct RtcSession<T: RtcCommandSender> {
     /// Command sender for sending events to the Matrix room.
     command_sender: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
-    own_membership_machine: Option<OwnMembershipMachine<T>>,
+    ///
+    /// Behind an `Arc` so [`Self::keep_alive`] can hand the keep-alive out on its
+    /// own: a host's heartbeat task must not have to queue behind whatever lock
+    /// guards this session to beat. See [`KeepAlive`].
+    own_membership_machine: Option<Arc<OwnMembershipMachine<T>>>,
     /// Identity of the current join, or `None` while not joined.
     own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
@@ -271,6 +286,24 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
     }
 
+    /// Changes the participant count at which this session suspends key rotation
+    /// (see [`EncryptionManager::set_key_rotation_participant_limit`]).
+    ///
+    /// Returns `false` if the session has not joined yet — the limit then comes
+    /// from the join parameters' [`EncryptionConfig`], and there is nothing to
+    /// change.
+    ///
+    /// [`EncryptionConfig`]: crate::encryption::types::EncryptionConfig
+    pub fn set_key_rotation_participant_limit(&mut self, limit: usize) -> bool {
+        match &mut self.encryption_manager {
+            Some(manager) => {
+                manager.set_key_rotation_participant_limit(limit);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Installs the identity mapper used to derive the RTC-backend participant
     /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
     ///
@@ -381,7 +414,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         machine.join(transports).await?;
 
         // Store the machine
-        self.own_membership_machine = Some(machine);
+        self.own_membership_machine = Some(Arc::new(machine));
         self.own_participation = Some(OwnParticipation {
             user_id: params.user_id.clone(),
             device_id: params.device_id.clone(),
@@ -569,6 +602,23 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
     }
 
+    /// A handle on this session's keep-alive, beatable without going through the
+    /// session (or the lock a host keeps over its manager).
+    ///
+    /// Prefer this to [`Self::heartbeat`] for a periodic task: the two do the
+    /// same thing, but this one cannot be starved by a key distribution running
+    /// under the same lock — which is the difference between a beat that is late
+    /// and a delayed leave that fires. [`KeepAlive`] has the full argument.
+    ///
+    /// `None` while not joined. Take it after the join and hold it for the life
+    /// of the task; it does not follow a later rejoin, which mints a new
+    /// `member.id` and therefore a new machine.
+    pub fn keep_alive(&self) -> Option<KeepAlive<T>> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| KeepAlive::new(machine.clone()))
+    }
+
     /// Returns the number of currently tracked joined members.
     pub fn member_count(&self) -> usize {
         self.members.len()
@@ -615,7 +665,49 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             // announce every partial roster on the way — starting with a
             // one-member one, which reads as everybody else leaving. Refresh
             // happens once, below.
-            self.record_membership_event(event);
+            //
+            // Logging is left to the diff below for the same reason the refresh
+            // is: every candidate is re-recorded on every sticky tick, so
+            // per-event lines reprint the entire roster as "added" a few times a
+            // second — N lines per tick per session, N² for the process running
+            // a whole load test.
+            self.record_membership_event(event, EventLogging::Silent);
+        }
+
+        let is_same_candidate = |a: &JoinedMembership, b: &JoinedMembership| {
+            a.sender == b.sender && a.sticky_key == b.sticky_key
+        };
+
+        let added: Vec<&str> = self
+            .candidates
+            .iter()
+            .filter(|now| !previous.iter().any(|before| is_same_candidate(now, before)))
+            .map(|candidate| candidate.sticky_key.as_str())
+            .collect();
+        if !added.is_empty() {
+            log::debug!(
+                "[{}] {} candidate(s) new in the current sticky state: {added:?}",
+                self.log_tag,
+                added.len(),
+            );
+        }
+
+        let updated: Vec<&str> = self
+            .candidates
+            .iter()
+            .filter(|now| {
+                previous
+                    .iter()
+                    .any(|before| is_same_candidate(now, before) && before != *now)
+            })
+            .map(|candidate| candidate.sticky_key.as_str())
+            .collect();
+        if !updated.is_empty() {
+            log::debug!(
+                "[{}] {} candidate(s) changed in the current sticky state: {updated:?}",
+                self.log_tag,
+                updated.len(),
+            );
         }
 
         let dropped: Vec<&str> = previous
@@ -624,7 +716,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                 !self
                     .candidates
                     .iter()
-                    .any(|now| now.sender == before.sender && now.sticky_key == before.sticky_key)
+                    .any(|now| is_same_candidate(now, before))
             })
             .map(|candidate| candidate.sticky_key.as_str())
             .collect();
@@ -649,7 +741,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
     /// Applies one membership event and publishes the result.
     async fn apply_membership_event(&mut self, event: CallMembershipEvent) {
-        if self.record_membership_event(event) {
+        if self.record_membership_event(event, EventLogging::PerEvent) {
             self.refresh().await;
         }
     }
@@ -670,7 +762,13 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// call.
     ///
     /// [`set_current_state`]: Self::set_current_state
-    fn record_membership_event(&mut self, event: CallMembershipEvent) -> bool {
+    fn record_membership_event(
+        &mut self,
+        event: CallMembershipEvent,
+        logging: EventLogging,
+    ) -> bool {
+        let verbose = logging == EventLogging::PerEvent;
+
         match event {
             CallMembershipEvent::Joined(joined) => {
                 let existing = self.candidates.iter().position(|candidate| {
@@ -679,30 +777,36 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
                 match existing {
                     Some(index) if self.candidates[index] == joined => {
-                        log::trace!(
-                            "[{}] member event unchanged, ignored: {}/{}",
-                            self.log_tag,
-                            joined.sender,
-                            joined.sticky_key,
-                        );
+                        if verbose {
+                            log::trace!(
+                                "[{}] member event unchanged, ignored: {}/{}",
+                                self.log_tag,
+                                joined.sender,
+                                joined.sticky_key,
+                            );
+                        }
                         return false;
                     }
                     Some(index) => {
-                        log::debug!(
-                            "[{}] candidate updated: {}/{}",
-                            self.log_tag,
-                            joined.sender,
-                            joined.sticky_key,
-                        );
+                        if verbose {
+                            log::debug!(
+                                "[{}] candidate updated: {}/{}",
+                                self.log_tag,
+                                joined.sender,
+                                joined.sticky_key,
+                            );
+                        }
                         self.candidates[index] = joined;
                     }
                     None => {
-                        log::debug!(
-                            "[{}] candidate added: {}/{}",
-                            self.log_tag,
-                            joined.sender,
-                            joined.sticky_key,
-                        );
+                        if verbose {
+                            log::debug!(
+                                "[{}] candidate added: {}/{}",
+                                self.log_tag,
+                                joined.sender,
+                                joined.sticky_key,
+                            );
+                        }
                         self.candidates.push(joined);
                     }
                 }
@@ -714,21 +818,25 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                 });
 
                 if self.candidates.len() == before {
-                    log::trace!(
-                        "[{}] leave for an unknown candidate, ignored: {}/{}",
+                    if verbose {
+                        log::trace!(
+                            "[{}] leave for an unknown candidate, ignored: {}/{}",
+                            self.log_tag,
+                            left.sender,
+                            left.sticky_key,
+                        );
+                    }
+                    return false;
+                }
+
+                if verbose {
+                    log::debug!(
+                        "[{}] candidate removed: {}/{}",
                         self.log_tag,
                         left.sender,
                         left.sticky_key,
                     );
-                    return false;
                 }
-
-                log::debug!(
-                    "[{}] candidate removed: {}/{}",
-                    self.log_tag,
-                    left.sender,
-                    left.sticky_key,
-                );
             }
         }
 
@@ -813,6 +921,24 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                     excluded.len(),
                     describe_exclusions(&excluded),
                 );
+            }
+
+            // A rotation deferred by `leave_rotation_grace_period_ms` waits on
+            // time, not on the roster, and the roster it is waiting in may never
+            // move again — the last departure of a burst can be the last event of
+            // the call. The core owns no timers (it is driven from synchronous
+            // host calls), so the wait is resolved here instead: every state push
+            // reaches `refresh`, including the periodic re-assertions of unchanged
+            // state, and those are what carry a due rotation over the line. The
+            // check is a mutex and a clock read, so running it on each one is free.
+            if let Some(ref encryption_manager) = self.encryption_manager
+                && encryption_manager.rotation_due()
+            {
+                log::info!(
+                    "[{}] membership unchanged, but a deferred key rotation is due",
+                    self.log_tag,
+                );
+                let _ = encryption_manager.on_memberships_update().await;
             }
             return;
         }
@@ -1170,6 +1296,22 @@ pub struct JoinedMembership {
     pub sticky_key: String,
     /// `member.id` — identifies this participation, unique per join.
     pub member_id: String,
+    /// When this participation began, if the sender states it.
+    ///
+    /// The tie-breaker for dialects where `member_id` does *not* change per join.
+    /// MSC4143 mints a fresh `member.id` every time, so there this is `None` and
+    /// nothing needs it. The pre-2026 state dialect derives the member id from
+    /// user+device, where it is the same string for every join that device ever
+    /// makes — so without this, a leave and an immediate rejoin produce a
+    /// byte-identical membership, `refresh` discards the update as unchanged, and
+    /// the returner is never handed the key they threw away on the way out.
+    ///
+    /// Stated by the sender and pinned for the life of one participation, so a
+    /// membership re-sent to extend its lifetime carries the same value; a
+    /// rejoin carries a new one. A sender that states nothing leaves this `None`,
+    /// which means *unknown*, not *different* — see
+    /// `ParticipantDeviceInfo::is_same_participation`.
+    pub joined_at: Option<u64>,
     /// Application type from `content.application.type`.
     pub application: Option<String>,
     /// Transports this member publishes on (`content.transports.published`).

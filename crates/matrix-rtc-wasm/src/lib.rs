@@ -348,6 +348,17 @@ pub struct WasmEncryptionConfig {
     pub delay_before_use_ms: u64,
     #[serde(default = "default_key_rotation_grace_period_ms")]
     pub key_rotation_grace_period_ms: u64,
+    /// Grace period (ms) before a departure forces a rotation, collapsing a burst
+    /// of leaves into one rotation. Defaults to 0 — rotate immediately — because
+    /// any other value leaves a departed member able to decrypt us for that long.
+    #[serde(default)]
+    pub leave_rotation_grace_period_ms: u64,
+    /// Participant count (ourselves included) at which key rotation stops:
+    /// joiners are still served the current key, but the index stops moving and
+    /// departures no longer rotate it. Rotation resumes below the limit.
+    /// Defaults to 30.
+    #[serde(default = "default_key_rotation_participant_limit")]
+    pub key_rotation_participant_limit: usize,
     #[serde(default = "default_manage_media_keys")]
     pub manage_media_keys: bool,
     /// Whether to discard keys from devices that are not cross-signed
@@ -362,6 +373,9 @@ fn default_delay_before_use_ms() -> u64 {
 fn default_key_rotation_grace_period_ms() -> u64 {
     10000
 }
+fn default_key_rotation_participant_limit() -> usize {
+    30
+}
 fn default_manage_media_keys() -> bool {
     true
 }
@@ -374,6 +388,8 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
         EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms,
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms,
+            leave_rotation_grace_period_ms: value.leave_rotation_grace_period_ms,
+            key_rotation_participant_limit: value.key_rotation_participant_limit,
             manage_media_keys: value.manage_media_keys,
             require_cross_signed_sender: value.require_cross_signed_sender,
         }
@@ -655,6 +671,14 @@ struct WasmStickyEventContent {
     sticky_key: String,
     application: Option<WasmApplication>,
     member: Option<WasmMember>,
+    /// `content.created_ts`, when the sender states one.
+    ///
+    /// Not an MSC4143 field. Spec-current member ids are fresh per join and
+    /// already distinguish one participation from the next; this is read only for
+    /// dialects whose member ids repeat across joins, where it is the only thing
+    /// that tells a rejoin from the membership it replaced.
+    #[serde(default)]
+    created_ts: Option<u64>,
     #[serde(default)]
     transports: Option<WasmTransports>,
     #[serde(default)]
@@ -739,6 +763,7 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                     extra: std::collections::BTreeMap::new(),
                 },
                 member,
+                created_ts: value.content.created_ts,
                 transports: value
                     .content
                     .transports

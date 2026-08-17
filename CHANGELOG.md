@@ -381,6 +381,39 @@ single integrator, rather than dripped out over several:
 
 ### Fixed
 
+- **A device rejoining a large call was never re-sent anyone's media key.** Above
+  `key_rotation_participant_limit` rotation is suspended, so an arriving member is
+  served the standing key and nothing else happens — and a rejoin was not read as
+  an arrival. Two gates closed in front of it, both keyed on identity that does
+  not move when `member.id` is derived from user+device rather than minted per
+  join (the pre-2026 Element Call state dialect): `RtcSession::refresh` discarded
+  the update because the `JoinedMembership` was byte-identical, and the roster
+  diff in `rollout_outbound_key` matched on `member_id`, so the returner was on
+  neither side of it. The rejoiner discards every inbound key on the way out and
+  needs all of them again; below the limit an unrelated member's churn rotates and
+  hides the bug, above it nothing ever does, and the device spends the rest of the
+  call unable to decrypt anyone.
+
+  Membership now carries `joined_at` — the participation's start, from
+  `content.created_ts` or the member event's own stamp when none is stated, so a
+  re-assertion keeps it and a rejoin gets a new one — and key distribution diffs
+  on the *participation* rather than the member. It is deliberately not the
+  clamped value used to judge expiry: `min(created_ts, origin_server_ts)` picks
+  the event stamp whenever a sender's clock runs ahead, and that moves while the
+  participation has not. An unstated `joined_at` means *unknown*, never
+  *different*, so the spec-current path (where `member.id` is already per-join) is
+  untouched.
+
+  A second, independent path catches dialects that report neither: a sender never
+  reuses a key index within one participation, so material replacing material at
+  an index we already hold means that member restarted. We then retire the dead
+  participation's other indices and re-serve our key to them — one message, no
+  rotation, rate-limited per member. This needs no membership support at all and
+  is guaranteed to fire, since a rejoiner sends its first key to everyone.
+
+  `StickyEvent` (FFI) gains `created_ts` and `JoinedMembership` gains `joined_at`;
+  hosts on the spec-current dialect should leave both `None`.
+
 - **Key rotation never took effect: we advertised a new key and kept encrypting
   with the old one.** `KeyProvider::set_key` only fills the key *ring*; the index
   a sender stamps lives on its frame cryptor, which is created at index 0 and

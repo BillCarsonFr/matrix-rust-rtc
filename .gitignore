@@ -55,3 +55,5 @@ mobile/android/matrixrtc/src/main/java/uniffi/
 scripts/load-test.sh
 
 scripts/load-test-state.sh
+
+scripts/load-test-eu.sh

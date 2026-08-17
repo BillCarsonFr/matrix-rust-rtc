@@ -156,6 +156,21 @@ pub struct RawStickyEventContent {
     /// whole: that participant simply never appears in the call.
     #[serde(rename = "msc4354_sticky_key", alias = "sticky_key")]
     pub sticky_key: String,
+    /// When this *participation* began, if the sender states it.
+    ///
+    /// Not an MSC4143 field, and never sent by this crate: MSC4143 mints a fresh
+    /// `member.id` per join, so there the member id already tells one
+    /// participation from the next. The pre-2026 state dialect derives the member
+    /// id from user+device instead, where it is the same string for every join
+    /// that device ever makes — and this is then the only thing that distinguishes
+    /// a rejoin from the membership it replaced. See
+    /// [`JoinedMembership::joined_at`](crate::JoinedMembership::joined_at).
+    ///
+    /// Only ever read, so it is skipped on serialization and our own outbound
+    /// content stays byte-identical to what it was before this field existed —
+    /// which the sticky re-assertion path depends on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ts: Option<u64>,
     /// Member info from `content.member` (MSC4143).
     #[serde(default, skip_serializing_if = "MemberInfo::is_empty")]
     pub member: MemberInfo,
@@ -270,6 +285,7 @@ impl RawStickyEvent {
             origin: self.origin,
             sticky_key: self.content.sticky_key,
             member_id,
+            joined_at: self.content.created_ts,
             application: application_type,
             transports: transports
                 .published
@@ -330,6 +346,11 @@ impl RawStickyEventContent {
                 membership: Some(Membership::Join),
             },
             sticky_key: member_id,
+            // Never stated by us: our own `member.id` is fresh on every join, so
+            // it already distinguishes one participation from the next and there
+            // is nothing for this to add. Only read, and only from dialects whose
+            // member ids are not per-join.
+            created_ts: None,
             // Skipped entirely when this member neither publishes nor states
             // anything it can receive.
             transports: (!transports.is_empty()).then_some(transports),
@@ -354,6 +375,7 @@ impl RawStickyEventContent {
             },
             sticky_key: member_id,
             application: ApplicationInfo::default(),
+            created_ts: None,
             transports: None,
             leave_reason,
         }

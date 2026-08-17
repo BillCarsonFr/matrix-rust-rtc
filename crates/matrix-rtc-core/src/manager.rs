@@ -31,6 +31,7 @@ use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
+use crate::own_membership::KeepAlive;
 use crate::session::{CallMembershipEvent, JoinedMembership, RtcSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
@@ -237,7 +238,11 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             batches.entry(key).or_default();
         }
 
+        // Own target, so a caller that wants the rest of this module at debug can
+        // still silence this one line: it fires per sticky-state sync per room,
+        // which drowns everything else out under a load test.
         log::debug!(
+            target: "matrix_rtc_core::manager::sticky_routing",
             "[{room_id}] current sticky state routed to {} session(s): {}",
             batches.len(),
             describe_batches(&batches),
@@ -261,6 +266,28 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             Some(session) => session.heartbeat().await,
             None => false,
         }
+    }
+
+    /// A handle on one session's keep-alive, beatable without holding whatever
+    /// lock the host keeps over this manager.
+    ///
+    /// This is the one a periodic heartbeat task should take, and [`Self::
+    /// heartbeat`] is for hosts that beat from a call they already make into the
+    /// manager. Both do the same work; the difference is what can delay it. Every
+    /// membership change this manager applies distributes media keys to every
+    /// member from inside the call that delivered the change — awaited, so the
+    /// host's lock is held throughout — and a heartbeat that has to wait for that
+    /// eventually waits past the delayed leave's deadline. The homeserver then
+    /// publishes our leave while we are still in the call, which every peer
+    /// answers with a key rotation to everyone: the fan-out that delayed the beat
+    /// begets a bigger one. See [`KeepAlive`].
+    ///
+    /// `None` if the session does not exist or has not joined.
+    ///
+    /// [`Self::heartbeat`]: Self::heartbeat
+    pub fn keep_alive(&self, room_id: &str, slot_id: &str) -> Option<KeepAlive<T>> {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions.get(&key).and_then(RtcSession::keep_alive)
     }
 
     /// Returns the number of tracked sessions.
@@ -300,6 +327,27 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         self.sessions
             .get_mut(&key)
             .is_some_and(|session| session.set_encryption_signal_handler(handler))
+    }
+
+    /// Changes the participant count at which one `(room_id, slot_id)` session
+    /// suspends key rotation, without disturbing the rest of its encryption
+    /// configuration (see
+    /// [`EncryptionManager::set_key_rotation_participant_limit`]).
+    ///
+    /// Returns `false` if the session does not exist or has not joined. The new
+    /// limit is applied by the next key rollout, not here.
+    ///
+    /// [`EncryptionManager::set_key_rotation_participant_limit`]: crate::encryption::EncryptionManager::set_key_rotation_participant_limit
+    pub fn set_key_rotation_participant_limit(
+        &mut self,
+        room_id: &str,
+        slot_id: &str,
+        limit: usize,
+    ) -> bool {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get_mut(&key)
+            .is_some_and(|session| session.set_key_rotation_participant_limit(limit))
     }
 
     /// Our `member.id` in one `(room_id, slot_id)` session, or `None` if there

@@ -28,7 +28,7 @@ use crate::transport::RtcTransport;
 /// Default keep-alive timeout in milliseconds (30 seconds).
 ///
 /// This is the delay before the cleanup event would fire if not restarted.
-pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 300_000;
 
 /// Default sticky-map lifetime for our membership event, in milliseconds
 /// (1 hour).

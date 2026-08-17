@@ -50,7 +50,7 @@ pub use event::{
 pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
 pub use manager::RtcSessionManager;
 pub use own_membership::{
-    KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
+    KeepAlive, KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
 };
 pub use session::{
     ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,
@@ -90,6 +90,7 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: slot_id.to_owned(),
                 sticky_key: sticky_key.to_owned(),
+                created_ts: None,
                 application: ApplicationInfo {
                     application_type: application_type.map(str::to_owned),
                     extra: std::collections::BTreeMap::new(),
@@ -345,6 +346,188 @@ mod tests {
             content.pointer("/media_key/index").and_then(|v| v.as_u64()),
             Some(0),
             "a fresh join starts a fresh key index"
+        );
+    }
+
+    /// A rotation deferred by `leave_rotation_grace_period_ms` is waiting on the
+    /// clock, not on the roster — and the departure that triggered it can be the
+    /// last thing that ever happens in the call, so no further membership change
+    /// is guaranteed to come and collect it. What carries it over the line is the
+    /// re-assertion of unchanged state every host performs periodically (every 30s
+    /// in `matrix-rtc-bridge`), which means `refresh` must not swallow the due
+    /// rotation along with the rest of that no-op.
+    #[tokio::test]
+    async fn a_deferred_rotation_lands_on_an_unchanged_state_push() {
+        const GRACE_MS: u64 = 400;
+
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        let mut params = JoinSessionParams::new(
+            "@alice:example.org".to_owned(),
+            "ALICEDEV".to_owned(),
+            ROOM_ID.to_owned(),
+            "m.call#ROOM".to_owned(),
+            "m.call".to_owned(),
+            RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://example.com/jwt".to_owned(),
+            }),
+        );
+        params.membership_id = Some("alice-a".to_owned());
+        params.encryption_config = Some(EncryptionConfig {
+            leave_rotation_grace_period_ms: GRACE_MS,
+            ..EncryptionConfig::default()
+        });
+        manager.join(params).await.expect("join should succeed");
+
+        let bob = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+            ..joined_event("@bob:example.org", "m.call#ROOM", "bob-a")
+        };
+        let carol = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("CAROLDEV".to_owned())),
+            ..joined_event("@carol:example.org", "m.call#ROOM", "carol-a")
+        };
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![bob.clone(), carol])
+            .await
+            .unwrap();
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Carol's sticky entry lapses. The key she holds was minted moments ago,
+        // so the rotation is held back and nothing goes out.
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![bob.clone()])
+            .await
+            .unwrap();
+        assert!(
+            sender
+                .to_device_messages_for("@bob:example.org", "BOBDEV")
+                .is_empty(),
+            "the rotation was inside the window and should have been deferred"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(GRACE_MS + 150)).await;
+
+        // The same state again: the roster has not moved, and this is the only
+        // thing that ever will happen again in this call.
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![bob])
+            .await
+            .unwrap();
+
+        let sent = sender.to_device_messages_for("@bob:example.org", "BOBDEV");
+        assert_eq!(
+            sent.len(),
+            1,
+            "the deferred rotation never reached bob, so carol can still decrypt \
+             everything we send: {sent:?}"
+        );
+        assert_eq!(
+            sent[0]
+                .1
+                .pointer("/media_key/index")
+                .and_then(|v| v.as_u64()),
+            Some(1),
+            "the rotation should hand bob the next index"
+        );
+    }
+
+    /// End-to-end for the rejoin a stable `member_id` hides.
+    ///
+    /// Two gates used to close in front of this, both keyed on identity that does
+    /// not move: `refresh` discards the update because the `JoinedMembership` is
+    /// byte-identical, and the roster diff finds the returner on neither side
+    /// because it matches on `member_id`. Over the participant limit nothing
+    /// rotates either, so the member sits in the call unable to decrypt anyone.
+    ///
+    /// Driven through `set_current_sticky_state` — the only way membership
+    /// reaches the core — so it exercises the real path rather than the
+    /// encryption manager alone.
+    #[tokio::test]
+    async fn a_peer_rejoining_under_a_stable_member_id_is_served_the_key_again() {
+        /// `{user}:{device}`, the shape the pre-2026 dialect derives, and
+        /// identical across every join this device makes.
+        const STABLE: &str = "@bob:example.org:BOBDEV";
+
+        let peer_at = |created_ts: u64| RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+            content: RawStickyEventContent {
+                created_ts: Some(created_ts),
+                ..joined_event("@bob:example.org", "m.call#ROOM", STABLE).content
+            },
+            ..joined_event("@bob:example.org", "m.call#ROOM", STABLE)
+        };
+
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+        join_as(&mut manager, "alice-a").await;
+
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![peer_at(1_000)])
+            .await
+            .unwrap();
+        assert_eq!(
+            sender
+                .to_device_messages_for("@bob:example.org", "BOBDEV")
+                .len(),
+            1,
+            "bob should have been served on arrival"
+        );
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Bob parts and rejoins between two syncs, so we never see a roster
+        // without him. Same member id, same device, same everything but the
+        // participation's start.
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![peer_at(2_000)])
+            .await
+            .unwrap();
+
+        let sent = sender.to_device_messages_for("@bob:example.org", "BOBDEV");
+        assert_eq!(
+            sent.len(),
+            1,
+            "bob discarded his keys when he left and was never sent them again: {sent:?}"
+        );
+    }
+
+    /// The other half of that: a membership re-sent to extend its lifetime keeps
+    /// its start, and must stay silent. Every member re-asserts on a timer, so
+    /// reading one as a rejoin would put a message on the wire per member per
+    /// tick.
+    #[tokio::test]
+    async fn a_re_asserted_membership_is_not_mistaken_for_a_rejoin() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+        join_as(&mut manager, "alice-a").await;
+
+        let bob = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+            content: RawStickyEventContent {
+                created_ts: Some(1_000),
+                ..joined_event("@bob:example.org", "m.call#ROOM", "@bob:example.org:BOBDEV").content
+            },
+            ..joined_event("@bob:example.org", "m.call#ROOM", "@bob:example.org:BOBDEV")
+        };
+
+        manager
+            .set_current_sticky_state(ROOM_ID, vec![bob.clone()])
+            .await
+            .unwrap();
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for _ in 0..3 {
+            manager
+                .set_current_sticky_state(ROOM_ID, vec![bob.clone()])
+                .await
+                .unwrap();
+        }
+
+        let sent = sender.to_device_messages_for("@bob:example.org", "BOBDEV");
+        assert!(
+            sent.is_empty(),
+            "re-assertions of an unchanged membership must cost nothing: {sent:?}"
         );
     }
 
@@ -1044,6 +1227,7 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),
+                created_ts: None,
                 application: ApplicationInfo {
                     application_type: Some("m.call".to_owned()),
                     extra: std::collections::BTreeMap::new(),
@@ -1098,6 +1282,7 @@ mod tests {
             content: RawStickyEventContent {
                 slot_id: "m.call#ROOM".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),
+                created_ts: None,
                 application: ApplicationInfo {
                     application_type: Some("m.call".to_owned()),
                     extra: std::collections::BTreeMap::new(),

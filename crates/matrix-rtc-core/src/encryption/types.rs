@@ -33,16 +33,40 @@ pub struct ParticipantDeviceInfo {
     /// Device ID of the participant
     pub device_id: String,
     /// The `member.id` from the `m.rtc.member` event (MSC4143)
-    /// This is globally unique per member instance
+    /// This is globally unique per member instance (with sticky events. with state events it is not unique. It will be the same for each join)
     pub member_id: String,
+    /// When this participation began, if the membership stated it.
+    ///
+    /// Carried from `JoinedMembership::joined_at`, and only ever consulted
+    /// through [`Self::is_same_participation`].
+    pub joined_at: Option<u64>,
 }
 
 impl ParticipantDeviceInfo {
-    /// Creates a map key for this participant using the member_id.
+    /// Whether these two describe the *same participation*, rather than merely
+    /// the same member.
     ///
-    /// MSC4143 uses member_id as the primary key for participants.
-    pub fn map_key(&self) -> String {
-        self.member_id.clone()
+    /// The distinction is the whole point. Every roster diff in key distribution
+    /// asks "is this the party I already sent my key to", and `member_id` answers
+    /// that only where MSC4143 mints a fresh one per join. The pre-2026 state
+    /// dialect derives it from user+device (see `compat`), so a device that
+    /// leaves and rejoins keeps its id — and the rejoin then reads as no change
+    /// at all: the returner is in both `shared_with` and the roster, so nothing
+    /// is `joined`, nothing is `left`, and the key they discarded on the way out
+    /// is never re-sent. Above `key_rotation_participant_limit` no rotation
+    /// happens to cover that up, so it is permanent.
+    ///
+    /// An absent `joined_at` means *unknown*, never *different*. Treating it as a
+    /// difference would be far worse than the bug: a sender that states nothing
+    /// would look like it rejoined on every membership update, and every peer
+    /// would re-send to it forever. So an unknown on either side falls back to
+    /// the member id alone, which is exactly today's behaviour.
+    pub fn is_same_participation(&self, other: &Self) -> bool {
+        self.member_id == other.member_id
+            && match (self.joined_at, other.joined_at) {
+                (Some(ours), Some(theirs)) => ours == theirs,
+                _ => true,
+            }
     }
 }
 
@@ -232,6 +256,65 @@ pub struct EncryptionConfig {
     /// Default: 10000ms (10 seconds).
     pub key_rotation_grace_period_ms: u64,
 
+    /// Grace period (ms) before a *departure* forces a rotation.
+    ///
+    /// A member leaving always costs a new key, and MSC4143 has no grace period
+    /// for it. When several leave at once — a big call emptying out, a partition
+    /// dropping a group of devices, a sticky batch expiring — every membership
+    /// update that reaches us mints and distributes its own key, one to-device
+    /// send per remaining member each time. Holding the rotation back until the
+    /// current key is at least this old collapses the burst: the first departure
+    /// rotates as it always did, and every departure landing inside the window
+    /// of that fresh key is answered by a single rotation once it closes.
+    ///
+    /// Measured against the *age of the current key*, not against when the
+    /// departure arrived, exactly like [`Self::key_rotation_grace_period_ms`]. A
+    /// lone member leaving a call whose key is older than this therefore still
+    /// rotates immediately — the deferral only ever applies to a key we just
+    /// minted, which is what a burst looks like.
+    ///
+    /// The cost is forward secrecy on leave: for as long as a rotation is
+    /// deferred we keep encrypting with a key the departed member holds, so it
+    /// can still decrypt our media. `0` — the default — rotates immediately,
+    /// which is the conservative choice and what this crate did before the knob
+    /// existed. Raise it deliberately.
+    ///
+    /// There is no timer behind this. A deferred rotation is carried out by the
+    /// next membership update the session sees (see
+    /// [`EncryptionManager::rotation_due`]), so the effective delay is this value
+    /// rounded up to however often the consumer pushes state — 30s in
+    /// `matrix-rtc-bridge`. Values below that granularity buy less than they
+    /// look like they do.
+    ///
+    /// [`EncryptionManager::rotation_due`]: crate::encryption::EncryptionManager::rotation_due
+    pub leave_rotation_grace_period_ms: u64,
+
+    /// Participant count at which key rotation stops.
+    ///
+    /// Counted over the whole call, ourselves included. At or above this many
+    /// participants we stop minting new keys altogether: the key index stays put
+    /// for the rest of the call, a departure no longer costs a rotation, and no
+    /// grace period applies because there is nothing to defer.
+    ///
+    /// What does *not* stop is distribution. A member arriving over the limit is
+    /// sent the current key in one to-device message and can decrypt from their
+    /// first frame — and since every member already present holds that same key,
+    /// nobody else hears from us at all. That is the point of the limit: a
+    /// rotation is a message to every other member, so it costs O(N) per
+    /// membership change in a call where changes arrive at a rate that also grows
+    /// with N, while serving a joiner costs exactly one message however large the
+    /// call is.
+    ///
+    /// The price is forward secrecy: over the limit, a departed member keeps a key
+    /// that stays live, so it can decrypt our media until the call drops back
+    /// under the limit. It does not lose *confidentiality* against non-members —
+    /// the key is still only ever sent to members. Rotation resumes below the
+    /// limit, and the first rollout after it retires every member who left
+    /// meanwhile in a single rotation.
+    ///
+    /// Default: 30.
+    pub key_rotation_participant_limit: usize,
+
     /// Whether to manage media keys (default: true).
     ///
     /// If false, the encryption manager will not distribute keys or signal
@@ -255,6 +338,13 @@ impl Default for EncryptionConfig {
         Self {
             delay_before_use_ms: 5000,            // MSC4143 default
             key_rotation_grace_period_ms: 10_000, // MSC4143 default
+            // Not in MSC4143: departures rotate at once unless a consumer opts
+            // into trading forward secrecy on leave for fewer rotations.
+            leave_rotation_grace_period_ms: 0,
+            // Not in MSC4143 either: past this many participants the O(N) cost of
+            // a rotation is what breaks first, so we stop paying it and keep only
+            // the O(1) part — handing an arriving member the current key.
+            key_rotation_participant_limit: 30,
             manage_media_keys: true,
             require_cross_signed_sender: true,
         }
@@ -370,15 +460,49 @@ impl OutdatedKeyFilter {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_participant_device_info_map_key() {
-        let info = ParticipantDeviceInfo {
+    fn participant(member_id: &str, joined_at: Option<u64>) -> ParticipantDeviceInfo {
+        ParticipantDeviceInfo {
             user_id: "@alice:example.org".to_string(),
             device_id: "device123".to_string(),
-            member_id: "xyzABCDEF0123".to_string(),
-        };
+            member_id: member_id.to_string(),
+            joined_at,
+        }
+    }
 
-        assert_eq!(info.map_key(), "xyzABCDEF0123");
+    #[test]
+    fn a_participation_is_told_from_another_by_member_id() {
+        assert!(
+            participant("xyzABCDEF0123", None)
+                .is_same_participation(&participant("xyzABCDEF0123", None))
+        );
+        assert!(
+            !participant("xyzABCDEF0123", None).is_same_participation(&participant("other", None))
+        );
+    }
+
+    /// The whole reason the field exists: where the member id repeats across
+    /// joins, this is the only thing that says a rejoin happened.
+    #[test]
+    fn a_repeated_member_id_with_a_new_start_is_a_different_participation() {
+        assert!(
+            !participant("@alice:example.org:device123", Some(1_000))
+                .is_same_participation(&participant("@alice:example.org:device123", Some(2_000)))
+        );
+        assert!(
+            participant("@alice:example.org:device123", Some(1_000))
+                .is_same_participation(&participant("@alice:example.org:device123", Some(1_000))),
+            "a membership re-sent to extend its lifetime keeps its start and must not \
+             read as a rejoin"
+        );
+    }
+
+    /// An unknown start means *unknown*, never *different* — a sender that states
+    /// none would otherwise look like it rejoined on every single update, and
+    /// every peer would re-send its key forever.
+    #[test]
+    fn an_unstated_start_never_makes_two_participations_differ() {
+        assert!(participant("bob-a", None).is_same_participation(&participant("bob-a", Some(1))));
+        assert!(participant("bob-a", Some(1)).is_same_participation(&participant("bob-a", None)));
     }
 
     #[test]
@@ -387,6 +511,10 @@ mod tests {
 
         assert_eq!(config.delay_before_use_ms, 5000);
         assert_eq!(config.key_rotation_grace_period_ms, 10_000);
+        assert_eq!(
+            config.leave_rotation_grace_period_ms, 0,
+            "a departure must rotate immediately unless a consumer opts out"
+        );
         assert!(config.manage_media_keys);
     }
 

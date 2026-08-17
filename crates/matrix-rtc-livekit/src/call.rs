@@ -67,8 +67,8 @@ use matrix_rtc_bridge::compat::{
 };
 use matrix_rtc_bridge::{SdkCommandSender, run_sticky_bridge};
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, ReceivedEncryptionKey,
-    RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
+    EncryptionConfig, JoinSessionParams, KeepAlive, KeyOrigin, LiveKitTransport,
+    ReceivedEncryptionKey, RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
@@ -124,6 +124,12 @@ pub struct CallOptions {
     pub encryption_config: Option<EncryptionConfig>,
     /// How often to refresh the dead man's switch delayed leave.
     pub heartbeat_interval: Duration,
+    /// How long after the last refresh the dead man's switch fires, i.e. the
+    /// MSC4140 delayed leave's timeout. `None` keeps the core's default of 300
+    /// seconds.
+    ///
+    /// The twin of [`heartbeat_interval`](Self::heartbeat_interval)
+    pub keep_alive_timeout_ms: Option<u64>,
     /// How long the homeserver keeps our membership in the sticky map. `None`
     /// keeps the core's default of an hour.
     ///
@@ -179,7 +185,8 @@ impl Default for CallOptions {
             application: "m.call".to_owned(),
             livekit_service_url_fallback: None,
             encryption_config: None,
-            heartbeat_interval: Duration::from_secs(15),
+            heartbeat_interval: Duration::from_secs(150),
+            keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             http: None,
             auto_subscribe: true,
@@ -378,8 +385,9 @@ impl Call {
         );
         params.membership_id = Some(membership_id.clone());
         params.encryption_config = options.encryption_config.clone();
+        params.keep_alive_timeout_ms = options.keep_alive_timeout_ms;
         params.sticky_duration_ms = options.sticky_duration_ms;
-        let memberships = {
+        let (memberships, keep_alive) = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;
             // The same `Arc` that produced `own_identity` above and that the
@@ -405,19 +413,23 @@ impl Call {
                     "failed to register encryption signal handler".into(),
                 ));
             }
-            mgr.subscribe_membership_snapshots(&room_id, &options.slot_id)
+            let memberships = mgr
+                .subscribe_membership_snapshots(&room_id, &options.slot_id)
                 .ok_or_else(|| {
                     CallError::Signalling("joined session is not tracked by the manager".into())
-                })?
+                })?;
+            // Taken here, under the lock we already hold, because the heartbeat
+            // must never need this lock again — see `spawn_heartbeat`. It belongs
+            // to this join alone, so a later rejoin would need a fresh one; this
+            // `Call` never rejoins.
+            let keep_alive = mgr.keep_alive(&room_id, &options.slot_id).ok_or_else(|| {
+                CallError::Signalling("the joined session has no keep-alive".into())
+            })?;
+            (memberships, keep_alive)
         };
 
         let key_pump = AbortOnDrop(spawn_key_pump(manager.clone(), key_rx));
-        let heartbeat = AbortOnDrop(spawn_heartbeat(
-            manager.clone(),
-            room_id.clone(),
-            options.slot_id.clone(),
-            options.heartbeat_interval,
-        ));
+        let heartbeat = AbortOnDrop(spawn_heartbeat(keep_alive, options.heartbeat_interval));
 
         // The media layer: a LiveKit transport sharing the E2EE key provider,
         // and the engine reconciling memberships with connection events. The
@@ -698,6 +710,23 @@ impl Call {
             .await
             .member_count(&self.room_id, &self.slot_id)
             .unwrap_or(0)
+    }
+
+    /// Change the participant count at which this call stops rotating its media
+    /// key, from the [`EncryptionConfig::key_rotation_participant_limit`] it
+    /// joined with. Returns `false` if the session is gone.
+    ///
+    /// Only that one setting moves; everything else the join negotiated stays.
+    /// The new limit is honoured by the next key rollout — the next membership
+    /// change, in other words — because whether rotation is suspended is decided
+    /// from the roster each time, never cached.
+    ///
+    /// [`EncryptionConfig::key_rotation_participant_limit`]: matrix_rtc_core::EncryptionConfig::key_rotation_participant_limit
+    pub async fn set_key_rotation_participant_limit(&self, limit: usize) -> bool {
+        self.manager
+            .lock()
+            .await
+            .set_key_rotation_participant_limit(&self.room_id, &self.slot_id, limit)
     }
 
     /// Whether a media key for the given MSC4195 participant identity has been
@@ -985,17 +1014,23 @@ fn spawn_key_pump(manager: Manager, mut key_rx: UnboundedReceiver<ReceivedKey>) 
 }
 
 /// Keep pushing the dead man's switch delayed leave back while joined.
-fn spawn_heartbeat(
-    manager: Manager,
-    room_id: String,
-    slot_id: String,
-    interval: Duration,
-) -> JoinHandle<()> {
+///
+/// Beats through a [`KeepAlive`] taken at join time rather than through
+/// `manager.lock()`, and that is the whole point of the handle. The manager lock
+/// is held across key distribution — the membership bridge takes it, hands the
+/// core a new roster, and the core answers by writing a media key to every
+/// member before the call returns — so a heartbeat sharing that lock is blocked
+/// for exactly as long as the fan-out takes. In a large call that can outlast the
+/// delayed leave's timeout, and then the homeserver publishes our leave while we
+/// are still here: every peer rotates at once and writes to everyone, which
+/// makes the next beat later still. The lock and the beat have nothing to say to
+/// each other, so they no longer share one.
+fn spawn_heartbeat(keep_alive: KeepAlive<SdkCommandSender>, interval: Duration) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            manager.lock().await.heartbeat(&room_id, &slot_id).await;
+            keep_alive.heartbeat().await;
         }
     })
 }
