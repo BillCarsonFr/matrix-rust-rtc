@@ -53,12 +53,13 @@
 //! before the run began. Devices are then kept on exit, and `--purge-devices`
 //! clears the folder along with them.
 //!
-//! While running, device 0 listens to the room for control messages, so the
-//! fleet can be resized from any Matrix client, without shell access to the
-//! machine running the tool:
+//! While running, device 0 listens to the room for control messages, so the run
+//! can be steered from any Matrix client, without shell access to the machine
+//! running the tool:
 //!
 //! ```text
 //! !load_test device_count 12
+//! !load_test key_rotation_participant_limit 100
 //! ```
 //!
 //! A count of `0` takes every device out of the call while the tool keeps
@@ -66,6 +67,13 @@
 //! removed this way stay logged in, so scaling up again costs no logins.
 //! Anyone in the room can send the command, which is why `--max-devices`
 //! caps it.
+//!
+//! `key_rotation_participant_limit` re-runs the same fleet against the other
+//! side of the rotation-suspension threshold (`--key-rotation-participant-limit`)
+//! without restarting it — the interesting comparison being how much to-device
+//! traffic a ramp or a mass leave costs with rotation on versus suspended. Every
+//! device in the call is reconfigured in place, and devices parked outside it
+//! pick the new limit up when they next join.
 
 use rlimit::increase_nofile_limit;
 use std::error::Error;
@@ -344,6 +352,23 @@ struct Args {
     /// before it arrived. `10000` is the library and MSC4143 default.
     #[arg(long, default_value_t = 10_000)]
     key_rotation_grace_ms: u64,
+
+    /// Participant count (ourselves included) at or above which a device stops
+    /// rotating its media key, serving arriving members the standing key instead.
+    ///
+    /// The threshold this tool exists to find the far side of: below it every
+    /// membership change costs a rotation, which is a to-device send to every
+    /// other member, so a fleet of N ramping up or leaving together pays O(N²)
+    /// sends — both halves of them on this machine. Above it a join costs one
+    /// send per device and a leave costs nothing.
+    ///
+    /// `30` is the library default. While the run lasts, a `!load_test
+    /// key_rotation_participant_limit <n>` message in the room moves it: every
+    /// device in the call is reconfigured in place, so one fleet can be measured
+    /// on both sides of the threshold. The new limit lands on the next membership
+    /// change, since that is when the suspension is next decided.
+    #[arg(long, default_value_t = 30)]
+    key_rotation_participant_limit: usize,
 
     /// How often each device restarts its dead man's switch (MSC4140 delayed
     /// leave) and refreshes its membership.
@@ -684,6 +709,13 @@ struct Fleet {
     /// batch then waits [`WARMUP_SETTLE`] first, so the key exchange the
     /// warm-up started is not racing the joins.
     needs_settle: bool,
+    /// The `key_rotation_participant_limit` every device in the call is currently
+    /// configured with, and that the next join will use.
+    ///
+    /// `--key-rotation-participant-limit` at first, then whatever the room
+    /// commands. Held here rather than read from the channel at each join so that
+    /// joined and joining devices cannot disagree about it.
+    key_rotation_participant_limit: usize,
 }
 
 impl Fleet {
@@ -699,6 +731,7 @@ impl Fleet {
             stranded: Vec::new(),
             run_id: format!("{nanos:x}"),
             needs_settle: false,
+            key_rotation_participant_limit: args.key_rotation_participant_limit,
         }
     }
 
@@ -729,7 +762,10 @@ impl Fleet {
             );
         }
 
-        let mut targets = listen_for_commands(&control, &room_id, args.devices, args.max_devices);
+        let Controls {
+            device_count: mut targets,
+            key_rotation_participant_limit: mut limits,
+        } = listen_for_commands(&control, &room_id, args);
 
         if args.open_slot {
             open_slot(
@@ -749,8 +785,10 @@ impl Fleet {
         let deadline =
             (args.duration > 0).then(|| Instant::now() + Duration::from_secs(args.duration));
         println!(
-            "listening for '{COMMAND_PREFIX} device_count <n>' (up to {}) in the room; {}",
+            "listening for '{COMMAND_PREFIX} device_count <n>' (up to {}) and \
+             '{COMMAND_PREFIX} key_rotation_participant_limit <n>' (now {}) in the room; {}",
             args.max_devices,
+            self.key_rotation_participant_limit,
             match deadline {
                 Some(_) => format!("stopping after {}s (type :q to stop early)", args.duration),
                 None => "type :q to stop".to_owned(),
@@ -764,6 +802,11 @@ impl Fleet {
         ticker.tick().await; // fires immediately; skip it
         let mut previous = Vec::new();
         loop {
+            let limit = *limits.borrow_and_update();
+            if limit != self.key_rotation_participant_limit {
+                self.set_key_rotation_participant_limit(limit).await;
+                continue;
+            }
             let target = *targets.borrow_and_update();
             if target != self.active_count() {
                 self.reconcile(args, &clip, &http, &room_id, target, &mut targets)
@@ -772,9 +815,10 @@ impl Fleet {
             }
             tokio::select! {
                 _ = ticker.tick() => self.report(&mut previous).await,
-                // Cannot fail while device 0 (whose handler holds the sender)
-                // is alive; the loop re-reads the target on wake.
+                // Neither can fail while device 0 (whose handler holds the
+                // senders) is alive; the loop re-reads both on wake.
                 _ = targets.changed() => {}
+                _ = limits.changed() => {}
                 _ = sleep_until(deadline) => {
                     println!("duration elapsed; leaving the call");
                     break;
@@ -1004,6 +1048,7 @@ impl Fleet {
                 room.clone(),
                 total,
                 *index,
+                self.key_rotation_participant_limit,
                 captured.clone(),
                 errors.clone(),
             )
@@ -1025,6 +1070,48 @@ impl Fleet {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Reconfigure the whole fleet's key rotation threshold, in place.
+    ///
+    /// Devices in the call are reconfigured one by one — each takes its session
+    /// lock, and holding a batch of those at once would queue behind the key
+    /// fan-outs the same locks serialise. Parked devices need nothing: the new
+    /// limit is recorded here and goes into their `EncryptionConfig` when they
+    /// next join.
+    ///
+    /// Nothing is rolled out by this, and nothing is nudged into rolling out: a
+    /// device only re-decides the suspension when its roster actually moves, and
+    /// re-asserting unchanged membership (what the heartbeat does) is not that. So
+    /// the limit sits armed until the next join, leave or lapsed membership — in
+    /// practice the next `device_count` command, which is the measurement anyway.
+    /// That is also why the direction matters little: a lowered limit has nothing
+    /// to do until something would have rotated, and a raised one resumes rotation
+    /// with the first change that asks for it, retiring in that one rotation
+    /// everyone who left while it was suspended.
+    async fn set_key_rotation_participant_limit(&mut self, limit: usize) {
+        let previous = self.key_rotation_participant_limit;
+        self.key_rotation_participant_limit = limit;
+
+        let mut applied = 0;
+        for device in &self.devices {
+            let Some(call) = &device.call else {
+                continue;
+            };
+            if call.set_key_rotation_participant_limit(limit).await {
+                applied += 1;
+            } else {
+                eprintln!(
+                    "[{}] key rotation participant limit not applied: no joined session",
+                    device.index
+                );
+            }
+        }
+        println!(
+            "key rotation participant limit {previous} -> {limit}: {applied} device(s) in the \
+             call reconfigured, {} parked device(s) will use it when they next join",
+            self.devices.len() - self.active_count(),
+        );
     }
 
     /// Take device `index` out of the call, keeping it logged in and syncing
@@ -1224,6 +1311,7 @@ async fn join_device(
     room: Room,
     total: usize,
     index: usize,
+    key_rotation_participant_limit: usize,
     captured: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
 ) -> Result<(Call, Vec<AbortOnDrop>), Box<dyn Error>> {
@@ -1239,12 +1327,17 @@ async fn join_device(
             sticky_duration_ms: Some(args.sticky_duration_ms),
             heartbeat_interval: Duration::from_millis(args.heartbeat_interval_ms),
             keep_alive_timeout_ms: Some(args.keep_alive_timeout_ms),
-            // Everything but the two rotation grace periods stays at the
-            // library's policy — notably the MSC4153 cross-signing
-            // requirement, which these devices satisfy.
+            // Everything but the two rotation grace periods and the rotation
+            // participant limit stays at the library's policy — notably the
+            // MSC4153 cross-signing requirement, which these devices satisfy.
+            //
+            // The limit comes from the fleet, not from `args`: a room command may
+            // have moved it since the run started, and a device joining with the
+            // old one would be the only member still rotating.
             encryption_config: Some(EncryptionConfig {
                 leave_rotation_grace_period_ms: args.leave_rotation_grace_ms,
                 key_rotation_grace_period_ms: args.key_rotation_grace_ms,
+                key_rotation_participant_limit,
                 ..EncryptionConfig::default()
             }),
             ..CallOptions::default()
@@ -1563,13 +1656,17 @@ async fn wait_for_room(client: &Client, room_id: &RoomId) -> Result<Room, Box<dy
     }
 }
 
-/// Watch the room through `client` (device 0) for `!load_test device_count
-/// <n>` messages, and publish the latest requested count on the returned
-/// channel, starting at `initial`.
+/// Watch the room through `client` (device 0) for `!load_test` commands, and
+/// publish what they ask for on the returned channels, each starting at the
+/// matching command-line default.
+///
+/// One channel per knob rather than one carrying a settings struct: the run loop
+/// treats a device count that moved mid-ramp as a reason to abandon the rest of
+/// the ramp, and a rotation-limit command is not that.
 ///
 /// Commands are acknowledged with a message back into the room, because
 /// whoever is steering the run from a chat client has no view of this tool's
-/// stdout. Counts above `max_devices` are clamped, and the acknowledgement
+/// stdout. Counts above `--max-devices` are clamped, and the acknowledgement
 /// says so.
 ///
 /// In an encrypted room a command decrypts only if its megolm key has arrived;
@@ -1579,18 +1676,17 @@ async fn wait_for_room(client: &Client, room_id: &RoomId) -> Result<Room, Box<dy
 /// missed, because [`quiet_room_key_gossip`] turns key requests off, so a
 /// command that stays unacknowledged across several retries is waiting on the
 /// sender to rotate its megolm session rather than on this tool.
-fn listen_for_commands(
-    client: &Client,
-    room_id: &RoomId,
-    initial: usize,
-    max_devices: usize,
-) -> tokio::sync::watch::Receiver<usize> {
-    let (tx, rx) = tokio::sync::watch::channel(initial);
+fn listen_for_commands(client: &Client, room_id: &RoomId, args: &Args) -> Controls {
+    let (device_count_tx, device_count) = tokio::sync::watch::channel(args.devices);
+    let (limit_tx, key_rotation_participant_limit) =
+        tokio::sync::watch::channel(args.key_rotation_participant_limit);
+    let max_devices = args.max_devices;
     let started = MilliSecondsSinceUnixEpoch::now();
     client.add_room_event_handler(
         room_id,
         move |event: OriginalSyncRoomMessageEvent, room: Room| {
-            let targets = tx.clone();
+            let targets = device_count_tx.clone();
+            let limits = limit_tx.clone();
             async move {
                 // Sync replays recent room history to a fresh device, and a
                 // command from a previous run must not steer this one.
@@ -1600,7 +1696,7 @@ fn listen_for_commands(
                 let reply = match parse_command(event.content.body()) {
                     None => return,
                     Some(Err(usage)) => usage,
-                    Some(Ok(count)) => {
+                    Some(Ok(ControlCommand::DeviceCount(count))) => {
                         let target = count.min(max_devices);
                         let _ = targets.send(target);
                         if target < count {
@@ -1608,6 +1704,17 @@ fn listen_for_commands(
                         } else {
                             format!("device count set to {target}")
                         }
+                    }
+                    // Unclamped, unlike the device count: this costs the machine
+                    // running the tool nothing directly, and both extremes are
+                    // legitimate — 0 suspends rotation for the whole run, a
+                    // number above --max-devices never suspends it at all.
+                    Some(Ok(ControlCommand::KeyRotationParticipantLimit(limit))) => {
+                        let _ = limits.send(limit);
+                        format!(
+                            "key rotation participant limit set to {limit}; it takes effect at \
+                             each device's next membership change"
+                        )
                     }
                 };
                 // Spawned, not awaited: the SDK runs event handler futures
@@ -1633,15 +1740,36 @@ fn listen_for_commands(
             }
         },
     );
-    rx
+    Controls {
+        device_count,
+        key_rotation_participant_limit,
+    }
+}
+
+/// The knobs the room can turn while a run is going, each channel carrying the
+/// latest value asked for. See [`listen_for_commands`].
+struct Controls {
+    /// How many devices should be in the call, clamped to `--max-devices`.
+    device_count: tokio::sync::watch::Receiver<usize>,
+    /// The participant count at which devices suspend key rotation.
+    key_rotation_participant_limit: tokio::sync::watch::Receiver<usize>,
+}
+
+/// What a control message asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum ControlCommand {
+    /// How many devices should be in the call.
+    DeviceCount(usize),
+    /// The `key_rotation_participant_limit` the fleet should run with.
+    KeyRotationParticipantLimit(usize),
 }
 
 /// Parse a room message as a control command.
 ///
 /// `None` is a message that is not for this tool at all. `Some(Err)` is one
 /// that addressed it and got the syntax wrong, carrying the reply to send;
-/// `Some(Ok(n))` is a new device count.
-fn parse_command(body: &str) -> Option<Result<usize, String>> {
+/// `Some(Ok(command))` is an instruction for the run loop.
+fn parse_command(body: &str) -> Option<Result<ControlCommand, String>> {
     let rest = body.trim().strip_prefix(COMMAND_PREFIX)?;
     // "!load_tester" and friends address someone else.
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
@@ -1651,8 +1779,16 @@ fn parse_command(body: &str) -> Option<Result<usize, String>> {
     Some(match (tokens.next(), tokens.next(), tokens.next()) {
         (Some("device_count"), Some(count), None) => count
             .parse()
+            .map(ControlCommand::DeviceCount)
             .map_err(|_| format!("{count:?} is not a device count")),
-        _ => Err(format!("usage: {COMMAND_PREFIX} device_count <n>")),
+        (Some("key_rotation_participant_limit"), Some(limit), None) => limit
+            .parse()
+            .map(ControlCommand::KeyRotationParticipantLimit)
+            .map_err(|_| format!("{limit:?} is not a participant limit")),
+        _ => Err(format!(
+            "usage: {COMMAND_PREFIX} device_count <n> | {COMMAND_PREFIX} \
+             key_rotation_participant_limit <n>"
+        )),
     })
 }
 
@@ -2036,8 +2172,14 @@ mod tests {
 
     #[test]
     fn parses_device_count_commands() {
-        assert_eq!(parse_command("!load_test device_count 12"), Some(Ok(12)));
-        assert_eq!(parse_command("  !load_test  device_count 0 "), Some(Ok(0)));
+        assert_eq!(
+            parse_command("!load_test device_count 12"),
+            Some(Ok(ControlCommand::DeviceCount(12)))
+        );
+        assert_eq!(
+            parse_command("  !load_test  device_count 0 "),
+            Some(Ok(ControlCommand::DeviceCount(0)))
+        );
         // Chatter, including a longer word sharing the prefix, is ignored.
         assert_eq!(parse_command("hello there"), None);
         assert_eq!(parse_command("!load_tester device_count 3"), None);
@@ -2057,6 +2199,40 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("!load_test devices 3"),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn parses_key_rotation_participant_limit_commands() {
+        assert_eq!(
+            parse_command("!load_test key_rotation_participant_limit 100"),
+            Some(Ok(ControlCommand::KeyRotationParticipantLimit(100)))
+        );
+        // 0 is meaningful: rotation suspended for the whole run.
+        assert_eq!(
+            parse_command(" !load_test  key_rotation_participant_limit 0 "),
+            Some(Ok(ControlCommand::KeyRotationParticipantLimit(0)))
+        );
+        assert_eq!(
+            parse_command("!load_tester key_rotation_participant_limit 3"),
+            None
+        );
+        assert!(matches!(
+            parse_command("!load_test key_rotation_participant_limit"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_command("!load_test key_rotation_participant_limit thirty"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_command("!load_test key_rotation_participant_limit 3 4"),
+            Some(Err(_))
+        ));
+        // Near-misses on the name draw the usage reply, not a silent no-op.
+        assert!(matches!(
+            parse_command("!load_test key_rotation_limit 30"),
             Some(Err(_))
         ));
     }

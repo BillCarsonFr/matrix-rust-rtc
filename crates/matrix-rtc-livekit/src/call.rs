@@ -712,6 +712,23 @@ impl Call {
             .unwrap_or(0)
     }
 
+    /// Change the participant count at which this call stops rotating its media
+    /// key, from the [`EncryptionConfig::key_rotation_participant_limit`] it
+    /// joined with. Returns `false` if the session is gone.
+    ///
+    /// Only that one setting moves; everything else the join negotiated stays.
+    /// The new limit is honoured by the next key rollout — the next membership
+    /// change, in other words — because whether rotation is suspended is decided
+    /// from the roster each time, never cached.
+    ///
+    /// [`EncryptionConfig::key_rotation_participant_limit`]: matrix_rtc_core::EncryptionConfig::key_rotation_participant_limit
+    pub async fn set_key_rotation_participant_limit(&self, limit: usize) -> bool {
+        self.manager
+            .lock()
+            .await
+            .set_key_rotation_participant_limit(&self.room_id, &self.slot_id, limit)
+    }
+
     /// Whether a media key for the given MSC4195 participant identity has been
     /// received and imported into this call's frame decryptor. See
     /// [`Call::local_identity`] for the identity peers know us by.

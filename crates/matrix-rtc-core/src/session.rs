@@ -286,6 +286,24 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
     }
 
+    /// Changes the participant count at which this session suspends key rotation
+    /// (see [`EncryptionManager::set_key_rotation_participant_limit`]).
+    ///
+    /// Returns `false` if the session has not joined yet — the limit then comes
+    /// from the join parameters' [`EncryptionConfig`], and there is nothing to
+    /// change.
+    ///
+    /// [`EncryptionConfig`]: crate::encryption::types::EncryptionConfig
+    pub fn set_key_rotation_participant_limit(&mut self, limit: usize) -> bool {
+        match &mut self.encryption_manager {
+            Some(manager) => {
+                manager.set_key_rotation_participant_limit(limit);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Installs the identity mapper used to derive the RTC-backend participant
     /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
     ///

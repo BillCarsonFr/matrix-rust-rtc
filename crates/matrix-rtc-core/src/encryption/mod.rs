@@ -490,6 +490,19 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         self.config = config;
     }
 
+    /// Changes [`EncryptionConfig::key_rotation_participant_limit`] on a manager
+    /// that has already joined, leaving the rest of the configuration — notably
+    /// the `manage_media_keys` the session negotiated at join — alone.
+    ///
+    /// Nothing is rolled out here. Whether rotation is suspended is decided
+    /// afresh from the roster on every key rollout, so the new limit takes effect
+    /// at the next membership update: raising it above the current participant
+    /// count retires, in one rotation, every member who left while it was
+    /// suspended.
+    pub fn set_key_rotation_participant_limit(&mut self, limit: usize) {
+        self.config.key_rotation_participant_limit = limit;
+    }
+
     /// Sets the handler for key material signals.
     ///
     /// Keys that arrived before this was installed were stored but not

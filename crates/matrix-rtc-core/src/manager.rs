@@ -329,6 +329,27 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             .is_some_and(|session| session.set_encryption_signal_handler(handler))
     }
 
+    /// Changes the participant count at which one `(room_id, slot_id)` session
+    /// suspends key rotation, without disturbing the rest of its encryption
+    /// configuration (see
+    /// [`EncryptionManager::set_key_rotation_participant_limit`]).
+    ///
+    /// Returns `false` if the session does not exist or has not joined. The new
+    /// limit is applied by the next key rollout, not here.
+    ///
+    /// [`EncryptionManager::set_key_rotation_participant_limit`]: crate::encryption::EncryptionManager::set_key_rotation_participant_limit
+    pub fn set_key_rotation_participant_limit(
+        &mut self,
+        room_id: &str,
+        slot_id: &str,
+        limit: usize,
+    ) -> bool {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get_mut(&key)
+            .is_some_and(|session| session.set_key_rotation_participant_limit(limit))
+    }
+
     /// Our `member.id` in one `(room_id, slot_id)` session, or `None` if there
     /// is no such session or it has not joined.
     ///
