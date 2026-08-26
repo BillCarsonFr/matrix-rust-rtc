@@ -36,8 +36,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
 # `rt-multi-thread` and `time` are needed by the slim build too, not just
-# `media`: every synchronous entry point bridges to the async core through the
-# runtime in `src/runtime.rs`, and the core arms a `delayBeforeUse` timer on the
+# `media`: every join spawns its keep-alive driver on the runtime in
+# `src/runtime.rs`, and the core arms a `delayBeforeUse` timer on the
 # key-rotation path. See that module for why it has to be multi-threaded.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 # `tokio`: the manager handle's exported methods are async, and

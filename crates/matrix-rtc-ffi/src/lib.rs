@@ -293,6 +293,7 @@ async fn run_heartbeat(
     manager: Weak<TokioMutex<RtcSessionManager<FfiCommandSender>>>,
     room_id: String,
     slot_id: String,
+    interval: Duration,
     mut stop: tokio::sync::mpsc::Receiver<()>,
 ) {
     loop {
@@ -300,7 +301,7 @@ async fn run_heartbeat(
             // The driver was dropped (leave, rejoin, or the handle died), so a
             // stop takes effect at once rather than at the end of the interval.
             _ = stop.recv() => break,
-            _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
+            _ = tokio::time::sleep(interval) => {}
         }
 
         let Some(manager) = manager.upgrade() else {
@@ -727,9 +728,6 @@ impl RtcSessionManagerHandle {
 
         if result.is_ok() {
             log::info!("manager: join succeeded as {member_id}");
-            // Drop the manager lock before starting the driver: its first act
-            // is to try_lock, and holding it here would make that first tick a
-            // guaranteed skip.
             drop(manager);
             self.start_heartbeat(room_id, slot_id);
         }
@@ -772,38 +770,34 @@ impl RtcSessionManagerHandle {
 
     /// Starts (or replaces) the keep-alive driver for one session.
     fn start_heartbeat(&self, room_id: String, slot_id: String) {
+        self.start_heartbeat_every(room_id, slot_id, HEARTBEAT_INTERVAL);
+    }
+
+    /// [`Self::start_heartbeat`] with the interval spelled out, so a test can
+    /// beat faster than a session ships with.
+    fn start_heartbeat_every(&self, room_id: String, slot_id: String, interval: Duration) {
         let (stop, stop_rx) = tokio::sync::mpsc::channel(1);
         let manager = Arc::downgrade(&self.inner);
         let key = (room_id.clone(), slot_id.clone());
 
-        let thread = std::thread::Builder::new()
-            .name(format!("matrix-rtc-heartbeat-{room_id}"))
-            .spawn(move || run_heartbeat(manager, room_id, slot_id, stop_rx));
+        // On `runtime()` rather than a thread of its own: the body is a sleep
+        // and an await on a mutex, and `tokio::time::sleep` needs a timer to
+        // fire at all. Detached — it stops when the `stop` sender below is
+        // dropped, or when the manager behind its `Weak` goes away.
+        runtime::runtime().spawn(run_heartbeat(manager, room_id, slot_id, interval, stop_rx));
 
-        match thread {
-            Ok(_) => {
-                log::info!(
-                    "manager: keep-alive driver started for [{}/{}] every {}s",
-                    key.0,
-                    key.1,
-                    HEARTBEAT_INTERVAL.as_secs(),
-                );
-                // Replaces any previous driver for this session; dropping the
-                // old sender stops its thread.
-                match lock_mutex(&self.heartbeats) {
-                    Ok(mut drivers) => {
-                        drivers.insert(key, HeartbeatDriver { _stop: stop });
-                    }
-                    Err(error) => log::error!("manager: could not register keep-alive: {error}"),
-                }
+        log::info!(
+            "manager: keep-alive driver started for [{}/{}] every {interval:?}",
+            key.0,
+            key.1,
+        );
+        // Replaces any previous driver for this session; dropping the old
+        // sender stops its task.
+        match lock_mutex(&self.heartbeats) {
+            Ok(mut drivers) => {
+                drivers.insert(key, HeartbeatDriver { _stop: stop });
             }
-            Err(error) => log::error!(
-                "manager: could not start the keep-alive driver for [{}/{}]: {error}. The \
-                 membership will be cleaned up by the delayed leave unless the host drives \
-                 `heartbeat()` itself.",
-                key.0,
-                key.1,
-            ),
+            Err(error) => log::error!("manager: could not register keep-alive: {error}"),
         }
     }
 

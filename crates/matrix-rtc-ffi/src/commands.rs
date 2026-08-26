@@ -838,6 +838,7 @@ impl RtcCommandSender for FfiCommandSender {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// Mock callback that records the event type each send was given, so tests
     /// can assert on what a native host would actually put on the wire.
@@ -1264,6 +1265,88 @@ mod tests {
                 .await
                 .expect("the call itself should succeed"),
             Some(second),
+        );
+    }
+
+    /// The keep-alive driver a join starts has to actually beat.
+    ///
+    /// It once spawned `run_heartbeat` on a bare OS thread — the closure built
+    /// the future and returned it, nothing polled it, and the thread exited.
+    /// That logs identically to a working driver and registers identically in
+    /// `heartbeats`, so the assertion has to be on what reached the command
+    /// sender: no `restart_delayed_event` means the dead man's switch fires
+    /// mid-call.
+    #[tokio::test]
+    async fn the_keep_alive_driver_restarts_the_delayed_leave() {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Arc::new(mock.clone()))
+            .await
+            .expect("the mock sender should be accepted");
+
+        manager.join(join_params()).await.expect("join");
+        // Replaces the driver the join just registered with one fast enough to
+        // watch. Same code path, only the interval differs.
+        manager.start_heartbeat_every(
+            "!room:example.org".to_owned(),
+            "m.call#ROOM".to_owned(),
+            Duration::from_millis(50),
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let beats = mock
+            .sent_types()
+            .into_iter()
+            .filter(|sent| sent == "restart_delayed_event")
+            .count();
+        assert!(
+            beats >= 2,
+            "the driver should have restarted the delayed leave several times over 300ms at a \
+             50ms interval, saw {beats}",
+        );
+    }
+
+    /// A driver must not outlive the session it beats for: a beat landing after
+    /// the leave has cancelled the delayed event would re-arm a leave nobody
+    /// cancels.
+    #[tokio::test]
+    async fn leaving_stops_the_keep_alive_driver() {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Arc::new(mock.clone()))
+            .await
+            .expect("the mock sender should be accepted");
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+
+        manager.join(join_params()).await.expect("join");
+        manager.start_heartbeat_every(room_id.clone(), slot_id.clone(), Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        manager
+            .leave(
+                room_id,
+                slot_id,
+                crate::FfiLeaveSessionParams { leave_reason: None },
+            )
+            .await
+            .expect("leave");
+        let after_leave = mock
+            .sent_types()
+            .into_iter()
+            .filter(|sent| sent == "restart_delayed_event")
+            .count();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            mock.sent_types()
+                .into_iter()
+                .filter(|sent| sent == "restart_delayed_event")
+                .count(),
+            after_leave,
+            "no beat should reach the sender once the session has left",
         );
     }
 
