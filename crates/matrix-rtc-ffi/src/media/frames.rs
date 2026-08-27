@@ -78,10 +78,8 @@ fn pcm_to_le_bytes(samples: &[i16]) -> Vec<u8> {
 /// half a sample, and truncating is better than shifting every later sample by
 /// one byte, which turns the whole frame into noise.
 fn pcm_from_le_bytes(bytes: &[u8]) -> Vec<i16> {
-    bytes
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-        .collect()
+    let (pairs, _trailing) = bytes.as_chunks::<2>();
+    pairs.iter().copied().map(i16::from_le_bytes).collect()
 }
 
 /// Frame rotation to apply before rendering.
