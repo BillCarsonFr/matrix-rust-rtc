@@ -29,11 +29,12 @@
 //!   a `Vec<i16>` becomes a boxed `List<Short>` — roughly 48 000 boxed objects a
 //!   second at 48 kHz mono, which was the single biggest cost this API imposed
 //!   on a host.
-//! - **Video frames are objects** ([`VideoFrameRef`]) exposing both safe
-//!   copies (`data_y`/`data_u`/`data_v`) and zero-copy plane pointers
-//!   (`plane_ptr` + strides) for renderers that consume raw memory. The
-//!   pointers are valid for as long as the object is referenced — lifetime
-//!   is the object, not a manual handle.
+//! - **Video frames are objects** ([`VideoFrameRef`]) whose default read path
+//!   is the zero-copy one: `plane_ptr` + `stride`, valid for as long as the
+//!   object is referenced (lifetime is the object, not a manual handle) and
+//!   readable and releasable from any thread. `data(plane)` returns a copy
+//!   for hosts that cannot take a pointer, and is the slow path — at frame
+//!   sizes the copies, and the garbage they make, cost more than the codec.
 //! - **Capture goes the other way by value**: the host pushes PCM/I420 into
 //!   a [`FfiLocalTrack`].
 
@@ -151,6 +152,14 @@ impl AudioFrameStream {
 }
 
 /// A stream of received video frames (latest-frame-wins).
+///
+/// Holding a frame does not apply backpressure and does not stall the stream:
+/// dropping happens upstream, in a queue of one, whether or not the host still
+/// holds earlier frames. Each frame owns its own plane allocations — nothing
+/// is recycled between them — so a host may hold several at once (a renderer
+/// with a frame in flight and the next one arriving) and read them all
+/// concurrently. The cost of holding is memory, and the price of holding too
+/// long is a dropped frame, never a corrupted one.
 #[derive(uniffi::Object)]
 pub struct VideoFrameStream {
     frames: TokioMutex<BoxStream<'static, VideoFrame>>,
@@ -174,9 +183,14 @@ impl VideoFrameStream {
 
 /// A received I420 video frame.
 ///
-/// Renderers on a fast path read plane memory directly via [`Self::plane_ptr`]
-/// and the strides — valid for as long as this object is referenced. The
-/// `data_*` accessors return safe copies instead.
+/// [`Self::plane_ptr`] + [`Self::stride`] is the intended way to render one:
+/// the planes are read in place, with no copy on either side of the boundary.
+/// [`Self::data`] is the fallback for hosts that cannot take a raw pointer —
+/// it copies the plane, and the bindings copy it again into a host array, so
+/// it costs two full frame copies per plane where the pointer costs none.
+///
+/// The memory is immutable and thread-agnostic for the object's whole life;
+/// [`Self::plane_ptr`] carries the exact contract.
 #[derive(uniffi::Object)]
 pub struct VideoFrameRef {
     frame: VideoFrame,
@@ -208,7 +222,12 @@ impl VideoFrameRef {
         }
     }
 
-    /// A safe copy of one plane's bytes.
+    /// A copy of one plane's bytes, for hosts that cannot read a raw pointer.
+    ///
+    /// Prefer [`Self::plane_ptr`]: this clones the plane here and the bindings
+    /// clone it again into a host-owned array — two full copies per plane, per
+    /// frame, per stream, which at 720p30 on three streams is the difference
+    /// between idle and a saturated core.
     pub fn data(&self, plane: FfiVideoPlane) -> Vec<u8> {
         match plane {
             FfiVideoPlane::Y => self.frame.buffer.data_y.clone(),
@@ -217,11 +236,47 @@ impl VideoFrameRef {
         }
     }
 
-    /// The raw address of one plane's bytes, for zero-copy renderers
-    /// (`CVPixelBuffer` wrapping, libyuv via JNI, ...).
+    /// The raw address of one plane's bytes, for zero-copy renderers (GL
+    /// upload, `CVPixelBuffer` wrapping, libyuv via JNI, ...). Read
+    /// [`Self::plane_len`] bytes, with [`Self::stride`] as the row pitch.
     ///
-    /// Valid only while this object is referenced — hold the frame for as
-    /// long as the memory is read, then drop it.
+    /// # Lifetime
+    ///
+    /// The address is valid for exactly as long as *any* reference to this
+    /// object is alive, and is stable across calls: the object owns the three
+    /// plane allocations outright and nothing reallocates them. The stream
+    /// does not retain the frame — once `next()` has handed it over, the host
+    /// alone decides when the memory goes away, by releasing this object.
+    ///
+    /// # Threads
+    ///
+    /// There is no thread affinity in either direction:
+    ///
+    /// - **Reading.** Any thread, any number of threads at once, no
+    ///   synchronisation needed. Nothing writes to the planes after the frame
+    ///   is constructed — this type has no interior mutability and no method
+    ///   taking `&mut self` — so the bytes are immutable for the object's
+    ///   whole life. Posting the frame to a render thread is enough; the
+    ///   handoff itself supplies the ordering.
+    /// - **Releasing.** Any thread, not only the one `next()` returned on.
+    ///   Dropping the object frees three plain heap allocations through the
+    ///   global allocator; there is no thread-local state, no runtime, and no
+    ///   JNI attach on that path.
+    ///
+    /// The one rule is ordering, not thread identity: **every read must
+    /// happen before the release**, and the release must happen exactly once.
+    /// Freeing the frame while a renderer is still reading through these
+    /// pointers is a use-after-free, exactly as in C.
+    ///
+    /// The trap is a renderer that *retains*. If the pointers go to something
+    /// that returns before it draws — a GL renderer posting to its own
+    /// thread, a libwebrtc buffer wrapping this memory — then the scope that
+    /// fetched the pointer is not the scope that may release. Drive the
+    /// release from that consumer's own completion callback (on Android, the
+    /// `releaseCallback` of the wrapping `JavaI420Buffer`), which is also the
+    /// only thing that knows when the last read finished. Such a callback
+    /// failing to fire leaks the frame rather than corrupting it — benign next
+    /// to a use-after-free, but these are megabyte allocations.
     pub fn plane_ptr(&self, plane: FfiVideoPlane) -> u64 {
         let slice: &[u8] = match plane {
             FfiVideoPlane::Y => &self.frame.buffer.data_y,
