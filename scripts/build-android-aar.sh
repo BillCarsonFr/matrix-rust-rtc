@@ -217,13 +217,23 @@ if [ ! -f "$PROJECT_ROOT/mobile/android/gradlew" ]; then
     echo ""
     echo "To complete the AAR build, run from the Android directory:"
     echo "  cd $PROJECT_ROOT/mobile/android"
-    echo "  ./gradlew :matrixrtc:assembleRelease"
+    if [ "${MEDIA:-0}" = "1" ]; then
+        echo "  ./gradlew :matrixrtc:assembleRelease -PmatrixRtcMedia=true"
+    else
+        echo "  ./gradlew :matrixrtc:assembleRelease"
+    fi
     echo ""
 else
     # Build AAR using Gradle
     echo "Building AAR with Gradle..."
     cd "$PROJECT_ROOT/mobile/android"
-    ./gradlew :matrixrtc:assembleRelease
+    # Selects the callback-pinning source dir: the media bindings carry
+    # callback interfaces the slim ones don't generate.
+    if [ "${MEDIA:-0}" = "1" ]; then
+        ./gradlew :matrixrtc:assembleRelease -PmatrixRtcMedia=true
+    else
+        ./gradlew :matrixrtc:assembleRelease
+    fi
 
     AAR_OUTPUT="$ANDROID_MODULE_ROOT/build/outputs/aar/matrixrtc-release.aar"
     if [ -f "$AAR_OUTPUT" ]; then

@@ -248,7 +248,12 @@ impl From<matrix_rtc_media::FrameEncryptionState> for FfiFrameEncryptionState {
 /// - **Arriving and decoding, but lossy**: both climbing, with `packetsLost`
 ///   or `jitter` rising.
 ///
-/// Fields that don't apply to the stream's media kind stay `0`.
+/// Fields that don't apply to the stream's media kind stay `0`, so a counter
+/// is only meaningful when read from a query for the kind being diagnosed.
+/// `framesDecoded` off a [`FfiStreamKind::Microphone`] query is `0` however
+/// well video is decoding — identical to what a stalled video decoder reports,
+/// and the reason to pass [`FfiStreamKind::Camera`] when the question is about
+/// video.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiReceiveStats {
     /// RTP packets received since subscribing.

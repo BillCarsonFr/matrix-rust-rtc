@@ -55,10 +55,20 @@ android {
         jvmTarget = '1.8'
     }
 
+    // The media bindings generate callback interfaces the slim ones do not
+    // (`OpenIdTokenProvider`), so the callback-thread pinning that names them
+    // lives in a per-variant source dir rather than in the shared file. Set by
+    // scripts/build-android-aar.sh from MEDIA; a plain `./gradlew` build gets
+    // the slim source, matching the default cargo feature set.
+    def mediaVariant = project.findProperty('matrixRtcMedia') == 'true'
+
     // Pre-built native libraries are placed in src/main/jniLibs by the build script
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jniLibs']
+            // Kotlin sources build from the java srcDirs here — the generated
+            // uniffi bindings already live under src/main/java as .kt.
+            java.srcDirs += mediaVariant ? 'src/media/kotlin' : 'src/slim/kotlin'
         }
     }
 }
@@ -66,8 +76,14 @@ android {
 dependencies {
     implementation "androidx.appcompat:appcompat:1.6.1"
     implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.0"
-    implementation 'net.java.dev.jna:jna:5.13.0'
-    implementation 'net.java.dev.jna:jna-platform:5.13.0'
+    // Keep in step with what hosts actually resolve. This is an `implementation`
+    // dependency, so an app that brings its own newer JNA wins the conflict and
+    // our bindings run against a version we never built against; declaring the
+    // version hosts are on removes that gap. 5.19.1 is API- and
+    // behaviour-identical to 5.13.0 for the callback-thread handling
+    // `MatrixRtc.pinCallbackThreads` relies on.
+    implementation 'net.java.dev.jna:jna:5.19.1'
+    implementation 'net.java.dev.jna:jna-platform:5.19.1'
     // Media variant only: the build script drops libwebrtc.jar in libs/
     // (libwebrtc's native code up-calls into its Java classes). Empty for
     // the slim signalling-only build.
