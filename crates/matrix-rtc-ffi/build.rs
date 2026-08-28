@@ -15,7 +15,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Android-only linker fix for the static `libwebrtc` that `livekit` pulls in.
+//! Android-only linker adjustments for this crate's `cdylib`: a build ID so
+//! crashes can be symbolicated, and the JNI symbol export the static
+//! `libwebrtc` that `livekit` pulls in needs to be reachable from Java.
+//!
+//! ## The JNI symbols
 //!
 //! libwebrtc's Java classes (`livekit.org.webrtc.*`, shipped in the bundled
 //! `libwebrtc.jar`) are backed by `Java_livekit_org_webrtc_*` native methods
@@ -47,8 +51,32 @@ fn main() {
     // Nothing below depends on the crate sources.
     println!("cargo:rerun-if-changed=build.rs");
 
+    emit_android_build_id();
+
     #[cfg(feature = "media")]
     export_android_jni_symbols();
+}
+
+/// Stamp a build ID into the Android `cdylib`, so a tombstone can be tied to
+/// the library that produced it.
+///
+/// Not on by default anywhere in this pipeline: lld writes no
+/// `.note.gnu.build-id` unless asked, and `cargo-ndk` strips the copy it places
+/// in `jniLibs`. That leaves the shipped library with no symbols and the
+/// unstripped one under `target/` with no identity, so nothing can establish
+/// that a given `.so` produced a given crash — and `ndk-stack` pointed at a
+/// mismatched build prints confident, wrong function names rather than failing.
+/// `llvm-strip` preserves the note, so stamping it here puts the same ID on
+/// both halves: a tombstone reports the shipped library's `BuildId:`, and that
+/// string identifies which `target/` artifact to symbolicate against.
+///
+/// Not gated on `media`: the slim variant needs symbolicatable crashes too.
+fn emit_android_build_id() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
+        return;
+    }
+
+    println!("cargo:rustc-link-arg-cdylib=-Wl,--build-id=sha1");
 }
 
 /// Re-emit libwebrtc's JNI link args against the cdylib being built.

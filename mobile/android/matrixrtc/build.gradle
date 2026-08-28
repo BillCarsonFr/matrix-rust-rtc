@@ -66,8 +66,14 @@ android {
 dependencies {
     implementation "androidx.appcompat:appcompat:1.6.1"
     implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.0"
-    implementation 'net.java.dev.jna:jna:5.13.0'
-    implementation 'net.java.dev.jna:jna-platform:5.13.0'
+    // Keep in step with what hosts actually resolve. This is an `implementation`
+    // dependency, so an app that brings its own newer JNA wins the conflict and
+    // our bindings run against a version we never built against; declaring the
+    // version hosts are on removes that gap. 5.19.1 is API- and
+    // behaviour-identical to 5.13.0 for the callback-thread handling
+    // `MatrixRtc.pinCallbackThreads` relies on.
+    implementation 'net.java.dev.jna:jna:5.19.1'
+    implementation 'net.java.dev.jna:jna-platform:5.19.1'
     // Media variant only: the build script drops libwebrtc.jar in libs/
     // (libwebrtc's native code up-calls into its Java classes). Empty for
     // the slim signalling-only build.
