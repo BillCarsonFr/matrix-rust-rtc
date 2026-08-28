@@ -55,10 +55,20 @@ android {
         jvmTarget = '1.8'
     }
 
+    // The media bindings generate callback interfaces the slim ones do not
+    // (`OpenIdTokenProvider`), so the callback-thread pinning that names them
+    // lives in a per-variant source dir rather than in the shared file. Set by
+    // scripts/build-android-aar.sh from MEDIA; a plain `./gradlew` build gets
+    // the slim source, matching the default cargo feature set.
+    def mediaVariant = project.findProperty('matrixRtcMedia') == 'true'
+
     // Pre-built native libraries are placed in src/main/jniLibs by the build script
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jniLibs']
+            // Kotlin sources build from the java srcDirs here — the generated
+            // uniffi bindings already live under src/main/java as .kt.
+            java.srcDirs += mediaVariant ? 'src/media/kotlin' : 'src/slim/kotlin'
         }
     }
 }

@@ -22,7 +22,6 @@ import com.sun.jna.CallbackThreadInitializer
 import com.sun.jna.Native
 import com.sun.jna.Structure
 import uniffi.matrix_rtc_ffi.uniffiCallbackInterfaceCommandSenderCallback
-import uniffi.matrix_rtc_ffi.uniffiCallbackInterfaceOpenIdTokenProvider
 import uniffi.matrix_rtc_ffi.uniffiCallbackInterfaceRtcLogSink
 import uniffi.matrix_rtc_ffi.uniffiForeignFutureFreeImpl
 import uniffi.matrix_rtc_ffi.uniffiRustFutureContinuationCallbackImpl
@@ -130,17 +129,25 @@ object MatrixRtc {
         for (vtable in arrayOf(
             uniffiCallbackInterfaceRtcLogSink.vtable,
             uniffiCallbackInterfaceCommandSenderCallback.vtable,
-            uniffiCallbackInterfaceOpenIdTokenProvider.vtable,
         )) {
             pinVTableCallbacks(vtable, initializer)
         }
-    }
 
-    private fun pinVTableCallbacks(vtable: Structure, initializer: CallbackThreadInitializer) {
-        for (field in vtable.javaClass.fields) {
-            (field.get(vtable) as? Callback)?.let {
-                Native.setCallbackThreadInitializer(it, initializer)
-            }
+        // Media-only callback interfaces; see the per-variant source dirs.
+        pinMediaCallbackThreads(initializer)
+    }
+}
+
+/**
+ * Pin every JNA callback reachable through one generated vtable struct.
+ *
+ * Top-level rather than a member so the per-variant `pinMediaCallbackThreads`
+ * can reuse it.
+ */
+internal fun pinVTableCallbacks(vtable: Structure, initializer: CallbackThreadInitializer) {
+    for (field in vtable.javaClass.fields) {
+        (field.get(vtable) as? Callback)?.let {
+            Native.setCallbackThreadInitializer(it, initializer)
         }
     }
 }
