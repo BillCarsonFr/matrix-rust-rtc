@@ -27,6 +27,7 @@ mod error;
 mod event;
 mod join;
 mod manager;
+mod notification;
 mod own_membership;
 mod session;
 mod slot;
@@ -49,6 +50,10 @@ pub use event::{
 };
 pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
 pub use manager::RtcSessionManager;
+pub use notification::{
+    DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
+    NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,
+};
 pub use own_membership::{
     KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
 };
@@ -346,6 +351,120 @@ mod tests {
             Some(0),
             "a fresh join starts a fresh key index"
         );
+    }
+
+    /// Joins as alice, asking for an MSC4075 notification.
+    async fn join_and_notify(
+        manager: &mut RtcSessionManager<crate::commands::MockCommandSender>,
+        member_id: &str,
+        notify: NotifyConfig,
+    ) {
+        let mut params = JoinSessionParams::new(
+            "@alice:example.org".to_owned(),
+            "ALICEDEV".to_owned(),
+            ROOM_ID.to_owned(),
+            "m.call#ROOM".to_owned(),
+            "m.call".to_owned(),
+            RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://example.com/jwt".to_owned(),
+            }),
+        );
+        params.membership_id = Some(member_id.to_owned());
+        params.notify = Some(notify);
+        manager.join(params).await.expect("join should succeed");
+    }
+
+    /// Every sticky send of the notification type, as `(content, duration_ms)`.
+    fn notifications_sent(
+        sender: &crate::commands::MockCommandSender,
+    ) -> Vec<(serde_json::Value, u64)> {
+        sender
+            .sticky_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, event_type, _, _)| event_type == NOTIFICATION_EVENT_TYPE)
+            .map(|(_, _, content, duration_ms)| (content.clone(), *duration_ms))
+            .collect()
+    }
+
+    /// Starting a call is what summons the room, and MSC4075 ties the
+    /// notification to the membership that justifies it — so the event id the
+    /// join's sticky send reported has to come back out as the relation target.
+    #[tokio::test]
+    async fn starting_a_call_notifies_the_room() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        let mut notify = NotifyConfig::ring();
+        notify.intent = Some("video".to_owned());
+        join_and_notify(&mut manager, "alice-a", notify).await;
+
+        let sent = notifications_sent(&sender);
+        assert_eq!(sent.len(), 1, "the call starter should notify exactly once");
+        let (content, duration_ms) = &sent[0];
+
+        let member_event_id = sender
+            .sticky_events
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|(_, event_type, _, _)| event_type == "m.rtc.member")
+            .map(|index| format!("$sticky-{}", index + 1))
+            .expect("the join sends a membership event");
+        assert_eq!(
+            content.pointer("/m.relates_to/event_id").unwrap(),
+            &serde_json::json!(member_event_id),
+            "the relation must name our own membership event"
+        );
+        assert_eq!(
+            content.pointer("/m.relates_to/rel_type").unwrap(),
+            "m.reference"
+        );
+        assert_eq!(content.pointer("/application/type").unwrap(), "m.call");
+        assert_eq!(
+            content.pointer("/application/notification_type").unwrap(),
+            "ring"
+        );
+        assert_eq!(
+            content.pointer("/application/m.call.intent").unwrap(),
+            "video"
+        );
+        assert_eq!(
+            content.pointer("/application/device_id").unwrap(),
+            "ALICEDEV"
+        );
+        assert_eq!(
+            *duration_ms,
+            2 * DEFAULT_RING_LIFETIME_MS,
+            "MSC4075: the sticky entry must outlive the ring so acknowledgements can extend it"
+        );
+    }
+
+    /// Joining a call someone else started must not ring the room a second
+    /// time, even if the host asked for a notification.
+    #[tokio::test]
+    async fn joining_an_occupied_session_notifies_nobody() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        admit_peer(&mut manager, "@bob:example.org", "BOBDEV", "bob-a").await;
+        join_and_notify(&mut manager, "alice-a", NotifyConfig::ring()).await;
+
+        assert!(
+            notifications_sent(&sender).is_empty(),
+            "bob was already in the session, so he started the call, not us"
+        );
+    }
+
+    #[tokio::test]
+    async fn joining_quietly_notifies_nobody() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        join_as(&mut manager, "alice-a").await;
+
+        assert!(notifications_sent(&sender).is_empty());
     }
 
     /// MSC4143 requires a fresh `member.id` per join, so the previous

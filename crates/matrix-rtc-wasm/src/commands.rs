@@ -49,7 +49,12 @@ impl JsCommandSender {
     /// Creates a new JsCommandSender with the given Matrix client.
     ///
     /// The client must implement the following methods:
-    /// - sendStickyEvent(roomId, eventType, content, durationMs, callback)
+    /// - sendStickyEvent(roomId, eventType, content, durationMs) -> Promise,
+    ///   resolving to matrix-js-sdk's `{event_id}`. Resolving to anything else
+    ///   is treated as a failed send: the SDK needs the id to relate an MSC4075
+    ///   call notification to the membership event that justifies it.
+    /// - sendStateEvent(roomId, eventType, stateKey, content) -> Promise,
+    ///   resolving to `{event_id}` on the same terms
     /// - sendDelayedEvent(roomId, eventType, content, delayMs, callback)
     /// - sendToDeviceMessage(recipients, type, content) -> Promise, resolving to
     ///   `[{userId, deviceId, error?}, ...]` (or nothing, meaning all delivered)
@@ -148,7 +153,7 @@ impl RtcCommandSender for JsCommandSender {
         event_type: String,
         content: Value,
         duration_ms: u64,
-    ) -> Result<(), CommandError> {
+    ) -> Result<String, CommandError> {
         // The JS host puts this string on the wire verbatim, so translate the
         // core's stable id to the one peers actually match on.
         let event_type = wire_event_type(&event_type);
@@ -177,11 +182,11 @@ impl RtcCommandSender for JsCommandSender {
             .map_err(JsCommandSender::convert_js_error)?;
 
         // Convert the Promise to a Rust Future and await it
-        wasm_bindgen_futures::JsFuture::from(promise)
+        let resolved = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(JsCommandSender::convert_js_error)?;
 
-        Ok(())
+        js_event_id(&resolved, "sendStickyEvent")
     }
 
     async fn send_state_event(
@@ -190,7 +195,7 @@ impl RtcCommandSender for JsCommandSender {
         event_type: String,
         state_key: String,
         content: Value,
-    ) -> Result<(), CommandError> {
+    ) -> Result<String, CommandError> {
         let event_type = wire_event_type(&event_type);
         self.log_command(&format!(
             "send_state_event: room={}, type={}, state_key={}",
@@ -212,11 +217,11 @@ impl RtcCommandSender for JsCommandSender {
             )
             .map_err(JsCommandSender::convert_js_error)?;
 
-        wasm_bindgen_futures::JsFuture::from(promise)
+        let resolved = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(JsCommandSender::convert_js_error)?;
 
-        Ok(())
+        js_event_id(&resolved, "sendStateEvent")
     }
 
     async fn send_delayed_event(
@@ -395,6 +400,31 @@ impl Default for JsCommandSender {
     fn default() -> Self {
         panic!("JsCommandSender requires a client object. Use new(client) instead.");
     }
+}
+
+/// Reads the event id out of whatever a send method resolved to.
+///
+/// `{ event_id }` is matrix-js-sdk's own send response; `{ eventId }` and a bare
+/// string are accepted because a host wrapping the SDK may hand back either.
+///
+/// A host that resolves to anything else — `undefined` included — is reported as
+/// a failed send rather than a silent success. Every Matrix send responds with
+/// an event id, and swallowing its absence would leave the call joined but
+/// unable to ring, with nothing in the log to say why.
+fn js_event_id(resolved: &JsValue, method: &str) -> Result<String, CommandError> {
+    if let Some(event_id) = resolved.as_string() {
+        return Ok(event_id);
+    }
+    for key in ["event_id", "eventId"] {
+        if let Ok(value) = Reflect::get(resolved, &JsValue::from_str(key))
+            && let Some(event_id) = value.as_string()
+        {
+            return Ok(event_id);
+        }
+    }
+    Err(CommandError::SendError(format!(
+        "{method} must resolve to the event id (matrix-js-sdk's `{{event_id}}`); got {resolved:?}"
+    )))
 }
 
 #[cfg(test)]

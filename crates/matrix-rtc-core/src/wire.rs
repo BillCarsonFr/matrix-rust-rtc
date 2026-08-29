@@ -43,6 +43,7 @@ pub fn wire_event_type(event_type: &str) -> &str {
         "m.rtc.member" => "org.matrix.msc4143.rtc.member",
         "m.rtc.slot" => "org.matrix.msc4143.rtc.slot",
         "m.rtc.encryption_key" => "org.matrix.msc4143.rtc.encryption_key",
+        "m.rtc.notification" => "org.matrix.msc4075.rtc.notification",
         other => other,
     }
 }
@@ -50,7 +51,7 @@ pub fn wire_event_type(event_type: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KEY_MESSAGE_TYPE, SLOT_EVENT_TYPE};
+    use crate::{KEY_MESSAGE_TYPE, NOTIFICATION_EVENT_TYPE, SLOT_EVENT_TYPE};
 
     #[test]
     fn maps_the_types_the_core_sends() {
@@ -61,6 +62,11 @@ mod tests {
         assert_eq!(
             wire_event_type(SLOT_EVENT_TYPE),
             "org.matrix.msc4143.rtc.slot"
+        );
+        // MSC4075, not MSC4143: notifications are their own proposal.
+        assert_eq!(
+            wire_event_type(NOTIFICATION_EVENT_TYPE),
+            "org.matrix.msc4075.rtc.notification"
         );
         // Already unstable in the core; must survive a round through the table.
         assert_eq!(wire_event_type(KEY_MESSAGE_TYPE), KEY_MESSAGE_TYPE);
@@ -73,7 +79,12 @@ mod tests {
 
     #[test]
     fn is_idempotent() {
-        for stable in ["m.rtc.member", SLOT_EVENT_TYPE, KEY_MESSAGE_TYPE] {
+        for stable in [
+            "m.rtc.member",
+            SLOT_EVENT_TYPE,
+            KEY_MESSAGE_TYPE,
+            NOTIFICATION_EVENT_TYPE,
+        ] {
             let once = wire_event_type(stable);
             assert_eq!(wire_event_type(once), once);
         }

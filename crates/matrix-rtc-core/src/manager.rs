@@ -627,9 +627,11 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         let content =
             serde_json::to_value(content).expect("m.rtc.slot content is always serializable");
 
+        // The event id goes nowhere: nothing relates to a slot event.
         command_sender
             .send_state_event(room_id, SLOT_EVENT_TYPE.to_owned(), slot_id, content)
             .await
+            .map(|_event_id| ())
     }
 
     /// Everything the manager and its sessions believe, as JSON.

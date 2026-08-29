@@ -38,7 +38,8 @@ mod logging;
 mod runtime;
 pub use commands::{
     CommandSenderCallback, CommandSenderError, FfiCommandSender, FfiJoinSessionParams,
-    FfiLeaveSessionParams, FfiToDeviceDelivery, FfiToDeviceRecipient, FfiTransportConfig,
+    FfiLeaveSessionParams, FfiNotificationType, FfiNotifyConfig, FfiToDeviceDelivery,
+    FfiToDeviceRecipient, FfiTransportConfig,
 };
 pub use compat::{FfiElementCallCompat, LegacyStateMemberEvent, RawMemberEvent};
 pub use logging::{

@@ -94,6 +94,55 @@ pub struct FfiEncryptionConfig {
     pub require_cross_signed_sender: Option<bool>,
 }
 
+/// What kind of notification an MSC4075 call notification asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiNotificationType {
+    /// Ring audibly, for `lifetime_ms`.
+    Ring,
+    /// Show a visual indication only.
+    Notification,
+}
+
+/// FFI-friendly MSC4075 notification request, for a join that *starts* a call.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiNotifyConfig {
+    /// Ring, or notify silently.
+    pub notification_type: FfiNotificationType,
+    /// MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
+    #[uniffi(default = None)]
+    pub intent: Option<String>,
+    /// How long the ring stays valid, in milliseconds (default: 30000, capped
+    /// at 120000 because that is what receivers honour).
+    #[uniffi(default = None)]
+    pub lifetime_ms: Option<u64>,
+    /// Users named individually in `m.mentions`. Usually empty.
+    #[uniffi(default = [])]
+    pub mention_user_ids: Vec<String>,
+    /// Whether the whole room is targeted (default: true, which is what a call
+    /// in a room means). Note that the room's power levels may gate this.
+    #[uniffi(default = true)]
+    pub mention_room: bool,
+}
+
+impl From<FfiNotifyConfig> for matrix_rtc_core::NotifyConfig {
+    fn from(value: FfiNotifyConfig) -> Self {
+        matrix_rtc_core::NotifyConfig {
+            notification_type: match value.notification_type {
+                FfiNotificationType::Ring => matrix_rtc_core::NotificationType::Ring,
+                FfiNotificationType::Notification => {
+                    matrix_rtc_core::NotificationType::Notification
+                }
+            },
+            intent: value.intent,
+            lifetime_ms: value.lifetime_ms,
+            mentions: matrix_rtc_core::Mentions {
+                user_ids: value.mention_user_ids,
+                room: value.mention_room,
+            },
+        }
+    }
+}
+
 /// FFI-friendly join session parameters.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiJoinSessionParams {
@@ -142,6 +191,15 @@ pub struct FfiJoinSessionParams {
     /// per mode.
     #[uniffi(default = None)]
     pub element_call_compat: Option<FfiElementCallCompat>,
+    /// Ask for an MSC4075 notification to be sent with this join, so other
+    /// devices in the room ring or show an incoming call.
+    ///
+    /// Unset — the default — joins quietly, which is what joining a call
+    /// someone else started does. Set it only when the user is *starting* the
+    /// call: the SDK still suppresses the notification if anybody is already in
+    /// the session, but the intent to summon anyone at all is yours to state.
+    #[uniffi(default = None)]
+    pub notify: Option<FfiNotifyConfig>,
 }
 
 /// FFI-friendly leave session parameters.
@@ -216,7 +274,7 @@ impl FfiJoinSessionParams {
 
         format!(
             "[{}/{}] user={} device={} application={} transport={} keep_alive={:?}ms \
-             encryption={} element_call_compat={:?}",
+             encryption={} element_call_compat={:?} notify={:?}",
             self.room_id,
             self.slot_id,
             self.user_id,
@@ -226,6 +284,7 @@ impl FfiJoinSessionParams {
             self.keep_alive_timeout_ms,
             self.encryption_config.is_some(),
             self.element_call_compat.unwrap_or_default(),
+            self.notify.as_ref().map(|notify| notify.notification_type),
         )
     }
 
@@ -255,6 +314,7 @@ impl FfiJoinSessionParams {
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
             encryption_config,
+            notify: self.notify.map(Into::into),
         })
     }
 }
@@ -312,14 +372,19 @@ pub trait CommandSenderCallback: Send + Sync {
     ///   the value always fits — the clamp is for hosts that pass their own.
     ///
     /// # Returns
-    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    /// The event id the homeserver assigned — matrix-rust-sdk: the `eventId` on
+    /// the send response. Every Matrix send responds with one, so this is never
+    /// optional; the SDK needs it to relate an MSC4075 call notification to the
+    /// membership event that justifies it.
+    ///
+    /// Throw a CommandSenderError on failure.
     async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content_json: String,
         duration_ms: u64,
-    ) -> Result<(), CommandSenderError>;
+    ) -> Result<String, CommandSenderError>;
 
     /// Called when a delayed event needs to be scheduled.
     ///
@@ -356,14 +421,19 @@ pub trait CommandSenderCallback: Send + Sync {
     /// * `content_json` - The event content as a JSON string
     ///
     /// # Returns
-    /// Return Ok(()) on success, or Err with a CommandSenderError on failure.
+    /// The event id the homeserver assigned, on the same terms as
+    /// `sendStickyEvent`. Nothing reads it for a slot; it is required because
+    /// in `StateEvents` compat mode the *membership* comes through here, and
+    /// there it is what an MSC4075 notification relates to.
+    ///
+    /// Throw a CommandSenderError on failure.
     async fn send_state_event(
         &self,
         room_id: String,
         event_type: String,
         state_key: String,
         content_json: String,
-    ) -> Result<(), CommandSenderError>;
+    ) -> Result<String, CommandSenderError>;
 
     /// Called when a delayed **state** event needs to be scheduled.
     ///
@@ -603,14 +673,13 @@ impl RtcCommandSender for FfiCommandSender {
         event_type: String,
         content: Value,
         duration_ms: u64,
-    ) -> Result<(), CommandError> {
+    ) -> Result<String, CommandError> {
         // Anything that is not a membership routes straight through in every
         // mode; the legacy generations differ about memberships, not about
         // everything. See `matrix_rtc_bridge::compat`.
-        match self
-            .dialect(&room_id)
-            .route_member_event(event_type, content)
-        {
+        let dialect = self.dialect(&room_id);
+        let content = dialect.rewrite_notification(&event_type, content);
+        match dialect.route_member_event(event_type, content) {
             MemberEventRoute::Sticky {
                 event_type,
                 content,
@@ -816,7 +885,7 @@ impl RtcCommandSender for FfiCommandSender {
         event_type: String,
         state_key: String,
         content: Value,
-    ) -> Result<(), CommandError> {
+    ) -> Result<String, CommandError> {
         let content_json = serde_json::to_string(&content)
             .map_err(|e| CommandError::SerializationError(e.to_string()))?;
 
@@ -931,11 +1000,11 @@ mod tests {
             event_type: String,
             content_json: String,
             duration_ms: u64,
-        ) -> Result<(), CommandSenderError> {
+        ) -> Result<String, CommandSenderError> {
             self.record(&event_type);
             self.record_send(Carrier::Sticky, &event_type, None, &content_json);
             *self.sticky_duration_ms.lock().unwrap() = Some(duration_ms);
-            Ok(())
+            Ok("$sticky".to_owned())
         }
 
         async fn send_delayed_event(
@@ -956,10 +1025,10 @@ mod tests {
             event_type: String,
             state_key: String,
             content_json: String,
-        ) -> Result<(), CommandSenderError> {
+        ) -> Result<String, CommandSenderError> {
             self.record(&event_type);
             self.record_send(Carrier::State, &event_type, Some(state_key), &content_json);
-            Ok(())
+            Ok("$state".to_owned())
         }
 
         async fn send_delayed_state_event(
@@ -1036,7 +1105,7 @@ mod tests {
             event_type: String,
             content_json: String,
             duration_ms: u64,
-        ) -> Result<(), CommandSenderError> {
+        ) -> Result<String, CommandSenderError> {
             (**self)
                 .send_sticky_event(room_id, event_type, content_json, duration_ms)
                 .await
@@ -1060,7 +1129,7 @@ mod tests {
             event_type: String,
             state_key: String,
             content_json: String,
-        ) -> Result<(), CommandSenderError> {
+        ) -> Result<String, CommandSenderError> {
             (**self)
                 .send_state_event(room_id, event_type, state_key, content_json)
                 .await
@@ -1222,6 +1291,7 @@ mod tests {
             sticky_duration_ms: None,
             encryption_config: None,
             element_call_compat: None,
+            notify: None,
         }
     }
 

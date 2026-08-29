@@ -223,6 +223,27 @@ impl OutboundDialect {
         }
     }
 
+    /// Render an outbound MSC4075 notification's content for the target
+    /// generation.
+    ///
+    /// Returns the content unchanged for anything that is not a notification and
+    /// for [`OutboundDialect::None`]. The event type never moves — both
+    /// generations already agree on it — so only the content is passed.
+    ///
+    /// Both legacy generations read the same flat shape, so both delegate to the
+    /// one implementation: the pre-sticky one never sends notifications itself,
+    /// but a client of that vintage still parses this shape and there is no
+    /// other for it to read.
+    pub fn rewrite_notification(&self, event_type: &str, content: Value) -> Value {
+        let flattened = match self {
+            Self::None => None,
+            Self::Sticky(_) | Self::State(_) => {
+                element_call::flatten_notification_content(event_type, &content)
+            }
+        };
+        flattened.unwrap_or(content)
+    }
+
     /// Translate an outbound media key into the legacy type and shape, or `None`
     /// to send it untouched.
     ///

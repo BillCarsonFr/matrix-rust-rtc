@@ -67,8 +67,8 @@ use matrix_rtc_bridge::compat::{
 };
 use matrix_rtc_bridge::{SdkCommandSender, run_sticky_bridge};
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, ReceivedEncryptionKey,
-    RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
+    EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, NotifyConfig,
+    ReceivedEncryptionKey, RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
@@ -170,6 +170,14 @@ pub struct CallOptions {
     /// Reading the 2025 sticky dialect needs no flag and is always on. See
     /// [`crate::compat`], and delete all of it once Element Call catches up.
     pub element_call_compat: ElementCallCompat,
+    /// Ask for an MSC4075 notification to be sent with this join, so other
+    /// devices in the room ring or show an incoming call.
+    ///
+    /// `None` — the default — joins quietly, which is what joining a call
+    /// someone else started does. Set it only when *starting* the call: the
+    /// core still suppresses the notification if anybody is already in the
+    /// session, but the intent to summon anyone at all is the caller's.
+    pub notify: Option<NotifyConfig>,
 }
 
 impl Default for CallOptions {
@@ -184,6 +192,7 @@ impl Default for CallOptions {
             http: None,
             auto_subscribe: true,
             element_call_compat: ElementCallCompat::default(),
+            notify: None,
         }
     }
 }
@@ -380,6 +389,7 @@ impl Call {
         params.membership_id = Some(membership_id.clone());
         params.encryption_config = options.encryption_config.clone();
         params.sticky_duration_ms = options.sticky_duration_ms;
+        params.notify = options.notify.clone();
         let memberships = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;

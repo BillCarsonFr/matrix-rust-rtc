@@ -189,8 +189,9 @@ impl RtcCommandSender for SdkCommandSender {
         event_type: String,
         content: Value,
         duration_ms: u64,
-    ) -> Result<(), CommandError> {
+    ) -> Result<String, CommandError> {
         let room = self.room(&room_id)?;
+        let content = self.compat.rewrite_notification(&event_type, content);
         match self.compat.route_member_event(event_type, content) {
             MemberEventRoute::Sticky {
                 event_type,
@@ -205,11 +206,13 @@ impl RtcCommandSender for SdkCommandSender {
                 // against the longer figure would fire after the entry had
                 // already lapsed.
                 let duration_ms = u32::try_from(duration_ms).unwrap_or(u32::MAX);
-                room.send_raw(&event_type, &content)
+                let response = room
+                    .send_raw(&event_type, &content)
                     .with_sticky_duration_ms(duration_ms)
                     .with_request_config(rtc_request_config())
                     .await
                     .map_err(command_error)?;
+                Ok(response.response.event_id.to_string())
             }
             // `duration_ms` is dropped on purpose: room state has no TTL, and in
             // this dialect the lifetime is stated inside the content instead
@@ -234,14 +237,15 @@ impl RtcCommandSender for SdkCommandSender {
                     state_key,
                     Raw::<AnyStateEventContent>::from_json(raw),
                 );
-                self.client
+                let response = self
+                    .client
                     .send(request)
                     .with_request_config(rtc_request_config())
                     .await
                     .map_err(command_error)?;
+                Ok(response.event_id.to_string())
             }
         }
-        Ok(())
     }
 
     async fn send_delayed_event(
@@ -355,17 +359,18 @@ impl RtcCommandSender for SdkCommandSender {
         event_type: String,
         state_key: String,
         content: Value,
-    ) -> Result<(), CommandError> {
+    ) -> Result<String, CommandError> {
         let room = self.room(&room_id)?;
         // Normalise through ruma, which registers `m.rtc.slot` as an alias of
         // the MSC4143 id and stringifies back to whichever it currently treats
         // as primary — `org.matrix.msc4143.rtc.slot` today, the stable id once
         // ruma flips after FCP. Same mechanism as `wire_event_type`.
         let event_type = StateEventType::from(event_type).to_string();
-        room.send_state_event_raw(&event_type, &state_key, &content)
+        let response = room
+            .send_state_event_raw(&event_type, &state_key, &content)
             .await
             .map_err(command_error)?;
-        Ok(())
+        Ok(response.event_id.to_string())
     }
 
     async fn send_to_device_message(

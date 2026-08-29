@@ -108,7 +108,7 @@ pub trait RtcCommandSender: Send + Sync {
     /// Send a sticky event to a Matrix room.
     ///
     /// The event will be sent as a sticky event (using the appropriate MSC or
-    /// stable event type). Returns Ok(()) on success or an error on failure.
+    /// stable event type).
     ///
     /// # Arguments
     ///
@@ -119,13 +119,21 @@ pub trait RtcCommandSender: Send + Sync {
     ///   sticky map. Implementations MUST pass this through rather than
     ///   choosing their own: the caller re-sends the event before this elapses,
     ///   so a different lifetime here silently breaks that refresh.
+    ///
+    /// # Returns
+    ///
+    /// The event id the homeserver assigned. Every Matrix send responds with
+    /// one, so an implementation that cannot produce it is broken rather than
+    /// merely terse — hence no `Option`. The core needs it for MSC4075, which
+    /// requires an `m.reference` relation from a notification to the member
+    /// event that justifies it.
     async fn send_sticky_event(
         &self,
         room_id: String,
         event_type: String,
         content: Value,
         duration_ms: u64,
-    ) -> Result<(), CommandError>;
+    ) -> Result<String, CommandError>;
 
     /// Send a delayed event to a Matrix room.
     ///
@@ -243,13 +251,21 @@ pub trait RtcCommandSender: Send + Sync {
     /// * `event_type` - The event type (e.g., "m.rtc.slot")
     /// * `state_key` - The state key (for a slot, the slot id)
     /// * `content` - The event content as a JSON value
+    ///
+    /// # Returns
+    ///
+    /// The event id the homeserver assigned, on the same terms as
+    /// [`send_sticky_event`](Self::send_sticky_event). No caller of a *slot*
+    /// send reads it; it is here because the pre-MSC4354 Element Call dialect
+    /// routes the membership through this method, and there the id is what a
+    /// notification relates to.
     async fn send_state_event(
         &self,
         room_id: String,
         event_type: String,
         state_key: String,
         content: Value,
-    ) -> Result<(), CommandError>;
+    ) -> Result<String, CommandError>;
 }
 
 /// A no-op implementation of `RtcCommandSender` for testing purposes.
@@ -269,8 +285,8 @@ impl RtcCommandSender for NoopCommandSender {
         _event_type: String,
         _content: Value,
         _duration_ms: u64,
-    ) -> Result<(), CommandError> {
-        Ok(())
+    ) -> Result<String, CommandError> {
+        Ok("$mock-sticky-event".to_string())
     }
 
     async fn send_delayed_event(
@@ -314,8 +330,8 @@ impl RtcCommandSender for NoopCommandSender {
         _event_type: String,
         _state_key: String,
         _content: Value,
-    ) -> Result<(), CommandError> {
-        Ok(())
+    ) -> Result<String, CommandError> {
+        Ok("$mock-state-event".to_string())
     }
 }
 
@@ -376,12 +392,12 @@ impl RtcCommandSender for MockCommandSender {
         event_type: String,
         content: Value,
         duration_ms: u64,
-    ) -> Result<(), CommandError> {
-        self.sticky_events
-            .lock()
-            .unwrap()
-            .push((room_id, event_type, content, duration_ms));
-        Ok(())
+    ) -> Result<String, CommandError> {
+        let mut guard = self.sticky_events.lock().unwrap();
+        guard.push((room_id, event_type, content, duration_ms));
+        // Numbered by send order, so a test can name the event a relation is
+        // expected to point at.
+        Ok(format!("$sticky-{}", guard.len()))
     }
 
     async fn send_delayed_event(
@@ -448,11 +464,9 @@ impl RtcCommandSender for MockCommandSender {
         event_type: String,
         state_key: String,
         content: Value,
-    ) -> Result<(), CommandError> {
-        self.state_events
-            .lock()
-            .unwrap()
-            .push((room_id, event_type, state_key, content));
-        Ok(())
+    ) -> Result<String, CommandError> {
+        let mut guard = self.state_events.lock().unwrap();
+        guard.push((room_id, event_type, state_key, content));
+        Ok(format!("$state-{}", guard.len()))
     }
 }

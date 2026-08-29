@@ -32,7 +32,11 @@ use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdenti
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
-use crate::own_membership::{OwnMembershipMachine, transport_to_json};
+use crate::notification::{
+    NOTIFICATION_EVENT_TYPE, NotifyConfig, build_notification_content,
+    notification_sticky_duration_ms,
+};
+use crate::own_membership::{OwnMembershipMachine, now_ms, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -407,7 +411,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        machine.join(transports).await?;
+        let member_event_id = machine.join(transports).await?;
 
         // Store the machine
         self.own_membership_machine = Some(machine);
@@ -504,7 +508,78 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             if manage_media_keys { "managed" } else { "off" },
         );
 
+        if let Some(notify) = &params.notify {
+            self.notify_session_started(notify, &params, &member_event_id)
+                .await;
+        }
+
         Ok(())
+    }
+
+    /// Sends the MSC4075 notification that summons the room to this session.
+    ///
+    /// Called at the tail of [`Self::join`], where the roster has just been
+    /// republished. Never fails the join: the user is in the call whether or
+    /// not anyone else was told about it.
+    async fn notify_session_started(
+        &self,
+        notify: &NotifyConfig,
+        params: &JoinSessionParams,
+        member_event_id: &str,
+    ) {
+        // MSC4075 leaves who sends the notification open, but every joiner
+        // sending one would ring the room once per participant. Only the member
+        // who *starts* the session does — matching what Element Call does.
+        //
+        // `self.members` is the right test at exactly this point: our own
+        // membership has not echoed back through sync yet, so it is not among
+        // the candidates, and a still-sticky participation of ours from an
+        // earlier join in this process is already excluded as
+        // `SupersededOwnParticipation`.
+        if !self.members.is_empty() {
+            log::info!(
+                "[{}] not notifying: {} member(s) were already in the session, so somebody \
+                 else started it",
+                self.log_tag,
+                self.members.len(),
+            );
+            return;
+        }
+
+        let Some(command_sender) = self.command_sender.as_ref() else {
+            return;
+        };
+
+        let content = build_notification_content(
+            notify,
+            &params.application,
+            &params.user_id,
+            &params.device_id,
+            member_event_id,
+            now_ms(),
+        );
+
+        log::info!(
+            "[{}] notifying the room: {}",
+            self.log_tag,
+            notify.notification_type.as_str(),
+        );
+
+        if let Err(error) = command_sender
+            .send_sticky_event(
+                params.room_id.clone(),
+                NOTIFICATION_EVENT_TYPE.to_owned(),
+                content,
+                notification_sticky_duration_ms(notify.lifetime_ms()),
+            )
+            .await
+        {
+            log::warn!(
+                "[{}] the session-started notification was not sent ({error:?}); the call \
+                 itself is unaffected",
+                self.log_tag,
+            );
+        }
     }
 
     /// Leaves this RTC session.
