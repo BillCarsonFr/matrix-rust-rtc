@@ -458,13 +458,11 @@ pub struct ElementCallStateDialect {
     slot_id: String,
     /// Pinned on the first join and never moved.
     ///
-    /// The core re-sends our membership every half sticky-duration
-    /// (`refresh_sticky_if_due`), which for room state is a no-op we neither
-    /// need nor want to suppress. Pinning makes every re-send **byte-identical**,
-    /// so Synapse either drops the duplicate or accepts it and moves nothing but
-    /// `origin_server_ts` — and since `created_ts` is present, peers compute the
-    /// same deadline either way. A `created_ts` stamped afresh each time would
-    /// silently extend our validity past what peers computed when they read us.
+    /// It is the join instant, and peers read it as one: this generation's
+    /// `oldest_membership` focus selection picks the SFU of whoever has the
+    /// smallest `created_ts`, so re-stamping it on every refresh would make us
+    /// perpetually the newest member and hand focus selection to somebody else.
+    /// The refresh moves `expires` instead — see [`Self::member_content`].
     ///
     /// Shared so a clone of the command sender agrees with the original.
     created_ts: Arc<OnceLock<u64>>,
@@ -528,6 +526,19 @@ impl ElementCallStateDialect {
     /// A leave returns `{}`, which is the whole protocol for it — this dialect
     /// has no `membership` field to set to `"leave"`.
     ///
+    /// `lifetime_ms` is how much longer the membership should be considered
+    /// valid *from now* — the same number the sticky dialect hands the
+    /// homeserver as its TTL, so both dialects expire our membership on one
+    /// clock. It becomes `expires`, measured from the pinned `created_ts`
+    /// (`expires = now - created_ts + lifetime_ms`), which is what makes a
+    /// refresh actually move the deadline: peers read `created_ts + expires`,
+    /// and `created_ts` deliberately never moves. `None` — the delayed leave,
+    /// whose content is `{}` anyway — falls back to the JS SDK's four hours.
+    ///
+    /// This is the *only* thing that bounds a ghost in this dialect when the
+    /// homeserver has no MSC4140: there is no delayed `{}` to clear the state
+    /// event, so a crashed client is visible until this deadline passes.
+    ///
     /// `foci_preferred` is lifted out of the content the core already built, not
     /// injected from the caller, so the dialect needs nothing that is not known
     /// when the command sender is constructed. The `livekit_alias` we add is the
@@ -536,7 +547,7 @@ impl ElementCallStateDialect {
     /// value and the `/sfu/get` `room` field must stay equal**, or the two
     /// clients land in different LiveKit rooms and never see each other while
     /// both connections look perfectly healthy.
-    pub fn member_content(&self, spec: &Value) -> Value {
+    pub fn member_content(&self, spec: &Value, lifetime_ms: Option<u64>) -> Value {
         // A spec leave, or anything that is not a membership we can dress up.
         // `slot_id` is the tell: the core's leave content still carries one, but
         // an already-legacy content does not.
@@ -547,6 +558,14 @@ impl ElementCallStateDialect {
         let (application, call_id) = legacy_session(&self.slot_id);
         let created_ts = *self.created_ts.get_or_init(now_ms);
 
+        // Measured from `created_ts`, not from now, because that is where peers
+        // measure it from. On the first send the two instants are the same and
+        // this is just `lifetime_ms`; on a refresh it is the elapsed time plus
+        // the lifetime, which pushes `created_ts + expires` out to
+        // `now + lifetime_ms`.
+        let expires =
+            now_ms().saturating_sub(created_ts) + lifetime_ms.unwrap_or(DEFAULT_EXPIRES_MS);
+
         let mut content = json!({
             "application": application,
             "call_id": call_id,
@@ -554,7 +573,7 @@ impl ElementCallStateDialect {
             "device_id": self.own_device_id,
             "membershipID": self.membership_id(),
             "created_ts": created_ts,
-            "expires": DEFAULT_EXPIRES_MS,
+            "expires": expires,
             // We publish on exactly one focus, so which selection mode we
             // declare only matters for how peers read *us*. `multi_sfu` says
             // "use the focus I name", which is true and is what the transports
@@ -1082,7 +1101,7 @@ mod tests {
     #[test]
     fn a_spec_join_becomes_pre_sticky_state_content() {
         let dialect = dialect();
-        let legacy = dialect.member_content(&content(SPEC_JOIN));
+        let legacy = dialect.member_content(&content(SPEC_JOIN), None);
 
         assert_eq!(legacy["application"], "m.call");
         assert_eq!(legacy["call_id"], "");
@@ -1111,30 +1130,65 @@ mod tests {
 
     #[test]
     fn a_spec_leave_becomes_the_empty_object() {
-        assert_eq!(dialect().member_content(&content(SPEC_LEAVE)), json!({}));
+        assert_eq!(
+            dialect().member_content(&content(SPEC_LEAVE), None),
+            json!({})
+        );
     }
 
     /// An already-legacy content (no `slot_id`) must not be dressed up again
     /// into something that looks like a fresh membership.
     #[test]
     fn content_without_a_slot_id_becomes_the_empty_object() {
-        assert_eq!(dialect().member_content(&json!({})), json!({}));
+        assert_eq!(dialect().member_content(&json!({}), None), json!({}));
     }
 
-    /// The regression test for the `created_ts` pinning: the core re-sends our
-    /// membership every half sticky-duration, and a content that differed each
-    /// time would move the deadline peers computed for us.
+    /// The regression test for the `created_ts` pinning. Peers read
+    /// `created_ts` as the join instant — this generation's
+    /// `oldest_membership` focus selection picks the SFU of the smallest one —
+    /// so a refresh must not move it, however many times we re-send.
     #[test]
-    fn the_same_join_renders_byte_identically_every_time() {
+    fn a_refresh_never_moves_created_ts() {
         let dialect = dialect();
         let spec = content(SPEC_JOIN);
 
-        let first = dialect.member_content(&spec);
-        let second = dialect.member_content(&spec);
+        let first = dialect.member_content(&spec, Some(60_000));
+        let second = dialect.member_content(&spec, Some(60_000));
 
-        assert_eq!(first, second);
+        assert_eq!(first["created_ts"], second["created_ts"]);
         // Including across a clone, which is how the command sender holds it.
-        assert_eq!(first, dialect.clone().member_content(&spec));
+        assert_eq!(
+            first["created_ts"],
+            dialect.clone().member_content(&spec, Some(60_000))["created_ts"],
+        );
+    }
+
+    /// The deadline peers compute is `created_ts + expires`, and `created_ts`
+    /// never moves, so `expires` is the only thing a refresh can push out. On a
+    /// homeserver without MSC4140 it is the *sole* thing bounding a ghost, so it
+    /// has to track the lifetime the core asked for rather than a fixed constant.
+    #[test]
+    fn expires_carries_the_lifetime_the_core_asked_for() {
+        let dialect = dialect();
+        let spec = content(SPEC_JOIN);
+        let lifetime = 60_000;
+
+        let first = dialect.member_content(&spec, Some(lifetime));
+        let created_ts = first["created_ts"].as_u64().expect("stamped");
+        let deadline = created_ts + first["expires"].as_u64().expect("stated");
+
+        // The first send is the join itself, so its deadline is one lifetime out.
+        assert!(deadline.abs_diff(now_ms() + lifetime) < 1_000);
+
+        // A later send moves the deadline out by a further lifetime from *then*,
+        // which is what keeps a refreshed membership alive.
+        let refreshed = dialect.member_content(&spec, Some(lifetime));
+        assert!(refreshed["expires"].as_u64().expect("stated") >= lifetime);
+
+        // No lifetime stated is the delayed leave, which needs no deadline: the
+        // JS SDK's four hours, as before.
+        let unstated = dialect.member_content(&spec, None);
+        assert!(unstated["expires"].as_u64().expect("stated") >= DEFAULT_EXPIRES_MS);
     }
 
     /// This generation validates `m.call.intent` and logs
@@ -1142,13 +1196,16 @@ mod tests {
     /// always was, because the core carries no intent for us to copy.
     #[test]
     fn a_join_always_states_a_call_intent() {
-        let legacy = dialect().member_content(&content(SPEC_JOIN));
+        let legacy = dialect().member_content(&content(SPEC_JOIN), None);
         assert_eq!(legacy["m.call.intent"], DEFAULT_CALL_INTENT);
 
         // An intent the core did supply wins over the default.
         let mut spec = content(SPEC_JOIN);
         spec["application"]["m.call.intent"] = json!("audio");
-        assert_eq!(dialect().member_content(&spec)["m.call.intent"], "audio");
+        assert_eq!(
+            dialect().member_content(&spec, None)["m.call.intent"],
+            "audio"
+        );
     }
 
     #[test]
@@ -1156,7 +1213,7 @@ mod tests {
         let mut spec = content(SPEC_JOIN);
         spec["transports"]["published"] = json!([{ "type": "something-else" }]);
 
-        let legacy = dialect().member_content(&spec);
+        let legacy = dialect().member_content(&spec, None);
         assert_eq!(legacy["foci_preferred"], json!([]));
     }
 }

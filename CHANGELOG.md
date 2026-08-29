@@ -439,6 +439,37 @@ single integrator, rather than dripped out over several:
 
 ### Fixed
 
+- **A homeserver without MSC4140 delayed events could not join a call at all.**
+  `matrix.org` answers `403 M_FORBIDDEN "Sending delayed events has been
+  disallowed"`, and the dead man's switch was armed as step 1 of the join, so
+  that 403 failed the whole join — no call, on a homeserver where the call works
+  perfectly well.
+
+  The delayed leave is a cleanup *optimisation*: both dialects already expire a
+  membership on their own, so losing it costs the speed of the cleanup, not the
+  call. The join now degrades instead of failing, and publishes the membership on
+  `degraded_lifetime_ms` (new; default 5 min, on `JoinSessionParams`,
+  `CallOptions`, `FfiJoinSessionParams` and the WASM join params) so a client that
+  dies is forgotten in minutes rather than in an hour. Hosts can throw the new
+  `CommandSenderError::NotSupported` from the delayed-event callbacks to say the
+  homeserver means it — optional, since a plain `SendError` degrades the same way,
+  with a re-probe every five minutes in case it was a blip.
+  `RtcSession::delayed_leave_supported()` reports which mode a session ended up
+  in.
+
+  Five minutes and not less because MSC4354 says a sticky duration "SHOULD NOT be
+  set to below 5 minutes" — a server whose `origin_server_ts` runs behind expires
+  sticky events early, and a short duration has no room to absorb that. The
+  lifetime is also chosen *before the first membership is published* and never
+  moved: MSC4354 keeps whichever event with a given `sticky_key` expires last, so
+  an hour-long join entry would out-live every shorter refresh after it and the
+  degradation would buy nothing.
+
+  In `StateEvents` compat mode this is the *only* thing bounding a ghost — room
+  state has no TTL and there is no delayed `{}` to empty it — so `expires` is now
+  derived from that lifetime and moved forward on every refresh, instead of being
+  pinned at the JS SDK's four hours. `created_ts` still never moves: peers read it
+  as the join instant for `oldest_membership` focus selection.
 - **Key rotation never took effect: we advertised a new key and kept encrypting
   with the old one.** `KeyProvider::set_key` only fills the key *ring*; the index
   a sender stamps lives on its frame cryptor, which is created at index 0 and

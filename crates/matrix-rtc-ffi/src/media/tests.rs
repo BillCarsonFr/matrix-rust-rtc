@@ -177,6 +177,7 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
                 can_subscribe: Vec::new(),
                 keep_alive_timeout_ms: None,
                 sticky_duration_ms: None,
+                degraded_lifetime_ms: None,
                 encryption_config: None,
                 element_call_compat: None,
                 notify: None,

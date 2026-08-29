@@ -53,9 +53,15 @@ pub enum CommandError {
     #[error("failed to cancel delayed event: {0}")]
     CancelError(String),
 
-    /// The client SDK does not support delayed events.
-    #[error("delayed events not supported by client")]
-    DelayedEventsNotSupported,
+    /// The homeserver will never accept a delayed event, so retrying one is
+    /// pointless.
+    ///
+    /// Two shapes of rejection mean this: the endpoint is not implemented at all
+    /// (404 `M_UNRECOGNIZED`), and it is implemented but switched off — which is
+    /// what matrix.org answers, a 403 `M_FORBIDDEN` reading "Sending delayed
+    /// events has been disallowed".
+    #[error("delayed events not supported by the homeserver: {0}")]
+    DelayedEventsNotSupported(String),
 }
 
 /// Errors that can occur when attempting to join an RTC session.
@@ -94,5 +100,11 @@ impl CommandError {
     /// Create a generic command error from a string message.
     pub fn from_message(msg: impl Into<String>) -> Self {
         CommandError::SendError(msg.into())
+    }
+
+    /// Whether this rejection means the homeserver will never accept a delayed
+    /// event, so a client should stop asking rather than retry.
+    pub fn is_delayed_events_unsupported(&self) -> bool {
+        matches!(self, CommandError::DelayedEventsNotSupported(_))
     }
 }

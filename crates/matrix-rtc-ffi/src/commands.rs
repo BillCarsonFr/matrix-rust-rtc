@@ -53,6 +53,20 @@ pub enum CommandSenderError {
     /// Error from the native SDK when sending the event
     #[error("the send failed: {0}")]
     SendError(String),
+    /// The homeserver will never accept this request, so there is no point
+    /// retrying it.
+    ///
+    /// Throw this instead of `SendError` from the four delayed-event callbacks
+    /// when the homeserver has no MSC4140 support — a `404 M_UNRECOGNIZED`, or
+    /// matrix.org's `403 M_FORBIDDEN "Sending delayed events has been
+    /// disallowed"`. The SDK then stops arming a dead man's switch for the rest
+    /// of the session and keeps the membership alive by its lifetime alone,
+    /// rather than re-probing a homeserver that has already answered.
+    ///
+    /// Optional: a plain `SendError` degrades the same way, just with periodic
+    /// retries. Nothing breaks if you never throw this.
+    #[error("the homeserver does not support this: {0}")]
+    NotSupported(String),
 }
 
 impl From<CommandSenderError> for matrix_rtc_core::CommandError {
@@ -62,6 +76,9 @@ impl From<CommandSenderError> for matrix_rtc_core::CommandError {
                 matrix_rtc_core::CommandError::SerializationError(e)
             }
             CommandSenderError::SendError(e) => matrix_rtc_core::CommandError::SendError(e),
+            CommandSenderError::NotSupported(e) => {
+                matrix_rtc_core::CommandError::DelayedEventsNotSupported(e)
+            }
         }
     }
 }
@@ -173,6 +190,18 @@ pub struct FfiJoinSessionParams {
     /// homeserver keeps the membership at all. The SDK re-sends the membership
     /// at half this interval, so shortening it buys nothing but traffic.
     pub sticky_duration_ms: Option<u64>,
+    /// Optional membership lifetime to fall back to on a homeserver that
+    /// refuses MSC4140 delayed events, in milliseconds (default: 300000).
+    ///
+    /// Only ever used on such a homeserver, where nothing clears a crashed
+    /// client's membership except this lifetime running out. Raising it trades a
+    /// slower cleanup for less signalling; the SDK re-sends the membership at
+    /// half this interval, so 300000 means a membership event every 2½ minutes.
+    /// Do not lower it below 300000 — MSC4354 says a sticky duration "SHOULD NOT
+    /// be set to below 5 minutes", because a server whose clock runs behind
+    /// expires sticky events early and a shorter duration cannot absorb that.
+    #[uniffi(default = None)]
+    pub degraded_lifetime_ms: Option<u64>,
     /// Optional encryption configuration
     pub encryption_config: Option<FfiEncryptionConfig>,
     /// Render this session for an older MatrixRTC generation, to interoperate
@@ -313,6 +342,7 @@ impl FfiJoinSessionParams {
             transport,
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
+            degraded_lifetime_ms: self.degraded_lifetime_ms,
             encryption_config,
             notify: self.notify.map(Into::into),
         })
@@ -398,6 +428,14 @@ pub trait CommandSenderCallback: Send + Sync {
     /// Return Ok(delay_id) with the MSC4140 delay ID on success, or Err on
     /// failure. That id — not an event id — is what `restartDelayedEvent` and
     /// `cancelDelayedEvent` take.
+    ///
+    /// Throwing does **not** fail the join. MSC4140 is optional and plenty of
+    /// homeservers refuse it (matrix.org: `403 M_FORBIDDEN "Sending delayed
+    /// events has been disallowed"`), which costs only the speed of the cleanup
+    /// when a client dies, not the call — so the SDK joins anyway and shortens
+    /// the membership lifetime instead. Throw
+    /// [`CommandSenderError::NotSupported`] rather than `SendError` when the
+    /// homeserver has said so, and the SDK will stop asking.
     async fn send_delayed_event(
         &self,
         room_id: String,
@@ -448,9 +486,12 @@ pub trait CommandSenderCallback: Send + Sync {
     /// a delayed sticky leave clears nothing from the sticky map, so crash
     /// cleanup there rides on the entry's TTL. A delayed state event with `{}`
     /// content genuinely empties our membership, which is what MSC4140 was built
-    /// for and what this generation of Element Call relies on — without it a
-    /// crashed client is a permanent ghost in the call, since room state has no
-    /// TTL to lapse.
+    /// for and what this generation of Element Call relies on — room state has
+    /// no TTL to lapse.
+    ///
+    /// So a homeserver that refuses this one is the worst case for a ghost, and
+    /// the reason the membership's own `expires` is shortened when it does.
+    /// Throwing still does not fail the join; see [`Self::send_delayed_event`].
     ///
     /// matrix-rust-sdk: the MSC4140 delayed **state** send
     /// (`PUT /rooms/{roomId}/state/{eventType}/{stateKey}?org.matrix.msc4140.delay=…`).
@@ -679,7 +720,7 @@ impl RtcCommandSender for FfiCommandSender {
         // everything. See `matrix_rtc_bridge::compat`.
         let dialect = self.dialect(&room_id);
         let content = dialect.rewrite_notification(&event_type, content);
-        match dialect.route_member_event(event_type, content) {
+        match dialect.route_member_event(event_type, content, Some(duration_ms)) {
             MemberEventRoute::Sticky {
                 event_type,
                 content,
@@ -739,10 +780,11 @@ impl RtcCommandSender for FfiCommandSender {
     ) -> Result<String, CommandError> {
         // The delayed leave is a member event like any other, and a peer that
         // cannot read it is a peer we stay visible to forever — so it goes
-        // through the same routing as the join it is paired with.
+        // through the same routing as the join it is paired with. No lifetime:
+        // its legacy content is `{}`, which has nowhere to carry a deadline.
         match self
             .dialect(&room_id)
-            .route_member_event(event_type, content)
+            .route_member_event(event_type, content, None)
         {
             MemberEventRoute::Sticky {
                 event_type,
@@ -924,6 +966,9 @@ mod tests {
         /// carrier a membership took, and under what content, is the whole
         /// question there and the event type alone cannot answer it.
         sends: Mutex<Vec<Send>>,
+        /// Model a homeserver with MSC4140 switched off, the way matrix.org
+        /// answers: every delayed send is refused.
+        refuse_delayed: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Clone)]
@@ -990,6 +1035,17 @@ mod tests {
         fn clear_to_device(&self) {
             self.to_device.lock().unwrap().clear();
         }
+
+        /// matrix.org's answer to a delayed send, verbatim.
+        fn delayed_refusal(&self) -> Option<CommandSenderError> {
+            self.refuse_delayed
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then(|| {
+                    CommandSenderError::NotSupported(
+                        "Sending delayed events has been disallowed".to_owned(),
+                    )
+                })
+        }
     }
 
     #[async_trait]
@@ -1014,6 +1070,9 @@ mod tests {
             content_json: String,
             _delay_ms: u64,
         ) -> Result<String, CommandSenderError> {
+            if let Some(refusal) = self.delayed_refusal() {
+                return Err(refusal);
+            }
             self.record(&event_type);
             self.record_send(Carrier::DelayedSticky, &event_type, None, &content_json);
             Ok(format!("event-{}-{}", room_id, event_type))
@@ -1039,6 +1098,9 @@ mod tests {
             content_json: String,
             _delay_ms: u64,
         ) -> Result<String, CommandSenderError> {
+            if let Some(refusal) = self.delayed_refusal() {
+                return Err(refusal);
+            }
             self.record(&event_type);
             self.record_send(
                 Carrier::DelayedState,
@@ -1289,6 +1351,7 @@ mod tests {
             can_subscribe: Vec::new(),
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
+            degraded_lifetime_ms: None,
             encryption_config: None,
             element_call_compat: None,
             notify: None,
@@ -1705,6 +1768,45 @@ mod tests {
             serde_json::json!({}),
             "an empty content is this dialect's leave",
         );
+    }
+
+    /// The end-to-end shape of the matrix.org failure: Element X, a pre-sticky
+    /// Element Call room, and a homeserver answering
+    /// `403 M_FORBIDDEN "Sending delayed events has been disallowed"` to the
+    /// delayed state event. That used to fail the join outright — no call at
+    /// all, on a homeserver where the call works fine.
+    #[tokio::test]
+    async fn a_pre_sticky_join_survives_a_homeserver_without_delayed_events() {
+        let (mock, manager) = compat_manager().await;
+        mock.refuse_delayed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        manager
+            .join(compat_join(FfiElementCallCompat::StateEvents))
+            .await
+            .expect("a refused delayed leave must not fail the join");
+
+        let sends = mock.sends();
+        assert!(
+            sends
+                .iter()
+                .all(|send| send.carrier != Carrier::DelayedState),
+            "nothing was armed, because the homeserver refused",
+        );
+
+        // The membership itself still goes out, and still states a deadline —
+        // which here is the only thing that will ever clear it, since there is
+        // no delayed `{}` to empty the state event when this client dies.
+        let membership = sends
+            .iter()
+            .find(|send| send.carrier == Carrier::State)
+            .expect("the membership should still be published as room state");
+        let expires = membership
+            .content
+            .get("expires")
+            .and_then(serde_json::Value::as_u64)
+            .expect("a pre-sticky membership always states its lifetime");
+        assert!(expires > 0);
     }
 
     /// A pre-sticky room has no `m.rtc.slot` — the concept postdates that

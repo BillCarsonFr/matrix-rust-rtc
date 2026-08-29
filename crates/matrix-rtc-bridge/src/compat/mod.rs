@@ -194,7 +194,19 @@ impl OutboundDialect {
     /// Anything that is not a membership passes through as a sticky event
     /// untouched, in every mode — the legacy generations differ about
     /// memberships, not about everything.
-    pub fn route_member_event(&self, event_type: String, content: Value) -> MemberEventRoute {
+    ///
+    /// `lifetime_ms` is how long the membership should stay valid from now. The
+    /// sticky routes ignore it — the homeserver is told separately, as the
+    /// sticky TTL — but the pre-sticky state route has nowhere else to put a
+    /// deadline and writes it into `expires`
+    /// ([`ElementCallStateDialect::member_content`]). `None` means "no opinion",
+    /// which is what a delayed leave has.
+    pub fn route_member_event(
+        &self,
+        event_type: String,
+        content: Value,
+        lifetime_ms: Option<u64>,
+    ) -> MemberEventRoute {
         if !ElementCallDialect::is_member_event(&event_type) {
             return MemberEventRoute::Sticky {
                 event_type,
@@ -218,7 +230,7 @@ impl OutboundDialect {
             Self::State(dialect) => MemberEventRoute::State {
                 event_type: STATE_MEMBER_EVENT_TYPE,
                 state_key: dialect.state_key(),
-                content: dialect.member_content(&content),
+                content: dialect.member_content(&content, lifetime_ms),
             },
         }
     }

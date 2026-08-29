@@ -55,7 +55,8 @@ pub use notification::{
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,
 };
 pub use own_membership::{
-    KeepAliveInfo, OwnMembershipMachine, OwnMembershipState, transport_to_json,
+    DelayedLeaveSupport, KeepAliveInfo, MembershipTimings, OwnMembershipMachine,
+    OwnMembershipState, transport_to_json,
 };
 pub use session::{
     ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,
