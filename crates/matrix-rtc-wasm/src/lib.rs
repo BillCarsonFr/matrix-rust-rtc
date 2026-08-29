@@ -38,8 +38,8 @@
 
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,
-    LeaveSessionParams, RawRtcTransport, RawSlotEvent, RawStickyEvent, RtcSession,
-    RtcSessionManager, RtcTransport,
+    LeaveSessionParams, Mentions, NotificationType, NotifyConfig, RawRtcTransport, RawSlotEvent,
+    RawStickyEvent, RtcSession, RtcSessionManager, RtcTransport,
 };
 
 mod commands;
@@ -339,6 +339,63 @@ pub struct WasmJoinSessionParams {
     pub sticky_duration_ms: Option<u64>,
     #[serde(default)]
     pub encryption_config: Option<WasmEncryptionConfig>,
+    /// Ask for an MSC4075 notification to be sent with this join, so other
+    /// devices in the room ring or show an incoming call.
+    ///
+    /// Omit — the default — to join quietly, which is what joining a call
+    /// someone else started does. Pass it only when the user is *starting* the
+    /// call: the SDK still suppresses the notification if anybody is already in
+    /// the session, but the intent to summon anyone at all is the caller's to
+    /// state.
+    #[serde(default)]
+    pub notify: Option<WasmNotifyConfig>,
+}
+
+/// WASM-friendly MSC4075 notification request.
+#[derive(Debug, Deserialize)]
+pub struct WasmNotifyConfig {
+    /// `"ring"` or `"notification"`.
+    pub notification_type: String,
+    /// MSC4196 `m.call.intent`, e.g. `"audio"` or `"video"`.
+    #[serde(default)]
+    pub intent: Option<String>,
+    /// How long the ring stays valid, in milliseconds (default: 30000, capped
+    /// at 120000 because that is what receivers honour).
+    #[serde(default)]
+    pub lifetime_ms: Option<u64>,
+    /// Users named individually in `m.mentions`. Usually empty.
+    #[serde(default)]
+    pub mention_user_ids: Vec<String>,
+    /// Whether the whole room is targeted (default: true).
+    #[serde(default = "default_mention_room")]
+    pub mention_room: bool,
+}
+
+fn default_mention_room() -> bool {
+    true
+}
+
+impl WasmNotifyConfig {
+    fn into_core(self) -> Result<NotifyConfig, JsError> {
+        let notification_type = match self.notification_type.as_str() {
+            "ring" => NotificationType::Ring,
+            "notification" => NotificationType::Notification,
+            other => {
+                return Err(JsError::new(&format!(
+                    "notification_type must be \"ring\" or \"notification\", got {other:?}"
+                )));
+            }
+        };
+        Ok(NotifyConfig {
+            notification_type,
+            intent: self.intent,
+            lifetime_ms: self.lifetime_ms,
+            mentions: Mentions {
+                user_ids: self.mention_user_ids,
+                room: self.mention_room,
+            },
+        })
+    }
 }
 
 /// WASM-friendly encryption configuration.
@@ -413,6 +470,7 @@ impl WasmJoinSessionParams {
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
             encryption_config,
+            notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
         })
     }
 }

@@ -67,7 +67,7 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
 /// so the sticky refresh is decided by comparing timestamps when the host
 /// happens to call [`OwnMembershipMachine::heartbeat`], not by a task waking
 /// itself up.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -271,9 +271,11 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if both the delayed leave and join were scheduled/sent successfully.
-    /// Returns an error if either operation fails.
-    pub async fn join(&self, transports: MemberTransports) -> Result<(), CommandError> {
+    /// The event id of the membership event, if both the delayed leave and the
+    /// join were scheduled/sent successfully; an error if either operation
+    /// fails. The caller needs the id to relate an MSC4075 notification to the
+    /// membership that justifies it.
+    pub async fn join(&self, transports: MemberTransports) -> Result<String, CommandError> {
         let room_id = self.room_id.clone();
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
@@ -336,7 +338,8 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         );
 
         // Send the join event (Step 2 of dead man's switch)
-        self.command_sender
+        let event_id = self
+            .command_sender
             .send_sticky_event(
                 room_id.clone(),
                 "m.rtc.member".to_string(),
@@ -373,7 +376,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             room_id
         );
 
-        Ok(())
+        Ok(event_id)
     }
 
     /// Builds MSC4143-compliant content for a delayed leave event (dead man's switch).
@@ -629,7 +632,10 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             )
             .await
         {
-            Ok(()) => {
+            // The refresh's own event id is dropped: the only reader of one is
+            // the MSC4075 notification, which is sent once at join and relates
+            // to the event that existed then.
+            Ok(_) => {
                 let mut guard = self.last_sticky.lock().unwrap();
                 // Only advance the clock if we are still tracking the same
                 // content: a concurrent join/leave may have replaced it while
@@ -1074,12 +1080,12 @@ mod tests {
             _event_type: String,
             content: Value,
             _duration_ms: u64,
-        ) -> Result<(), CommandError> {
+        ) -> Result<String, CommandError> {
             if self.fail_sticky {
                 return Err(CommandError::from_message("sticky send rejected"));
             }
             self.sticky_events.lock().unwrap().push(content);
-            Ok(())
+            Ok("$sticky".to_string())
         }
 
         async fn send_delayed_event(
@@ -1129,8 +1135,8 @@ mod tests {
             _event_type: String,
             _state_key: String,
             _content: Value,
-        ) -> Result<(), CommandError> {
-            Ok(())
+        ) -> Result<String, CommandError> {
+            Ok("$state".to_string())
         }
     }
 

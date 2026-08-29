@@ -44,8 +44,8 @@ impl CommandSenderCallback for NoopCommands {
         _event_type: String,
         _content_json: String,
         _duration_ms: u64,
-    ) -> Result<(), CommandSenderError> {
-        Ok(())
+    ) -> Result<String, CommandSenderError> {
+        Ok("$sticky-event-1".to_owned())
     }
 
     async fn send_delayed_event(
@@ -64,8 +64,8 @@ impl CommandSenderCallback for NoopCommands {
         _event_type: String,
         _state_key: String,
         _content_json: String,
-    ) -> Result<(), CommandSenderError> {
-        Ok(())
+    ) -> Result<String, CommandSenderError> {
+        Ok("$state-event-1".to_owned())
     }
 
     async fn send_delayed_state_event(
@@ -179,6 +179,7 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
                 sticky_duration_ms: None,
                 encryption_config: None,
                 element_call_compat: None,
+                notify: None,
             })
             .await
             .unwrap();

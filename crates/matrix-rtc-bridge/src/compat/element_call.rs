@@ -69,6 +69,10 @@ const KEY_EVENT_TYPES: [&str; 2] = [
     "org.matrix.msc4143.rtc.encryption_key",
 ];
 
+/// The core's event type for an MSC4075 notification, before the bridge maps it
+/// to the unstable id that goes on the wire.
+const NOTIFICATION_EVENT_TYPE: &str = "m.rtc.notification";
+
 /// Wall-clock milliseconds since the Unix epoch, for the legacy `sent_ts`.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -502,6 +506,46 @@ pub fn rewrite_key_message(
     Some((LEGACY_KEY_EVENT_TYPE.to_owned(), legacy))
 }
 
+/// Flatten an MSC4075 notification into the shape Element Call sends and reads.
+///
+/// Returns `None` for any other event type, which the caller then sends
+/// untouched.
+///
+/// Element Call predates the `application` block: it puts `notification_type`,
+/// `sender_ts`, `lifetime` and `m.call.intent` straight in the content and sends
+/// no `m.text` at all. The event type is unchanged — both generations already
+/// agree on `org.matrix.msc4075.rtc.notification` — so only the content moves.
+///
+/// `device_id` is dropped rather than hoisted: it exists for ring
+/// acknowledgements, which this generation neither sends nor reads, and a
+/// top-level `device_id` means something else entirely in its key messages.
+pub fn flatten_notification_content(event_type: &str, content: &Value) -> Option<Value> {
+    if event_type != NOTIFICATION_EVENT_TYPE {
+        return None;
+    }
+
+    let application = content.get("application")?.as_object()?;
+    let mut flat = Map::new();
+    if let Some(mentions) = content.get("m.mentions") {
+        flat.insert("m.mentions".to_owned(), mentions.clone());
+    }
+    for field in [
+        "notification_type",
+        "sender_ts",
+        "lifetime",
+        "m.call.intent",
+    ] {
+        if let Some(value) = application.get(field) {
+            flat.insert(field.to_owned(), value.clone());
+        }
+    }
+    if let Some(relates_to) = content.get("m.relates_to") {
+        flat.insert("m.relates_to".to_owned(), relates_to.clone());
+    }
+
+    Some(Value::Object(flat))
+}
+
 /// Reconstruct the legacy `{application, call_id}` pair from a slot id.
 ///
 /// MSC4143 folded the old `{application, call_id, scope}` triple into a single
@@ -867,6 +911,105 @@ mod tests {
         assert_eq!(legacy.pointer("/session/call_id").unwrap(), "");
         assert_eq!(legacy.pointer("/session/scope").unwrap(), "m.room");
         assert!(legacy.get("sent_ts").is_some());
+    }
+
+    /// Stripped of `application` and `m.text`, what the core sends must equal
+    /// what a real Element Call sends — captured verbatim in
+    /// `skills/e2e-testing/references/Alice-Bob-Call-Events.md`, where Bob
+    /// starts the call and Alice, joining second, sends nothing.
+    #[test]
+    fn a_notification_is_flattened_into_what_element_call_sends() {
+        // As `matrix_rtc_core::build_notification_content` writes it: the MSC's
+        // `application` block plus the top-level copies every deployed receiver
+        // actually reads.
+        let spec = json!({
+            "application": {
+                "type": "m.call",
+                "notification_type": "notification",
+                "sender_ts": 1_779_030_731_419u64,
+                "lifetime": 30000,
+                "device_id": "WDQHAPEYDK",
+                "m.call.intent": "video",
+            },
+            "notification_type": "notification",
+            "sender_ts": 1_779_030_731_419u64,
+            "lifetime": 30000,
+            "m.call.intent": "video",
+            "m.text": [{ "body": "Session started by @bob:synapse.othersite.m.localhost" }],
+            "m.mentions": { "user_ids": [], "room": true },
+            "m.relates_to": {
+                "rel_type": "m.reference",
+                "event_id": "$_ErcrEWx3Hj77_wScF-U4e9aS6cVi37RvFUeq12BiaI",
+            },
+        });
+
+        let flat = flatten_notification_content("m.rtc.notification", &spec)
+            .expect("a notification must be flattened");
+
+        assert_eq!(
+            flat,
+            json!({
+                "m.mentions": { "user_ids": [], "room": true },
+                "notification_type": "notification",
+                "sender_ts": 1_779_030_731_419u64,
+                "lifetime": 30000,
+                "m.call.intent": "video",
+                "m.relates_to": {
+                    "event_id": "$_ErcrEWx3Hj77_wScF-U4e9aS6cVi37RvFUeq12BiaI",
+                    "rel_type": "m.reference",
+                },
+            })
+        );
+    }
+
+    /// A call with no stated intent must not grow an `m.call.intent: null`.
+    #[test]
+    fn a_flattened_notification_omits_an_absent_intent() {
+        let spec = json!({
+            "application": {
+                "type": "m.call",
+                "notification_type": "ring",
+                "sender_ts": 1u64,
+                "lifetime": 30000,
+                "device_id": "BOBDEVICE",
+            },
+            "m.mentions": { "user_ids": [], "room": true },
+            "m.relates_to": { "rel_type": "m.reference", "event_id": "$member" },
+        });
+
+        let flat = flatten_notification_content("m.rtc.notification", &spec).unwrap();
+
+        assert!(flat.get("m.call.intent").is_none());
+        assert!(flat.get("application").is_none());
+        assert!(flat.get("device_id").is_none());
+    }
+
+    /// Anything else through the same sender must come out untouched.
+    #[test]
+    fn other_event_types_are_not_flattened() {
+        assert!(flatten_notification_content("m.rtc.member", &json!({})).is_none());
+    }
+
+    /// The dialect decides; only the content moves, never the event type.
+    #[test]
+    fn only_the_legacy_dialects_flatten_a_notification() {
+        let spec = json!({
+            "application": { "type": "m.call", "notification_type": "ring" },
+            "m.mentions": { "user_ids": [], "room": true },
+        });
+
+        assert_eq!(
+            crate::compat::OutboundDialect::None
+                .rewrite_notification("m.rtc.notification", spec.clone()),
+            spec,
+            "a spec-current call sends the spec shape"
+        );
+        assert!(
+            crate::compat::OutboundDialect::Sticky(dialect())
+                .rewrite_notification("m.rtc.notification", spec)
+                .get("application")
+                .is_none()
+        );
     }
 
     /// The unstable id is what the core actually sends today.

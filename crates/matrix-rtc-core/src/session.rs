@@ -32,7 +32,11 @@ use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdenti
 use crate::error::{CommandError, JoinError, LeaveError};
 use crate::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
-use crate::own_membership::{OwnMembershipMachine, transport_to_json};
+use crate::notification::{
+    NOTIFICATION_EVENT_TYPE, NotifyConfig, build_notification_content,
+    notification_sticky_duration_ms,
+};
+use crate::own_membership::{OwnMembershipMachine, now_ms, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -407,7 +411,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        machine.join(transports).await?;
+        let member_event_id = machine.join(transports).await?;
 
         // Store the machine
         self.own_membership_machine = Some(machine);
@@ -504,7 +508,115 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             if manage_media_keys { "managed" } else { "off" },
         );
 
+        if let Some(notify) = &params.notify {
+            self.notify_session_started(notify, &params, &member_event_id)
+                .await;
+        }
+
         Ok(())
+    }
+
+    /// Whether a roster entry is this device's own participation — the current
+    /// one or an earlier one that is still sticky.
+    ///
+    /// Only used to decide whether we are starting the call
+    /// ([`Self::notify_session_started`]); the roster itself keeps our current
+    /// membership, which is correct there.
+    ///
+    /// A candidate whose sending device the host did not report counts as ours
+    /// when the *user* matches. See the caller for why erring that way is the
+    /// right trade here — it is the opposite of the rule
+    /// [`JoinCondition::SupersededOwnParticipation`] applies, which leaves such
+    /// a candidate in the roster rather than dropping a genuine peer.
+    fn is_own_participation(&self, member: &JoinedMembership, params: &JoinSessionParams) -> bool {
+        member.sender == params.user_id
+            && member
+                .origin
+                .sender_device_id()
+                .is_none_or(|device_id| device_id == params.device_id)
+    }
+
+    /// Sends the MSC4075 notification that summons the room to this session.
+    ///
+    /// Called at the tail of [`Self::join`], where the roster has just been
+    /// republished. Never fails the join: the user is in the call whether or
+    /// not anyone else was told about it.
+    async fn notify_session_started(
+        &self,
+        notify: &NotifyConfig,
+        params: &JoinSessionParams,
+        member_event_id: &str,
+    ) {
+        // MSC4075 leaves who sends the notification open, but every joiner
+        // sending one would ring the room once per participant. Only the member
+        // who *starts* the session does — matching what Element Call does.
+        //
+        // The question is whether anyone *else* is here, so our own
+        // participations have to come out of the count first. Both kinds occur:
+        // the host feeds the room's whole sticky map, which contains our own
+        // membership as soon as the homeserver echoes it back, and a session
+        // outlives `leave()` keeping the previous call's membership as a
+        // candidate. Counting either concludes that somebody else started the
+        // call and stays silent — the caller hits "call" and no phone rings.
+        //
+        // `SupersededOwnParticipation` already drops the stale ones from the
+        // roster, but only where the sending device is known, and an
+        // unencrypted room reports none. So a membership from our own user with
+        // no device attributed is treated as ours here too. That is a *wider*
+        // rule than the roster's on purpose: it can only misfire on another
+        // device of our own user in an unencrypted room, where the cost is one
+        // extra ring — against a silent failure to ring at all, which is the
+        // bug this replaced.
+        let others: Vec<&JoinedMembership> = self
+            .members
+            .iter()
+            .filter(|member| !self.is_own_participation(member, params))
+            .collect();
+
+        if !others.is_empty() {
+            log::info!(
+                "[{}] not notifying: {} member(s) were already in the session, so somebody \
+                 else started it",
+                self.log_tag,
+                others.len(),
+            );
+            return;
+        }
+
+        let Some(command_sender) = self.command_sender.as_ref() else {
+            return;
+        };
+
+        let content = build_notification_content(
+            notify,
+            &params.application,
+            &params.user_id,
+            &params.device_id,
+            member_event_id,
+            now_ms(),
+        );
+
+        log::info!(
+            "[{}] notifying the room: {}",
+            self.log_tag,
+            notify.notification_type.as_str(),
+        );
+
+        if let Err(error) = command_sender
+            .send_sticky_event(
+                params.room_id.clone(),
+                NOTIFICATION_EVENT_TYPE.to_owned(),
+                content,
+                notification_sticky_duration_ms(notify.lifetime_ms()),
+            )
+            .await
+        {
+            log::warn!(
+                "[{}] the session-started notification was not sent ({error:?}); the call \
+                 itself is unaffected",
+                self.log_tag,
+            );
+        }
     }
 
     /// Leaves this RTC session.

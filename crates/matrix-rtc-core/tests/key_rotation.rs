@@ -259,8 +259,8 @@ impl RtcCommandSender for PeerSender {
         _event_type: String,
         _content: Value,
         _duration_ms: u64,
-    ) -> Result<(), CommandError> {
-        Ok(())
+    ) -> Result<String, CommandError> {
+        Ok("$sticky".to_owned())
     }
 
     async fn send_delayed_event(
@@ -344,8 +344,8 @@ impl RtcCommandSender for PeerSender {
         _event_type: String,
         _state_key: String,
         _content: Value,
-    ) -> Result<(), CommandError> {
-        Ok(())
+    ) -> Result<String, CommandError> {
+        Ok("$state".to_owned())
     }
 }
 

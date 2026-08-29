@@ -28,6 +28,23 @@ single integrator, rather than dripped out over several:
   and `join_and_record`'s `LEGACY_ELEMENT_CALL` now takes `sticky` or `state`
   (any other value still means `sticky`).
 
+- **`sendStickyEvent` and `sendStateEvent` now return the event id.**
+  Kotlin/Swift: `String`; JS: resolve to matrix-js-sdk's `{event_id}` (a bare
+  string and `{eventId}` are accepted too), and resolving to anything else is
+  now a failed send rather than a silent success.
+
+  The id is what MSC4075 needs: a call notification must carry an `m.reference`
+  relation to the membership event that justifies it. It is not optional because
+  every Matrix send responds with one — `PUT /rooms/{id}/send/{type}/{txn}` and
+  `PUT /rooms/{id}/state/{type}/{key}` both do — so an implementation that
+  cannot produce it is broken, and failing loudly beats a call that joins fine
+  and quietly never rings. `sendStateEvent` is included because in `StateEvents`
+  compat mode the *membership* goes out through it; nothing reads the id of a
+  slot event.
+
+  The alternative, recovering the id from our own membership echoing back
+  through sync (what matrix-js-sdk does), puts a full sync round trip in front
+  of the ring.
 - **`sendToDeviceMessage` now takes a recipient *list* and returns a result per
   recipient**, replacing the per-device call whose only failure channel was an
   exception. That exception landed inside the core's loop over members, so one
@@ -140,6 +157,47 @@ single integrator, rather than dripped out over several:
   loads fine through JNA); harmless to call either way.
 
 ### Added
+
+- **MSC4075 call notifications, so a call can ring.** A membership says who is
+  *in* a session; it never said who should be *summoned* to one, which is why a
+  mobile client had nothing to raise an incoming call from. Passing `notify` on a
+  join now sends an `m.rtc.notification` (wire:
+  `org.matrix.msc4075.rtc.notification`) as a sticky event, with an `m.reference`
+  relation to our own `m.rtc.member` event.
+
+  - `NotifyConfig { notification_type: Ring | Notification, intent, lifetime_ms,
+    mentions }` on `JoinSessionParams::notify`, `CallOptions::notify`,
+    `FfiJoinSessionParams.notify` and the WASM join params' `notify`. Unset —
+    the default — joins quietly.
+  - **Only the member who *starts* the session notifies.** MSC4075 leaves the
+    question open, but every joiner sending one would ring the room once per
+    participant, so the core suppresses it when anybody *else* is already in the
+    session — our own memberships are excluded from that count, both the current
+    one (the host feeds the whole sticky map, which contains our echo) and a
+    previous one still held as a candidate across a `leave()` in the same
+    process. This matches matrix-js-sdk's `oldMemberships.length === 0`, and the
+    captured Element Call exchange in
+    `skills/e2e-testing/references/Alice-Bob-Call-Events.md`, where Bob starts
+    and Alice, joining second, sends nothing. The application still decides
+    whether to ask at all — Element Call passes the notification type only when
+    the app *starts* a call, never when it joins one.
+  - **The content carries the call fields twice, on purpose.** MSC4075 as
+    written nests them under `application`; nothing deployed reads them there.
+    Element Call puts `notification_type`, `sender_ts`, `lifetime` and
+    `m.call.intent` at the top level, and so does ruma's
+    `RtcNotificationEventContent` — which is what matrix-rust-sdk hands a mobile
+    client, and which *requires* all three at the top level, so a purely nested
+    event fails to deserialize there and rings nobody. Both shapes are written;
+    a reader of either ignores the other as unknown fields. `element_call_compat`
+    additionally strips `application` and `m.text`, for the byte-exact legacy
+    shape.
+  - Not implemented, and a separate change: the receiving rules (push rules,
+    `m.mentions` match, an open slot, not already joined), lifetime expiry
+    against `origin_server_ts`, optimistic ringing, `m.call.ring.ack`
+    acknowledgements, and the sender-side "still ringing" indication. On mobile
+    the first signal is a push notification, which arrives outside this
+    workspace entirely.
+  - `skills/msc/references/msc4075.md` vendors the proposal.
 
 - **An automated Element Call interop test.** Both compat dialects were
   validated against real Element Call by hand, once; nothing re-checked them, so

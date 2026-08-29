@@ -306,6 +306,7 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 - `MSC4143` (MatrixRTC): membership events represented by `m.rtc.member`.
 - `MSC4354` (Sticky events): membership updates are received as sticky events.
+- `MSC4075` (Notifications & ringing): `m.rtc.notification`, send side only.
 
 The core uses the stable ids (`m.rtc.member`, `m.rtc.slot`) internally, but the
 deployed ecosystem still matches on the unstable `org.matrix.msc4143.*` ones, so
@@ -360,6 +361,51 @@ stored and signalled once it has been matched against the sender's member event:
   cannot take the `(member, index)` slot and suppress the genuine one.
 
 The outgoing key message declares `format: 0` as the spec requires.
+
+### Notifications and ringing (MSC4075)
+
+Membership says who is *in* a session, never who should be *summoned* to one, so
+a mobile client had nothing to raise an incoming call from. `notification.rs`
+builds the `m.rtc.notification` that fills the gap; `RtcSession::join` sends it
+when the host set `JoinSessionParams::notify`. Three decisions are worth knowing:
+
+- **The relation is what forced a breaking host change.** MSC4075 requires an
+  `m.reference` to the sender's own `m.rtc.member` event, and nothing in this
+  workspace had ever seen an event id — `send_sticky_event` returned `()` and
+  `RawStickyEvent` carries no id either. Both `send_sticky_event` and
+  `send_state_event` now return `String`, filled from the send response at every
+  implementation site, and `OwnMembershipMachine::join` hands the membership's id
+  back to its caller. Not `Option<String>`: every Matrix send responds with an
+  event id, so an implementation that cannot produce one is broken, and failing
+  loudly beats a call that joins fine and quietly never rings. `send_state_event`
+  is included because the pre-MSC4354 Element Call dialect routes the membership
+  through it. Recovering the id from our own membership echoing back through sync
+  (what matrix-js-sdk does) was rejected for putting a full sync round trip in
+  front of the ring.
+- **Only the starter notifies.** The MSC leaves the question open, but every
+  joiner sending one rings the room once per participant, so the send is
+  suppressed unless the roster holds somebody *else*. "Else" is load-bearing:
+  the host feeds the room's whole sticky map, so our own membership is in it as
+  soon as the homeserver echoes it back, and a session outlives `leave()`
+  keeping the previous call's membership as a candidate. Counting either
+  concludes somebody else started the call and rings nobody. The check therefore
+  excludes memberships from our own user whose sending device is ours *or
+  unreported* — deliberately wider than the roster's own
+  `SupersededOwnParticipation` rule, which needs a known device and so leaves
+  such a candidate in. Being wrong that way costs one extra ring in an
+  unencrypted room; being wrong the other way is a call that silently never
+  rings.
+- **The content states the call fields twice.** The MSC nests them under
+  `application`; Element Call and ruma's `RtcNotificationEventContent` read them
+  at the top level, and ruma *requires* them there, so a purely nested event
+  fails to deserialize in the very SDK the mobile client uses. Both are written.
+  `element_call_compat` additionally strips `application` and `m.text` for the
+  byte-exact legacy shape.
+
+Receiving is not implemented: the MSC's ring conditions, lifetime expiry against
+`origin_server_ts`, `m.call.ring.ack` acknowledgements and the sender-side
+"still ringing" indication are all absent, and on mobile the first signal is a
+push notification that never passes through this workspace anyway.
 
 ### Slots and the join conditions
 

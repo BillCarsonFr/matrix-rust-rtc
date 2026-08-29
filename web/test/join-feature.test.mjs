@@ -29,9 +29,13 @@ function createMockMatrixClient() {
 
   const client = {
     // WASM now expects these methods to return Promises
+    // Resolves the way matrix-js-sdk's sendEvent does. The SDK reads the event
+    // id out of it to relate an MSC4075 call notification to the membership
+    // that justifies it, and treats a response without one as a failed send.
     sendStickyEvent: vi.fn((roomId, eventType, content) => {
-      stickyEventsSent.push({ roomId, eventType, content });
-      return Promise.resolve();
+      const eventId = `$sticky-event-${stickyEventsSent.length}`;
+      stickyEventsSent.push({ roomId, eventType, content, eventId });
+      return Promise.resolve({ event_id: eventId });
     }),
     sendDelayedEvent: vi.fn((roomId, eventType, content, delayMs) => {
       const eventId = `delayed-event-${delayedEventsSent.length}`;
@@ -44,8 +48,9 @@ function createMockMatrixClient() {
     }),
     // Used for m.rtc.slot, the only MatrixRTC event that lives in room state.
     sendStateEvent: vi.fn((roomId, eventType, stateKey, content) => {
-      stateEventsSent.push({ roomId, eventType, stateKey, content });
-      return Promise.resolve();
+      const eventId = `$state-event-${stateEventsSent.length}`;
+      stateEventsSent.push({ roomId, eventType, stateKey, content, eventId });
+      return Promise.resolve({ event_id: eventId });
     }),
     // Expose internal state for assertions
     _getStickyEvents: () => stickyEventsSent,

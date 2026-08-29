@@ -22,6 +22,7 @@
 //! call intent.
 
 use crate::encryption::types::EncryptionConfig;
+use crate::notification::NotifyConfig;
 use crate::session::{LeaveCode, LeaveReason};
 use crate::transport::RtcTransport;
 
@@ -142,6 +143,15 @@ pub struct JoinSessionParams {
     ///
     /// If not provided, defaults to `EncryptionConfig::default()`.
     pub encryption_config: Option<EncryptionConfig>,
+
+    /// Ask for an MSC4075 notification to be sent with this join.
+    ///
+    /// `None` — the default — joins quietly, which is what joining a call
+    /// someone else started does. Set it only when the user is *starting* the
+    /// call: the notification is still suppressed if somebody is already in the
+    /// session, but the intent to summon anyone at all is the application's to
+    /// state.
+    pub notify: Option<NotifyConfig>,
 }
 
 impl JoinSessionParams {
@@ -167,6 +177,7 @@ impl JoinSessionParams {
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             encryption_config: None,
+            notify: None,
         }
     }
 
@@ -190,6 +201,7 @@ impl JoinSessionParams {
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             encryption_config: None,
+            notify: None,
         }
     }
 

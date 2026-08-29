@@ -145,8 +145,8 @@
 //! #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 //! #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 //! impl RtcCommandSender for MyCommandSender {
-//!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _duration_ms: u64) -> Result<(), CommandError> {
-//!         Ok(())
+//!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _duration_ms: u64) -> Result<String, CommandError> {
+//!         Ok("$event".to_owned())
 //!     }
 //!     async fn send_delayed_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
 //!         Ok(String::new())
@@ -160,8 +160,8 @@
 //!     async fn send_to_device_message(&self, recipients: Vec<ToDeviceRecipient>, _message_type: String, _content: serde_json::Value) -> Result<Vec<ToDeviceDelivery>, CommandError> {
 //!         Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
 //!     }
-//!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<(), CommandError> {
-//!         Ok(())
+//!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<String, CommandError> {
+//!         Ok("$event".to_owned())
 //!     }
 //! }
 //!
@@ -3451,8 +3451,8 @@ mod tests {
                 _event_type: String,
                 _content: serde_json::Value,
                 _duration_ms: u64,
-            ) -> Result<(), CommandError> {
-                Ok(())
+            ) -> Result<String, CommandError> {
+                Ok("$sticky".to_string())
             }
             async fn send_delayed_event(
                 &self,
@@ -3502,8 +3502,8 @@ mod tests {
                 _event_type: String,
                 _state_key: String,
                 _content: serde_json::Value,
-            ) -> Result<(), CommandError> {
-                Ok(())
+            ) -> Result<String, CommandError> {
+                Ok("$state".to_string())
             }
         }
 
