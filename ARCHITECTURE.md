@@ -384,10 +384,17 @@ when the host set `JoinSessionParams::notify`. Three decisions are worth knowing
   front of the ring.
 - **Only the starter notifies.** The MSC leaves the question open, but every
   joiner sending one rings the room once per participant, so the send is
-  suppressed unless the joined roster is empty. That check is correct at exactly
-  the point it runs — the tail of `join`, after `refresh()` — because our own
-  membership has not echoed back yet and an earlier participation of this device
-  is already excluded as `SupersededOwnParticipation`.
+  suppressed unless the roster holds somebody *else*. "Else" is load-bearing:
+  the host feeds the room's whole sticky map, so our own membership is in it as
+  soon as the homeserver echoes it back, and a session outlives `leave()`
+  keeping the previous call's membership as a candidate. Counting either
+  concludes somebody else started the call and rings nobody. The check therefore
+  excludes memberships from our own user whose sending device is ours *or
+  unreported* — deliberately wider than the roster's own
+  `SupersededOwnParticipation` rule, which needs a known device and so leaves
+  such a candidate in. Being wrong that way costs one extra ring in an
+  unencrypted room; being wrong the other way is a call that silently never
+  rings.
 - **The content states the call fields twice.** The MSC nests them under
   `application`; Element Call and ruma's `RtcNotificationEventContent` read them
   at the top level, and ruma *requires* them there, so a purely nested event

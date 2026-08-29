@@ -171,8 +171,11 @@ single integrator, rather than dripped out over several:
     the default — joins quietly.
   - **Only the member who *starts* the session notifies.** MSC4075 leaves the
     question open, but every joiner sending one would ring the room once per
-    participant, so the core suppresses it when anybody is already in the
-    session. This matches matrix-js-sdk's `oldMemberships.length === 0`, and the
+    participant, so the core suppresses it when anybody *else* is already in the
+    session — our own memberships are excluded from that count, both the current
+    one (the host feeds the whole sticky map, which contains our echo) and a
+    previous one still held as a candidate across a `leave()` in the same
+    process. This matches matrix-js-sdk's `oldMemberships.length === 0`, and the
     captured Element Call exchange in
     `skills/e2e-testing/references/Alice-Bob-Call-Events.md`, where Bob starts
     and Alice, joining second, sends nothing. The application still decides

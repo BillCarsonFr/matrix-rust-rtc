@@ -441,6 +441,92 @@ mod tests {
         );
     }
 
+    /// "Is anyone already here?" must not be answered `yes` by our own
+    /// membership.
+    ///
+    /// The host feeds the room's whole sticky map, and once the homeserver has
+    /// echoed our membership back that map contains *us*. A count that includes
+    /// it concludes somebody else started the call and stays silent — so the
+    /// caller hits "call" and nobody's phone rings.
+    #[tokio::test]
+    async fn our_own_membership_does_not_count_as_somebody_else() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        // The echo of our own membership, under the very id we are about to
+        // join with.
+        admit_peer(&mut manager, "@alice:example.org", "ALICEDEV", "alice-a").await;
+        join_and_notify(&mut manager, "alice-a", NotifyConfig::ring()).await;
+
+        assert_eq!(
+            notifications_sent(&sender).len(),
+            1,
+            "the only membership in the session is our own, so we are the one starting the call"
+        );
+    }
+
+    /// A participation of ours from an earlier call in this process must not
+    /// count either — including when the host reported no sending device for
+    /// it.
+    ///
+    /// A session outlives `leave()` and keeps its candidates, so the previous
+    /// call's membership is still there on a rejoin. It is normally dropped as
+    /// `SupersededOwnParticipation`, but that rule needs the sending device, and
+    /// an unencrypted room supplies none. Left in, it silences every subsequent
+    /// call in the process until the app restarts.
+    #[tokio::test]
+    async fn a_stale_participation_of_ours_does_not_count_either() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+        manager
+            .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
+            .await;
+
+        // Our own device, one call ago, with no device reported — exactly what
+        // an unencrypted room yields.
+        manager
+            .set_current_sticky_state(
+                ROOM_ID,
+                vec![joined_event(
+                    "@alice:example.org",
+                    "m.call#ROOM",
+                    "alice-old",
+                )],
+            )
+            .await
+            .unwrap();
+
+        join_and_notify(&mut manager, "alice-new", NotifyConfig::ring()).await;
+
+        assert_eq!(
+            notifications_sent(&sender).len(),
+            1,
+            "the session held nothing but our own previous participation"
+        );
+    }
+
+    /// The other edge of the same rule: our own user on a *different* device is
+    /// an ordinary peer, and one already in the call started it.
+    #[tokio::test]
+    async fn another_device_of_ours_already_in_the_call_counts() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        admit_peer(
+            &mut manager,
+            "@alice:example.org",
+            "ALICELAPTOP",
+            "alice-laptop",
+        )
+        .await;
+        join_and_notify(&mut manager, "alice-a", NotifyConfig::ring()).await;
+
+        assert!(
+            notifications_sent(&sender).is_empty(),
+            "our laptop was already in the call, so our phone is joining, not starting"
+        );
+    }
+
     /// Joining a call someone else started must not ring the room a second
     /// time, even if the host asked for a notification.
     #[tokio::test]
