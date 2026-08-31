@@ -55,8 +55,10 @@ export class MatrixRtcCall {
    * @param {object} [options.roomOptions] - extra livekit-js `Room` options,
    *   merged under the E2EE ones (pass `e2ee.worker` here to enable frame
    *   encryption).
+   * @param {ManagerOpQueue} [options.managerOps] - the queue serializing every
+   *   wasm-manager call; pass the app's own when it also calls the manager.
    */
-  constructor({ manager, bindings, livekit, getOpenIdToken, fetchJson, roomOptions }) {
+  constructor({ manager, bindings, livekit, getOpenIdToken, fetchJson, roomOptions, managerOps }) {
     this.manager = manager;
     this.bindings = bindings;
     this.livekit = livekit;
@@ -69,15 +71,20 @@ export class MatrixRtcCall {
     this.session = null;
     this.heartbeatTimer = null;
     /**
-     * Serializes every manager mutation: the wasm object allows one in-flight
-     * call at a time, and both the heartbeat and the rotation flush await the
-     * app's Matrix client mid-call.
+     * Serializes every manager call: the wasm object allows one in-flight
+     * call at a time (a second one throws "recursive use of an object"), and
+     * both the heartbeat and the rotation flush await the app's Matrix client
+     * mid-call. An app that calls the manager itself (feeding sync state,
+     * join/leave) must pass ONE shared queue here and route its own calls
+     * through it too.
      */
-    this.managerQueue = Promise.resolve();
+    this.managerOps = managerOps ?? new ManagerOpQueue();
     /** @type {(participants: object[]) => void} */
     this.onParticipants = () => {};
     /** @type {(event: object) => void} */
     this.onEvent = () => {};
+    /** @type {(room: object, connectionKey: string) => void} */
+    this.onRoomConnected = () => {};
   }
 
   /**
@@ -93,34 +100,30 @@ export class MatrixRtcCall {
     this.config = config;
     this.keyProvider = new this.livekit.ExternalE2EEKeyProvider();
 
-    this.session = await this.manager.connectMedia(
-      {
-        room_id: config.roomId,
-        slot_id: config.slotId,
-        user_id: config.userId,
-        device_id: config.deviceId,
-        livekit_service_url: config.livekitServiceUrl,
-        key_ring_size: config.keyRingSize,
-        element_call_compat: config.elementCallCompat,
-      },
-      this.delegate(),
+    this.session = await this.managerOps.enqueue(() =>
+      this.manager.connectMedia(
+        {
+          room_id: config.roomId,
+          slot_id: config.slotId,
+          user_id: config.userId,
+          device_id: config.deviceId,
+          livekit_service_url: config.livekitServiceUrl,
+          key_ring_size: config.keyRingSize,
+          element_call_compat: config.elementCallCompat,
+        },
+        this.delegate(),
+      ),
     );
 
     // The page owns the keep-alive clock.
     const interval = this.bindings.HEARTBEAT_INTERVAL_MS();
     this.heartbeatTimer = setInterval(() => {
-      this.enqueueManagerOp(() => this.manager.heartbeat(config.roomId, config.slotId));
+      this.managerOps
+        .enqueue(() => this.manager.heartbeat(config.roomId, config.slotId))
+        .catch((error) => console.warn('matrix-rtc: heartbeat failed:', error));
     }, interval);
 
     return this.participants();
-  }
-
-  /** Chain a manager call so at most one is in flight (see `managerQueue`). */
-  enqueueManagerOp(op) {
-    this.managerQueue = this.managerQueue.then(op, () => {}).catch((error) => {
-      console.warn('matrix-rtc: manager call failed:', error);
-    });
-    return this.managerQueue;
   }
 
   /** The current roster, each entry with its `livekitParticipant` when live. */
@@ -165,9 +168,11 @@ export class MatrixRtcCall {
         call.onParticipants(call.withLivekitParticipants(roster)),
       onEvent: (event) => call.onEvent(event),
       onSwitchComplete: () =>
-        call.enqueueManagerOp(() =>
-          call.manager.flushDueKeyRotation(call.config.roomId, call.config.slotId),
-        ),
+        call.managerOps
+          .enqueue(() =>
+            call.manager.flushDueKeyRotation(call.config.roomId, call.config.slotId),
+          )
+          .catch((error) => console.warn('matrix-rtc: rotation flush failed:', error)),
     };
   }
 
@@ -185,6 +190,7 @@ export class MatrixRtcCall {
     this.registerSink(room, sink, request.connectionKey);
     await room.connect(request.sfuUrl, request.jwt);
     this.rooms.set(request.connectionKey, room);
+    this.onRoomConnected(room, request.connectionKey);
     return {
       close: async () => {
         this.rooms.delete(request.connectionKey);
@@ -266,6 +272,30 @@ export class MatrixRtcCall {
       if (participant) return participant;
     }
     return undefined;
+  }
+}
+
+/**
+ * Serializes calls into the wasm manager: it allows one in-flight call at a
+ * time (a second concurrent call throws "recursive use of an object"), and
+ * several of its methods await the app's Matrix client mid-call. Everything
+ * that touches the manager — this wrapper, the app's sync feeding, join/leave —
+ * must go through one shared instance.
+ */
+export class ManagerOpQueue {
+  constructor() {
+    this.queue = Promise.resolve();
+  }
+
+  /** Run `op` once every earlier op has settled; resolves/rejects as `op` does. */
+  enqueue(op) {
+    const result = this.queue.then(op);
+    // The chain itself never rejects; each caller handles its own result.
+    this.queue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
   }
 }
 

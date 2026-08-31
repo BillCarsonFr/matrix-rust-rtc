@@ -176,6 +176,10 @@ interop-trust:
 
 test-interop: interop-up
 	cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer
+	# The web peer: wasm bindings into web/pkg, then its page deps. Playwright's
+	# webServer builds and serves the page itself.
+	./web/scripts/build-bindings.sh
+	cd web/demo && { [ -f package-lock.json ] && npm ci || npm install; }
 	cd interop && { [ -f package-lock.json ] && npm ci || npm install; } && npx playwright test
 
 .PHONY: quality-check

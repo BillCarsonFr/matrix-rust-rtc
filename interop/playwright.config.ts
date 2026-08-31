@@ -51,6 +51,18 @@ export default defineConfig({
     trace: "retain-on-failure",
     video: "retain-on-failure",
   },
+  // The web peer page (`web/demo` in test mode). `http://localhost` is a
+  // secure context, so WebRTC, wasm, and the E2EE worker all work without a
+  // TLS origin; its cross-origin calls to the stack ride the same
+  // `ignoreHTTPSErrors`/CORS pairing Element Call itself uses. Built, not dev:
+  // the served page is exactly what `vite build` produces.
+  webServer: {
+    command:
+      "npm --prefix ../web/demo run build && npm --prefix ../web/demo run preview -- --port 5199 --strictPort",
+    url: "http://localhost:5199",
+    reuseExistingServer: !process.env.CI,
+    timeout: 180_000,
+  },
   projects: [
     {
       name: "chromium",
