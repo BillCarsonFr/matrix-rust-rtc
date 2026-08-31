@@ -2696,7 +2696,6 @@ name = "matrix-rtc-livekit"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
  "clap",
  "futures-util",
  "jni 0.21.1",
@@ -2704,6 +2703,7 @@ dependencies = [
  "log",
  "matrix-rtc-bridge",
  "matrix-rtc-core",
+ "matrix-rtc-livekit-proto",
  "matrix-rtc-media",
  "matrix-sdk",
  "matrix-sdk-ui",
@@ -2711,10 +2711,22 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "matrix-rtc-livekit-proto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "matrix-rtc-bridge",
+ "matrix-rtc-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

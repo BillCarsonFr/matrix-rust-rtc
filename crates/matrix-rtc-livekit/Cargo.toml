@@ -33,6 +33,10 @@ matrix-rtc-core = { path = "../matrix-rtc-core" }
 # pre-2026 Element Call wire compatibility `call` selects between. Nothing in it
 # knows about LiveKit, which is the point: a second transport reuses it as-is.
 matrix-rtc-bridge = { path = "../matrix-rtc-bridge" }
+# The pure MSC4195 control plane (identity derivations, token shapes, dialect
+# choices), shared with the web binding. This crate re-exports it and adds the
+# IO: reqwest for the token POST, livekit for the SFU itself.
+matrix-rtc-livekit-proto = { path = "../matrix-rtc-livekit-proto" }
 # Transport-agnostic media model this crate implements (`transport_impl`).
 matrix-rtc-media = { path = "../matrix-rtc-media" }
 serde = { workspace = true }
@@ -43,8 +47,6 @@ log.workspace = true
 # `media` uses tokio timers (interval / timeout_at) on top of the workspace rt+sync.
 tokio = { workspace = true, features = ["time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sha2 = "0.10"
-base64 = "0.22"
 # Keep default features (notably `tokio`, which enables the signal client) and
 # select the rustls TLS backend for the SFU WebSocket/HTTP connections. This
 # pulls in libwebrtc (native C++) via webrtc-sys, so building this crate needs a

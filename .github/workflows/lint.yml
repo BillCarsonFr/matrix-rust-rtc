@@ -99,4 +99,5 @@ jobs:
       - name: Run clippy (shared crates)
         run: >
           cargo clippy -p matrix-rtc-media -p matrix-rtc-bridge
+          -p matrix-rtc-livekit-proto
           --target wasm32-unknown-unknown -- -D warnings
