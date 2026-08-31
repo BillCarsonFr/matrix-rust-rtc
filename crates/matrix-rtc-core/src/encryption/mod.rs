@@ -245,6 +245,7 @@ pub type RtcClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 use crate::commands::{RtcCommandSender, ToDeviceRecipient};
 use crate::error::CommandError;
 use crate::event::EventOrigin;
+use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
 
 /// Message type for to-device encryption key distribution (MSC4143).
@@ -259,9 +260,12 @@ pub const KEY_MESSAGE_TYPE: &str = "org.matrix.msc4143.rtc.encryption_key";
 ///
 /// Implementations receive notifications when new key material is available
 /// for use by the media layer.
+///
+/// [`MaybeSend`] rather than `Send + Sync`: on the web the media layer is
+/// livekit-client, so this handler is a JS callback holding a `JsValue`.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait EncryptionKeySignalHandler: Send + Sync {
+pub trait EncryptionKeySignalHandler: MaybeSend {
     /// Called when new key material is available for a participant.
     ///
     /// The application layer should use these raw bytes with key derivation

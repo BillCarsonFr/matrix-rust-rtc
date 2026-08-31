@@ -138,11 +138,6 @@ impl JsCommandSender {
     }
 }
 
-// SAFE: In WASM, there's no actual thread sharing happening.
-// The Send+Sync bounds are required by the trait but are safe in this context.
-unsafe impl Send for JsCommandSender {}
-unsafe impl Sync for JsCommandSender {}
-
 // Unconditionally `?Send`: this crate is only ever built for wasm32, where the
 // core's trait takes the `?Send` shape, and these futures wrap JS promises.
 #[async_trait(?Send)]

@@ -77,6 +77,9 @@ impl WasmRtcSessionManager {
     /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
         log::info!("manager: command sender installed");
+        // `Rc` is not an option: the core's `set_command_sender` takes `Arc<T>`
+        // on every target. `expect` so this goes away by itself if that changes.
+        #[expect(clippy::arc_with_non_send_sync)]
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());
         self.command_sender = Some(command_sender);
@@ -585,6 +588,9 @@ impl WasmRtcSession {
     /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
     /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
     pub fn setup_command_sender(&mut self, client: JsValue) {
+        // `Rc` is not an option: the core's `set_command_sender` takes `Arc<T>`
+        // on every target. `expect` so this goes away by itself if that changes.
+        #[expect(clippy::arc_with_non_send_sync)]
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
         self.inner.set_command_sender(command_sender.clone());
         self.command_sender = Some(command_sender);

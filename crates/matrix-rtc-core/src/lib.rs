@@ -27,6 +27,7 @@ mod error;
 mod event;
 mod join;
 mod manager;
+mod maybe_send;
 mod notification;
 mod own_membership;
 mod session;
@@ -50,6 +51,7 @@ pub use event::{
 };
 pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
 pub use manager::RtcSessionManager;
+pub use maybe_send::MaybeSend;
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,
