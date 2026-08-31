@@ -17,11 +17,11 @@
 
 //! Pre-2026 Element Call interoperability, exposed to FFI hosts.
 //!
-//! The translation itself lives in [`matrix_rtc_bridge::compat`] and is shared
-//! verbatim with the Rust-native path; nothing here re-implements a dialect.
-//! What this module owns is the *binding*: an FFI-shaped mode enum, the raw-JSON
-//! ingestion the dialects need, and the two places the mode changes an identifier
-//! rather than a field.
+//! The translation itself lives in [`matrix_rtc_bridge::compat`] and its
+//! host-agnostic funnels in [`matrix_rtc_bridge::compat::ingest`], shared with
+//! the wasm binding and the Rust-native path; nothing here re-implements a
+//! dialect. What this module owns is the *uniffi* binding: an FFI-shaped mode
+//! enum and the JSON-string record shapes uniffi can carry.
 //!
 //! # Why the host cannot do this itself
 //!
@@ -30,7 +30,7 @@
 //! cannot work for a legacy one — a pre-2026 content states its transports in a
 //! different place, its membership nowhere at all, and a pre-sticky one is not
 //! even a sticky event. Re-implementing those rules in Kotlin and Swift would be
-//! three copies of the trickiest code in this repository, so the raw content
+//! more copies of the trickiest code in this repository, so the raw content
 //! crosses the boundary instead ([`RawMemberEvent`],
 //! [`LegacyStateMemberEvent`]) and Rust does the parsing.
 //!
@@ -70,11 +70,9 @@
 //! [`RtcSessionManagerHandle::receive_legacy_encryption_key`]: crate::RtcSessionManagerHandle::receive_legacy_encryption_key
 //! [`RtcSessionManagerHandle::on_room_slots_received`]: crate::RtcSessionManagerHandle::on_room_slots_received
 
-use matrix_rtc_bridge::compat::{
-    ElementCallCompat, ElementCallDialect, ElementCallStateDialect, MemberContent, OutboundDialect,
-    element_call, element_call_state,
-};
-use matrix_rtc_core::{EventOrigin, RawStickyEvent, RawStickyEventContent};
+use matrix_rtc_bridge::compat::ingest;
+use matrix_rtc_bridge::compat::{ElementCallCompat, OutboundDialect, element_call};
+use matrix_rtc_core::RawStickyEvent;
 use serde_json::Value;
 
 /// Which MatrixRTC generation a session speaks, for interoperating with Element
@@ -130,12 +128,7 @@ pub(crate) fn resolve(compat: Option<FfiElementCallCompat>) -> ElementCallCompat
     compat.unwrap_or_default().into()
 }
 
-/// Build the outbound dialect for one joined session.
-///
-/// Everything it needs is known at join time, which is why the mode is a join
-/// parameter rather than a manager-wide setting: the sticky dialect re-states our
-/// own user and device on the wire, and the state dialect derives a state key and
-/// a `livekit_alias` from the room.
+/// See [`ingest::outbound_dialect`].
 pub(crate) fn outbound_dialect(
     compat: ElementCallCompat,
     user_id: &str,
@@ -143,43 +136,18 @@ pub(crate) fn outbound_dialect(
     room_id: &str,
     slot_id: &str,
 ) -> OutboundDialect {
-    match compat {
-        ElementCallCompat::Off => OutboundDialect::None,
-        ElementCallCompat::StickyEvents => {
-            OutboundDialect::Sticky(ElementCallDialect::new(user_id, device_id, slot_id))
-        }
-        ElementCallCompat::StateEvents => OutboundDialect::State(ElementCallStateDialect::new(
-            user_id, device_id, room_id, slot_id,
-        )),
-    }
+    ingest::outbound_dialect(compat, user_id, device_id, room_id, slot_id)
 }
 
-/// The `member.id` to join a session with.
-///
-/// MSC4143 requires a fresh id per join, and the SDK generates one — except in
-/// the pre-sticky mode, where the member id *is* the legacy `membershipID`, which
-/// *is* the SFU participant identity, and that generation's authorisation service
-/// defines it as `{user}:{device}`. A random id there would leave our own state
-/// event, echoed back through sync, failing the core's
-/// `SupersededOwnParticipation` check: we would mark ourselves departed on our
-/// own join.
+/// See [`ingest::member_id`].
 pub(crate) fn member_id(compat: ElementCallCompat, user_id: &str, device_id: &str) -> String {
-    match compat {
-        ElementCallCompat::StateEvents => {
-            element_call_state::participant_identity(user_id, device_id)
-        }
-        _ => matrix_rtc_core::generate_member_id(),
-    }
+    ingest::member_id(compat, user_id, device_id)
 }
 
 /// One `m.rtc.member` sticky event, with its content as raw JSON.
 ///
-/// The raw counterpart of [`crate::StickyEvent`], and the only shape that can
-/// carry a pre-2026 membership: the legacy normalisation runs on the JSON, before
-/// anything typed sees it. Safe for spec-current events too — every
-/// normalisation rule fires only where the modern field is absent and its legacy
-/// counterpart is present — so a host that has both formats in one room feeds
-/// them all through here.
+/// The uniffi carrier for [`ingest::RawMemberEventIn`]; see there for the
+/// semantics of every field.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RawMemberEvent {
     /// Sender user ID of the event.
@@ -199,12 +167,35 @@ pub struct RawMemberEvent {
     pub content_json: String,
 }
 
+impl RawMemberEvent {
+    /// Parse the JSON-string carrier into the shared ingest shape, or explain
+    /// in the log why the member will not appear.
+    fn into_ingest(self, room_id: &str) -> Option<ingest::RawMemberEventIn> {
+        let content: Value = serde_json::from_str(&self.content_json)
+            .inspect_err(|error| {
+                log::warn!(
+                    "[{room_id}] ignoring a {} from {} whose content is not JSON: {error}. That \
+                     member will not appear in the call.",
+                    self.event_type,
+                    self.sender,
+                );
+            })
+            .ok()?;
+        Some(ingest::RawMemberEventIn {
+            sender: self.sender,
+            sender_device_id: self.sender_device_id,
+            was_encrypted: self.was_encrypted,
+            event_type: self.event_type,
+            content,
+        })
+    }
+}
+
 /// One `org.matrix.msc3401.call.member` **room state** event: a membership from
 /// the Element Call generation that predates MSC4354.
 ///
-/// Not a sticky event and not typed as one: it has no sticky key, its lifetime is
-/// stated in the content rather than enforced by the homeserver, and it is
-/// translated into an MSC4143 membership before the core sees it. Only fed in
+/// The uniffi carrier for [`ingest::LegacyStateMemberEventIn`]; see there for
+/// the semantics of every field. Only fed in
 /// [`FfiElementCallCompat::StateEvents`] mode.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct LegacyStateMemberEvent {
@@ -223,366 +214,86 @@ pub struct LegacyStateMemberEvent {
     pub content_json: String,
 }
 
-/// Normalise and parse one raw member event, or explain in the log why it
-/// contributes no membership.
-///
-/// Mirrors `matrix_rtc_bridge::sdk::snapshot`, which does the same job for the
-/// Rust-native path — including the origin ranking, which is the subtle half.
-pub(crate) fn to_core_member_event(room_id: &str, event: RawMemberEvent) -> Option<RawStickyEvent> {
-    let mut value: Value = match serde_json::from_str(&event.content_json) {
-        Ok(value) => value,
-        Err(error) => {
-            log::warn!(
-                "[{room_id}] ignoring a {} from {} whose content is not JSON: {error}. That \
-                 member will not appear in the call.",
-                event.event_type,
-                event.sender,
-            );
-            return None;
-        }
-    };
-
-    if element_call::normalize_member_content(&mut value) == MemberContent::BareLeave {
-        // A pre-2026 leave: the content is a sticky key and nothing else, so
-        // there is no slot to file it under. Dropping it *is* the leave — the
-        // membership set is applied whole, and a member who contributes no event
-        // is a member who is gone.
-        log::debug!(
-            "[{room_id}] pre-2026 leave from {}; member is gone",
-            event.sender
-        );
-        return None;
-    }
-
-    let claimed_device = element_call::claimed_device_id(&value);
-
-    let content: RawStickyEventContent = match serde_json::from_value(value) {
-        Ok(content) => content,
-        Err(error) => {
-            log::warn!(
-                "[{room_id}] ignoring an unparseable {} from {}: {error}. That member will not \
-                 appear in the call.",
-                event.event_type,
-                event.sender,
-            );
-            return None;
-        }
-    };
-
-    // A device the event merely *claims* is the last resort, never a preference:
-    // it is consulted only where decryption produced none, and it is what makes a
-    // pre-2026 Element Call peer usable at all — that client runs as a widget,
-    // whose API gives it no decryption metadata, so a self-asserted device is the
-    // only one it can either state or read. See `EventOrigin::Claimed`.
-    let claimed = || claimed_device.clone().map(EventOrigin::claimed);
-    let origin = match event.was_encrypted {
-        Some(true) => match event.sender_device_id {
-            Some(device_id) => EventOrigin::encrypted(Some(device_id)),
-            // Olm messages carry the sender's device keys, so a decrypted event
-            // should always name one. Worth saying out loud: without a device
-            // this member's media keys are rejected in both directions.
-            None => {
+impl LegacyStateMemberEvent {
+    fn into_ingest(self, room_id: &str) -> Option<ingest::LegacyStateMemberEventIn> {
+        let content: Value = serde_json::from_str(&self.content_json)
+            .inspect_err(|error| {
                 log::warn!(
-                    "[{room_id}] a decrypted {} from {} resolved to no sending device",
-                    event.event_type,
-                    event.sender,
+                    "[{room_id}] ignoring a {} from {} ({}) whose content is not JSON: {error}",
+                    matrix_rtc_bridge::compat::STATE_MEMBER_EVENT_TYPE,
+                    self.sender,
+                    self.state_key,
                 );
-                claimed().unwrap_or_else(|| EventOrigin::encrypted(None))
-            }
-        },
-        Some(false) => claimed().unwrap_or(EventOrigin::Cleartext),
-        None => claimed().unwrap_or(EventOrigin::Unknown),
-    };
-
-    Some(RawStickyEvent {
-        room_id: room_id.to_owned(),
-        sender: event.sender,
-        origin,
-        event_type: event.event_type,
-        content,
-    })
+            })
+            .ok()?;
+        Some(ingest::LegacyStateMemberEventIn {
+            sender: self.sender,
+            state_key: self.state_key,
+            origin_server_ts: self.origin_server_ts,
+            content,
+        })
+    }
 }
 
-/// Translate a room's whole `org.matrix.msc3401.call.member` state into core
-/// memberships.
-///
-/// Takes the batch rather than one event: expiry needs one clock reading for the
-/// whole set, and `focus_selection: "oldest_membership"` resolves a member's SFU
-/// against the oldest membership of the same slot.
-pub(crate) fn to_core_state_memberships(
+/// See [`ingest::merge_current_membership`].
+pub(crate) fn merge_current_membership(
     room_id: &str,
-    events: Vec<LegacyStateMemberEvent>,
+    member_events: Vec<RawMemberEvent>,
+    legacy_state_events: Vec<LegacyStateMemberEvent>,
 ) -> Vec<RawStickyEvent> {
-    let parsed: Vec<element_call_state::StateMemberEvent> = events
-        .into_iter()
-        .filter_map(|event| {
-            let content = serde_json::from_str(&event.content_json)
-                .inspect_err(|error| {
-                    log::warn!(
-                        "[{room_id}] ignoring a {} from {} ({}) whose content is not JSON: {error}",
-                        element_call_state::STATE_MEMBER_EVENT_TYPE,
-                        event.sender,
-                        event.state_key,
-                    );
-                })
-                .ok()?;
-            Some(element_call_state::StateMemberEvent {
-                sender: event.sender,
-                state_key: event.state_key,
-                origin_server_ts: event.origin_server_ts,
-                content,
-            })
-        })
-        .collect();
-
-    let translated =
-        element_call_state::translate_state_memberships(&parsed, element_call_state::now_ms());
-    log::debug!(
-        "[{room_id}] {} {} state event(s) translated to {} live membership(s)",
-        parsed.len(),
-        element_call_state::STATE_MEMBER_EVENT_TYPE,
-        translated.len(),
-    );
-
-    translated
-        .into_iter()
-        .filter_map(|membership| {
-            let content: RawStickyEventContent = match serde_json::from_value(membership.content) {
-                Ok(content) => content,
-                Err(error) => {
-                    log::warn!(
-                        "[{room_id}] a translated pre-sticky membership from {} does not parse as \
-                         MSC4143 content ({error}). That is a bug in the translation, not in the \
-                         peer; that member will not appear in the call.",
-                        membership.sender,
-                    );
-                    return None;
-                }
-            };
-            Some(RawStickyEvent {
-                room_id: room_id.to_owned(),
-                sender: membership.sender,
-                // The self-asserted device, which is all such a peer can state
-                // and all we can read — a state event carries no decryption
-                // metadata. Ranked below an authenticated device everywhere it
-                // matters (it never satisfies the encrypted-room rule), but it is
-                // what lets a media key travel in either direction at all.
-                origin: EventOrigin::claimed(membership.claimed_device_id),
-                // Not the type that was on the wire. What the core accepts is an
-                // MSC4143 membership, and after the translation that is exactly
-                // what this is; carrying the MSC3401 type here would only make
-                // the core reject it.
-                event_type: "m.rtc.member".to_owned(),
-                content,
-            })
-        })
-        .collect()
+    ingest::merge_current_membership(
+        room_id,
+        member_events
+            .into_iter()
+            .filter_map(|event| event.into_ingest(room_id))
+            .collect(),
+        legacy_state_events
+            .into_iter()
+            .filter_map(|event| event.into_ingest(room_id))
+            .collect(),
+    )
 }
 
-/// A media key lifted out of a legacy `io.element.call.encryption_keys`
-/// to-device message, bound to the membership the current mode files it under.
-///
-/// Returns `None` when the message is missing a field the core needs, or when
-/// there is no device to bind it to — both mean the key cannot be used, and both
-/// are logged where they happen.
+/// See [`ingest::parse_legacy_key`].
 pub(crate) fn parse_legacy_key(
     compat: ElementCallCompat,
     sender: &str,
     sender_device_id: Option<&str>,
     content: &Value,
 ) -> Option<element_call::LegacyKeyMessage> {
-    let mut key = element_call::parse_key_message(sender, content)?;
-
-    // In the pre-sticky generation the `member.id` a key message carries is
-    // Element Call's own per-session UUID, and it appears in *no* field of the
-    // membership state event — so binding the key by it can never match, and the
-    // key sits buffered while that peer's media stays undecryptable.
-    //
-    // Everything in that generation is keyed on `{user}:{device}` — the SFU
-    // identity, our translated `member_id`, the `membershipID` — so bind on that
-    // instead. The device comes from Olm decryption where possible, so both
-    // halves are authenticated rather than self-asserted.
-    if compat == ElementCallCompat::StateEvents {
-        let device_id = sender_device_id
-            .map(str::to_owned)
-            .or_else(|| element_call::claimed_key_device_id(content))?;
-        key.member_id = element_call_state::participant_identity(sender, &device_id);
-    }
-
-    Some(key)
+    ingest::parse_legacy_key(compat, sender, sender_device_id, content)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn raw(content: serde_json::Value) -> RawMemberEvent {
-        RawMemberEvent {
+    /// The dialect logic itself is tested where it lives
+    /// (`matrix_rtc_bridge::compat::ingest`); what is this crate's own is the
+    /// JSON-string carrier, so pin that a bad string drops the one event, not
+    /// the batch.
+    #[test]
+    fn a_non_json_content_drops_the_event_not_the_batch() {
+        let good = RawMemberEvent {
             sender: "@alice:example.org".to_owned(),
             sender_device_id: Some("ALICEDEVICE".to_owned()),
             was_encrypted: Some(true),
             event_type: "org.matrix.msc4143.rtc.member".to_owned(),
-            content_json: content.to_string(),
-        }
-    }
-
-    #[test]
-    fn normalises_a_pre_2026_membership() {
-        let event = raw(serde_json::json!({
-            "slot_id": "m.call#ROOM",
-            "msc4354_sticky_key": "MEMBER",
-            "application": { "type": "m.call" },
-            "member": { "id": "MEMBER", "user_id": "@alice:example.org", "device_id": "ALICEDEVICE" },
-            "rtc_transports": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
-        }));
-
-        let converted = to_core_member_event("!room:example.org", event).expect("a membership");
-        assert_eq!(converted.content.member.id.as_deref(), Some("MEMBER"));
-        // Inferred: that generation has no `membership` field at all.
-        assert_eq!(
-            converted.content.member.membership,
-            Some(matrix_rtc_core::Membership::Join),
-        );
-        // Lifted out of the flat `rtc_transports` array.
-        let transports = converted.content.transports.expect("transports");
-        assert_eq!(transports.published.len(), 1);
-        assert_eq!(transports.can_subscribe, vec!["livekit".to_owned()]);
-    }
-
-    #[test]
-    fn drops_a_pre_2026_leave() {
-        let event = raw(serde_json::json!({ "msc4354_sticky_key": "MEMBER" }));
-        assert!(to_core_member_event("!room:example.org", event).is_none());
-    }
-
-    #[test]
-    fn prefers_the_decrypted_device_over_the_claimed_one() {
-        let event = raw(serde_json::json!({
-            "slot_id": "m.call#ROOM",
-            "msc4354_sticky_key": "MEMBER",
-            "application": { "type": "m.call" },
-            "member": { "id": "MEMBER", "device_id": "CLAIMED" },
-        }));
-
-        let converted = to_core_member_event("!room:example.org", event).expect("a membership");
-        assert_eq!(converted.origin.sender_device_id(), Some("ALICEDEVICE"));
-        assert_eq!(converted.origin.was_encrypted(), Some(true));
-    }
-
-    #[test]
-    fn falls_back_to_the_claimed_device_when_nothing_decrypted() {
-        let mut event = raw(serde_json::json!({
-            "slot_id": "m.call#ROOM",
-            "msc4354_sticky_key": "MEMBER",
-            "application": { "type": "m.call" },
-            "member": { "id": "MEMBER", "device_id": "CLAIMED" },
-        }));
-        event.was_encrypted = None;
-        event.sender_device_id = None;
-
-        let converted = to_core_member_event("!room:example.org", event).expect("a membership");
-        assert_eq!(converted.origin.sender_device_id(), Some("CLAIMED"));
-        // A claim says nothing about encryption, so it never satisfies the
-        // encrypted-room rule.
-        assert_eq!(converted.origin.was_encrypted(), None);
-    }
-
-    #[test]
-    fn translates_pre_sticky_room_state() {
-        let now = element_call_state::now_ms();
-        let events = vec![LegacyStateMemberEvent {
-            sender: "@alice:example.org".to_owned(),
-            state_key: "_@alice:example.org_ALICEDEVICE_m.call".to_owned(),
-            origin_server_ts: now,
             content_json: serde_json::json!({
-                "application": "m.call",
-                "call_id": "",
-                "device_id": "ALICEDEVICE",
-                "expires": 14_400_000_u64,
-                "membershipID": "@alice:example.org:ALICEDEVICE",
-                "foci_preferred": [{
-                    "type": "livekit",
-                    "livekit_service_url": "https://sfu",
-                    "livekit_alias": "!room:example.org",
-                }],
+                "slot_id": "m.call#ROOM",
+                "msc4354_sticky_key": "MEMBER",
+                "application": { "type": "m.call" },
+                "member": { "id": "MEMBER", "membership": "join" },
             })
             .to_string(),
-        }];
+        };
+        let bad = RawMemberEvent {
+            content_json: "not json".to_owned(),
+            ..good.clone()
+        };
 
-        let converted = to_core_state_memberships("!room:example.org", events);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].content.slot_id, "m.call#ROOM");
-        assert_eq!(
-            converted[0].content.member.id.as_deref(),
-            Some("@alice:example.org:ALICEDEVICE"),
-        );
-        assert_eq!(converted[0].origin.sender_device_id(), Some("ALICEDEVICE"));
-    }
-
-    #[test]
-    fn drops_an_expired_pre_sticky_membership() {
-        let events = vec![LegacyStateMemberEvent {
-            sender: "@alice:example.org".to_owned(),
-            state_key: "_@alice:example.org_ALICEDEVICE_m.call".to_owned(),
-            origin_server_ts: 1,
-            content_json: serde_json::json!({
-                "application": "m.call",
-                "device_id": "ALICEDEVICE",
-                "expires": 1000_u64,
-            })
-            .to_string(),
-        }];
-
-        assert!(to_core_state_memberships("!room:example.org", events).is_empty());
-    }
-
-    #[test]
-    fn binds_a_pre_sticky_key_by_user_and_device() {
-        let content = serde_json::json!({
-            "keys": { "index": 0, "key": "AAAA" },
-            // The per-session UUID that matches no membership field.
-            "member": { "id": "ef8adf45-0000-0000-0000-000000000000" },
-            "device_id": "ALICEDEVICE",
-            "room_id": "!room:example.org",
-        });
-
-        let sticky = parse_legacy_key(
-            ElementCallCompat::StickyEvents,
-            "@alice:example.org",
-            Some("ALICEDEVICE"),
-            &content,
-        )
-        .expect("a key");
-        assert_eq!(sticky.member_id, "ef8adf45-0000-0000-0000-000000000000");
-
-        let state = parse_legacy_key(
-            ElementCallCompat::StateEvents,
-            "@alice:example.org",
-            Some("ALICEDEVICE"),
-            &content,
-        )
-        .expect("a key");
-        assert_eq!(state.member_id, "@alice:example.org:ALICEDEVICE");
-        assert_eq!(state.key_index, 0);
-        assert_eq!(state.room_id, "!room:example.org");
-    }
-
-    #[test]
-    fn refuses_a_pre_sticky_key_with_no_device_to_bind_it_to() {
-        let content = serde_json::json!({
-            "keys": { "index": 0, "key": "AAAA" },
-            "member": { "id": "ef8adf45" },
-            "room_id": "!room:example.org",
-        });
-
-        assert!(
-            parse_legacy_key(
-                ElementCallCompat::StateEvents,
-                "@alice:example.org",
-                None,
-                &content,
-            )
-            .is_none()
-        );
+        let merged = merge_current_membership("!room:example.org", vec![bad, good], vec![]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].content.sticky_key, "MEMBER");
     }
 }

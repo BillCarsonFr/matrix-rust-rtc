@@ -36,6 +36,7 @@
 //! ```
 #![cfg(target_arch = "wasm32")]
 
+use matrix_rtc_bridge::compat::{ElementCallCompat, ingest};
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership, KeyOrigin,
     LeaveSessionParams, Mentions, NotificationType, NotifyConfig, RawRtcTransport, RawSlotEvent,
@@ -44,6 +45,7 @@ use matrix_rtc_core::{
 };
 
 mod commands;
+mod compat;
 mod logging;
 mod media;
 pub use commands::JsCommandSender;
@@ -60,6 +62,12 @@ pub struct WasmRtcSessionManager {
     inner: RtcSessionManager<JsCommandSender>,
     /// Command sender for sending events to Matrix rooms
     command_sender: Option<Arc<JsCommandSender>>,
+    /// The Element Call compat mode each room was joined in, installed by
+    /// [`Self::join`] and cleared by [`Self::leave`]. Pages choose the mode
+    /// once, on the join; everything else — key binding, the media session's
+    /// identities and token endpoint — reads it from here so the pieces cannot
+    /// skew.
+    element_call_compat: std::collections::HashMap<String, ElementCallCompat>,
 }
 
 #[wasm_bindgen]
@@ -70,6 +78,7 @@ impl WasmRtcSessionManager {
         Self {
             inner: RtcSessionManager::new(),
             command_sender: None,
+            element_call_compat: std::collections::HashMap::new(),
         }
     }
 
@@ -243,9 +252,10 @@ impl WasmRtcSessionManager {
                 log::warn!("manager: invalid join params: {err}");
                 JsError::new(&format!("invalid join params: {err}"))
             })?;
+        let mode = compat::parse_compat(params.element_call_compat.as_deref())?;
 
         log::info!(
-            "manager: join requested [{}/{}] user={} device={} application={}",
+            "manager: join requested [{}/{}] user={} device={} application={} compat={mode:?}",
             params.room_id,
             params.slot_id,
             params.user_id,
@@ -253,9 +263,36 @@ impl WasmRtcSessionManager {
             params.application,
         );
 
+        // Kept past `into_core`, for the compat bookkeeping below.
+        let room_id = params.room_id.clone();
+        let slot_id = params.slot_id.clone();
+        let user_id = params.user_id.clone();
+        let device_id = params.device_id.clone();
+
         let mut core_params = params.into_core()?;
-        let member_id = matrix_rtc_core::generate_member_id();
+        // Not always a fresh id: see `ingest::member_id` for the one generation
+        // where a fresh one makes us mark ourselves departed on our own join.
+        let member_id = ingest::member_id(mode, &user_id, &device_id);
         core_params.membership_id = Some(member_id.clone());
+
+        // Before the join, not after: the join itself sends the membership
+        // (and arms the delayed leave), so a dialect registered afterwards
+        // would let exactly the two events that announce us go out
+        // spec-current.
+        self.element_call_compat.insert(room_id.clone(), mode);
+        if let Some(sender) = &self.command_sender {
+            sender.set_dialect(
+                &room_id,
+                ingest::outbound_dialect(mode, &user_id, &device_id, &room_id, &slot_id),
+            );
+        }
+        // Slots fed before this join were fed before anything knew the room
+        // belonged to a generation that has none, and "no slots" is what
+        // closes a session and projects out every member. Must run before the
+        // join so the session is created already unenforced.
+        if mode.reads_state_membership() {
+            self.inner.forget_room_slots(&room_id).await;
+        }
 
         let result = self
             .inner
@@ -308,6 +345,7 @@ impl WasmRtcSessionManager {
 
         let core_params = params.into_core();
 
+        let left_room = room_id.clone();
         let result = self
             .inner
             .leave(room_id, slot_id, core_params)
@@ -315,7 +353,16 @@ impl WasmRtcSessionManager {
             .map_err(|err| JsError::new(&err.to_string()));
 
         match &result {
-            Ok(()) => log::info!("manager: leave succeeded"),
+            Ok(()) => {
+                log::info!("manager: leave succeeded");
+                // After the leave, which had to be rendered in the room's
+                // dialect. Cleared on success only: a failed leave may retry
+                // and still needs it.
+                self.element_call_compat.remove(&left_room);
+                if let Some(sender) = &self.command_sender {
+                    sender.clear_dialect(&left_room);
+                }
+            }
             Err(_) => log::warn!("manager: leave failed"),
         }
 
@@ -387,6 +434,136 @@ impl WasmRtcSessionManager {
             .await
             .map_err(|err| {
                 log::warn!("manager: encryption key rejected: {err}");
+                JsError::new(&err.to_string())
+            })
+    }
+
+    /// Applies the **complete** current membership for one room, from raw
+    /// event content, across every MatrixRTC generation the room contains.
+    ///
+    /// The counterpart of [`Self::set_current_sticky_state`] for pages talking
+    /// to pre-2026 Element Call, and it replaces rather than merges for the
+    /// same reason: a member does not only leave by sending a leave, and a
+    /// lapsed entry produces no event to feed in.
+    ///
+    /// - `member_events` — the room's live `m.rtc.member` sticky events:
+    ///   `[{ sender, sender_device_id?, was_encrypted?, type, content }]` with
+    ///   `content` verbatim. The pre-2026 normalisation runs on every one and
+    ///   is safe for spec-current content, so a mixed room needs no sorting.
+    /// - `legacy_state_events` — the room's `org.matrix.msc3401.call.member`
+    ///   **room state**, for the `state_events` mode:
+    ///   `[{ sender, state_key, origin_server_ts, content }]`. Pass `[]`
+    ///   otherwise — both sources go in one call because both are replaced by
+    ///   it.
+    #[wasm_bindgen(js_name = setCurrentMembership)]
+    pub async fn set_current_membership(
+        &mut self,
+        room_id: String,
+        member_events: JsValue,
+        legacy_state_events: JsValue,
+    ) -> Result<(), JsError> {
+        let member_events: Vec<compat::WasmRawMemberEvent> =
+            serde_wasm_bindgen::from_value(member_events).map_err(|err| {
+                log::warn!("manager: [{room_id}] invalid membership payload: {err}");
+                JsError::new(&format!("invalid membership payload: {err}"))
+            })?;
+        let legacy_state_events: Vec<compat::WasmLegacyStateMemberEvent> =
+            serde_wasm_bindgen::from_value(legacy_state_events).map_err(|err| {
+                log::warn!("manager: [{room_id}] invalid legacy state payload: {err}");
+                JsError::new(&format!("invalid legacy state payload: {err}"))
+            })?;
+
+        log::debug!(
+            "manager: [{room_id}] current membership in: {} sticky + {} pre-sticky state event(s)",
+            member_events.len(),
+            legacy_state_events.len(),
+        );
+
+        let current = ingest::merge_current_membership(
+            &room_id,
+            member_events.into_iter().map(Into::into).collect(),
+            legacy_state_events.into_iter().map(Into::into).collect(),
+        );
+
+        self.inner
+            .set_current_sticky_state(&room_id, current)
+            .await
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Feeds a decrypted pre-2026 `io.element.call.encryption_keys` to-device
+    /// message to every session of its room.
+    ///
+    /// The legacy counterpart of [`Self::receive_encryption_key`], taking the
+    /// content raw because the two generations disagree about where the key,
+    /// the index and the owning membership live. Without it a legacy peer's
+    /// media never becomes decryptable — the roster fills in, everything looks
+    /// joined, and every remote tile stays black.
+    ///
+    /// `payload` is `{ sender, content, was_encrypted, sender_device_id?,
+    /// sender_is_cross_signed? }` — the `sender_*` fields from Olm decryption
+    /// metadata, `was_encrypted` honest (a cleartext key is discarded by the
+    /// core, as MSC4143 requires). The mode the room was joined in decides how
+    /// the key is bound; this call knows it already.
+    #[wasm_bindgen(js_name = receiveLegacyEncryptionKey)]
+    pub async fn receive_legacy_encryption_key(&mut self, payload: JsValue) -> Result<(), JsError> {
+        let payload: compat::WasmLegacyKeyMessage = serde_wasm_bindgen::from_value(payload)
+            .map_err(|err| JsError::new(&format!("invalid legacy key payload: {err}")))?;
+
+        let room_id = payload
+            .content
+            .get("room_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mode = self.element_call_compat_for(&room_id);
+
+        let Some(key) = ingest::parse_legacy_key(
+            mode,
+            &payload.sender,
+            payload.sender_device_id.as_deref(),
+            &payload.content,
+        ) else {
+            // Not an error the page can act on — the message is simply
+            // unusable — but silence here reads as a key that never arrived,
+            // which is the hardest interop failure to diagnose.
+            log::warn!(
+                "manager: [{room_id}] ignoring a legacy encryption key from {}: it is missing a \
+                 required field, or names no device to bind it to. That peer's media will not \
+                 decrypt.",
+                payload.sender,
+            );
+            return Ok(());
+        };
+
+        log::debug!(
+            "manager: [{}] legacy encryption key in: member={} index={} len={} encrypted={} \
+             cross_signed={}",
+            key.room_id,
+            key.member_id,
+            key.key_index,
+            key.key_b64.len(),
+            payload.was_encrypted,
+            payload.sender_is_cross_signed,
+        );
+
+        let received = WasmReceivedEncryptionKey {
+            room_id: key.room_id,
+            member_id: key.member_id,
+            key_b64: key.key_b64,
+            key_index: key.key_index,
+            was_encrypted: payload.was_encrypted,
+            sender_user_id: Some(payload.sender),
+            sender_device_id: payload.sender_device_id,
+            sender_is_cross_signed: payload.sender_is_cross_signed,
+        }
+        .into_core()?;
+
+        self.inner
+            .receive_encryption_key(received)
+            .await
+            .map_err(|err| {
+                log::warn!("manager: legacy encryption key rejected: {err}");
                 JsError::new(&err.to_string())
             })
     }
@@ -499,6 +676,16 @@ impl WasmReceivedEncryptionKey {
     }
 }
 
+impl WasmRtcSessionManager {
+    /// The mode `room_id` was joined in; an unregistered room is spec-current.
+    pub(crate) fn element_call_compat_for(&self, room_id: &str) -> ElementCallCompat {
+        self.element_call_compat
+            .get(room_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 impl Default for WasmRtcSessionManager {
     fn default() -> Self {
         Self::new()
@@ -538,6 +725,18 @@ pub struct WasmJoinSessionParams {
     /// state.
     #[serde(default)]
     pub notify: Option<WasmNotifyConfig>,
+    /// Element Call compatibility generation to speak in this room:
+    /// `"off"` (the default), `"sticky_events"`, or `"state_events"`.
+    ///
+    /// Chosen per join and remembered for the room, because it decides more
+    /// than the wire format of one event: the `member.id` we join with, how an
+    /// inbound media key is bound, the SFU participant identity, and the token
+    /// endpoint. See the FFI's `compat` module docs for what a host must do
+    /// differently per mode; on the web the same applies with
+    /// `setCurrentMembership` / `receiveLegacyEncryptionKey` and the client
+    /// object's `sendDelayedStateEvent`.
+    #[serde(default)]
+    pub element_call_compat: Option<String>,
 }
 
 /// WASM-friendly MSC4075 notification request.
@@ -1178,6 +1377,161 @@ mod tests {
                 .heartbeat("!room:example.org".to_owned(), "m.call#ROOM".to_owned())
                 .await
         );
+    }
+
+    /// An Element Call 2025 membership as captured on the wire
+    /// (`skills/e2e-testing/references/Alice-Bob-Call-Events.md`): flat
+    /// `rtc_transports`, `member` with `user_id`/`device_id` and no
+    /// `membership` field, `versions: []`. The raw funnel must normalise it
+    /// into a counted member.
+    #[wasm_bindgen_test]
+    async fn set_current_membership_reads_the_ec_2025_wire_shape() {
+        #[derive(Serialize)]
+        struct Empty {}
+
+        // The JSON-compatible serializer, so the fixture is plain objects —
+        // what a real page passes (the default serializer would make ES Maps).
+        let raw = serde_json::json!([{
+            "sender": "@bob:synapse.othersite.m.localhost",
+            "sender_device_id": "WDQHAPEYDK",
+            "was_encrypted": true,
+            "type": "org.matrix.msc4143.rtc.member",
+            "content": {
+                "application": { "type": "m.call", "m.call.intent": "video" },
+                "slot_id": "m.call#ROOM",
+                "rtc_transports": [{
+                    "type": "livekit",
+                    "livekit_service_url": "https://matrix-rtc.othersite.m.localhost/livekit/jwt",
+                }],
+                "member": {
+                    "device_id": "WDQHAPEYDK",
+                    "user_id": "@bob:synapse.othersite.m.localhost",
+                    "id": "bcab799f-abae-4d38-bf1b-77238346349a",
+                },
+                "versions": [],
+                "msc4354_sticky_key": "bcab799f-abae-4d38-bf1b-77238346349a",
+            },
+        }])
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap();
+        let empty = serde_wasm_bindgen::to_value(&Vec::<Empty>::new()).unwrap();
+
+        let mut manager = WasmRtcSessionManager::new();
+        manager
+            .set_current_membership("!room:example.org".to_owned(), raw, empty)
+            .await
+            .expect("the captured shape should ingest");
+        assert_eq!(
+            manager.member_count("!room:example.org".to_owned(), "m.call#ROOM".to_owned()),
+            Some(1),
+        );
+    }
+
+    /// The sticky dialect's outbound rewrite, through the real command path: a
+    /// join in `sticky_events` mode must put the EC-2025 mirror fields on the
+    /// wire, or that generation cannot see us.
+    #[wasm_bindgen_test]
+    async fn a_sticky_compat_join_mirrors_the_legacy_fields() {
+        let client = js_sys::Object::new();
+        let set = |name: &str, args: &str, body: &str| {
+            let function = js_sys::Function::new_with_args(args, body);
+            js_sys::Reflect::set(&client, &JsValue::from_str(name), &function).unwrap();
+        };
+        // Reject a membership missing any of the legacy mirror fields.
+        set(
+            "sendStickyEvent",
+            "roomId,eventType,content,durationMs",
+            "if (!Array.isArray(content.rtc_transports) \
+                 || !Array.isArray(content.versions) \
+                 || !content.member || content.member.user_id === undefined \
+                 || content.member.device_id === undefined) \
+                 return Promise.reject(new Error('legacy mirror fields missing: ' + JSON.stringify(content))); \
+             return Promise.resolve({ event_id: '$sticky' });",
+        );
+        set(
+            "sendDelayedEvent",
+            "roomId,eventType,content,delayMs",
+            "return Promise.resolve('delay-id');",
+        );
+        set(
+            "restartDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+        set(
+            "cancelDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+
+        #[derive(Serialize)]
+        struct TestTransport {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            livekit_service_url: &'static str,
+        }
+        #[derive(Serialize)]
+        struct TestJoinParams {
+            user_id: &'static str,
+            device_id: &'static str,
+            room_id: &'static str,
+            slot_id: &'static str,
+            application: &'static str,
+            transport: TestTransport,
+            element_call_compat: &'static str,
+        }
+
+        let mut manager = WasmRtcSessionManager::new();
+        manager.setup_command_sender(client.into());
+        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
+            user_id: "@alice:example.org",
+            device_id: "ALICEDEVICE",
+            room_id: "!room:example.org",
+            slot_id: "m.call#ROOM",
+            application: "m.call",
+            transport: TestTransport {
+                kind: "livekit",
+                livekit_service_url: "https://sfu.example.org/livekit/jwt",
+            },
+            element_call_compat: "sticky_events",
+        })
+        .unwrap();
+
+        manager
+            .join(params)
+            .await
+            .expect("the rewritten membership should satisfy the strict mock");
+    }
+
+    /// The `sticky_events` binding of a legacy key: bound by the `member.id`
+    /// the message carries, fed through the raw payload contract.
+    #[wasm_bindgen_test]
+    async fn receive_legacy_encryption_key_accepts_the_documented_payload() {
+        #[derive(Serialize)]
+        struct TestLegacyKey {
+            sender: &'static str,
+            content: serde_json::Value,
+            was_encrypted: bool,
+            sender_device_id: &'static str,
+            sender_is_cross_signed: bool,
+        }
+
+        let mut manager = WasmRtcSessionManager::new();
+        // No session exists: the key is parsed, then dropped — not an error.
+        let payload = serde_wasm_bindgen::to_value(&TestLegacyKey {
+            sender: "@peer:example.org",
+            content: serde_json::json!({
+                "keys": [{ "index": 0, "key": "AAAA" }],
+                "member": { "id": "bcab799f-abae-4d38-bf1b-77238346349a" },
+                "device_id": "PEERDEVICE",
+                "room_id": "!room:example.org",
+            }),
+            was_encrypted: true,
+            sender_device_id: "PEERDEVICE",
+            sender_is_cross_signed: true,
+        })
+        .unwrap();
+        assert!(manager.receive_legacy_encryption_key(payload).await.is_ok());
     }
 
     #[wasm_bindgen_test]

@@ -20,8 +20,12 @@
 //! This module provides the `JsCommandSender` that implements `RtcCommandSender`
 //! by delegating to a JavaScript object that provides the actual Matrix SDK integration.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
+use matrix_rtc_bridge::compat::{MemberEventRoute, OutboundDialect};
 use matrix_rtc_core::{
     CommandError, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient, wire_event_type,
 };
@@ -55,6 +59,15 @@ pub struct JsCommandSender {
     /// Optional callback for logging/debugging
     #[wasm_bindgen(skip)]
     on_command: Option<Function>,
+    /// The outbound dialect each room's session speaks, registered by
+    /// `WasmRtcSessionManager::join` and empty for every spec-current room —
+    /// the common case.
+    ///
+    /// Keyed by room rather than `(room, slot)` because a to-device media key
+    /// names only its room. A `RefCell` because the trait methods take `&self`
+    /// and wasm is one thread; never borrowed across an await.
+    #[wasm_bindgen(skip)]
+    dialects: RefCell<HashMap<String, OutboundDialect>>,
 }
 
 #[wasm_bindgen]
@@ -79,6 +92,7 @@ impl JsCommandSender {
         Self {
             client,
             on_command: None,
+            dialects: RefCell::new(HashMap::new()),
         }
     }
 
@@ -89,6 +103,41 @@ impl JsCommandSender {
 }
 
 impl JsCommandSender {
+    /// Make every later send for `room_id` speak `dialect`. Replaces any
+    /// previous one: a rejoin in a different mode is the point of setting this
+    /// per join.
+    pub(crate) fn set_dialect(&self, room_id: &str, dialect: OutboundDialect) {
+        self.dialects
+            .borrow_mut()
+            .insert(room_id.to_owned(), dialect);
+    }
+
+    /// Forget `room_id`'s dialect, after a leave has been rendered in it.
+    pub(crate) fn clear_dialect(&self, room_id: &str) {
+        self.dialects.borrow_mut().remove(room_id);
+    }
+
+    /// The dialect for `room_id`, or [`OutboundDialect::None`] — an
+    /// unregistered room is a spec-current one.
+    fn dialect(&self, room_id: &str) -> OutboundDialect {
+        self.dialects
+            .borrow()
+            .get(room_id)
+            .cloned()
+            .unwrap_or(OutboundDialect::None)
+    }
+
+    /// The dialect a to-device message is rendered in. A media key names its
+    /// room inside the content, which is the only routing information a
+    /// to-device send has.
+    fn dialect_for_content(&self, content: &Value) -> OutboundDialect {
+        content
+            .get("room_id")
+            .and_then(Value::as_str)
+            .map(|room_id| self.dialect(room_id))
+            .unwrap_or(OutboundDialect::None)
+    }
+
     fn log_command(&self, description: &str) {
         log::debug!("command sending: {description}");
 
@@ -162,38 +211,81 @@ impl RtcCommandSender for JsCommandSender {
         content: Value,
         duration_ms: u64,
     ) -> Result<String, CommandError> {
-        // The JS host puts this string on the wire verbatim, so translate the
-        // core's stable id to the one peers actually match on.
-        let event_type = wire_event_type(&event_type);
-        self.log_command(&format!(
-            "send_sticky_event: room={}, type={}, duration={}ms",
-            room_id, event_type, duration_ms
-        ));
+        // Anything that is not a membership routes straight through in every
+        // mode; the legacy generations differ about memberships, not about
+        // everything. See `matrix_rtc_bridge::compat`.
+        let dialect = self.dialect(&room_id);
+        let content = dialect.rewrite_notification(&event_type, content);
+        match dialect.route_member_event(event_type, content, Some(duration_ms)) {
+            MemberEventRoute::Sticky {
+                event_type,
+                content,
+            } => {
+                // The JS host puts this string on the wire verbatim, so
+                // translate the core's stable id to the one peers match on.
+                let event_type = wire_event_type(&event_type);
+                self.log_command(&format!(
+                    "send_sticky_event: room={}, type={}, duration={}ms",
+                    room_id, event_type, duration_ms
+                ));
 
-        // Convert Rust Value to JsValue
-        let js_content = to_plain_js(&content)?;
+                let js_content = to_plain_js(&content)?;
+                let promise = self
+                    .call_js_promise_method(
+                        "sendStickyEvent",
+                        vec![
+                            JsValue::from_str(&room_id),
+                            JsValue::from_str(event_type),
+                            js_content,
+                            // The core refreshes the entry against this
+                            // lifetime; the host must pass it through, not
+                            // choose its own.
+                            JsValue::from_f64(duration_ms as f64),
+                        ],
+                    )
+                    .map_err(JsCommandSender::convert_js_error)?;
 
-        // Create a Promise that will be resolved by the JS callback
-        let promise = self
-            .call_js_promise_method(
-                "sendStickyEvent",
-                vec![
-                    JsValue::from_str(&room_id),
-                    JsValue::from_str(event_type),
-                    js_content,
-                    // The core refreshes the entry against this lifetime; the
-                    // host must pass it through, not choose its own.
-                    JsValue::from_f64(duration_ms as f64),
-                ],
-            )
-            .map_err(JsCommandSender::convert_js_error)?;
+                let resolved = wasm_bindgen_futures::JsFuture::from(promise)
+                    .await
+                    .map_err(JsCommandSender::convert_js_error)?;
 
-        // Convert the Promise to a Rust Future and await it
-        let resolved = wasm_bindgen_futures::JsFuture::from(promise)
-            .await
-            .map_err(JsCommandSender::convert_js_error)?;
+                js_event_id(&resolved, "sendStickyEvent")
+            }
+            // `duration_ms` is dropped on purpose: room state has no TTL, and
+            // in this dialect the lifetime is stated inside the content
+            // instead. The type is already the legacy wire id, so it does NOT
+            // go through `wire_event_type` — that table is the core's own
+            // alias map, and this type is not the core's.
+            MemberEventRoute::State {
+                event_type,
+                state_key,
+                content,
+            } => {
+                self.log_command(&format!(
+                    "send_sticky_event as state: room={room_id}, type={event_type}, \
+                     state_key={state_key}",
+                ));
 
-        js_event_id(&resolved, "sendStickyEvent")
+                let js_content = to_plain_js(&content)?;
+                let promise = self
+                    .call_js_promise_method(
+                        "sendStateEvent",
+                        vec![
+                            JsValue::from_str(&room_id),
+                            JsValue::from_str(event_type),
+                            JsValue::from_str(&state_key),
+                            js_content,
+                        ],
+                    )
+                    .map_err(JsCommandSender::convert_js_error)?;
+
+                let resolved = wasm_bindgen_futures::JsFuture::from(promise)
+                    .await
+                    .map_err(JsCommandSender::convert_js_error)?;
+
+                js_event_id(&resolved, "sendStateEvent")
+            }
+        }
     }
 
     async fn send_state_event(
@@ -237,37 +329,69 @@ impl RtcCommandSender for JsCommandSender {
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
-        let event_type = wire_event_type(&event_type);
-        self.log_command(&format!(
-            "send_delayed_event: room={}, type={}, delay={}ms",
-            room_id, event_type, delay_ms
-        ));
+        // The delayed leave is a member event like any other, and a peer that
+        // cannot read it is a peer we stay visible to forever — so it goes
+        // through the same routing as the join it is paired with. No lifetime:
+        // its legacy content is `{}`, which has nowhere to carry a deadline.
+        let (method, args) = match self
+            .dialect(&room_id)
+            .route_member_event(event_type, content, None)
+        {
+            MemberEventRoute::Sticky {
+                event_type,
+                content,
+            } => {
+                let event_type = wire_event_type(&event_type).to_owned();
+                self.log_command(&format!(
+                    "send_delayed_event: room={}, type={}, delay={}ms",
+                    room_id, event_type, delay_ms
+                ));
+                (
+                    "sendDelayedEvent",
+                    vec![
+                        JsValue::from_str(&room_id),
+                        JsValue::from_str(&event_type),
+                        to_plain_js(&content)?,
+                        JsValue::from_f64(delay_ms as f64),
+                    ],
+                )
+            }
+            // The pre-sticky dialect's delayed leave is a delayed STATE event,
+            // which needs its own host method — only rooms joined in
+            // `state_events` mode ever dispatch it.
+            MemberEventRoute::State {
+                event_type,
+                state_key,
+                content,
+            } => {
+                self.log_command(&format!(
+                    "send_delayed_event as state: room={room_id}, type={event_type}, \
+                     state_key={state_key}, delay={delay_ms}ms",
+                ));
+                (
+                    "sendDelayedStateEvent",
+                    vec![
+                        JsValue::from_str(&room_id),
+                        JsValue::from_str(event_type),
+                        JsValue::from_str(&state_key),
+                        to_plain_js(&content)?,
+                        JsValue::from_f64(delay_ms as f64),
+                    ],
+                )
+            }
+        };
 
-        // Convert Rust Value to JsValue
-        let js_content = to_plain_js(&content)?;
-
-        // Create a Promise that will be resolved by the JS callback
         let promise = self
-            .call_js_promise_method(
-                "sendDelayedEvent",
-                vec![
-                    JsValue::from_str(&room_id),
-                    JsValue::from_str(event_type),
-                    js_content,
-                    JsValue::from_f64(delay_ms as f64),
-                ],
-            )
+            .call_js_promise_method(method, args)
             .map_err(JsCommandSender::convert_js_error)?;
 
-        // Convert the Promise to a Rust Future and await it
         // The Promise should resolve to the MSC4140 delay id
         let js_result = wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(JsCommandSender::convert_js_error)?;
 
-        // Extract the delay id from the result
         let delay_id = js_result.as_string().ok_or_else(|| {
-            CommandError::SendError("sendDelayedEvent did not return a string delay id".to_string())
+            CommandError::SendError(format!("{method} did not return a string delay id"))
         })?;
 
         Ok(delay_id)
@@ -331,6 +455,14 @@ impl RtcCommandSender for JsCommandSender {
         message_type: String,
         content: Value,
     ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+        // Unlike a member event, a to-device message cannot carry both dialects
+        // at once — the type is one or the other — so in compat mode the media
+        // key goes out in the legacy dialect alone, and is exchanged with
+        // legacy peers rather than spec-current ones.
+        let (message_type, content) = self
+            .dialect_for_content(&content)
+            .rewrite_key_message(&message_type, &content)
+            .unwrap_or((message_type, content));
         let message_type = wire_event_type(&message_type);
         self.log_command(&format!(
             "send_to_device_message: {} recipient(s), type={}",

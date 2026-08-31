@@ -68,19 +68,6 @@ struct WasmMediaSessionConfig {
     element_call_compat: Option<String>,
 }
 
-fn parse_compat(value: Option<&str>) -> Result<ElementCallCompat, JsError> {
-    Ok(match value {
-        None | Some("off") => ElementCallCompat::Off,
-        Some("sticky_events") => ElementCallCompat::StickyEvents,
-        Some("state_events") => ElementCallCompat::StateEvents,
-        Some(other) => {
-            return Err(JsError::new(&format!(
-                "unknown element_call_compat {other:?}: expected off | sticky_events | state_events",
-            )));
-        }
-    })
-}
-
 /// Calls the delegate's `setLocalKeyIndex(index)`; the local-sender hook.
 fn set_local_key_index(delegate: &JsValue, index: u8) {
     let method = Reflect::get(delegate, &JsValue::from_str("setLocalKeyIndex"))
@@ -134,12 +121,23 @@ impl WasmRtcSessionManager {
             config.livekit_service_url,
         );
 
-        // Which MatrixRTC generation this room was joined for: it decides the
+        // Which MatrixRTC generation this room was joined for, read back from
+        // the join rather than trusted from this config: it decides the
         // participant identity and the token endpoint, and those disagreeing
         // with the membership we already published is not an error but a
         // silence — peers sit in the roster with no media, keys install under
-        // an identity the SFU never assigned, and nothing logs a problem.
-        let compat = parse_compat(config.element_call_compat.as_deref())?;
+        // an identity the SFU never assigned, and nothing logs a problem. The
+        // config field is accepted only as a cross-check.
+        let compat = self.element_call_compat_for(&config.room_id);
+        if let Some(requested) = config.element_call_compat.as_deref() {
+            let requested = crate::compat::parse_compat(Some(requested))?;
+            if requested != compat {
+                return Err(JsError::new(&format!(
+                    "element_call_compat {requested:?} disagrees with the mode this room was \
+                     joined in ({compat:?}); set the mode on join and drop it here",
+                )));
+            }
+        }
         if compat != ElementCallCompat::Off {
             log::info!(
                 "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
