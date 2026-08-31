@@ -148,6 +148,7 @@ export class WebPeerApp {
     const focusUrl = await this.host.discoverFocus();
     this.roomId = roomId;
     this.slotId = slotId;
+    this.compat = compat;
     this.log(`joining ${roomId} / ${slotId} on focus ${focusUrl}`);
 
     // Feed before joining: the manager must know the room's encryption state
@@ -252,6 +253,25 @@ export class WebPeerApp {
   }
 
   onCallEvent(event) {
+    if (event.type === 'unknown_participant') {
+      // The classic dialect mismatch reads as exactly this silence: the modes
+      // derive SFU identities differently, so the peer maps to no membership,
+      // its key binds to nothing, and its tile stays black. Name it.
+      const looksHashed = !event.identity.includes(':');
+      const stateMode = this.compat === 'state_events';
+      if (stateMode && looksHashed) {
+        this.log(
+          `HINT: ${event.identity} is a hashed identity but this call speaks state events — ` +
+            `the peer is likely in Element Call's "Matrix 2.0" mode; both sides must use the same mode`,
+        );
+      } else if (!stateMode && !looksHashed) {
+        this.log(
+          `HINT: ${event.identity} is a {user}:{device} identity but this call speaks ` +
+            `${this.compat ?? 'the spec-current dialect'} — the peer is likely in Element Call's ` +
+            `"state events" mode; both sides must use the same mode`,
+        );
+      }
+    }
     if (event.type === 'key_imported') {
       const entry = this.call
         .participants()
