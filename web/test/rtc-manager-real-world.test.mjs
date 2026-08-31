@@ -102,40 +102,34 @@ describe('RTC manager with real-world data', () => {
     WasmRtcSessionManager = bindings.WasmRtcSessionManager;
   });
 
-  it('ingests realistic sticky DTOs and updates member count', () => {
+  // Sticky state is replace-not-merge (`set_current_sticky_state`): every call
+  // carries the room's complete set, and absence is departure.
+  it('ingests realistic sticky DTOs and updates member count', async () => {
     const manager = new WasmRtcSessionManager();
 
-    manager.on_sticky_events_snapshot_received(ROOM_ID, [bobJoinEvent()]);
+    await manager.set_current_sticky_state(ROOM_ID, [bobJoinEvent()]);
     expect(manager.session_count()).toBe(1);
     expect(manager.member_count(ROOM_ID, SLOT_ID)).toBe(1);
 
-    manager.on_sticky_events_update_received(ROOM_ID, {
-      added: [aliceJoinEvent()],
-      updated: [],
-      removed: [],
-    });
+    await manager.set_current_sticky_state(ROOM_ID, [bobJoinEvent(), aliceJoinEvent()]);
     expect(manager.session_count()).toBe(1);
     expect(manager.member_count(ROOM_ID, SLOT_ID)).toBe(2);
 
-    manager.on_sticky_events_update_received(ROOM_ID, {
-      added: [],
-      updated: [],
-      removed: [aliceLeaveEvent()],
-    });
+    await manager.set_current_sticky_state(ROOM_ID, [bobJoinEvent(), aliceLeaveEvent()]);
     expect(manager.member_count(ROOM_ID, SLOT_ID)).toBe(1);
   });
 
-  it('session membership snapshots include livekit transport data', () => {
+  it('session membership snapshots include livekit transport data', async () => {
     const manager = new WasmRtcSessionManager();
 
-    manager.on_sticky_events_snapshot_received(ROOM_ID, [bobJoinEvent()]);
+    await manager.set_current_sticky_state(ROOM_ID, [bobJoinEvent()]);
     const session = manager.member_count(ROOM_ID, SLOT_ID);
-    
+
     // The session was created successfully
     expect(session).toBe(1);
   });
 
-  it('session handles unknown transport types as unsupported', () => {
+  it('session handles unknown transport types as unsupported', async () => {
     const manager = new WasmRtcSessionManager();
 
     // Create an event with an unknown transport type
@@ -159,11 +153,11 @@ describe('RTC manager with real-world data', () => {
       },
     };
 
-    // Should not throw even with unknown transport
-    expect(() => {
-      manager.on_sticky_events_snapshot_received(ROOM_ID, [eventWithUnknownTransport]);
-    }).not.toThrow();
-    
+    // Should not reject even with unknown transport
+    await expect(
+      manager.set_current_sticky_state(ROOM_ID, [eventWithUnknownTransport]),
+    ).resolves.toBeUndefined();
+
     expect(manager.session_count()).toBe(1);
   });
 });

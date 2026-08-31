@@ -26,6 +26,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The media roster/pool engine (its actor runs on `spawn_local` here) and the
+# shared key handler; `bridge` for the compat dialects and `OpenIdToken`;
+# `proto` for the MSC4195 identity derivation and token shapes. None of these
+# pull livekit/libwebrtc — the browser's media is livekit-js.
+matrix-rtc-media = { path = "../matrix-rtc-media" }
+matrix-rtc-bridge = { path = "../matrix-rtc-bridge" }
+matrix-rtc-livekit-proto = { path = "../matrix-rtc-livekit-proto" }
 serde.workspace = true
 serde_json.workspace = true
 wasm-bindgen.workspace = true

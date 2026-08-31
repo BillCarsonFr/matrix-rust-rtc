@@ -45,8 +45,10 @@ use matrix_rtc_core::{
 
 mod commands;
 mod logging;
+mod media;
 pub use commands::JsCommandSender;
 pub use logging::{init_logging, log_event};
+pub use media::{WasmConnectionEventSink, WasmMediaSession};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::watch;
