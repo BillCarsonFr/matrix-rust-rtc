@@ -45,11 +45,19 @@ if (params.get('test') === '1') {
   document.getElementById('joinBtn').addEventListener('click', async () => {
     field('joinBtn').disabled = true;
     try {
-      await app.login({
-        homeserver: field('homeserver').value,
-        user: field('user').value || undefined,
-        password: field('password').value || undefined,
-      });
+      // One session per page: logging in again with a blank User field would
+      // register a NEW throwaway user — who is not invited to any room the
+      // previous one created. Reload the page to switch users.
+      if (!app.client) {
+        await app.login({
+          homeserver: field('homeserver').value,
+          user: field('user').value || undefined,
+          password: field('password').value || undefined,
+        });
+        field('user').value = app.userId;
+      } else {
+        log(`reusing session as ${app.userId} (reload the page to switch users)`);
+      }
       let roomId = field('room').value.trim();
       if (roomId) {
         await app.joinRoom(roomId);
