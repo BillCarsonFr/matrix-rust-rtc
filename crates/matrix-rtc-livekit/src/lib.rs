@@ -67,6 +67,7 @@ pub use matrix_rtc_bridge::compat;
 pub use keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
     ParticipantKey, SwitchCompleteListener, msc4195_key_provider, msc4195_key_provider_options,
+    msc4195_media_key_bridge,
 };
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, SfuToken};

@@ -47,6 +47,14 @@ where
     TaskHandle(tokio::spawn(future))
 }
 
+/// Whether [`spawn`] has somewhere to run: a current tokio runtime here, always
+/// on wasm (the JS event loop). Callers that can degrade check this instead of
+/// letting `spawn` panic.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn can_spawn() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
@@ -74,6 +82,14 @@ where
         let _ = future.await;
     });
     TaskHandle(handle)
+}
+
+/// Whether [`spawn`] has somewhere to run: a current tokio runtime off wasm,
+/// always here (the JS event loop). Callers that can degrade check this instead
+/// of letting `spawn` panic.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn can_spawn() -> bool {
+    true
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -46,6 +46,7 @@ pub mod constraints;
 pub mod engine;
 pub mod event;
 pub mod frame;
+pub mod keys;
 pub mod local;
 pub mod participant;
 mod rt;
@@ -58,6 +59,10 @@ pub use constraints::{
 pub use engine::{CallEngine, EngineConfig, EngineHandle};
 pub use event::{CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState};
 pub use frame::{AudioFrame, I420Buffer, VideoFrame, VideoRotation};
+pub use keys::{
+    FrameKeyRing, KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyHandler,
+    ParticipantKey, SwitchCompleteListener,
+};
 pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSourceConfig};
 pub use participant::{MediaStreamKind, Participant, StreamState};
 pub use stats::ReceiveStats;

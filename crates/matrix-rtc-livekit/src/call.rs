@@ -77,7 +77,9 @@ use matrix_rtc_media::{
 
 use crate::session::LiveKitSession;
 use crate::transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
-use crate::{MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider};
+use crate::{
+    MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
+};
 
 type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
 
@@ -324,7 +326,7 @@ impl Call {
         // MediaKeyBridge (which imports every key the core signals). MSC4195
         // per-participant HKDF mode.
         let provider = msc4195_key_provider();
-        let bridge = Arc::new(MediaKeyBridge::with_provider(provider.clone()));
+        let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
 
         // Receive path: peers distribute their media keys as Olm-encrypted
         // `m.rtc.encryption_key` to-device messages. The SDK decrypts and
