@@ -2658,6 +2658,7 @@ dependencies = [
  "async-trait",
  "base64 0.21.7",
  "futures",
+ "getrandom 0.2.17",
  "log",
  "rand 0.8.6",
  "rand_core 0.6.4",
@@ -2723,10 +2724,12 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-util",
+ "gloo-timers",
  "log",
  "matrix-rtc-core",
  "thiserror 2.0.18",
  "tokio",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -2738,7 +2741,6 @@ dependencies = [
  "console_log",
  "env_filter",
  "futures",
- "getrandom 0.2.17",
  "js-sys",
  "log",
  "matrix-rtc-core",

@@ -24,6 +24,7 @@
 //! in our membership's `transports`, where peers subscribe to us.
 
 use async_trait::async_trait;
+use matrix_rtc_core::MaybeSend;
 
 use crate::frame::{AudioFrame, VideoFrame};
 use crate::participant::MediaStreamKind;
@@ -105,8 +106,9 @@ impl PublishOptions {
 ///
 /// Handles are cheap `Arc`s. There is no explicit unpublish yet — the
 /// publication ends with its connection (leave/close).
-#[async_trait]
-pub trait LocalTrackHandle: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait LocalTrackHandle: MaybeSend {
     fn kind(&self) -> MediaStreamKind;
 
     /// Mute or unmute this publication at the transport.

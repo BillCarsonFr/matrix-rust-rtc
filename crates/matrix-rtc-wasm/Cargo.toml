@@ -45,12 +45,6 @@ console_error_panic_hook = "0.1"
 # No regex: it is a large dependency to put in a wasm bundle.
 env_filter = { version = "0.1", default-features = false }
 
-[target.'cfg(target_family = "wasm")'.dependencies]
-# `matrix-rtc-core` uses `rand` for key generation, which reaches getrandom 0.2.
-# That has no wasm entropy source unless its `js` feature is on, and refuses to
-# compile for wasm32-unknown-unknown without it.
-getrandom = { version = "0.2", features = ["js"] }
-
 [dev-dependencies]
 serde_json.workspace = true
 wasm-bindgen-test.workspace = true

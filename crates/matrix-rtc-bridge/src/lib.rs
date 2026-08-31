@@ -48,6 +48,7 @@
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
 use async_trait::async_trait;
+use matrix_rtc_core::MaybeSend;
 use serde::{Deserialize, Serialize};
 
 pub mod compat;
@@ -95,8 +96,12 @@ pub struct OpenIdTokenError(pub String);
 /// own credentials — for LiveKit, the MSC4195 SFU JWT. A default
 /// `matrix_sdk::Client` implementation is provided behind the `matrix-sdk`
 /// feature.
-#[async_trait]
-pub trait OpenIdTokenSource: Send + Sync {
+///
+/// [`MaybeSend`] rather than `Send + Sync`: on the web the source is the host's
+/// matrix-js-sdk client, reached through a `JsValue` delegate.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait OpenIdTokenSource: MaybeSend {
     /// Request a fresh OpenID token for the current account.
     async fn open_id_token(&self) -> Result<OpenIdToken, OpenIdTokenError>;
 }

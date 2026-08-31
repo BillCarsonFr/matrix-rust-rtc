@@ -25,14 +25,29 @@ description = "Transport-agnostic MatrixRTC media model: participants, frame str
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
 # The engine's actor loop multiplexes channels with `tokio::select!`
-# (`macros`) and drives backoff/idle-grace timers (`time`).
-tokio = { workspace = true, features = ["macros", "time"] }
-# `BoxStream` for the frame streams handed out by `RemoteTrackHandle`. Only the
-# type is needed here; combinators stay in the transport implementations.
+# (`macros`). Timers are NOT tokio's on every target — see `src/rt.rs` and the
+# per-target sections below.
+tokio = { workspace = true, features = ["macros"] }
+# `BoxStream`/`LocalBoxStream` for the frame streams handed out by
+# `RemoteTrackHandle`. Only the type is needed here; combinators stay in the
+# transport implementations.
 futures-core = "0.3"
 async-trait.workspace = true
 log.workspace = true
 thiserror.workspace = true
+
+# The task/timer seam (`src/rt.rs`): tokio's spawn and timer driver off wasm32;
+# `spawn_local` plus setTimeout-backed sleeps on it. `tokio::time` must not
+# reach the wasm build at all — it panics at runtime on wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
+# `Abortable`, so `rt::TaskHandle::abort` has a wasm counterpart to
+# `JoinHandle::abort`.
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }

@@ -37,6 +37,13 @@ rand = "0.8"
 rand_core = "0.6"
 base64 = "0.21"
 
+# `rand` reaches getrandom 0.2, which has no wasm entropy source unless its
+# `js` feature is on and refuses to compile for wasm32-unknown-unknown without
+# it. Lives here — where the `rand` dependency is — so every crate over the
+# core checks for wasm32 without repeating it.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
 futures = "0.3"
