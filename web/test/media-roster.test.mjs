@@ -74,6 +74,8 @@ function fakeDelegate() {
     sinks: [],
     keysSet: [],
     localKeyIndexes: [],
+    events: [],
+    rosters: [],
     closed: 0,
   };
   const delegate = {
@@ -107,6 +109,12 @@ function fakeDelegate() {
     },
     setLocalKeyIndex: (index) => {
       log.localKeyIndexes.push(index);
+    },
+    onEvent: (event) => {
+      log.events.push(event);
+    },
+    onParticipants: (roster) => {
+      log.rosters.push(roster);
     },
   };
   return { delegate, log };
@@ -223,21 +231,21 @@ describe('web media roster over a fake transport delegate', () => {
       return entry.streams[0].muted ? entry : null;
     }, 'the muted camera stream');
 
-    // The event stream reports the same transitions.
-    const events = [];
-    while (events.length < 2) {
-      const event = await session.nextEvent();
-      if (event === null) throw new Error('event stream ended early');
-      if (event.type === 'stream_started' || event.type === 'stream_muted') {
-        events.push(event);
-      }
-    }
-    expect(events[0]).toEqual({
+    // The event callback reports the same transitions, and the roster
+    // callback carried the same truth.
+    const streamEvents = await waitFor(() => {
+      const seen = log.events.filter(
+        (event) => event.type === 'stream_started' || event.type === 'stream_muted',
+      );
+      return seen.length >= 2 ? seen : null;
+    }, 'the stream events to reach onEvent');
+    expect(streamEvents[0]).toEqual({
       type: 'stream_started',
       member_id: 'peer-member-1',
       kind: 'camera',
     });
-    expect(events[1].type).toBe('stream_muted');
+    expect(streamEvents[1].type).toBe('stream_muted');
+    expect(log.rosters.length).toBeGreaterThan(0);
 
     // A transport-level leave is diagnostics, never roster truth.
     sink.remoteLeft(peer.rtc_identity);

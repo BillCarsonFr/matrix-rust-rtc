@@ -112,7 +112,10 @@ impl WasmRtcSessionManager {
     /// `config` is `{ room_id, slot_id, user_id, device_id,
     /// livekit_service_url, key_ring_size?, element_call_compat? }`;
     /// `delegate` is the object driving livekit-js (see the module docs of
-    /// the transport for its required methods).
+    /// the transport for its required methods). The delegate may additionally
+    /// implement `onParticipants(roster)`, `onEvent(event)`, and
+    /// `onSwitchComplete()` — the push half of the session, invoked from
+    /// spawned pumps for the life of the call.
     #[wasm_bindgen(js_name = connectMedia)]
     pub async fn connect_media(
         &mut self,
@@ -249,13 +252,9 @@ impl WasmRtcSessionManager {
 
         // A key rotation coalesced into a `delayBeforeUse` window falls due
         // the instant the window closes, and the handler's timer is the only
-        // thing that knows when that is. `EngineHandle` cannot flush the core,
-        // so hand the flush to the JS event loop through a oneshot-per-switch
-        // channel the page's heartbeat would otherwise cover.
-        //
-        // Simplest correct wiring on one thread: notify a watch channel and
-        // let `WasmMediaSession::next_switch_complete` (below) hand it to JS,
-        // which calls `flushDueKeyRotation`.
+        // thing that knows when that is. The core cannot be flushed from the
+        // handler's task, so the moment is handed to JS (the
+        // `onSwitchComplete` pump below), which calls `flushDueKeyRotation`.
         let (switch_tx, switch_rx) = watch::channel(0u64);
         handler.set_switch_complete_listener(Box::new(move || {
             switch_tx.send_modify(|count| *count += 1);
@@ -285,9 +284,69 @@ impl WasmRtcSessionManager {
             })?;
         engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
-        let events = engine.subscribe_events();
-        let participants_rx = engine.subscribe_participants();
         let own_identity = mapper(&config.user_id, &config.device_id, &member_id);
+
+        // Roster, event, and switch-complete delivery run as spawned pumps
+        // owning their receivers, invoking the delegate's optional callbacks.
+        // NOT as async session methods: a wasm-bindgen `&mut self` future
+        // holds the object borrowed across its awaits, so a parked long-poll
+        // would make every other session call throw ("recursive use of an
+        // object"). The pumps borrow nothing from the session.
+        if let Some(on_participants) = delegate_callback(&delegate, "onParticipants") {
+            let mut participants_rx = engine.subscribe_participants();
+            let mapper = mapper.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                while participants_rx.changed().await.is_ok() {
+                    let roster: Vec<Participant> = participants_rx.borrow_and_update().clone();
+                    let roster: Vec<WasmParticipant> = roster
+                        .iter()
+                        .map(|participant| to_wasm_participant(&mapper, participant))
+                        .collect();
+                    match serde_wasm_bindgen::to_value(&roster) {
+                        Ok(roster) => {
+                            let _ = on_participants.call1(&JsValue::NULL, &roster);
+                        }
+                        Err(error) => log::warn!("media: roster did not serialize: {error}"),
+                    }
+                }
+            });
+        }
+        if let Some(on_event) = delegate_callback(&delegate, "onEvent") {
+            let mut events = engine.subscribe_events();
+            wasm_bindgen_futures::spawn_local(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            let event = WasmCallEvent::from(event);
+                            match serde_wasm_bindgen::to_value(&event) {
+                                Ok(event) => {
+                                    let _ = on_event.call1(&JsValue::NULL, &event);
+                                }
+                                Err(error) => {
+                                    log::warn!("media: event did not serialize: {error}")
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(missed)) => {
+                            log::warn!("media: event consumer lagged, {missed} event(s) dropped");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+        // Optional but recommended: the heartbeat also flushes due rotations,
+        // so without this a coalesced rotation waits for the next beat instead
+        // of happening at the instant it is owed. The callback should call
+        // `manager.flushDueKeyRotation(roomId, slotId)`.
+        if let Some(on_switch_complete) = delegate_callback(&delegate, "onSwitchComplete") {
+            let mut switch_rx = switch_rx;
+            wasm_bindgen_futures::spawn_local(async move {
+                while switch_rx.changed().await.is_ok() {
+                    let _ = on_switch_complete.call0(&JsValue::NULL);
+                }
+            });
+        }
 
         // Move our sender onto each key we rotate to. Importing a key only
         // fills the ring; the index our frames actually carry lives on the
@@ -308,19 +367,28 @@ impl WasmRtcSessionManager {
             engine,
             own_connection: connection,
             _handler: handler,
-            events,
-            participants_rx,
-            switch_rx,
             identity_mapper: mapper,
             own_identity,
         })
     }
 }
 
+/// An optional delegate callback, by name.
+fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
+    Reflect::get(delegate, &JsValue::from_str(name))
+        .ok()
+        .filter(|method| !method.is_undefined())
+        .and_then(|method| method.dyn_into::<Function>().ok())
+}
+
 /// A live media session on a joined slot: the participant roster (with the
-/// livekit-js identity of each entry) and the unified event stream. Media
-/// itself — tracks, publishing, rendering — stays in livekit-js; join roster
-/// entries to `room.getParticipantByIdentity(rtc_identity)`.
+/// livekit-js identity of each entry). Media itself — tracks, publishing,
+/// rendering — stays in livekit-js; join roster entries to
+/// `room.getParticipantByIdentity(rtc_identity)`.
+///
+/// Roster changes, call events, and switch-complete moments arrive through
+/// the delegate's `onParticipants` / `onEvent` / `onSwitchComplete`
+/// callbacks, registered at [`WasmRtcSessionManager::connect_media`] time.
 ///
 /// End it with [`WasmMediaSession::disconnect`]; leaving the slot itself stays
 /// a manager concern ([`WasmRtcSessionManager::leave`]).
@@ -331,9 +399,6 @@ pub struct WasmMediaSession {
     /// Keeps the key handler alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
     _handler: Arc<MediaKeyHandler>,
-    events: broadcast::Receiver<CallEvent>,
-    participants_rx: watch::Receiver<Vec<Participant>>,
-    switch_rx: watch::Receiver<u64>,
     identity_mapper: matrix_rtc_core::RtcIdentityMapper,
     own_identity: String,
 }
@@ -348,61 +413,9 @@ impl WasmMediaSession {
             .engine
             .participants()
             .iter()
-            .map(|participant| self.to_wasm_participant(participant))
+            .map(|participant| to_wasm_participant(&self.identity_mapper, participant))
             .collect();
         serde_wasm_bindgen::to_value(&roster).map_err(|err| JsError::new(&err.to_string()))
-    }
-
-    /// Resolves with the roster after its next change (`await` it in a loop).
-    /// Resolves to `null` once the session is over.
-    #[wasm_bindgen(js_name = participantsChanged)]
-    pub async fn participants_changed(&mut self) -> Result<JsValue, JsError> {
-        if self.participants_rx.changed().await.is_err() {
-            return Ok(JsValue::NULL);
-        }
-        // Cloned out: the watch borrow may not outlive the `self` methods below.
-        let roster: Vec<Participant> = self.participants_rx.borrow_and_update().clone();
-        let roster: Vec<WasmParticipant> = roster
-            .iter()
-            .map(|participant| self.to_wasm_participant(participant))
-            .collect();
-        serde_wasm_bindgen::to_value(&roster).map_err(|err| JsError::new(&err.to_string()))
-    }
-
-    /// The next event on the unified call stream (`await` it in a loop; see
-    /// the crate docs for the JSON shape). Resolves to `null` once the session
-    /// is over.
-    ///
-    /// A consumer that falls very far behind may miss events (the internal
-    /// buffer holds 256); resynchronise from [`Self::participants`].
-    #[wasm_bindgen(js_name = nextEvent)]
-    pub async fn next_event(&mut self) -> Result<JsValue, JsError> {
-        loop {
-            match self.events.recv().await {
-                Ok(event) => {
-                    let event = WasmCallEvent::from(event);
-                    return serde_wasm_bindgen::to_value(&event)
-                        .map_err(|err| JsError::new(&err.to_string()));
-                }
-                Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    log::warn!("media: event consumer lagged, {missed} event(s) dropped");
-                }
-                Err(broadcast::error::RecvError::Closed) => return Ok(JsValue::NULL),
-            }
-        }
-    }
-
-    /// Resolves each time a key's `delayBeforeUse` window closes — the moment
-    /// a rotation coalesced into that window falls due. On resolution, call
-    /// `manager.flushDueKeyRotation(roomId, slotId)` (`await` this in a loop;
-    /// resolves to `false` once the session is over).
-    ///
-    /// Optional but recommended: the heartbeat also flushes due rotations, so
-    /// without this loop a coalesced rotation waits for the next beat instead
-    /// of happening at the instant it is owed.
-    #[wasm_bindgen(js_name = nextSwitchComplete)]
-    pub async fn next_switch_complete(&mut self) -> bool {
-        self.switch_rx.changed().await.is_ok()
     }
 
     /// Our own livekit-js participant identity (the MSC4195 pseudonymous
@@ -422,29 +435,33 @@ impl WasmMediaSession {
             .await
             .map_err(|error| JsError::new(&error.to_string()))
     }
+}
 
-    fn to_wasm_participant(&self, participant: &Participant) -> WasmParticipant {
-        // No attributable device, no identity — such a member also cannot be
-        // reached on the media plane (same rule as `remote_identity`).
-        let rtc_identity = participant.device_id.as_deref().map(|device_id| {
-            (self.identity_mapper)(&participant.user_id, device_id, &participant.member_id)
-        });
-        WasmParticipant {
-            member_id: participant.member_id.clone(),
-            user_id: participant.user_id.clone(),
-            device_id: participant.device_id.clone(),
-            is_local: participant.is_local,
-            reachable: participant.reachable,
-            rtc_identity,
-            streams: participant
-                .streams
-                .iter()
-                .map(|stream| WasmStreamState {
-                    kind: stream_kind_str(stream.kind),
-                    muted: stream.muted,
-                })
-                .collect(),
-        }
+fn to_wasm_participant(
+    mapper: &matrix_rtc_core::RtcIdentityMapper,
+    participant: &Participant,
+) -> WasmParticipant {
+    // No attributable device, no identity — such a member also cannot be
+    // reached on the media plane (same rule as `remote_identity`).
+    let rtc_identity = participant
+        .device_id
+        .as_deref()
+        .map(|device_id| mapper(&participant.user_id, device_id, &participant.member_id));
+    WasmParticipant {
+        member_id: participant.member_id.clone(),
+        user_id: participant.user_id.clone(),
+        device_id: participant.device_id.clone(),
+        is_local: participant.is_local,
+        reachable: participant.reachable,
+        rtc_identity,
+        streams: participant
+            .streams
+            .iter()
+            .map(|stream| WasmStreamState {
+                kind: stream_kind_str(stream.kind),
+                muted: stream.muted,
+            })
+            .collect(),
     }
 }
 

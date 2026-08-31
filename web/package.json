@@ -11,10 +11,19 @@
       "browser": "./pkg/browser/matrix_rtc_wasm.js",
       "node": "./pkg/node/matrix_rtc_wasm.js",
       "default": "./pkg/browser/matrix_rtc_wasm.js"
-    }
+    },
+    "./call": "./src/matrix-rtc-call.mjs"
   },
   "devDependencies": {
     "vitest": "^2.1.3"
+  },
+  "peerDependencies": {
+    "livekit-client": ">=2"
+  },
+  "peerDependenciesMeta": {
+    "livekit-client": {
+      "optional": true
+    }
   },
   "scripts": {
     "build": "./scripts/build-bindings.sh",
