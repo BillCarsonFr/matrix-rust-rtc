@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>matrix-rtc demo</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; padding: 1rem; max-width: 1100px; margin-inline: auto; }
+    h1 { font-size: 1.2rem; }
+    .note { padding: .5rem .8rem; border-radius: 6px; background: #fde68a33; border: 1px solid #d9a90655; font-size: .85rem; }
+    .toolbar { display: flex; gap: .5rem; margin: 1rem 0; flex-wrap: wrap; }
+    button { padding: .45rem .8rem; border-radius: 6px; border: 1px solid #8884; background: #6366f1; color: white; cursor: pointer; }
+    button.secondary { background: transparent; color: inherit; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; }
+    section { border: 1px solid #8884; border-radius: 8px; padding: .8rem; min-height: 6rem; }
+    section h2 { margin: 0 0 .5rem; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
+    #tiles { display: flex; gap: .6rem; flex-wrap: wrap; }
+    .tile { width: 130px; border-radius: 8px; border: 1px solid #8886; padding: .6rem; text-align: center; }
+    .tile.leaving { opacity: .5; border-style: dashed; }
+    .tile .avatar { width: 48px; height: 48px; border-radius: 50%; background: #6366f1; color: white; display: flex; align-items: center; justify-content: center; margin: 0 auto .4rem; font-size: 1.2rem; }
+    .tile .state { font-size: .7rem; opacity: .7; }
+    pre { margin: 0; font-size: .75rem; white-space: pre-wrap; word-break: break-all; max-height: 14rem; overflow-y: auto; }
+    #status { font-weight: 600; }
+    .err { color: #dc2626; }
+  </style>
+</head>
+<body>
+  <h1>matrix-rtc — ParticipationManager demo (TS MatrixDriver mock)</h1>
+  <p class="note">
+    The Rust crate is a skeleton: every method body is <code>todo!()</code>, so calls
+    panic — that is expected. This app (and the vitest suite) documents how the
+    SDK is used; it starts working as the implementations land.
+  </p>
+  <div class="toolbar">
+    <span id="status">initializing wasm…</span>
+    <span style="flex:1"></span>
+    <button id="join">Join call</button>
+    <button id="leave" class="secondary">Leave</button>
+    <button id="inject-slot" class="secondary">Inject slot open</button>
+    <button id="inject-join" class="secondary">Inject remote member join</button>
+    <button id="inject-leave" class="secondary">Inject remote member leave</button>
+    <button id="inject-key" class="secondary">Inject remote media key</button>
+  </div>
+  <div class="grid">
+    <section style="grid-column: 1 / -1;">
+      <h2>Tiles (one per membership)</h2>
+      <div id="tiles"></div>
+    </section>
+    <section><h2>Connections (LK rooms to hold)</h2><pre id="connections"></pre></section>
+    <section><h2>Key map</h2><pre id="keymap"></pre></section>
+    <section><h2>Outbound driver calls (mock homeserver)</h2><pre id="outbound"></pre></section>
+    <section><h2>Errors / panics</h2><pre id="errors"></pre></section>
+  </div>
+  <script type="module" src="/src/app.ts"></script>
+</body>
+</html>

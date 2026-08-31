@@ -1,0 +1,9 @@
+rust:
+  directory: ..
+  manifestPath: Cargo.toml
+web:
+  wasmCrateName: matrix-rtc-wasm-shim
+  ts: src/generated
+  manifestPatchFile: Cargo.patch.toml
+  features:
+    - uniffi
