@@ -44,6 +44,12 @@
         <label>Invite <input id="invite" placeholder="@friend:server (when creating)" /></label>
       </div>
       <div>
+        <label>Mode
+          <select id="mode">
+            <option value="off" selected>Spec-current (MSC4143)</option>
+            <option value="sticky_events">Element Call "Matrix 2.0" (sticky 2025)</option>
+          </select>
+        </label>
         <button id="joinBtn">Join call</button>
         <button id="leaveBtn" disabled>Leave</button>
       </div>

@@ -45,6 +45,8 @@ import {
 const MEMBER_EVENT_TYPES = ['m.rtc.member', 'org.matrix.msc4143.rtc.member'];
 const SLOT_EVENT_TYPES = ['m.rtc.slot', 'org.matrix.msc4143.rtc.slot'];
 const KEY_MESSAGE_TYPES = ['m.rtc.encryption_key', 'org.matrix.msc4143.rtc.encryption_key'];
+/// The pre-2026 Element Call key type; bound per the room's compat mode.
+const LEGACY_KEY_MESSAGE_TYPE = 'io.element.call.encryption_keys';
 
 /**
  * Register a throwaway user (the dev homeserver has open registration) and
@@ -237,7 +239,11 @@ export class MatrixHost {
       await manager.on_room_encryption_received(roomId, encrypted);
       await manager.on_room_slots_received(roomId, slots);
       await manager.on_room_members_received(roomId, members);
-      await manager.set_current_sticky_state(roomId, sticky);
+      // The raw funnel, in every mode: it normalises pre-2026 Element Call
+      // shapes (flat `rtc_transports`, membership-less `member`) and is a
+      // no-op on spec-current content. The third argument is the pre-sticky
+      // generation's room-state membership — state_events mode, not wired yet.
+      await manager.setCurrentMembership(roomId, sticky, []);
     });
   }
 
@@ -293,9 +299,10 @@ export class MatrixHost {
     return undefined;
   }
 
-  /** Route a decrypted `m.rtc.encryption_key` into the manager. */
+  /** Route a decrypted media-key to-device message into the manager. */
   async onToDeviceMessage({ message, encryptionInfo }) {
-    if (!KEY_MESSAGE_TYPES.includes(message.type)) return;
+    const legacy = message.type === LEGACY_KEY_MESSAGE_TYPE;
+    if (!legacy && !KEY_MESSAGE_TYPES.includes(message.type)) return;
     const content = message.content ?? {};
 
     // MSC4153: the key is only accepted from a cross-signed device.
@@ -307,19 +314,32 @@ export class MatrixHost {
       senderIsCrossSigned = status?.signedByOwner ?? false;
     }
 
+    // The legacy type takes its content raw — the generations disagree about
+    // where the key, index and owning membership live, and the wasm side
+    // binds it per the mode the room was joined in.
+    const receive = legacy
+      ? () =>
+          this.manager.receiveLegacyEncryptionKey({
+            sender: encryptionInfo?.sender ?? message.sender,
+            content,
+            was_encrypted: encryptionInfo !== null,
+            sender_device_id: encryptionInfo?.senderDevice,
+            sender_is_cross_signed: senderIsCrossSigned,
+          })
+      : () =>
+          this.manager.receiveEncryptionKey({
+            room_id: content.room_id,
+            member_id: content.member_id,
+            key_b64: content.media_key?.key,
+            key_index: content.media_key?.index,
+            was_encrypted: encryptionInfo !== null,
+            sender_user_id: encryptionInfo?.sender,
+            sender_device_id: encryptionInfo?.senderDevice,
+            sender_is_cross_signed: senderIsCrossSigned,
+          });
+
     this.managerOps
-      .enqueue(() =>
-        this.manager.receiveEncryptionKey({
-          room_id: content.room_id,
-          member_id: content.member_id,
-          key_b64: content.media_key?.key,
-          key_index: content.media_key?.index,
-          was_encrypted: encryptionInfo !== null,
-          sender_user_id: encryptionInfo?.sender,
-          sender_device_id: encryptionInfo?.senderDevice,
-          sender_is_cross_signed: senderIsCrossSigned,
-        }),
-      )
+      .enqueue(receive)
       .catch((error) => this.log(`encryption key rejected: ${error}`));
   }
 

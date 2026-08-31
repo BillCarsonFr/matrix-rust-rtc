@@ -116,6 +116,14 @@ export class WebPeerApp {
       },
     });
     await this.waitForRoom(response.room_id);
+    // We created the room, so opening the slot is ours to do: our own sync
+    // feed reports the room's complete slot state, and "no slots" resolves the
+    // session closed. Encrypted room ⇒ MSC4143 requires `m.per_member`.
+    await this.managerOps.enqueue(() =>
+      this.manager.openSlot(response.room_id, DEFAULT_SLOT_ID, 'm.call', {
+        type: 'm.per_member',
+      }),
+    );
     this.emit({ event: 'room_created', room_id: response.room_id, room_name: name });
     return response.room_id;
   }

@@ -38,6 +38,12 @@ log.workspace = true
 # it, which is what keeps `cargo test -p matrix-rtc-bridge` a seconds-long build.
 tokio = { workspace = true, optional = true }
 
+# `std::time::SystemTime::now()` PANICS on wasm32-unknown-unknown; web-time is
+# the drop-in that reads `Date.now()` instead. The compat dialects stamp
+# `created_ts` on outbound legacy content, so this is on the wasm send path.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "1"
+
 # The experimental branch carries MSC4354 sticky-event support that the crates.io
 # release lacks; the whole MatrixRTC signalling path (own membership, keep-alive,
 # peer discovery) rides on it. See `sdk`. Keeps matrix-sdk's default features

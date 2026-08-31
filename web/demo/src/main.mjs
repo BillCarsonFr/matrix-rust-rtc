@@ -60,7 +60,11 @@ if (params.get('test') === '1') {
         });
         field('room').value = roomId;
       }
-      await app.join({ roomId, publish: { devices: true } });
+      await app.join({
+        roomId,
+        compat: field('mode').value,
+        publish: { devices: true },
+      });
       field('leaveBtn').disabled = false;
     } catch (error) {
       log(`join failed: ${error}`);

@@ -52,7 +52,12 @@
 //!   member to. That claim is never preferred over an authenticated device; see
 //!   `sdk::snapshot`.
 
+// `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
+// is the same API over `Date.now()`.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
