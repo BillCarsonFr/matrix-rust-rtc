@@ -4,6 +4,8 @@ Browser-first JavaScript bindings for `matrix-rtc-wasm`.
 
 This package is a thin packaging layer around the Rust wasm crate in `crates/matrix-rtc-wasm`. It uses `wasm-pack` to generate runtime bindings into `web/pkg/`, which stays uncommitted.
 
+For what the binding *is* and how to integrate it — the Matrix host contract, sync feeding, keys, Element Call compatibility, and a get-started sample — see `crates/matrix-rtc-wasm/README.md`. The complete working reference is `web/demo/`.
+
 ## Package shape
 
 - `pkg/browser/`: browser-first wasm-pack output built with `--target web`
