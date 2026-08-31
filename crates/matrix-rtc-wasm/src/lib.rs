@@ -221,6 +221,11 @@ impl WasmRtcSessionManager {
     ///   - `keep_alive_timeout_ms`: Optional keep-alive timeout in milliseconds (default: 30000)
     ///   - `sticky_duration_ms`: Optional sticky-map lifetime for our membership in
     ///     milliseconds (default: 3600000); the SDK re-sends the membership at half this
+    ///   - `degraded_lifetime_ms`: Optional membership lifetime to fall back to on a
+    ///     homeserver that refuses MSC4140 delayed events (default: 300000, and not to
+    ///     be set below that — see MSC4354 on clock skew). Note that nothing refreshes
+    ///     it here: this binding exposes no heartbeat, so a degraded join lapses when
+    ///     this elapses.
     ///
     /// Resolves to the `member.id` this join used. The SDK generates it: MSC4143
     /// requires a fresh one per join, and reusing one keeps the media-plane
@@ -337,6 +342,8 @@ pub struct WasmJoinSessionParams {
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
     pub sticky_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub degraded_lifetime_ms: Option<u64>,
     #[serde(default)]
     pub encryption_config: Option<WasmEncryptionConfig>,
     /// Ask for an MSC4075 notification to be sent with this join, so other
@@ -469,6 +476,7 @@ impl WasmJoinSessionParams {
             },
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
+            degraded_lifetime_ms: self.degraded_lifetime_ms,
             encryption_config,
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
         })

@@ -36,7 +36,7 @@ use crate::notification::{
     NOTIFICATION_EVENT_TYPE, NotifyConfig, build_notification_content,
     notification_sticky_duration_ms,
 };
-use crate::own_membership::{OwnMembershipMachine, now_ms, transport_to_json};
+use crate::own_membership::{MembershipTimings, OwnMembershipMachine, now_ms, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -406,8 +406,11 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             params.slot_id.clone(),
             membership_id.clone(),
             params.application.clone(),
-            params.keep_alive_timeout_ms(),
-            params.sticky_duration_ms(),
+            MembershipTimings {
+                keep_alive_timeout_ms: params.keep_alive_timeout_ms(),
+                sticky_duration_ms: params.sticky_duration_ms(),
+                degraded_lifetime_ms: params.degraded_lifetime_ms(),
+            },
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
@@ -743,6 +746,17 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         self.own_membership_machine
             .as_ref()
             .map(|machine| machine.sticky_key())
+    }
+
+    /// Whether a dead man's switch is protecting our membership.
+    ///
+    /// `false` once the homeserver has refused to arm an MSC4140 delayed leave —
+    /// the call works, but a client that dies is cleaned up by the membership
+    /// lifetime running out rather than promptly. `None` while not joined.
+    pub fn delayed_leave_supported(&self) -> Option<bool> {
+        self.own_membership_machine
+            .as_ref()
+            .map(OwnMembershipMachine::delayed_leave_supported)
     }
 
     /// Subscribes to full membership snapshots for this session as a watch receiver.
@@ -1144,6 +1158,10 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                 .own_membership_machine
                 .as_ref()
                 .map(|machine| machine.sticky_key()),
+            "delayed_leave_supported": self
+                .own_membership_machine
+                .as_ref()
+                .map(OwnMembershipMachine::delayed_leave_supported),
             "has_encryption_manager": self.encryption_manager.is_some(),
         })
     }

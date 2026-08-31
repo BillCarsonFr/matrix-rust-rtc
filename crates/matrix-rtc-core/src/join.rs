@@ -52,6 +52,22 @@ pub const DEFAULT_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 /// clamped here, where the refresh interval is derived from the same number.
 pub const MAX_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 
+/// The membership lifetime to fall back to on a homeserver that refuses MSC4140
+/// delayed events, in milliseconds (5 minutes).
+///
+/// Without a delayed leave there is no dead man's switch, so the only thing that
+/// clears a crashed client's membership is the lifetime running out — an hour of
+/// ghost with [`DEFAULT_STICKY_DURATION_MS`], four hours in the pre-sticky
+/// Element Call dialect. This shortens that to five minutes, at the cost of a
+/// membership event every 2½ minutes instead of every 30.
+///
+/// Five and not less: MSC4354 says a sticky duration "SHOULD NOT be set to below
+/// 5 minutes", because a server whose `origin_server_ts` runs behind expires
+/// sticky events early and a short duration has no room to absorb that. So this
+/// is the floor, not a compromise — the ghost window cannot be tightened further
+/// in the sticky dialect however often we refresh.
+pub const DEFAULT_DEGRADED_LIFETIME_MS: u64 = 5 * 60 * 1000;
+
 /// Generates a fresh `member.id` for a join.
 ///
 /// MSC4143 requires the id to be unique per join and suggests it be
@@ -139,6 +155,14 @@ pub struct JoinSessionParams {
     /// presence.
     pub sticky_duration_ms: Option<u64>,
 
+    /// The membership lifetime to use instead of `sticky_duration_ms` once the
+    /// homeserver has refused to arm a delayed leave, in milliseconds.
+    ///
+    /// Defaults to `DEFAULT_DEGRADED_LIFETIME_MS`. Raising it trades a slower
+    /// cleanup of a crashed client for less signalling; it only ever applies on
+    /// a homeserver without MSC4140.
+    pub degraded_lifetime_ms: Option<u64>,
+
     /// Configuration for encryption key management.
     ///
     /// If not provided, defaults to `EncryptionConfig::default()`.
@@ -176,6 +200,7 @@ impl JoinSessionParams {
             transport: TransportIntent::Publish(transport),
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
+            degraded_lifetime_ms: None,
             encryption_config: None,
             notify: None,
         }
@@ -200,6 +225,7 @@ impl JoinSessionParams {
             transport,
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
+            degraded_lifetime_ms: None,
             encryption_config: None,
             notify: None,
         }
@@ -239,6 +265,19 @@ impl JoinSessionParams {
             return MAX_STICKY_DURATION_MS;
         }
         requested
+    }
+
+    /// Gets the membership lifetime to use once delayed events are known to be
+    /// unavailable.
+    ///
+    /// Returns the configured duration or the default. Clamped to
+    /// [`MAX_STICKY_DURATION_MS`] for the same reason
+    /// [`Self::sticky_duration_ms`] is, and it is only ever *shorter* than that
+    /// in practice.
+    pub fn degraded_lifetime_ms(&self) -> u64 {
+        self.degraded_lifetime_ms
+            .unwrap_or(DEFAULT_DEGRADED_LIFETIME_MS)
+            .min(MAX_STICKY_DURATION_MS)
     }
 
     /// Gets the encryption configuration to use.

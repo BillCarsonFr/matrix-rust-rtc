@@ -40,6 +40,7 @@ use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, delayed_state_event, update_delayed_event,
 };
 use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
+use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::ruma::events::{
     AnyMessageLikeEventContent, AnyStateEventContent, AnyToDeviceEventContent,
     MessageLikeEventType, StateEventType,
@@ -93,6 +94,30 @@ use crate::compat::{
 
 fn command_error(error: impl std::fmt::Display) -> CommandError {
     CommandError::from_message(error.to_string())
+}
+
+/// [`command_error`] for the three MSC4140 endpoints, which get one distinction
+/// the others do not need: "this homeserver will never do this".
+///
+/// Worth telling apart because the caller's response differs in kind. An
+/// ordinary failure is retried on the next heartbeat; a refusal makes
+/// [`matrix_rtc_core::OwnMembershipMachine`] stop asking and fall back to
+/// keeping its membership alive by lifetime alone, for the rest of the session.
+///
+/// Two answers mean it. `M_UNRECOGNIZED` is a homeserver built without the
+/// unstable endpoint. `M_FORBIDDEN` is one that has it and has switched it off —
+/// matrix.org's "Sending delayed events has been disallowed". Reading
+/// `M_FORBIDDEN` this way is safe even for the *other* thing it can mean (we are
+/// not allowed to send in this room at all): the membership send that follows
+/// would fail for the same reason and surface it properly, so the worst case is
+/// a shorter membership lifetime on a join that fails anyway.
+fn delayed_command_error(error: matrix_sdk::HttpError) -> CommandError {
+    match error.client_api_error_kind() {
+        Some(ErrorKind::Unrecognized | ErrorKind::Forbidden) => {
+            CommandError::DelayedEventsNotSupported(error.to_string())
+        }
+        _ => command_error(error),
+    }
 }
 
 /// The sole conversion from a core event-type string to the wire type.
@@ -192,7 +217,10 @@ impl RtcCommandSender for SdkCommandSender {
     ) -> Result<String, CommandError> {
         let room = self.room(&room_id)?;
         let content = self.compat.rewrite_notification(&event_type, content);
-        match self.compat.route_member_event(event_type, content) {
+        match self
+            .compat
+            .route_member_event(event_type, content, Some(duration_ms))
+        {
             MemberEventRoute::Sticky {
                 event_type,
                 content,
@@ -263,7 +291,9 @@ impl RtcCommandSender for SdkCommandSender {
         // The delayed leave is a member event like any other, and a peer that
         // cannot read it is a peer we stay visible to forever — so it goes
         // through the same routing as the join it is paired with.
-        let delay_id = match self.compat.route_member_event(event_type, content) {
+        // No lifetime: the delayed leave's legacy content is `{}`, which has
+        // nowhere to carry a deadline and needs none.
+        let delay_id = match self.compat.route_member_event(event_type, content, None) {
             MemberEventRoute::Sticky {
                 event_type,
                 content,
@@ -280,7 +310,7 @@ impl RtcCommandSender for SdkCommandSender {
                     .send(request)
                     .with_request_config(rtc_request_config())
                     .await
-                    .map_err(command_error)?
+                    .map_err(delayed_command_error)?
                     .delay_id
             }
             // Worth knowing: this arm gives the *legacy* path a dead man's switch
@@ -310,7 +340,7 @@ impl RtcCommandSender for SdkCommandSender {
                     .send(request)
                     .with_request_config(rtc_request_config())
                     .await
-                    .map_err(command_error)?
+                    .map_err(delayed_command_error)?
                     .delay_id
             }
         };
@@ -334,7 +364,7 @@ impl RtcCommandSender for SdkCommandSender {
             .send(request)
             .with_request_config(rtc_request_config())
             .await
-            .map_err(command_error)?;
+            .map_err(delayed_command_error)?;
         Ok(())
     }
 
@@ -349,7 +379,7 @@ impl RtcCommandSender for SdkCommandSender {
             .send(request)
             .with_request_config(rtc_request_config())
             .await
-            .map_err(command_error)?;
+            .map_err(delayed_command_error)?;
         Ok(())
     }
 

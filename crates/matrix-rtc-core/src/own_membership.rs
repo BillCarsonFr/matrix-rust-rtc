@@ -47,8 +47,25 @@
 //! perfectly healthy heartbeat; tending only the second leaves a ghost
 //! membership behind when the client dies. A host that never calls `heartbeat`
 //! gets both failures.
+//!
+//! # When the homeserver has no delayed events
+//!
+//! MSC4140 is optional and plenty of homeservers refuse it — matrix.org answers
+//! `403 M_FORBIDDEN "Sending delayed events has been disallowed"`. Only the first
+//! of the two clocks is lost there, so the call is perfectly joinable: the
+//! membership still expires on its own, just on the slower schedule. The machine
+//! therefore degrades rather than failing the join, and publishes on
+//! [`crate::join::DEFAULT_DEGRADED_LIFETIME_MS`] so a crashed client is forgotten
+//! in minutes rather than in an hour. See [`DelayedLeaveSupport`].
+//!
+//! That choice is made **before the first membership goes out** and never
+//! revisited, because a sticky entry cannot be shortened afterwards: MSC4354
+//! keeps whichever event expires last, so a refresh carrying a shorter duration
+//! loses to the entry already in the map. It is only expressible at all because
+//! the delayed leave is armed one step earlier than the membership.
 
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,6 +77,15 @@ use crate::transport::{MemberTransports, RtcTransport};
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
+
+/// How long to wait before asking a homeserver that just refused a delayed event
+/// whether it has changed its mind (5 minutes).
+///
+/// Only used when the refusal was *unclassified* — a plain send failure that may
+/// well have been a network blip. A homeserver that said so in as many words
+/// ([`CommandError::is_delayed_events_unsupported`]) is never probed again for
+/// the life of the session.
+const DELAYED_LEAVE_PROBE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
 /// Wall-clock milliseconds since the Unix epoch.
 ///
@@ -125,6 +151,64 @@ pub struct KeepAliveInfo {
     pub last_restart_ms: u64,
 }
 
+/// What this homeserver has told us about MSC4140 delayed events.
+///
+/// Learned by trying, never by probing a capability endpoint: there is no
+/// reliable one, and the arm we need to make anyway is the most honest test
+/// there is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelayedLeaveSupport {
+    /// Nothing tried yet. Treated as supported, because assuming the worst would
+    /// shorten the membership lifetime of every join before it had a reason to.
+    Unknown,
+    /// A delayed leave was armed successfully at least once.
+    Supported,
+    /// The last arm failed. `permanent` distinguishes a homeserver that said so
+    /// in as many words from one that merely failed; `last_probe_ms` paces the
+    /// retries in the latter case.
+    Unsupported {
+        /// Unix ms of the last arm attempt.
+        last_probe_ms: u64,
+        /// Whether the failure was classified as "this will never work".
+        permanent: bool,
+    },
+}
+
+impl DelayedLeaveSupport {
+    /// Whether a delayed leave is believed to be available, which is what the
+    /// membership lifetime turns on.
+    fn is_available(&self) -> bool {
+        !matches!(self, Self::Unsupported { .. })
+    }
+}
+
+/// The three clocks a membership runs on.
+///
+/// One struct rather than three positional `u64`s because they are all
+/// milliseconds and all plausible at each other's positions — swapping the
+/// sticky lifetime and the delayed-leave timeout compiles, and produces a call
+/// that quietly drops out every thirty seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembershipTimings {
+    /// How long the delayed leave waits before firing, restarted on every beat.
+    pub keep_alive_timeout_ms: u64,
+    /// How long the homeserver keeps our sticky-map entry.
+    pub sticky_duration_ms: u64,
+    /// The shorter lifetime to use instead once delayed events turn out to be
+    /// unavailable.
+    pub degraded_lifetime_ms: u64,
+}
+
+impl Default for MembershipTimings {
+    fn default() -> Self {
+        Self {
+            keep_alive_timeout_ms: DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
+            sticky_duration_ms: crate::join::DEFAULT_STICKY_DURATION_MS,
+            degraded_lifetime_ms: crate::join::DEFAULT_DEGRADED_LIFETIME_MS,
+        }
+    }
+}
+
 /// The OwnMembershipMachine manages the lifecycle of our own membership in an RTC session.
 ///
 /// It implements the dead man's switch strategy:
@@ -159,6 +243,24 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     keep_alive_timeout_ms: u64,
     /// How long the homeserver keeps our sticky-map entry.
     sticky_duration_ms: u64,
+    /// The shorter lifetime to use instead once delayed events turn out to be
+    /// unavailable.
+    degraded_lifetime_ms: u64,
+    /// What we know about this homeserver's delayed-event support.
+    delayed_support: Arc<Mutex<DelayedLeaveSupport>>,
+    /// The lifetime every membership event of this join is published with,
+    /// chosen once by [`Self::join`] and never moved.
+    ///
+    /// Fixed rather than tracking `delayed_support`, because in the sticky
+    /// dialect a lifetime cannot be shortened after the fact. MSC4354 resolves
+    /// two events with one `sticky_key` by *last to expire*, so a refresh
+    /// carrying a shorter duration is simply ignored in favour of the longer
+    /// entry already in the map — "there is no mechanism for sticky events to
+    /// expire earlier than their timeout value" — and the MSC asks clients to
+    /// reuse the same duration for a key for exactly that reason. So the choice
+    /// has to be made before the first publish, which is possible because the
+    /// delayed leave is armed one step earlier.
+    published_lifetime_ms: AtomicU64,
     /// The join content and when we last sent it, so the heartbeat can re-send
     /// it before the sticky entry expires. `None` until we join.
     last_sticky: Arc<Mutex<Option<SentSticky>>>,
@@ -183,16 +285,20 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// * `slot_id` - The slot ID for the session
     /// * `sticky_key` - Our `member.id`, which doubles as the sticky key
     /// * `application_type` - Application type (for MSC4143 application.type, e.g., "m.call")
-    /// * `keep_alive_timeout_ms` - The keep-alive timeout in milliseconds (default: 30000)
+    /// * `timings` - The three lifetimes the membership runs on
     pub fn new(
         command_sender: Arc<T>,
         room_id: String,
         slot_id: String,
         sticky_key: String,
         application_type: String,
-        keep_alive_timeout_ms: u64,
-        sticky_duration_ms: u64,
+        timings: MembershipTimings,
     ) -> Self {
+        let MembershipTimings {
+            keep_alive_timeout_ms,
+            sticky_duration_ms,
+            degraded_lifetime_ms,
+        } = timings;
         Self {
             command_sender,
             room_id,
@@ -203,6 +309,9 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             keep_alive_info: Arc::new(Mutex::new(None)),
             keep_alive_timeout_ms,
             sticky_duration_ms,
+            degraded_lifetime_ms,
+            delayed_support: Arc::new(Mutex::new(DelayedLeaveSupport::Unknown)),
+            published_lifetime_ms: AtomicU64::new(sticky_duration_ms),
             last_sticky: Arc::new(Mutex::new(None)),
         }
     }
@@ -221,8 +330,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             slot_id,
             sticky_key,
             application_type,
-            DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
-            crate::join::DEFAULT_STICKY_DURATION_MS,
+            MembershipTimings::default(),
         )
     }
 
@@ -244,6 +352,29 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// Gets the slot ID.
     pub fn slot_id(&self) -> &str {
         &self.slot_id
+    }
+
+    /// What this homeserver has told us about MSC4140 delayed events.
+    pub fn delayed_leave_support(&self) -> DelayedLeaveSupport {
+        *self.delayed_support.lock().unwrap()
+    }
+
+    /// Whether a dead man's switch is protecting this membership.
+    ///
+    /// `false` means the homeserver refused to arm one and the membership is
+    /// being kept alive by its lifetime alone — still a working call, with a
+    /// slower cleanup if this client dies.
+    pub fn delayed_leave_supported(&self) -> bool {
+        self.delayed_leave_support().is_available()
+    }
+
+    /// How long every membership event of this join lives.
+    ///
+    /// The sticky duration, or the degraded one if the homeserver had already
+    /// refused a delayed leave by the time we published. Settled once, at join;
+    /// see [`Self::published_lifetime_ms`] for why it cannot move afterwards.
+    pub fn membership_lifetime_ms(&self) -> u64 {
+        self.published_lifetime_ms.load(Ordering::Relaxed)
     }
 
     /// Gets the delayed event ID, if one is active.
@@ -269,12 +400,18 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     ///
     /// * `transports` - The `transports` object to publish for this member
     ///
+    /// A homeserver that refuses step 1 does not fail the join. MSC4140 is
+    /// optional, and losing it costs only the *speed* of the cleanup — the
+    /// membership still expires on its own. Step 1 therefore degrades (see
+    /// [`DelayedLeaveSupport`]) and the membership goes out with the shorter
+    /// [`Self::membership_lifetime_ms`] instead. Step 2 failing is different:
+    /// that means we are not in the call, and it still fails the join.
+    ///
     /// # Returns
     ///
-    /// The event id of the membership event, if both the delayed leave and the
-    /// join were scheduled/sent successfully; an error if either operation
-    /// fails. The caller needs the id to relate an MSC4075 notification to the
-    /// membership that justifies it.
+    /// The event id of the membership event if the join was sent successfully;
+    /// an error if it was not. The caller needs the id to relate an MSC4075
+    /// notification to the membership that justifies it.
     pub async fn join(&self, transports: MemberTransports) -> Result<String, CommandError> {
         let room_id = self.room_id.clone();
         let slot_id = self.slot_id.clone();
@@ -300,7 +437,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
         // Schedule the delayed leave (Step 1 of dead man's switch)
         // This returns the event_id on success
-        let delayed_event_id = self
+        match self
             .command_sender
             .send_delayed_event(
                 room_id.clone(),
@@ -309,26 +446,39 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 keep_alive_timeout_ms,
             )
             .await
-            .inspect_err(|error| {
-                log::warn!(
-                    "[{room_id}] join aborted at step 1: the delayed leave could not be \
-                     scheduled ({error}). The host's homeserver may not support MSC4140 \
-                     delayed events.",
-                )
-            })?;
-
-        // Store the delayed event ID for later cancellation
         {
-            let mut info_guard = self.keep_alive_info.lock().unwrap();
-            *info_guard = Some(KeepAliveInfo {
-                delayed_event_id,
-                timeout_ms: keep_alive_timeout_ms,
-                last_restart_ms: now_ms(),
-            });
+            // Store the delayed event ID for later cancellation
+            Ok(delayed_event_id) => {
+                *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+                let mut info_guard = self.keep_alive_info.lock().unwrap();
+                *info_guard = Some(KeepAliveInfo {
+                    delayed_event_id,
+                    timeout_ms: keep_alive_timeout_ms,
+                    last_restart_ms: now_ms(),
+                });
+            }
+            // Not fatal: the dead man's switch is a cleanup optimisation, not a
+            // precondition for being in the call. Join without it, and let the
+            // membership's own lifetime do the cleanup instead — shortened, so a
+            // client that dies is forgotten in minutes rather than in an hour.
+            //
+            // Here, before the first publish, is the only place that shortening
+            // can happen; see `published_lifetime_ms`.
+            Err(error) => {
+                self.mark_delayed_leave_unsupported(&error);
+                self.published_lifetime_ms
+                    .store(self.degraded_lifetime_ms, Ordering::Relaxed);
+                log::warn!(
+                    "[{room_id}] no dead man's switch: the delayed leave could not be scheduled \
+                     ({error}). The homeserver may not support MSC4140; joining anyway, with the \
+                     membership kept alive by its lifetime alone ({}ms instead of {}ms).",
+                    self.degraded_lifetime_ms,
+                    self.sticky_duration_ms,
+                );
+            }
         }
 
         // Step 2: Send join membership event
-        // **Only sent after delayed leave is confirmed scheduled.**
         let join_content =
             self.build_join_content(&slot_id, &sticky_key, &application_type, transports);
 
@@ -344,13 +494,18 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 room_id.clone(),
                 "m.rtc.member".to_string(),
                 join_content.clone(),
-                self.sticky_duration_ms,
+                self.membership_lifetime_ms(),
             )
             .await
             .inspect_err(|error| {
+                // Back to NotJoined, not left at `Joining`: we never made it
+                // into the call, and a state that says otherwise would have
+                // `heartbeat` arming delayed leaves for a membership that does
+                // not exist.
+                *self.state.lock().unwrap() = OwnMembershipState::NotJoined;
                 log::warn!(
                     "[{room_id}] join aborted at step 2: the join membership event was not \
-                     sent ({error}). The delayed leave stays armed and will clean up.",
+                     sent ({error}). The delayed leave, if one is armed, will clean up.",
                 )
             })?;
 
@@ -377,6 +532,19 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         );
 
         Ok(event_id)
+    }
+
+    /// Records that an attempt to arm a delayed leave failed.
+    ///
+    /// A homeserver that named the reason ([`CommandError::DelayedEventsNotSupported`])
+    /// is taken at its word and never asked again; anything else may have been a
+    /// blip, so the heartbeat re-probes on
+    /// [`DELAYED_LEAVE_PROBE_INTERVAL_MS`].
+    fn mark_delayed_leave_unsupported(&self, error: &CommandError) {
+        *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Unsupported {
+            last_probe_ms: now_ms(),
+            permanent: error.is_delayed_events_unsupported(),
+        };
     }
 
     /// Builds MSC4143-compliant content for a delayed leave event (dead man's switch).
@@ -449,7 +617,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 room_id.clone(),
                 "m.rtc.member".to_string(),
                 leave_content,
-                self.sticky_duration_ms,
+                self.membership_lifetime_ms(),
             )
             .await?;
 
@@ -523,12 +691,26 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         self.refresh_sticky_if_due().await;
 
         let Some(event_id) = self.delayed_event_id() else {
-            // Nothing armed (not joined, or a previous re-arm failed). Arming
-            // one is the safe move: without it a crash leaves a ghost behind.
-            if self.state() == OwnMembershipState::Joined
-                && let Err(error) = self.schedule_delayed_leave().await
-            {
-                log::warn!("[{room_id}] Failed to arm a delayed leave: {error:?}");
+            // Nothing armed (not joined, or a previous arm failed). Arming one
+            // is the safe move: without it a crash leaves a ghost behind.
+            if self.state() == OwnMembershipState::Joined && self.delayed_leave_probe_due() {
+                let was_degraded = !self.delayed_leave_supported();
+                match self.schedule_delayed_leave().await {
+                    // The membership lifetime stays where the join left it. It
+                    // is the safe direction to be wrong in — a shorter lifetime
+                    // than we now need costs signalling, where a longer one
+                    // would cost a ghost — and MSC4354 would ignore a change of
+                    // duration mid-key anyway.
+                    Ok(()) if was_degraded => log::info!(
+                        "[{room_id}] the homeserver accepts delayed events after all; the dead \
+                         man's switch is armed again",
+                    ),
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.mark_delayed_leave_unsupported(&error);
+                        log::warn!("[{room_id}] Failed to arm a delayed leave: {error:?}");
+                    }
+                }
             }
             return;
         };
@@ -556,6 +738,26 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 );
                 self.rearm_if_certainly_fired().await;
             }
+        }
+    }
+
+    /// Whether it is worth asking the homeserver for a delayed leave again.
+    ///
+    /// Always, unless it has already refused one: a homeserver that refused in
+    /// as many words is never asked again, and one that merely failed is asked
+    /// at [`DELAYED_LEAVE_PROBE_INTERVAL_MS`] rather than on every beat, so a
+    /// permanently-off endpoint is not hammered every ten seconds for the
+    /// length of a call.
+    fn delayed_leave_probe_due(&self) -> bool {
+        match self.delayed_leave_support() {
+            DelayedLeaveSupport::Unknown | DelayedLeaveSupport::Supported => true,
+            DelayedLeaveSupport::Unsupported {
+                permanent: true, ..
+            } => false,
+            DelayedLeaveSupport::Unsupported {
+                last_probe_ms,
+                permanent: false,
+            } => now_ms().saturating_sub(last_probe_ms) >= DELAYED_LEAVE_PROBE_INTERVAL_MS,
         }
     }
 
@@ -592,6 +794,11 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             *guard = None;
         }
         if let Err(error) = self.schedule_delayed_leave().await {
+            // Recorded so the probing slows down and the host can see that this
+            // call is unprotected. The membership lifetime does *not* follow —
+            // it was fixed at join and cannot be shortened now; see
+            // `published_lifetime_ms`.
+            self.mark_delayed_leave_unsupported(&error);
             log::warn!("[{room_id}] Failed to arm a replacement delayed leave: {error:?}");
         }
     }
@@ -611,15 +818,18 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             return;
         };
 
+        // The lifetime the join settled on, which is both when the refresh falls
+        // due and what it re-publishes — a refresh that stated a different
+        // duration is what MSC4354 asks clients not to do.
+        let lifetime_ms = self.membership_lifetime_ms();
         let elapsed = now_ms().saturating_sub(sticky.sent_at_ms);
-        if elapsed < self.sticky_duration_ms / 2 {
+        if elapsed < lifetime_ms / 2 {
             return;
         }
 
         let room_id = self.room_id.clone();
         log::debug!(
-            "[{room_id}] Refreshing sticky membership ({elapsed}ms of {}ms elapsed)",
-            self.sticky_duration_ms,
+            "[{room_id}] Refreshing sticky membership ({elapsed}ms of {lifetime_ms}ms elapsed)"
         );
 
         match self
@@ -628,7 +838,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 room_id.clone(),
                 "m.rtc.member".to_string(),
                 sticky.content.clone(),
-                self.sticky_duration_ms,
+                lifetime_ms,
             )
             .await
         {
@@ -692,6 +902,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
         // Store the event ID
         {
+            *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
             let mut info_guard = self.keep_alive_info.lock().unwrap();
             *info_guard = Some(KeepAliveInfo {
                 delayed_event_id,
@@ -1011,8 +1222,10 @@ mod tests {
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
-            0,
-            crate::join::DEFAULT_STICKY_DURATION_MS,
+            MembershipTimings {
+                keep_alive_timeout_ms: 0,
+                ..MembershipTimings::default()
+            },
         );
         machine
             .join(MemberTransports::default())
@@ -1056,8 +1269,10 @@ mod tests {
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
-            DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
-            sticky_duration_ms,
+            MembershipTimings {
+                sticky_duration_ms,
+                ..MembershipTimings::default()
+            },
         )
     }
 
@@ -1138,6 +1353,342 @@ mod tests {
         ) -> Result<String, CommandError> {
             Ok("$state".to_string())
         }
+    }
+
+    /// A homeserver with MSC4140 switched off: every attempt to arm a delayed
+    /// leave is refused, everything else works.
+    ///
+    /// `permanent` is the difference between the two refusals a real homeserver
+    /// gives — one that named the reason, and one that merely failed.
+    #[derive(Default)]
+    struct NoDelayedEventsSender {
+        /// `(content, duration_ms)` for every membership put in the sticky map.
+        sticky_events: std::sync::Mutex<Vec<(Value, u64)>>,
+        /// Attempts to arm a delayed leave, all of which failed.
+        refused: std::sync::Mutex<u32>,
+        restarts: std::sync::Mutex<u32>,
+        cancels: std::sync::Mutex<u32>,
+        permanent: bool,
+        /// Flipped in a test to model a homeserver that starts accepting them.
+        accepts_now: std::sync::atomic::AtomicBool,
+    }
+
+    impl NoDelayedEventsSender {
+        fn permanent() -> Self {
+            Self {
+                permanent: true,
+                ..Self::default()
+            }
+        }
+
+        /// The `duration_ms` the membership was last published with — the whole
+        /// point of degrading, so every test here asserts on it.
+        fn last_lifetime_ms(&self) -> u64 {
+            self.sticky_events.lock().unwrap().last().expect("sent").1
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl RtcCommandSender for NoDelayedEventsSender {
+        async fn send_sticky_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            content: Value,
+            duration_ms: u64,
+        ) -> Result<String, CommandError> {
+            self.sticky_events
+                .lock()
+                .unwrap()
+                .push((content, duration_ms));
+            Ok("$sticky".to_string())
+        }
+
+        async fn send_delayed_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            _content: Value,
+            _delay_ms: u64,
+        ) -> Result<String, CommandError> {
+            if self.accepts_now.load(Ordering::Relaxed) {
+                return Ok("delay-1".to_string());
+            }
+            *self.refused.lock().unwrap() += 1;
+            Err(if self.permanent {
+                CommandError::DelayedEventsNotSupported(
+                    "M_FORBIDDEN: Sending delayed events has been disallowed".to_string(),
+                )
+            } else {
+                CommandError::from_message("502 Bad Gateway")
+            })
+        }
+
+        async fn restart_delayed_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+        ) -> Result<(), CommandError> {
+            *self.restarts.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        async fn cancel_delayed_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+        ) -> Result<(), CommandError> {
+            *self.cancels.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        async fn send_to_device_message(
+            &self,
+            recipients: Vec<ToDeviceRecipient>,
+            _message_type: String,
+            _content: Value,
+        ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+            Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
+        }
+
+        async fn send_state_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            _state_key: String,
+            _content: Value,
+        ) -> Result<String, CommandError> {
+            Ok("$state".to_string())
+        }
+    }
+
+    /// A machine against a homeserver with no delayed events. The degraded
+    /// lifetime is zero so a single heartbeat makes the refresh due, the same
+    /// trick [`heartbeat_refreshes_the_sticky_membership_once_half_expired`]
+    /// uses — and zero is also unmistakably not `sticky_duration_ms`.
+    fn degraded_machine(
+        sender: Arc<NoDelayedEventsSender>,
+    ) -> OwnMembershipMachine<NoDelayedEventsSender> {
+        OwnMembershipMachine::new(
+            sender,
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            APPLICATION_TYPE.to_string(),
+            MembershipTimings {
+                degraded_lifetime_ms: 0,
+                ..MembershipTimings::default()
+            },
+        )
+    }
+
+    /// The regression this whole degradation path exists for: matrix.org refuses
+    /// delayed events, and until now that failed the join outright — no call at
+    /// all on a homeserver where the call would have worked fine.
+    #[tokio::test]
+    async fn a_homeserver_without_delayed_events_can_still_be_joined() {
+        let sender = Arc::new(NoDelayedEventsSender::permanent());
+        let machine = degraded_machine(sender.clone());
+
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("a refused delayed leave must not fail the join");
+
+        assert_eq!(machine.state(), OwnMembershipState::Joined);
+        assert!(machine.delayed_event_id().is_none(), "nothing armed");
+        assert!(!machine.delayed_leave_supported());
+        assert_eq!(
+            sender.sticky_events.lock().unwrap().len(),
+            1,
+            "the membership itself must still go out",
+        );
+    }
+
+    /// Losing the dead man's switch is survivable only because the membership
+    /// expires on its own — so it has to expire *soon*, not in an hour.
+    #[tokio::test]
+    async fn a_degraded_membership_is_refreshed_on_the_short_lifetime() {
+        let sender = Arc::new(NoDelayedEventsSender::permanent());
+        let machine = degraded_machine(sender.clone());
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine.heartbeat().await;
+
+        assert_eq!(
+            sender.sticky_events.lock().unwrap().len(),
+            2,
+            "the beat should have refreshed the membership",
+        );
+        assert_eq!(machine.membership_lifetime_ms(), 0);
+        assert_eq!(sender.last_lifetime_ms(), 0, "on the degraded lifetime");
+    }
+
+    /// The shortening has to reach the *first* membership, not just its
+    /// refreshes. MSC4354 keeps whichever event expires last, so an hour-long
+    /// join entry would out-live every short refresh that followed it and the
+    /// degradation would buy nothing at all.
+    #[tokio::test]
+    async fn the_first_membership_of_a_degraded_join_is_already_short() {
+        let sender = Arc::new(NoDelayedEventsSender::permanent());
+        let machine = degraded_machine(sender.clone());
+
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        assert_eq!(
+            sender.last_lifetime_ms(),
+            0,
+            "the join itself must already carry the degraded lifetime",
+        );
+    }
+
+    /// The other half of the same rule: every event for one `sticky_key` states
+    /// the same duration, which MSC4354 asks for and which a mid-call change of
+    /// lifetime would break.
+    #[tokio::test]
+    async fn every_membership_of_a_join_states_one_lifetime() {
+        let sender = Arc::new(NoDelayedEventsSender::permanent());
+        let machine = degraded_machine(sender.clone());
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine.heartbeat().await;
+        machine.heartbeat().await;
+        machine.leave(None).await.expect("leave should succeed");
+
+        let durations: Vec<u64> = sender
+            .sticky_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, duration)| *duration)
+            .collect();
+        assert!(durations.len() >= 3, "join, refreshes, and the leave");
+        assert!(
+            durations.iter().all(|duration| *duration == 0),
+            "the lifetime settled at join must not move: {durations:?}",
+        );
+    }
+
+    /// There is no delay id to restart, and asking the homeserver to restart
+    /// nothing is a request per beat that can only fail.
+    #[tokio::test]
+    async fn a_degraded_heartbeat_restarts_nothing() {
+        let sender = Arc::new(NoDelayedEventsSender::permanent());
+        let machine = degraded_machine(sender.clone());
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine.heartbeat().await;
+
+        assert_eq!(*sender.restarts.lock().unwrap(), 0);
+    }
+
+    /// A homeserver that said "never" is taken at its word: re-asking every ten
+    /// seconds for the length of a call is a 403 per beat and buys nothing.
+    #[tokio::test]
+    async fn a_stated_refusal_is_never_asked_again() {
+        let sender = Arc::new(NoDelayedEventsSender::permanent());
+        let machine = degraded_machine(sender.clone());
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine.heartbeat().await;
+        machine.heartbeat().await;
+
+        assert_eq!(
+            *sender.refused.lock().unwrap(),
+            1,
+            "only the arm at join; the beats must not re-ask",
+        );
+    }
+
+    /// A refusal that named no reason may have been a blip, so it is retried,
+    /// and a homeserver that starts accepting them gets its dead man's switch
+    /// back. The membership lifetime does not follow it back up: it was settled
+    /// at join and MSC4354 would ignore a change of duration mid-key anyway.
+    #[tokio::test]
+    async fn an_unexplained_refusal_is_retried_and_can_recover() {
+        let sender = Arc::new(NoDelayedEventsSender::default());
+        let machine = degraded_machine(sender.clone());
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+        assert!(!machine.delayed_leave_supported());
+
+        // Backdate the probe so the retry is due without waiting out the
+        // interval, then let the homeserver start accepting them.
+        *machine.delayed_support.lock().unwrap() = DelayedLeaveSupport::Unsupported {
+            last_probe_ms: 0,
+            permanent: false,
+        };
+        sender.accepts_now.store(true, Ordering::Relaxed);
+
+        machine.heartbeat().await;
+
+        assert!(machine.delayed_leave_supported());
+        assert!(machine.delayed_event_id().is_some(), "armed on the retry");
+        assert_eq!(
+            machine.membership_lifetime_ms(),
+            0,
+            "the lifetime the join settled on stands for the whole join",
+        );
+    }
+
+    /// Leaving a call we joined without a dead man's switch has nothing to
+    /// cancel, and must not invent a cancellation to fail on.
+    #[tokio::test]
+    async fn a_degraded_leave_cancels_nothing() {
+        let sender = Arc::new(NoDelayedEventsSender::permanent());
+        let machine = degraded_machine(sender.clone());
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect("join should succeed");
+
+        machine.leave(None).await.expect("leave should succeed");
+
+        assert_eq!(machine.state(), OwnMembershipState::Left);
+        assert_eq!(*sender.cancels.lock().unwrap(), 0);
+    }
+
+    /// A join that never published a membership is not a join. Leaving the
+    /// state at `Joining` would have the heartbeat arming delayed leaves for a
+    /// membership nobody can see.
+    #[tokio::test]
+    async fn a_failed_join_returns_to_not_joined() {
+        let sender = Arc::new(CancelFailsSender {
+            fail_sticky: true,
+            ..CancelFailsSender::default()
+        });
+        let machine = OwnMembershipMachine::with_default_timeout(
+            sender,
+            "!room:example.org".to_string(),
+            "m.call#ROOM".to_string(),
+            "alice-device-a".to_string(),
+            APPLICATION_TYPE.to_string(),
+        );
+
+        machine
+            .join(MemberTransports::default())
+            .await
+            .expect_err("the membership send fails");
+
+        assert_eq!(machine.state(), OwnMembershipState::NotJoined);
     }
 
     /// The sticky entry expires independently of the delayed leave, so a call

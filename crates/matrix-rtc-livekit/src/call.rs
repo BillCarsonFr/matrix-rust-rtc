@@ -138,6 +138,16 @@ pub struct CallOptions {
     /// above twice [`heartbeat_interval`](Self::heartbeat_interval), or the
     /// entry can lapse between beats.
     pub sticky_duration_ms: Option<u64>,
+    /// The membership lifetime to publish instead of
+    /// [`sticky_duration_ms`](Self::sticky_duration_ms) when the homeserver
+    /// refuses to arm a delayed leave. `None` keeps the core's default of five
+    /// minutes, which is also the floor MSC4354 states.
+    ///
+    /// Only ever reached on a homeserver without MSC4140, where the join
+    /// degrades rather than failing. Subject to the same rule as
+    /// `sticky_duration_ms`: keep it well above twice
+    /// [`heartbeat_interval`](Self::heartbeat_interval).
+    pub degraded_lifetime_ms: Option<u64>,
     /// HTTP client used for the token exchange with the authorisation
     /// service. Supply one to control TLS behaviour (e.g. self-signed dev
     /// certs); `None` builds a default client.
@@ -189,6 +199,7 @@ impl Default for CallOptions {
             encryption_config: None,
             heartbeat_interval: Duration::from_secs(15),
             sticky_duration_ms: None,
+            degraded_lifetime_ms: None,
             http: None,
             auto_subscribe: true,
             element_call_compat: ElementCallCompat::default(),
@@ -389,6 +400,7 @@ impl Call {
         params.membership_id = Some(membership_id.clone());
         params.encryption_config = options.encryption_config.clone();
         params.sticky_duration_ms = options.sticky_duration_ms;
+        params.degraded_lifetime_ms = options.degraded_lifetime_ms;
         params.notify = options.notify.clone();
         let memberships = {
             let mut mgr = manager.lock().await;
