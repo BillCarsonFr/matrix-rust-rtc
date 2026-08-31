@@ -103,7 +103,7 @@ export class MatrixRtcCall {
   async connect(config) {
     if (this.session) throw new Error('already connected');
     this.config = config;
-    this.keyProvider = new this.livekit.ExternalE2EEKeyProvider();
+    this.keyProvider = makePerParticipantKeyProvider(this.livekit);
 
     this.session = await this.managerOps.enqueue(() =>
       this.manager.connectMedia(
@@ -186,12 +186,16 @@ export class MatrixRtcCall {
    * translation onto the sink, and hand back the close handle.
    */
   async connectRoom(request, sink) {
-    const room = new this.livekit.Room({
-      ...this.roomOptions,
-      e2ee: this.roomOptions.e2ee
-        ? { keyProvider: this.keyProvider, ...this.roomOptions.e2ee }
-        : undefined,
-    });
+    const e2ee = this.roomOptions.e2ee
+      ? { keyProvider: this.keyProvider, ...this.roomOptions.e2ee }
+      : undefined;
+    const room = new this.livekit.Room({ ...this.roomOptions, e2ee });
+    if (e2ee) {
+      // Constructing the room with `e2ee` only arms *decryption*; without
+      // this, everything we publish goes out (and is signalled) in the clear —
+      // peers show it with a "not encrypted" warning while it decodes fine.
+      await room.setE2EEEnabled(true);
+    }
     this.registerSink(room, sink, request.connectionKey);
     this.onRoomCreated(room, request.connectionKey);
     await room.connect(request.sfuUrl, request.jwt);
@@ -278,6 +282,36 @@ export class MatrixRtcCall {
     }
     return undefined;
   }
+}
+
+/**
+ * A per-participant key provider over the injected livekit-client module.
+ *
+ * NOT `ExternalE2EEKeyProvider`: that one is "a single shared passphrase
+ * between all participants" — with it, the local sender encrypts with
+ * whichever key was set *last* (usually a peer's), and nobody decrypts us.
+ * MSC4195 keys are per participant identity, so this subclasses
+ * `BaseKeyProvider` with `sharedKey: false` and hands each raw key to the
+ * E2EE worker as HKDF material under its identity and index — the exact
+ * mirror of the native `KeyProvider::set_key`.
+ */
+function makePerParticipantKeyProvider(livekit) {
+  class PerParticipantKeyProvider extends livekit.BaseKeyProvider {
+    constructor() {
+      // No ratcheting: MSC4143 rotates by distributing whole new keys at new
+      // indices. failureTolerance -1 keeps the cryptor trying (a key may
+      // simply not have arrived yet).
+      super({ sharedKey: false, ratchetWindowSize: 0, failureTolerance: -1 });
+    }
+
+    /** The `FrameKeyRing` shape: raw bytes, participant identity, key index. */
+    async setKey(material, participantIdentity, keyIndex) {
+      const cryptoKey = await livekit.createKeyMaterialFromBuffer(material.buffer);
+      this.onSetEncryptionKey(cryptoKey, participantIdentity, keyIndex);
+      return true;
+    }
+  }
+  return new PerParticipantKeyProvider();
 }
 
 /**

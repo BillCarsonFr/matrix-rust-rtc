@@ -74,6 +74,16 @@ test(`Web client and Element Call share a call — ec-2025 sticky events`, async
     });
     await web.waitFor("joined", { timeout: 120_000 });
 
+    // Both publications signalled frame-encrypted — Element Call decodes
+    // cleartext frames too, flagging them only with a "not encrypted" badge
+    // no other assertion here would catch.
+    for (const kind of ["video", "audio"]) {
+      const published = await web.waitFor("published", {
+        predicate: (event) => event.kind === kind,
+      });
+      expect(published.encrypted, `the ${kind} publication must be encrypted`).toBe(true);
+    }
+
     await joinCall(page);
 
     // ---- Element Call sees the web client ----------------------------------

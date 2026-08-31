@@ -192,19 +192,35 @@ export class WebPeerApp {
   async publishMedia(focusUrl, { pattern, tone, devices } = {}) {
     const room = this.call.rooms.get(focusUrl);
     if (!room) throw new Error('own-focus room missing after connect');
+    // Every publication reports whether it went out frame-encrypted — the
+    // signalled truth peers act on, and exactly what silently regressing to
+    // cleartext would flip. The test driver asserts on it.
+    const report = (publication) =>
+      this.emit({
+        event: 'published',
+        kind: publication.kind,
+        encrypted: publication.isEncrypted,
+      });
     if (devices) {
       await room.localParticipant.enableCameraAndMicrophone();
+      for (const publication of room.localParticipant.trackPublications.values()) {
+        report(publication);
+      }
       return;
     }
     if (pattern) {
-      await room.localParticipant.publishTrack(patternVideoTrack(), {
-        source: livekit.Track.Source.Camera,
-      });
+      report(
+        await room.localParticipant.publishTrack(patternVideoTrack(), {
+          source: livekit.Track.Source.Camera,
+        }),
+      );
     }
     if (tone) {
-      await room.localParticipant.publishTrack(toneAudioTrack(), {
-        source: livekit.Track.Source.Microphone,
-      });
+      report(
+        await room.localParticipant.publishTrack(toneAudioTrack(), {
+          source: livekit.Track.Source.Microphone,
+        }),
+      );
     }
   }
 

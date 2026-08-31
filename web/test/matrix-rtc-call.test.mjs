@@ -83,17 +83,18 @@ function fakeLivekit() {
       this.handlers.get(event)?.(...args);
     }
   }
-  class ExternalE2EEKeyProvider {
-    constructor() {
-      this.keys = [];
+  class BaseKeyProvider {
+    constructor(options) {
+      this.options = options;
+      this.set = [];
     }
-    setKey(material, identity, index) {
-      this.keys.push({ identity, index, length: material.length });
-      return true;
+    onSetEncryptionKey(cryptoKey, identity, index) {
+      this.set.push({ cryptoKey, identity, index });
     }
   }
+  const createKeyMaterialFromBuffer = async (buffer) => ({ fakeKeyFor: buffer.byteLength });
   return {
-    module: { Room: FakeRoom, RoomEvent, ExternalE2EEKeyProvider },
+    module: { Room: FakeRoom, RoomEvent, BaseKeyProvider, createKeyMaterialFromBuffer },
     instances,
   };
 }

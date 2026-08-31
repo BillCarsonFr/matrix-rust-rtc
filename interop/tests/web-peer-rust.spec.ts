@@ -77,6 +77,17 @@ test(`Web client and Rust client share a call — spec-current dialect`, async (
     });
     await web.waitFor("joined", { timeout: 120_000 });
 
+    // Both publications signalled frame-encrypted. Without this, a regression
+    // to cleartext stays invisible: peers decode unencrypted frames happily
+    // (with a "not encrypted" warning no machine reads), and the media
+    // assertions below keep passing.
+    for (const kind of ["video", "audio"]) {
+      const published = await web.waitFor("published", {
+        predicate: (event) => event.kind === kind,
+      });
+      expect(published.encrypted, `the ${kind} publication must be encrypted`).toBe(true);
+    }
+
     // ---- the web client sees the Rust client ------------------------------
     await web.waitFor("members", {
       timeout: 90_000,
