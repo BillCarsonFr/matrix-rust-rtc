@@ -24,6 +24,13 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['matrix-rtc-wasm', '@matrix-org/matrix-sdk-crypto-wasm'],
   },
+  // Dev server only (build/preview bundle the wasm as assets): the bindings
+  // live in the parent package (`web/pkg/browser`), outside this package's
+  // workspace root, and vite's filesystem fence 403s the `/@fs/` fetch for
+  // them unless the parent is allowed.
+  server: {
+    fs: { allow: ['..'] },
+  },
   build: {
     // Top-level await appears in matrix-sdk-crypto-wasm's module glue.
     target: 'es2022',
