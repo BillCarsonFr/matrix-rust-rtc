@@ -153,6 +153,22 @@ impl WasmRtcSessionManager {
             input.iter().map(|slot| &slot.slot_id).collect::<Vec<_>>(),
         );
 
+        // A room joined in the pre-sticky generation predates `m.rtc.slot`
+        // entirely: its truthful "no slots" would resolve the session closed
+        // and project out every member, us included. The join forgot earlier
+        // slot state; this keeps later feeds from re-closing it. Pages feed
+        // slots unconditionally and the mode decides — same as the FFI.
+        if self
+            .element_call_compat_for(&room_id)
+            .reads_state_membership()
+        {
+            log::debug!(
+                "manager: [{room_id}] ignoring the slot state: the room was joined in a \
+                 MatrixRTC generation that predates m.rtc.slot",
+            );
+            return Ok(());
+        }
+
         let mapped: Vec<RawSlotEvent> = input
             .into_iter()
             .map(|slot| RawSlotEvent {

@@ -65,6 +65,7 @@ if (params.get('test') === '1') {
         roomId = await app.createRoom({
           name: `Web call ${new Date().toISOString()}`,
           invite: field('invite').value.trim() || undefined,
+          mode: field('mode').value,
         });
         field('room').value = roomId;
       }

@@ -22,7 +22,8 @@
  * In: `window.webPeer.command(jsonString)` — `{cmd: "login"|"create_room"|
  * "join_room"|"join"|"leave", ...payload}`. Each command resolves after its
  * work completes; failures surface both as a rejected promise and an `error`
- * event.
+ * event. `create_room` takes `{name, invite?, mode?}` — the mode decides
+ * whether a slot is opened (the pre-sticky generation has none).
  *
  * Out: every observable event goes to `window.__onWebPeerEvent(jsonString)`
  * (a Playwright `exposeFunction`), and to the on-page log for humans.

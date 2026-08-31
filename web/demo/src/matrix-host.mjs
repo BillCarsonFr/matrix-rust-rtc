@@ -44,6 +44,8 @@ import {
 
 const MEMBER_EVENT_TYPES = ['m.rtc.member', 'org.matrix.msc4143.rtc.member'];
 const SLOT_EVENT_TYPES = ['m.rtc.slot', 'org.matrix.msc4143.rtc.slot'];
+/// The pre-MSC4354 generation's membership carrier: room state.
+const LEGACY_STATE_MEMBER_EVENT_TYPE = 'org.matrix.msc3401.call.member';
 const KEY_MESSAGE_TYPES = ['m.rtc.encryption_key', 'org.matrix.msc4143.rtc.encryption_key'];
 /// The pre-2026 Element Call key type; bound per the room's compat mode.
 const LEGACY_KEY_MESSAGE_TYPE = 'io.element.call.encryption_keys';
@@ -162,6 +164,18 @@ export class MatrixHost {
         // The binding expects the bare MSC4140 delay id.
         return response.delay_id;
       },
+      // The pre-sticky dialect's delayed leave is a delayed STATE event; only
+      // rooms joined in state_events mode dispatch this.
+      sendDelayedStateEvent: async (roomId, eventType, stateKey, content, delayMs) => {
+        const response = await client._unstable_sendDelayedStateEvent(
+          roomId,
+          { delay: delayMs },
+          eventType,
+          content,
+          stateKey,
+        );
+        return response.delay_id;
+      },
       restartDelayedEvent: (_roomId, delayId) =>
         client._unstable_updateDelayedEvent(delayId, UpdateDelayedEventAction.Restart),
       cancelDelayedEvent: (_roomId, delayId) =>
@@ -178,21 +192,37 @@ export class MatrixHost {
   /**
    * Start feeding one room into the manager and route its inbound key
    * messages. Resolves once the initial snapshot is fed.
+   *
+   * `readsStateMembership` mirrors the native bridge's gating: msc3401 room
+   * state is only membership in the pre-sticky mode — in any other, a room's
+   * stale state events from an old call must not resurrect as members.
    */
-  async attachRoom(manager, roomId) {
+  async attachRoom(manager, roomId, { readsStateMembership = false } = {}) {
     const room = this.client.getRoom(roomId);
     if (!room) throw new Error(`not joined to ${roomId}`);
     this.room = room;
     this.manager = manager;
+    this.readsStateMembership = readsStateMembership;
 
     const refeed = () => this.scheduleFeed();
     room.on(RoomStickyEventsEvent.Update, refeed);
-    room.on(RoomStateEvent.Events, refeed);
-    room.on(RoomStateEvent.Members, refeed);
+    // State listeners on the CLIENT, not the room: the room-level re-emit is
+    // unreliable (it re-arms only when the RoomState instance is swapped, and
+    // MSC4222 `state_after` sync churns those), while the client-level one is
+    // what js-sdk's own MatrixRTCSessionManager trusts. Empirically the
+    // room-level listener missed every msc3401 membership update.
+    const onStateEvent = (event) => {
+      if (event.getRoomId() === roomId) refeed();
+    };
+    const onMembers = (_event, _state, member) => {
+      if (member.roomId === roomId) refeed();
+    };
+    this.client.on(RoomStateEvent.Events, onStateEvent);
+    this.client.on(RoomStateEvent.Members, onMembers);
     this.detachers.push(() => {
       room.off(RoomStickyEventsEvent.Update, refeed);
-      room.off(RoomStateEvent.Events, refeed);
-      room.off(RoomStateEvent.Members, refeed);
+      this.client.off(RoomStateEvent.Events, onStateEvent);
+      this.client.off(RoomStateEvent.Members, onMembers);
     });
 
     const onToDevice = (payload) => this.onToDeviceMessage(payload);
@@ -234,6 +264,19 @@ export class MatrixHost {
     );
     const members = room.getJoinedMembers().map((member) => member.userId);
     const sticky = await this.stickySnapshot();
+    // The pre-sticky generation's membership: `org.matrix.msc3401.call.member`
+    // room state, only read in that mode. Its lifetime is stated in the
+    // content, which is why `origin_server_ts` rides along as the deadline
+    // base. In a mid-transition room the funnel dedupes it against the sticky
+    // set (sticky wins on a shared key).
+    const legacyState = this.readsStateMembership
+      ? room.currentState.getStateEvents(LEGACY_STATE_MEMBER_EVENT_TYPE).map((ev) => ({
+          sender: ev.getSender(),
+          state_key: ev.getStateKey(),
+          origin_server_ts: ev.getTs(),
+          content: ev.getContent(),
+        }))
+      : [];
 
     await this.managerOps.enqueue(async () => {
       await manager.on_room_encryption_received(roomId, encrypted);
@@ -241,9 +284,8 @@ export class MatrixHost {
       await manager.on_room_members_received(roomId, members);
       // The raw funnel, in every mode: it normalises pre-2026 Element Call
       // shapes (flat `rtc_transports`, membership-less `member`) and is a
-      // no-op on spec-current content. The third argument is the pre-sticky
-      // generation's room-state membership — state_events mode, not wired yet.
-      await manager.setCurrentMembership(roomId, sticky, []);
+      // no-op on spec-current content.
+      await manager.setCurrentMembership(roomId, sticky, legacyState);
     });
   }
 

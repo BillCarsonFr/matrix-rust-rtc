@@ -29,6 +29,7 @@ import {
   joinCall,
   loginToElementWeb,
   setRtcModeBeforeJoining,
+  type RtcMode,
 } from "../helpers/element-web";
 import { registerUser } from "../helpers/register";
 import { expectPeerVideoPattern } from "../helpers/video";
@@ -36,7 +37,25 @@ import { WebPeer } from "../helpers/web-peer";
 
 const HOMESERVER_URL = process.env.HOMESERVER_URL ?? "https://synapse.m.localhost";
 
-test(`Web client and Element Call share a call — ec-2025 sticky events`, async ({
+interface Scenario {
+  /** Element Call's Developer-tab dialect. */
+  ec: RtcMode;
+  /** The matching web-peer mode string. */
+  web: "state_events" | "sticky_events";
+  title: string;
+}
+
+const SCENARIOS: Scenario[] = [
+  // Same order and rationale as element-call.spec.ts: the state dialect is
+  // what deployed Element Call speaks today. It swaps the membership carrier
+  // (msc3401 room state), the identity ({user}:{device}), the token endpoint
+  // (/sfu/get), and the delayed leave (a delayed STATE event).
+  { ec: "compat", web: "state_events", title: "ec-2024 state events" },
+  { ec: "2_0", web: "sticky_events", title: "ec-2025 sticky events" },
+];
+
+for (const scenario of SCENARIOS) {
+test(`Web client and Element Call share a call — ${scenario.title}`, async ({
   browser,
 }, testInfo) => {
   // Two logins with crypto bootstrap, a room, a real call and media.
@@ -45,16 +64,22 @@ test(`Web client and Element Call share a call — ec-2025 sticky events`, async
   const bob = await registerUser("ec");
   const page = await loginToElementWeb(browser, bob);
 
-  // The web peer creates the room (and opens the slot): it puts our device in
-  // the room before Element Call ever joins — a device that arrives later
-  // cannot decrypt a membership Element Call has already sent.
+  // The web peer creates the room (and, outside the pre-sticky mode, opens
+  // the slot): it puts our device in the room before Element Call ever joins —
+  // a device that arrives later cannot decrypt a membership Element Call has
+  // already sent.
   const web = await WebPeer.open(browser);
   await web.send({ cmd: "login", homeserver: HOMESERVER_URL });
   await web.waitFor("ready");
 
   try {
-    const roomName = `Web interop 2_0 ${Date.now().toString(16)}`;
-    await web.send({ cmd: "create_room", name: roomName, invite: bob.userId });
+    const roomName = `Web interop ${scenario.ec} ${Date.now().toString(16)}`;
+    await web.send({
+      cmd: "create_room",
+      name: roomName,
+      invite: bob.userId,
+      mode: scenario.web,
+    });
     const created = await web.waitFor("room_created");
     const roomId = created.room_id as string;
 
@@ -62,14 +87,14 @@ test(`Web client and Element Call share a call — ec-2025 sticky events`, async
 
     // Before joining: the dialect decides the membership carrier, the SFU
     // identity and the token endpoint together, so it cannot change mid-call.
-    await setRtcModeBeforeJoining(page, "2_0");
+    await setRtcModeBeforeJoining(page, scenario.ec);
 
     // The web peer joins the slot first, publishing the interop pattern+tone
-    // in the sticky compat dialect.
+    // in the scenario's compat dialect.
     await web.send({
       cmd: "join",
       roomId,
-      compat: "sticky_events",
+      compat: scenario.web,
       publish: { pattern: true, tone: true },
     });
     await web.waitFor("joined", { timeout: 120_000 });
@@ -124,3 +149,4 @@ test(`Web client and Element Call share a call — ec-2025 sticky events`, async
     await testInfo.attach("web-peer.log", { body: web.log });
   }
 });
+}

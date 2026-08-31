@@ -95,10 +95,10 @@ export class WebPeerApp {
   }
 
   /**
-   * Create an encrypted room for the call and invite a peer (Phase B — the
-   * shape mirrors the native interop peer's `create_encrypted_room`).
+   * Create an encrypted room for the call and invite a peer; the shape
+   * mirrors the native interop peer's `create_encrypted_room`.
    */
-  async createRoom({ name, invite }) {
+  async createRoom({ name, invite, mode }) {
     const response = await this.client.createRoom({
       name,
       invite: invite ? [invite] : [],
@@ -118,12 +118,16 @@ export class WebPeerApp {
     await this.waitForRoom(response.room_id);
     // We created the room, so opening the slot is ours to do: our own sync
     // feed reports the room's complete slot state, and "no slots" resolves the
-    // session closed. Encrypted room ⇒ MSC4143 requires `m.per_member`.
-    await this.managerOps.enqueue(() =>
-      this.manager.openSlot(response.room_id, DEFAULT_SLOT_ID, 'm.call', {
-        type: 'm.per_member',
-      }),
-    );
+    // session closed. Encrypted room ⇒ MSC4143 requires `m.per_member`. Not in
+    // the pre-sticky mode: that generation predates slots (a join in it leaves
+    // the condition unenforced), and its Element Call ignores them anyway.
+    if (mode !== 'state_events') {
+      await this.managerOps.enqueue(() =>
+        this.manager.openSlot(response.room_id, DEFAULT_SLOT_ID, 'm.call', {
+          type: 'm.per_member',
+        }),
+      );
+    }
     this.emit({ event: 'room_created', room_id: response.room_id, room_name: name });
     return response.room_id;
   }
@@ -148,7 +152,9 @@ export class WebPeerApp {
 
     // Feed before joining: the manager must know the room's encryption state
     // (it decides how the membership counts) before it publishes ours.
-    await this.host.attachRoom(this.manager, roomId);
+    await this.host.attachRoom(this.manager, roomId, {
+      readsStateMembership: compat === 'state_events',
+    });
 
     const memberId = await this.managerOps.enqueue(() =>
       this.manager.join({
