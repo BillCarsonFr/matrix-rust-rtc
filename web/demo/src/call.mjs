@@ -165,7 +165,7 @@ export class WebPeerApp {
     });
     this.call.onParticipants = (roster) => this.onRoster(roster);
     this.call.onEvent = (event) => this.onCallEvent(event);
-    this.call.onRoomConnected = (room, key) => this.onRoomConnected(room, key);
+    this.call.onRoomCreated = (room, key) => this.onRoomCreated(room, key);
 
     await this.call.connect({
       roomId,
@@ -238,7 +238,7 @@ export class WebPeerApp {
   }
 
   /** Per-room media observation: attach, then meter what arrives. */
-  onRoomConnected(room) {
+  onRoomCreated(room) {
     room.on(livekit.RoomEvent.TrackSubscribed, (track, publication, participant) => {
       this.emit({
         event: 'track_subscribed',

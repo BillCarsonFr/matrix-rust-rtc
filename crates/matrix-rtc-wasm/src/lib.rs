@@ -911,7 +911,15 @@ struct WasmStickyEvent {
 #[derive(Debug, Deserialize)]
 struct WasmStickyEventContent {
     slot_id: String,
-    sticky_key: String,
+    /// On the wire this is the MSC4354 unstable id `msc4354_sticky_key` (what
+    /// every peer — this SDK included — currently writes); the plain spelling
+    /// is what the MSC lands as. Two fields rather than a serde `alias`:
+    /// captured Element Call events carry BOTH, which an alias rejects as a
+    /// duplicate. The unstable spelling wins when they disagree.
+    #[serde(default)]
+    msc4354_sticky_key: Option<String>,
+    #[serde(default)]
+    sticky_key: Option<String>,
     application: Option<WasmApplication>,
     member: Option<WasmMember>,
     #[serde(default)]
@@ -992,7 +1000,14 @@ impl From<WasmStickyEvent> for RawStickyEvent {
             event_type: value.event_type,
             content: matrix_rtc_core::RawStickyEventContent {
                 slot_id: value.content.slot_id,
-                sticky_key: value.content.sticky_key,
+                // Empty when the event carries neither spelling; the core's
+                // validation then drops the event with a logged reason rather
+                // than this conversion failing the whole snapshot.
+                sticky_key: value
+                    .content
+                    .msc4354_sticky_key
+                    .or(value.content.sticky_key)
+                    .unwrap_or_default(),
                 application: matrix_rtc_core::ApplicationInfo {
                     application_type: value.content.application.map(|app| app.kind),
                     extra: std::collections::BTreeMap::new(),

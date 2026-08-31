@@ -53,7 +53,8 @@ function memberEvent({ sender, deviceId, memberId, focus }) {
     type: 'm.rtc.member',
     content: {
       slot_id: SLOT_ID,
-      sticky_key: memberId,
+      // The wire spelling (MSC4354 unstable id), as real events carry it.
+      msc4354_sticky_key: memberId,
       application: { type: 'm.call' },
       member: { id: memberId, membership: 'join' },
       transports: {

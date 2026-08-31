@@ -83,8 +83,13 @@ export class MatrixRtcCall {
     this.onParticipants = () => {};
     /** @type {(event: object) => void} */
     this.onEvent = () => {};
-    /** @type {(room: object, connectionKey: string) => void} */
-    this.onRoomConnected = () => {};
+    /**
+     * Invoked with each livekit-js `Room` when it is created, BEFORE it
+     * connects: `TrackSubscribed` and friends can fire while `connect()` is
+     * still awaiting, so a listener added any later misses them.
+     * @type {(room: object, connectionKey: string) => void}
+     */
+    this.onRoomCreated = () => {};
   }
 
   /**
@@ -188,9 +193,9 @@ export class MatrixRtcCall {
         : undefined,
     });
     this.registerSink(room, sink, request.connectionKey);
+    this.onRoomCreated(room, request.connectionKey);
     await room.connect(request.sfuUrl, request.jwt);
     this.rooms.set(request.connectionKey, room);
-    this.onRoomConnected(room, request.connectionKey);
     return {
       close: async () => {
         this.rooms.delete(request.connectionKey);
