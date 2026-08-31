@@ -25,9 +25,22 @@ use js_sys::{Array, Function, Reflect};
 use matrix_rtc_core::{
     CommandError, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient, wire_event_type,
 };
+use serde::Serialize;
 use serde_json::Value;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+
+/// Serializes a payload as a plain JS object for the host.
+///
+/// The JSON-compatible serializer, NOT the default one: the default turns
+/// serde maps — which every event content is — into ES `Map`s, and a real
+/// Matrix client `JSON.stringify`s those to `{}`, silently sending empty
+/// content on the wire.
+fn to_plain_js<T: Serialize>(value: &T) -> Result<JsValue, CommandError> {
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|e| CommandError::SerializationError(e.to_string()))
+}
 
 /// WASM implementation of the RtcCommandSender trait.
 ///
@@ -158,8 +171,7 @@ impl RtcCommandSender for JsCommandSender {
         ));
 
         // Convert Rust Value to JsValue
-        let js_content = serde_wasm_bindgen::to_value(&content)
-            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        let js_content = to_plain_js(&content)?;
 
         // Create a Promise that will be resolved by the JS callback
         let promise = self
@@ -197,8 +209,7 @@ impl RtcCommandSender for JsCommandSender {
             room_id, event_type, state_key
         ));
 
-        let js_content = serde_wasm_bindgen::to_value(&content)
-            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        let js_content = to_plain_js(&content)?;
 
         let promise = self
             .call_js_promise_method(
@@ -233,8 +244,7 @@ impl RtcCommandSender for JsCommandSender {
         ));
 
         // Convert Rust Value to JsValue
-        let js_content = serde_wasm_bindgen::to_value(&content)
-            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        let js_content = to_plain_js(&content)?;
 
         // Create a Promise that will be resolved by the JS callback
         let promise = self
@@ -328,11 +338,10 @@ impl RtcCommandSender for JsCommandSender {
             message_type
         ));
 
-        let js_content = serde_wasm_bindgen::to_value(&content)
-            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        let js_content = to_plain_js(&content)?;
         // `[{userId, deviceId}, ...]`, mirroring matrix-js-sdk's own to-device
         // shape so a host can pass it straight through.
-        let js_recipients = serde_wasm_bindgen::to_value(
+        let js_recipients = to_plain_js(
             &recipients
                 .iter()
                 .map(|recipient| {
@@ -342,8 +351,7 @@ impl RtcCommandSender for JsCommandSender {
                     })
                 })
                 .collect::<Vec<_>>(),
-        )
-        .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+        )?;
 
         let promise = self
             .call_js_promise_method(

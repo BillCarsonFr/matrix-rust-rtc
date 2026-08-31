@@ -1088,15 +1088,22 @@ mod tests {
             let function = js_sys::Function::new_with_args(args, body);
             js_sys::Reflect::set(&client, &JsValue::from_str(name), &function).unwrap();
         };
+        // Contents must arrive as plain objects: a real Matrix client
+        // `JSON.stringify`s them, and an ES `Map` (the default
+        // serde-wasm-bindgen output for serde maps) stringifies to `{}`.
         set(
             "sendStickyEvent",
             "roomId,eventType,content,durationMs",
-            "return Promise.resolve({ event_id: '$sticky' });",
+            "if (JSON.stringify(content) === '{}' || content.member === undefined) \
+                 return Promise.reject(new Error('content is not a plain object')); \
+             return Promise.resolve({ event_id: '$sticky' });",
         );
         set(
             "sendDelayedEvent",
             "roomId,eventType,content,delayMs",
-            "return Promise.resolve('delay-id');",
+            "if (JSON.stringify(content) === '{}') \
+                 return Promise.reject(new Error('content is not a plain object')); \
+             return Promise.resolve('delay-id');",
         );
         set(
             "restartDelayedEvent",
