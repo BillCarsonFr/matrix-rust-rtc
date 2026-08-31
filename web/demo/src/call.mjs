@@ -263,6 +263,15 @@ export class WebPeerApp {
 
   /** Per-room media observation: attach, then meter what arrives. */
   onRoomCreated(room) {
+    // Own tile: TrackSubscribed only fires for remote tracks, so the local
+    // camera is attached from its publication (video only — attaching our own
+    // microphone would echo).
+    room.on(livekit.RoomEvent.LocalTrackPublished, (publication) => {
+      const track = publication.track;
+      if (track?.kind === 'video') {
+        this.attachTrack(track, room.localParticipant.identity);
+      }
+    });
     room.on(livekit.RoomEvent.TrackSubscribed, (track, publication, participant) => {
       this.emit({
         event: 'track_subscribed',
@@ -319,6 +328,17 @@ export class WebPeerApp {
           .map((stream) => `${stream.kind}${stream.muted ? ' (muted)' : ''}`)
           .join(', ') || 'no streams'}`;
       tile.dataset.identity = participant.rtc_identity ?? '';
+      // The local publication may predate this tile; backfill the video.
+      if (participant.is_local && this.call) {
+        const video = tile.querySelector('video');
+        if (!video.srcObject) {
+          for (const room of this.call.rooms.values()) {
+            for (const publication of room.localParticipant?.trackPublications?.values() ?? []) {
+              if (publication.track?.kind === 'video') publication.track.attach(video);
+            }
+          }
+        }
+      }
     }
     for (const [memberId, tile] of this.tiles) {
       if (!seen.has(memberId)) {
