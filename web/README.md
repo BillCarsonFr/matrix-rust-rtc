@@ -10,8 +10,10 @@ For what the binding *is* and how to integrate it — the Matrix host contract, 
 
 - `pkg/browser/`: browser-first wasm-pack output built with `--target web`
 - `pkg/node/`: Node.js fallback output built with `--target nodejs`
-- `src/`: the `MatrixRtcCall` wrapper (export `./call`), joining the Rust
-  roster with livekit-js
+- `src/`: the shipped integration layers — `MatrixRtcCall` (export `./call`,
+  the livekit-client half) and `MatrixHost`/`createMatrixSession` (export
+  `./matrix-js-sdk-host`, the Matrix half); each dependency is an optional,
+  injected peer
 - `test/`: JavaScript smoke tests for package exports and generated bindings
 
 ## The call model (`./call`)

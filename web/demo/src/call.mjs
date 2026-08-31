@@ -26,10 +26,10 @@
 
 import * as livekit from 'livekit-client';
 import E2EEWorker from 'livekit-client/e2ee-worker?worker';
+import * as sdk from 'matrix-js-sdk';
 import init, * as bindings from 'matrix-rtc-wasm';
 import { ManagerOpQueue, MatrixRtcCall } from 'matrix-rtc-wasm/call';
-
-import { MatrixHost, createMatrixSession } from './matrix-host.mjs';
+import { MatrixHost, createMatrixSession } from 'matrix-rtc-wasm/matrix-js-sdk-host';
 import {
   AUDIO_RMS_FLOOR,
   patternVideoTrack,
@@ -64,6 +64,7 @@ export class WebPeerApp {
   async login({ homeserver, user, password, displayName = 'Web Peer' }) {
     await this.ready;
     const session = await createMatrixSession({
+      sdk,
       homeserverUrl: homeserver,
       user,
       password,
@@ -76,6 +77,7 @@ export class WebPeerApp {
 
     this.manager = new bindings.WasmRtcSessionManager();
     this.host = new MatrixHost({
+      sdk,
       client: this.client,
       managerOps: this.managerOps,
       log: this.log,

@@ -35,25 +35,34 @@ The complete, working reference is **`web/demo/`** — a call page over
 matrix-js-sdk + livekit-client that is also the interop test peer. What
 follows is the shape of it.
 
-### The quick way: `MatrixRtcCall`
+### The quick way: the three shipped layers
 
-The JS wrapper (`matrix-rtc-wasm/call`) implements the media delegate over
-livekit-client and drives the heartbeat; you bring a Matrix host object and
-the sync feeding (next section).
+The package ships every layer of the integration, each dependency an
+optional, injected peer: `matrix-rtc-wasm/call` (`MatrixRtcCall`, the
+livekit-client half) and `matrix-rtc-wasm/matrix-js-sdk-host`
+(`createMatrixSession` + `MatrixHost`, the Matrix half). You write the app
+glue.
 
 ```js
 import init, * as bindings from 'matrix-rtc-wasm';
 import { ManagerOpQueue, MatrixRtcCall } from 'matrix-rtc-wasm/call';
+import { MatrixHost, createMatrixSession } from 'matrix-rtc-wasm/matrix-js-sdk-host';
+import * as sdk from 'matrix-js-sdk';
 import * as livekit from 'livekit-client';
 import E2EEWorker from 'livekit-client/e2ee-worker?worker';
 
 await init();
 bindings.initLogging('info', '');
 
+// A crypto-ready, syncing client (cross-signing bootstrapped — MSC4153).
+const { client, userId, deviceId } =
+  await createMatrixSession({ sdk, homeserverUrl, user, password });
+
 const managerOps = new ManagerOpQueue();       // see "Rules of the road"
 const manager = new bindings.WasmRtcSessionManager();
-manager.setup_command_sender(myMatrixHost);    // the host contract below
-await feedRoomState(manager, roomId);          // encryption, slots, members, sticky
+const host = new MatrixHost({ sdk, client, managerOps });
+manager.setup_command_sender(host.commandSender());
+await host.attachRoom(manager, roomId);        // sync feeding, keys in
 
 // 1. Publish our membership (starts the keep-alive machinery).
 const memberId = await managerOps.enqueue(() =>
@@ -92,6 +101,9 @@ join `rtc_identity` to `room.getParticipantByIdentity()` for the live
 livekit-js participant.
 
 ### The host contract
+
+Only needed when you bring your own Matrix stack instead of
+`matrix-rtc-wasm/matrix-js-sdk-host` (which implements all of this section).
 
 `setup_command_sender` takes an object the manager dispatches outbound
 commands on. Contents arrive as plain JS objects; every method returns a

@@ -16,7 +16,7 @@
 // along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
 
 /**
- * The Matrix side of the web peer: matrix-js-sdk behind the wasm manager's
+ * The Matrix side of a web call: matrix-js-sdk behind the wasm manager's
  * host contract.
  *
  * Two halves:
@@ -26,21 +26,18 @@
  *   to-device messages;
  * - sync feeding (`attachRoom()`): complete per-room snapshots pushed in the
  *   same order the native bridge uses — encryption, slots, members, then the
- *   sticky membership set (replace, not merge) — plus inbound
- *   `m.rtc.encryption_key` to-device messages with their Olm decryption
- *   metadata and MSC4153 cross-signing status.
+ *   membership set through the raw funnel (replace, not merge) — plus inbound
+ *   media-key to-device messages with their Olm decryption metadata and
+ *   MSC4153 cross-signing status.
+ *
+ * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
+ * the module is injected (`sdk`), keeping it an optional peer dependency and
+ * this file testable against a mock. Requires v42+ (`_unstable_` sticky and
+ * delayed-event APIs, rust-crypto).
  *
  * Every manager call goes through the shared ManagerOpQueue: the wasm object
  * allows one in-flight call at a time.
  */
-
-import {
-  ClientEvent,
-  RoomStateEvent,
-  RoomStickyEventsEvent,
-  UpdateDelayedEventAction,
-  createClient,
-} from 'matrix-js-sdk';
 
 const MEMBER_EVENT_TYPES = ['m.rtc.member', 'org.matrix.msc4143.rtc.member'];
 const SLOT_EVENT_TYPES = ['m.rtc.slot', 'org.matrix.msc4143.rtc.slot'];
@@ -51,11 +48,16 @@ const KEY_MESSAGE_TYPES = ['m.rtc.encryption_key', 'org.matrix.msc4143.rtc.encry
 const LEGACY_KEY_MESSAGE_TYPE = 'io.element.call.encryption_keys';
 
 /**
- * Register a throwaway user (the dev homeserver has open registration) and
- * return a logged-in, crypto-ready client. `login` with existing credentials
- * skips registration.
+ * Log in (registering a throwaway user first when `user` is blank — dev
+ * homeservers with open registration) and return a crypto-ready, syncing
+ * client. Cross-signing is bootstrapped before returning: MSC4153 peers
+ * discard media keys from devices that are not cross-signed.
+ *
+ * @param {object} options
+ * @param {object} options.sdk - the `matrix-js-sdk` module.
  */
 export async function createMatrixSession({
+  sdk,
   homeserverUrl,
   user,
   password,
@@ -83,14 +85,14 @@ export async function createMatrixSession({
     }
   }
 
-  const bootstrap = createClient({ baseUrl: homeserverUrl });
+  const bootstrap = sdk.createClient({ baseUrl: homeserverUrl });
   const login = await bootstrap.loginRequest({
     type: 'm.login.password',
     identifier: { type: 'm.id.user', user: localpart },
     password: pass,
   });
 
-  const client = createClient({
+  const client = sdk.createClient({
     baseUrl: homeserverUrl,
     accessToken: login.access_token,
     userId: login.user_id,
@@ -120,7 +122,7 @@ export async function createMatrixSession({
 
   client.startClient();
   await new Promise((resolve, reject) => {
-    client.once(ClientEvent.Sync, (state) =>
+    client.once(sdk.ClientEvent.Sync, (state) =>
       state === 'PREPARED' ? resolve() : reject(new Error(`sync failed: ${state}`)),
     );
   });
@@ -131,11 +133,13 @@ export async function createMatrixSession({
 export class MatrixHost {
   /**
    * @param {object} options
+   * @param {object} options.sdk - the `matrix-js-sdk` module.
    * @param {object} options.client - a crypto-ready, syncing MatrixClient.
    * @param {object} options.managerOps - the shared ManagerOpQueue.
    * @param {(line: string) => void} [options.log]
    */
-  constructor({ client, managerOps, log = () => {} }) {
+  constructor({ sdk, client, managerOps, log = () => {} }) {
+    this.sdk = sdk;
     this.client = client;
     this.managerOps = managerOps;
     this.log = log;
@@ -177,9 +181,9 @@ export class MatrixHost {
         return response.delay_id;
       },
       restartDelayedEvent: (_roomId, delayId) =>
-        client._unstable_updateDelayedEvent(delayId, UpdateDelayedEventAction.Restart),
+        client._unstable_updateDelayedEvent(delayId, this.sdk.UpdateDelayedEventAction.Restart),
       cancelDelayedEvent: (_roomId, delayId) =>
-        client._unstable_updateDelayedEvent(delayId, UpdateDelayedEventAction.Cancel),
+        client._unstable_updateDelayedEvent(delayId, this.sdk.UpdateDelayedEventAction.Cancel),
       sendToDeviceMessage: async (recipients, messageType, content) => {
         // Olm-encrypted, per specific device — never `*`. Resolving with
         // nothing reports every recipient as served; a throw reports the
@@ -205,7 +209,7 @@ export class MatrixHost {
     this.readsStateMembership = readsStateMembership;
 
     const refeed = () => this.scheduleFeed();
-    room.on(RoomStickyEventsEvent.Update, refeed);
+    room.on(this.sdk.RoomStickyEventsEvent.Update, refeed);
     // State listeners on the CLIENT, not the room: the room-level re-emit is
     // unreliable (it re-arms only when the RoomState instance is swapped, and
     // MSC4222 `state_after` sync churns those), while the client-level one is
@@ -217,17 +221,17 @@ export class MatrixHost {
     const onMembers = (_event, _state, member) => {
       if (member.roomId === roomId) refeed();
     };
-    this.client.on(RoomStateEvent.Events, onStateEvent);
-    this.client.on(RoomStateEvent.Members, onMembers);
+    this.client.on(this.sdk.RoomStateEvent.Events, onStateEvent);
+    this.client.on(this.sdk.RoomStateEvent.Members, onMembers);
     this.detachers.push(() => {
-      room.off(RoomStickyEventsEvent.Update, refeed);
-      this.client.off(RoomStateEvent.Events, onStateEvent);
-      this.client.off(RoomStateEvent.Members, onMembers);
+      room.off(this.sdk.RoomStickyEventsEvent.Update, refeed);
+      this.client.off(this.sdk.RoomStateEvent.Events, onStateEvent);
+      this.client.off(this.sdk.RoomStateEvent.Members, onMembers);
     });
 
     const onToDevice = (payload) => this.onToDeviceMessage(payload);
-    this.client.on(ClientEvent.ReceivedToDeviceMessage, onToDevice);
-    this.detachers.push(() => this.client.off(ClientEvent.ReceivedToDeviceMessage, onToDevice));
+    this.client.on(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice);
+    this.detachers.push(() => this.client.off(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice));
 
     await this.feed();
   }
