@@ -43,6 +43,10 @@ base64 = "0.21"
 # core checks for wasm32 without repeating it.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+# `std::time::SystemTime::now()` PANICS on wasm32-unknown-unknown (std has no
+# clock there); web-time is the drop-in that reads `Date.now()` instead. A
+# clock read only — the no-timers rule above is untouched.
+web-time = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

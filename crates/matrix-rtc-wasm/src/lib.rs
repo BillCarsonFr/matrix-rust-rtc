@@ -37,9 +37,10 @@
 #![cfg(target_arch = "wasm32")]
 
 use matrix_rtc_core::{
-    EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership,
+    EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership, KeyOrigin,
     LeaveSessionParams, Mentions, NotificationType, NotifyConfig, RawRtcTransport, RawSlotEvent,
-    RawStickyEvent, RtcSession, RtcSessionManager, RtcTransport,
+    RawStickyEvent, ReceivedEncryptionKey, RtcSession, RtcSessionManager, RtcTransport,
+    SlotEncryption,
 };
 
 mod commands;
@@ -226,9 +227,9 @@ impl WasmRtcSessionManager {
     ///     milliseconds (default: 3600000); the SDK re-sends the membership at half this
     ///   - `degraded_lifetime_ms`: Optional membership lifetime to fall back to on a
     ///     homeserver that refuses MSC4140 delayed events (default: 300000, and not to
-    ///     be set below that — see MSC4354 on clock skew). Note that nothing refreshes
-    ///     it here: this binding exposes no heartbeat, so a degraded join lapses when
-    ///     this elapses.
+    ///     be set below that — see MSC4354 on clock skew). Refreshing it is the page's
+    ///     job: this binding starts no driver, so call [`Self::heartbeat`] on an
+    ///     interval while joined.
     ///
     /// Resolves to the `member.id` this join used. The SDK generates it: MSC4143
     /// requires a fresh one per join, and reusing one keeps the media-plane
@@ -317,6 +318,182 @@ impl WasmRtcSessionManager {
         }
 
         result
+    }
+
+    /// Restarts the keep-alive for one session: reschedules the delayed leave,
+    /// and re-sends the membership if its sticky entry is halfway to expiring.
+    /// Also flushes a key rotation that has come due.
+    ///
+    /// The core arms no timers and this binding starts no driver — **the page
+    /// must call this on an interval while joined** (`setInterval`,
+    /// [`HEARTBEAT_INTERVAL_MS`]), or the dead man's switch fires and peers see
+    /// us depart mid-call.
+    ///
+    /// Resolves to `false` if there is no joined session for
+    /// `(room_id, slot_id)`, which means there is nothing to keep alive.
+    pub async fn heartbeat(&mut self, room_id: String, slot_id: String) -> bool {
+        self.inner.heartbeat(&room_id, &slot_id).await
+    }
+
+    /// When the session's next key rotation falls due, in epoch milliseconds,
+    /// or `undefined` when none is owed. Diagnostics: the rotation itself is
+    /// performed by [`Self::heartbeat`] and by the media layer's
+    /// switch-complete signal, not by polling this.
+    #[wasm_bindgen(js_name = keyRotationDueAtMs)]
+    pub fn key_rotation_due_at_ms(&self, room_id: String, slot_id: String) -> Option<f64> {
+        self.inner
+            .key_rotation_due_at_ms(&room_id, &slot_id)
+            .map(|at| at as f64)
+    }
+
+    /// Performs the session's key rotation if one has come due; a no-op
+    /// otherwise. Resolves to whether a rotation ran.
+    #[wasm_bindgen(js_name = flushDueKeyRotation)]
+    pub async fn flush_due_key_rotation(&mut self, room_id: String, slot_id: String) -> bool {
+        self.inner.flush_due_key_rotation(&room_id, &slot_id).await
+    }
+
+    /// Feeds a decrypted `m.rtc.encryption_key` to-device message to every
+    /// session of its room. Call for each such message the host's sync
+    /// delivers; without it peers' media never becomes decryptable.
+    ///
+    /// `key` is `{ room_id, member_id, key_b64, key_index, was_encrypted,
+    /// sender_user_id?, sender_device_id?, sender_is_cross_signed? }` — the
+    /// `sender_*` fields come from the host's Olm decryption metadata, not from
+    /// the payload.
+    #[wasm_bindgen(js_name = receiveEncryptionKey)]
+    pub async fn receive_encryption_key(&mut self, key: JsValue) -> Result<(), JsError> {
+        let key: WasmReceivedEncryptionKey = serde_wasm_bindgen::from_value(key)
+            .map_err(|err| JsError::new(&format!("invalid encryption key payload: {err}")))?;
+
+        // Never the key material itself — only what decides whether it is
+        // accepted. Its length is enough to spot a truncated or empty key.
+        log::debug!(
+            "manager: [{}] encryption key in: member={} index={} len={} encrypted={} \
+             cross_signed={}",
+            key.room_id,
+            key.member_id,
+            key.key_index,
+            key.key_b64.len(),
+            key.was_encrypted,
+            key.sender_is_cross_signed,
+        );
+
+        let received = key.into_core()?;
+        self.inner
+            .receive_encryption_key(received)
+            .await
+            .map_err(|err| {
+                log::warn!("manager: encryption key rejected: {err}");
+                JsError::new(&err.to_string())
+            })
+    }
+
+    /// Opens a slot by publishing its `m.rtc.slot` state event.
+    ///
+    /// `slot_id` must start with `{application_type}#` (MSC4143 makes the slot
+    /// id the state key and requires that shape). `encryption` is the raw
+    /// MSC4143 `content.encryption` object — `{ type: "m.per_member" }` in an
+    /// encrypted room, `null`/`undefined` elsewhere; the mismatch resolves the
+    /// slot closed for everyone. Publishing room state usually needs a raised
+    /// power level, so a rejection by the homeserver surfaces here.
+    #[wasm_bindgen(js_name = openSlot)]
+    pub async fn open_slot(
+        &mut self,
+        room_id: String,
+        slot_id: String,
+        application_type: String,
+        encryption: JsValue,
+    ) -> Result<(), JsError> {
+        let encryption: Option<SlotEncryption> = serde_wasm_bindgen::from_value(encryption)
+            .map_err(|err| JsError::new(&format!("invalid slot encryption payload: {err}")))?;
+
+        log::info!(
+            "manager: [{room_id}/{slot_id}] opening slot: application={application_type} \
+             encryption={encryption:?}",
+        );
+
+        self.inner
+            .open_slot(room_id, slot_id, application_type, encryption)
+            .await
+            .map_err(|err| {
+                log::warn!("manager: could not open the slot: {err}");
+                JsError::new(&err.to_string())
+            })
+    }
+
+    /// Closes a slot, by setting its `m.rtc.slot` status to `closed`.
+    ///
+    /// Every member of it becomes left as soon as clients apply the new state —
+    /// this ends the call for everyone, not just for us. Leaving is
+    /// [`Self::leave`].
+    #[wasm_bindgen(js_name = closeSlot)]
+    pub async fn close_slot(&mut self, room_id: String, slot_id: String) -> Result<(), JsError> {
+        log::info!("manager: [{room_id}/{slot_id}] closing slot");
+
+        self.inner
+            .close_slot(room_id, slot_id)
+            .await
+            .map_err(|err| {
+                log::warn!("manager: could not close the slot: {err}");
+                JsError::new(&err.to_string())
+            })
+    }
+}
+
+/// How often a page should call [`WasmRtcSessionManager::heartbeat`] while
+/// joined. Matches the FFI's keep-alive driver interval.
+#[wasm_bindgen(js_name = HEARTBEAT_INTERVAL_MS)]
+pub fn heartbeat_interval_ms() -> u32 {
+    10_000
+}
+
+/// A decrypted `m.rtc.encryption_key` to-device message, as JS hands it in.
+#[derive(Debug, Deserialize)]
+struct WasmReceivedEncryptionKey {
+    /// The `room_id` carried in the message content.
+    room_id: String,
+    /// The `member_id` carried in the message content.
+    member_id: String,
+    /// The key material, encoded per the message's `format`.
+    key_b64: String,
+    /// The rolling key index (0-255).
+    key_index: u8,
+    /// Whether the to-device message arrived Olm-encrypted. MSC4143 requires
+    /// it; the core discards cleartext keys.
+    was_encrypted: bool,
+    /// User the message was decrypted as coming from (required when
+    /// `was_encrypted`).
+    #[serde(default)]
+    sender_user_id: Option<String>,
+    /// Device the message was decrypted as coming from, when attributable.
+    #[serde(default)]
+    sender_device_id: Option<String>,
+    /// Whether that device is cross-signed (MSC4153).
+    #[serde(default)]
+    sender_is_cross_signed: bool,
+}
+
+impl WasmReceivedEncryptionKey {
+    fn into_core(self) -> Result<ReceivedEncryptionKey, JsError> {
+        let origin = if self.was_encrypted {
+            KeyOrigin::Encrypted {
+                sender_user_id: self
+                    .sender_user_id
+                    .ok_or_else(|| JsError::new("an encrypted key needs its sender_user_id"))?,
+                sender_device_id: self.sender_device_id,
+                sender_is_cross_signed: self.sender_is_cross_signed,
+            }
+        } else {
+            KeyOrigin::Cleartext
+        };
+        Ok(ReceivedEncryptionKey {
+            origin,
+            room_id: self.room_id,
+            member_id: self.member_id,
+            key_b64: self.key_b64,
+            key_index: self.key_index,
+        })
     }
 }
 
@@ -899,6 +1076,139 @@ mod tests {
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["sender"], "@alice:example.org");
+    }
+
+    /// A JS mock of the Matrix client the manager's command sender dispatches
+    /// on, answering every method with a resolved Promise.
+    fn mock_client() -> JsValue {
+        let client = js_sys::Object::new();
+        let set = |name: &str, args: &str, body: &str| {
+            let function = js_sys::Function::new_with_args(args, body);
+            js_sys::Reflect::set(&client, &JsValue::from_str(name), &function).unwrap();
+        };
+        set(
+            "sendStickyEvent",
+            "roomId,eventType,content,durationMs",
+            "return Promise.resolve({ event_id: '$sticky' });",
+        );
+        set(
+            "sendDelayedEvent",
+            "roomId,eventType,content,delayMs",
+            "return Promise.resolve('delay-id');",
+        );
+        set(
+            "restartDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+        set(
+            "cancelDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+        set(
+            "sendStateEvent",
+            "roomId,eventType,stateKey,content",
+            "return Promise.resolve({ event_id: '$state' });",
+        );
+        client.into()
+    }
+
+    /// A full join on the wasm target. Beyond the join flow itself, this pins
+    /// the clock: the join path reads wall-clock time, which on
+    /// wasm32-unknown-unknown must come from `Date.now()` (web-time) —
+    /// `std::time::SystemTime::now()` traps there.
+    #[wasm_bindgen_test]
+    async fn a_join_succeeds_on_wasm() {
+        #[derive(Serialize)]
+        struct TestJoinParams {
+            user_id: &'static str,
+            device_id: &'static str,
+            room_id: &'static str,
+            slot_id: &'static str,
+            application: &'static str,
+        }
+
+        let mut manager = WasmRtcSessionManager::new();
+        manager.setup_command_sender(mock_client());
+
+        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
+            user_id: "@alice:example.org",
+            device_id: "DEVICEID",
+            room_id: "!room:example.org",
+            slot_id: "m.call#ROOM",
+            application: "m.call",
+        })
+        .unwrap();
+
+        let member_id = manager.join(params).await.expect("join should succeed");
+        assert!(!member_id.is_empty());
+        assert_eq!(
+            manager.own_member_id("!room:example.org".to_owned(), "m.call#ROOM".to_owned()),
+            Some(member_id),
+        );
+
+        // And the keep-alive can run: this is the other wall-clock reader.
+        assert!(
+            manager
+                .heartbeat("!room:example.org".to_owned(), "m.call#ROOM".to_owned())
+                .await
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn heartbeat_without_a_session_reports_nothing_to_keep_alive() {
+        let mut manager = WasmRtcSessionManager::new();
+        assert!(
+            !manager
+                .heartbeat("!room:example.org".to_owned(), "m.call#ROOM".to_owned())
+                .await
+        );
+    }
+
+    /// Pins the JS payload contract of `receiveEncryptionKey`: snake_case
+    /// fields, optional `sender_*`, and the encrypted-needs-a-sender rule.
+    #[wasm_bindgen_test]
+    async fn receive_encryption_key_accepts_the_documented_payload() {
+        // A plain JS object, as a page would pass. `serde_json::json!` is no
+        // substitute here: serde-wasm-bindgen turns its maps into ES `Map`s.
+        #[derive(Serialize)]
+        struct TestKey {
+            room_id: &'static str,
+            member_id: &'static str,
+            key_b64: &'static str,
+            key_index: u8,
+            was_encrypted: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sender_user_id: Option<&'static str>,
+        }
+
+        let key = TestKey {
+            room_id: "!room:example.org",
+            member_id: "alice-device-a",
+            key_b64: "AAAA",
+            key_index: 3,
+            was_encrypted: true,
+            sender_user_id: Some("@alice:example.org"),
+        };
+
+        let mut manager = WasmRtcSessionManager::new();
+        // No session exists for the room: the key is dropped, not an error.
+        let payload = serde_wasm_bindgen::to_value(&key).unwrap();
+        assert!(manager.receive_encryption_key(payload).await.is_ok());
+
+        let missing_sender = serde_wasm_bindgen::to_value(&TestKey {
+            sender_user_id: None,
+            ..key
+        })
+        .unwrap();
+        assert!(
+            manager
+                .receive_encryption_key(missing_sender)
+                .await
+                .is_err(),
+            "an encrypted key without its decrypted sender must be refused"
+        );
     }
 
     #[wasm_bindgen_test]
