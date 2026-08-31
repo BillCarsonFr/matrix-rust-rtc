@@ -106,8 +106,8 @@ impl WasmRtcSessionManager {
     #[wasm_bindgen(js_name = connectMedia)]
     pub async fn connect_media(
         &mut self,
-        config: JsValue,
-        delegate: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "MediaSessionConfigIn")] config: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "MediaDelegate")] delegate: JsValue,
     ) -> Result<WasmMediaSession, JsError> {
         let config: WasmMediaSessionConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|err| JsError::new(&format!("invalid media session config: {err}")))?;
@@ -403,9 +403,9 @@ pub struct WasmMediaSession {
 
 #[wasm_bindgen]
 impl WasmMediaSession {
-    /// The current roster, as an array of participants (see the crate docs for
-    /// the JSON shape). `rtc_identity` is the livekit-js participant identity,
-    /// when derivable.
+    /// The current roster. `rtc_identity` is the livekit-js participant
+    /// identity, when derivable.
+    #[wasm_bindgen(unchecked_return_type = "RtcParticipant[]")]
     pub fn participants(&self) -> Result<JsValue, JsError> {
         let roster: Vec<WasmParticipant> = self
             .engine

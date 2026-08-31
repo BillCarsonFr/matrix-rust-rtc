@@ -88,7 +88,7 @@ impl JsCommandSender {
     /// - cancelDelayedEvent(roomId, delayId, callback)
     /// - sendToDeviceMessage(userId, deviceId, messageType, content, callback)
     #[wasm_bindgen(constructor)]
-    pub fn new(client: JsValue) -> Self {
+    pub fn new(#[wasm_bindgen(unchecked_param_type = "MatrixClientHost")] client: JsValue) -> Self {
         Self {
             client,
             on_command: None,

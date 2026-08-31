@@ -221,7 +221,10 @@ impl WasmConnectionEventSink {
     /// livekit-js `ActiveSpeakersChanged`: an array of
     /// `{identity, level}` (level `0.0`–`1.0`; pass `0` when unknown).
     #[wasm_bindgen(js_name = activeSpeakers)]
-    pub fn active_speakers(&self, speakers: JsValue) {
+    pub fn active_speakers(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "SpeakerIn[]")] speakers: JsValue,
+    ) {
         #[derive(Deserialize)]
         struct Speaker {
             identity: String,

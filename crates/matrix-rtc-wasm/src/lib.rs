@@ -48,6 +48,7 @@ mod commands;
 mod compat;
 mod logging;
 mod media;
+mod ts_types;
 pub use commands::JsCommandSender;
 pub use logging::{init_logging, log_event};
 pub use media::{WasmConnectionEventSink, WasmMediaSession};
@@ -87,7 +88,10 @@ impl WasmRtcSessionManager {
     /// This must be called before join/leave operations.
     /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
     /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
-    pub fn setup_command_sender(&mut self, client: JsValue) {
+    pub fn setup_command_sender(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "MatrixClientHost")] client: JsValue,
+    ) {
         log::info!("manager: command sender installed");
         // `Rc` is not an option: the core's `set_command_sender` takes `Arc<T>`
         // on every target. `expect` so this goes away by itself if that changes.
@@ -108,7 +112,7 @@ impl WasmRtcSessionManager {
     pub async fn set_current_sticky_state(
         &mut self,
         room_id: String,
-        events: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "StickyEventIn[]")] events: JsValue,
     ) -> Result<(), JsError> {
         let input: Vec<WasmStickyEvent> =
             serde_wasm_bindgen::from_value(events).map_err(|err| {
@@ -141,7 +145,7 @@ impl WasmRtcSessionManager {
     pub async fn on_room_slots_received(
         &mut self,
         room_id: String,
-        slots: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "SlotEventIn[]")] slots: JsValue,
     ) -> Result<(), JsError> {
         let input: Vec<WasmSlotEvent> = serde_wasm_bindgen::from_value(slots).map_err(|err| {
             log::warn!("manager: [{room_id}] invalid slot payload: {err}");
@@ -186,7 +190,11 @@ impl WasmRtcSessionManager {
     ///
     /// MSC4143 only counts a member event while its sender is still joined to
     /// the room; until this is called that condition is not enforced.
-    pub async fn on_room_members_received(&mut self, room_id: String, joined_user_ids: JsValue) {
+    pub async fn on_room_members_received(
+        &mut self,
+        room_id: String,
+        #[wasm_bindgen(unchecked_param_type = "string[]")] joined_user_ids: JsValue,
+    ) {
         let members: Vec<String> = serde_wasm_bindgen::from_value(joined_user_ids)
             .inspect_err(|err| {
                 log::warn!(
@@ -262,7 +270,10 @@ impl WasmRtcSessionManager {
     /// requires a fresh one per join, and reusing one keeps the media-plane
     /// participant identity stable while the key index restarts at 0, so peers
     /// would decrypt new media with the previous call's key.
-    pub async fn join(&mut self, params: JsValue) -> Result<String, JsError> {
+    pub async fn join(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "JoinParamsIn")] params: JsValue,
+    ) -> Result<String, JsError> {
         let params: WasmJoinSessionParams =
             serde_wasm_bindgen::from_value(params).map_err(|err| {
                 log::warn!("manager: invalid join params: {err}");
@@ -349,7 +360,7 @@ impl WasmRtcSessionManager {
         &mut self,
         room_id: String,
         slot_id: String,
-        params: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "LeaveParamsIn")] params: JsValue,
     ) -> Result<(), JsError> {
         let params: WasmLeaveSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid leave params: {err}")))?;
@@ -427,7 +438,10 @@ impl WasmRtcSessionManager {
     /// `sender_*` fields come from the host's Olm decryption metadata, not from
     /// the payload.
     #[wasm_bindgen(js_name = receiveEncryptionKey)]
-    pub async fn receive_encryption_key(&mut self, key: JsValue) -> Result<(), JsError> {
+    pub async fn receive_encryption_key(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "ReceivedKeyIn")] key: JsValue,
+    ) -> Result<(), JsError> {
         let key: WasmReceivedEncryptionKey = serde_wasm_bindgen::from_value(key)
             .map_err(|err| JsError::new(&format!("invalid encryption key payload: {err}")))?;
 
@@ -475,7 +489,8 @@ impl WasmRtcSessionManager {
     pub async fn set_current_membership(
         &mut self,
         room_id: String,
-        member_events: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "RawMemberEventIn[]")] member_events: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "LegacyStateMemberEventIn[]")]
         legacy_state_events: JsValue,
     ) -> Result<(), JsError> {
         let member_events: Vec<compat::WasmRawMemberEvent> =
@@ -522,7 +537,10 @@ impl WasmRtcSessionManager {
     /// core, as MSC4143 requires). The mode the room was joined in decides how
     /// the key is bound; this call knows it already.
     #[wasm_bindgen(js_name = receiveLegacyEncryptionKey)]
-    pub async fn receive_legacy_encryption_key(&mut self, payload: JsValue) -> Result<(), JsError> {
+    pub async fn receive_legacy_encryption_key(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "LegacyKeyIn")] payload: JsValue,
+    ) -> Result<(), JsError> {
         let payload: compat::WasmLegacyKeyMessage = serde_wasm_bindgen::from_value(payload)
             .map_err(|err| JsError::new(&format!("invalid legacy key payload: {err}")))?;
 
@@ -598,6 +616,7 @@ impl WasmRtcSessionManager {
         room_id: String,
         slot_id: String,
         application_type: String,
+        #[wasm_bindgen(unchecked_param_type = "SlotEncryptionIn | null | undefined")]
         encryption: JsValue,
     ) -> Result<(), JsError> {
         let encryption: Option<SlotEncryption> = serde_wasm_bindgen::from_value(encryption)
@@ -981,7 +1000,10 @@ impl WasmRtcSession {
     /// This must be called before join/leave operations.
     /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
     /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
-    pub fn setup_command_sender(&mut self, client: JsValue) {
+    pub fn setup_command_sender(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "MatrixClientHost")] client: JsValue,
+    ) {
         // `Rc` is not an option: the core's `set_command_sender` takes `Arc<T>`
         // on every target. `expect` so this goes away by itself if that changes.
         #[expect(clippy::arc_with_non_send_sync)]
@@ -997,7 +1019,10 @@ impl WasmRtcSession {
 
     /// Applies the complete current sticky state for this single session,
     /// replacing what it held: a member absent from `events` is gone.
-    pub async fn set_current_sticky_state(&mut self, events: JsValue) -> Result<(), JsError> {
+    pub async fn set_current_sticky_state(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "StickyEventIn[]")] events: JsValue,
+    ) -> Result<(), JsError> {
         let input: Vec<WasmStickyEvent> = serde_wasm_bindgen::from_value(events)
             .map_err(|err| JsError::new(&format!("invalid sticky snapshot payload: {err}")))?;
 
@@ -1033,7 +1058,10 @@ impl WasmRtcSession {
     /// * `params` - JSON object containing join parameters (same as WasmRtcSessionManager::join)
     ///
     /// Resolves to the SDK-generated `member.id` this join used.
-    pub async fn join(&mut self, params: JsValue) -> Result<String, JsError> {
+    pub async fn join(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "JoinParamsIn")] params: JsValue,
+    ) -> Result<String, JsError> {
         let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
 
@@ -1061,7 +1089,10 @@ impl WasmRtcSession {
     /// # Arguments
     ///
     /// * `params` - Optional JSON object containing leave parameters (same as WasmRtcSessionManager::leave)
-    pub fn leave(&mut self, params: JsValue) -> Result<(), JsError> {
+    pub fn leave(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "LeaveParamsIn")] params: JsValue,
+    ) -> Result<(), JsError> {
         let _params: WasmLeaveSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid leave params: {err}")))?;
 
@@ -1090,6 +1121,7 @@ pub struct WasmMembershipSnapshotSubscription {
 #[wasm_bindgen]
 impl WasmMembershipSnapshotSubscription {
     /// Returns the next full snapshot if available, or `null` if unchanged.
+    #[wasm_bindgen(unchecked_return_type = "MembershipSnapshot[] | null")]
     pub fn next_snapshot(&mut self) -> Result<JsValue, JsError> {
         if self.initial_pending {
             self.initial_pending = false;

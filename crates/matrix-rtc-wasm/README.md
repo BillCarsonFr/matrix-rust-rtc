@@ -176,6 +176,11 @@ no streams and its keys bind to nothing.
 - Frame E2EE on the web means a **per-participant** key provider and
   `room.setE2EEEnabled(true)`; `MatrixRtcCall` does both (livekit-js's
   `ExternalE2EEKeyProvider` is shared-key — wrong for MSC4195).
+- The generated `.d.ts` carries **real TypeScript types** for every value
+  crossing the boundary (`MatrixClientHost`, `JoinParamsIn`, `RtcParticipant`,
+  the `RtcCallEvent` union, ...). They are hand-written in `src/ts_types.rs`
+  and must be updated alongside the serde structs they describe;
+  `web/test/typecheck.test.mjs` type-checks them through a consumer.
 
 ## Testing
 
