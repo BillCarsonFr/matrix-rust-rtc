@@ -93,7 +93,11 @@ export async function createMatrixSession({
     deviceId: login.device_id,
   });
 
-  await client.initRustCrypto();
+  // In-memory, deliberately: the IndexedDB crypto store is origin-scoped and
+  // single-account, so switching users (throwaway registrations included)
+  // dies with "the account in the store doesn't match". Every login here is a
+  // fresh device anyway, so persisted crypto state buys nothing.
+  await client.initRustCrypto({ useIndexedDB: false });
   // MSC4153: peers discard our media keys unless this device is cross-signed,
   // so bootstrap before any key can be exchanged — the same order the native
   // interop peer enforces. Uploading the signing keys needs UIA.
