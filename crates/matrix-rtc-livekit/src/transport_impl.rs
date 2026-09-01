@@ -369,6 +369,7 @@ impl TransportConnection for LiveKitTransportConnection {
                     track: published,
                     session: Arc::clone(&self.session),
                     closed: AtomicBool::new(false),
+                    retraction_failed: AtomicBool::new(false),
                 }))
             }
             MediaStreamKind::Camera | MediaStreamKind::ScreenShare => {
@@ -413,6 +414,7 @@ impl TransportConnection for LiveKitTransportConnection {
                     track: published,
                     session: Arc::clone(&self.session),
                     closed: AtomicBool::new(false),
+                    retraction_failed: AtomicBool::new(false),
                 }))
             }
             MediaStreamKind::Data => Err(TransportError::Unsupported(
@@ -526,11 +528,19 @@ struct LiveKitLocalTrack {
     /// The session this was published on, kept so the publication can be
     /// retracted. The room never holds this wrapper, so no cycle.
     session: Arc<LiveKitSession>,
-    /// Set by `unpublish`. Captures still land in a live source until the
-    /// retraction completes, which is harmless — the frames go nowhere —
-    /// but a capture loop must see an error rather than silent success, or
-    /// it never learns the publication is gone.
+    /// Set once `unpublish` succeeds — not before: a failed retraction
+    /// leaves the publication live at the SFU, and the handle must stay
+    /// usable to feed, mute, and retry it. Captures landing in the source
+    /// while a retraction is in flight are harmless — the frames go
+    /// nowhere — but once the publication is gone a capture loop must see
+    /// an error rather than silent success, or it never learns to stop.
     closed: AtomicBool,
+    /// Set when an `unpublish` attempt fails. LiveKit drops the publication
+    /// from its local map *before* the fallible transport work, with no
+    /// rollback, so after a failure a retry sees "track not found" — which
+    /// must not be mistaken for the benign already-retracted case, because
+    /// the track may still be live at the SFU.
+    retraction_failed: AtomicBool,
 }
 
 #[async_trait]
@@ -551,9 +561,12 @@ impl LocalTrackHandle for LiveKitLocalTrack {
 
     /// Idempotent for the same reason `close` is: "track not found" means the
     /// publication is already gone (a second unpublish, or the room closed and
-    /// retracted everything), and the postcondition callers want holds.
+    /// retracted everything), and the postcondition callers want holds — with
+    /// one exception. After a *failed* attempt on this handle, "track not
+    /// found" only reflects LiveKit's local map (emptied before the fallible
+    /// work, without rollback), not the SFU, so it stays an error rather than
+    /// reporting a retraction that may never have happened.
     async fn unpublish(&self) -> Result<(), TransportError> {
-        self.closed.store(true, Ordering::Release);
         let sid = self.track.sid();
         match self
             .session
@@ -562,12 +575,22 @@ impl LocalTrackHandle for LiveKitLocalTrack {
             .unpublish_track(&sid)
             .await
         {
-            Ok(_) => Ok(()),
-            Err(livekit::RoomError::Internal(message)) if message.contains("track not found") => {
-                log::debug!("{sid} was already unpublished; treating as success");
+            Ok(_) => {
+                self.closed.store(true, Ordering::Release);
                 Ok(())
             }
-            Err(error) => Err(TransportError::Closed(error.to_string())),
+            Err(livekit::RoomError::Internal(message))
+                if message.contains("track not found")
+                    && !self.retraction_failed.load(Ordering::Acquire) =>
+            {
+                log::debug!("{sid} was already unpublished; treating as success");
+                self.closed.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.retraction_failed.store(true, Ordering::Release);
+                Err(TransportError::Closed(error.to_string()))
+            }
         }
     }
 

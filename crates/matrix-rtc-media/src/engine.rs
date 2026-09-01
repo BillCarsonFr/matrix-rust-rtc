@@ -172,6 +172,14 @@ enum ActorMessage {
         kind: MediaStreamKind,
         track: Arc<dyn LocalTrackHandle>,
     },
+    /// A local retraction resolved at the transport; the roster must drop it.
+    /// `track` identifies which publication was retracted, so a same-kind
+    /// publish that landed while the retraction was in flight is not the one
+    /// removed.
+    LocalUnpublished {
+        kind: MediaStreamKind,
+        track: Arc<dyn LocalTrackHandle>,
+    },
     SetLocalMuted {
         kind: MediaStreamKind,
         muted: bool,
@@ -405,11 +413,14 @@ impl CallEngine {
     /// off from a wedged sender, unpublish removes it: peers drop the stream
     /// (their transport reports it removed) instead of rendering an empty
     /// tile — what a stopped screen share needs, since a screen has no "off"
-    /// state worth showing. The own roster entry drops the stream and
-    /// [`CallEvent::StreamStopped`] is emitted.
+    /// state worth showing. On success the own roster entry drops the stream
+    /// and [`CallEvent::StreamStopped`] is emitted, and the handle obtained
+    /// from [`CallEngine::publish`] is dead: `capture_*` calls on it error.
     ///
-    /// The handle obtained from [`CallEngine::publish`] is dead afterwards:
-    /// `capture_*` calls on it error. Errors if nothing of that kind is
+    /// On failure the publication stays on the roster and stays usable
+    /// (mute, capture, retry this call): the retraction can fail while the
+    /// room is live, and dropping local state then would leave a still-live
+    /// publication nothing can retract. Errors if nothing of that kind is
     /// published.
     pub async fn unpublish(&self, kind: MediaStreamKind) -> Result<(), TransportError> {
         let (respond, response) = oneshot::channel();
@@ -779,22 +790,38 @@ impl Actor {
                 let _ = respond.send(outcome);
             }
             ActorMessage::Unpublish { kind, respond } => {
-                let Some(track) = self.local_tracks.remove(&kind) else {
+                let Some(track) = self.local_tracks.get(&kind) else {
                     let _ = respond.send(Err(TransportError::Unsupported(format!(
                         "nothing of kind {kind:?} is published locally"
                     ))));
                     return;
                 };
-                // Local state is cleared before the transport call resolves:
-                // if the retraction fails the room is almost certainly
-                // closed, which retracts every publication anyway.
-                let own_member_id = self.own_member_id.clone();
-                self.remove_stream(&own_member_id, kind);
-                // Awaited off-actor, like the publish itself, so a slow SFU
-                // does not stall every other message.
+                // Awaited off-actor like the publish itself, and the actor
+                // learns the outcome through `LocalUnpublished`: a retraction
+                // can fail while the room is live (the room-closed case comes
+                // back as success from the transport), and clearing local
+                // state on a failed attempt would leave a still-live
+                // publication that nothing can mute or retract anymore.
+                let track = Arc::clone(track);
+                let messages = self.messages_tx.clone();
                 rt::spawn(async move {
-                    let _ = respond.send(track.unpublish().await);
+                    let outcome = track.unpublish().await;
+                    if outcome.is_ok() {
+                        let _ = messages.send(ActorMessage::LocalUnpublished { kind, track });
+                    }
+                    let _ = respond.send(outcome);
                 });
+            }
+            ActorMessage::LocalUnpublished { kind, track } => {
+                if self
+                    .local_tracks
+                    .get(&kind)
+                    .is_some_and(|current| Arc::ptr_eq(current, &track))
+                {
+                    self.local_tracks.remove(&kind);
+                    let own_member_id = self.own_member_id.clone();
+                    self.remove_stream(&own_member_id, kind);
+                }
             }
             ActorMessage::SetConstraints {
                 member_id,
@@ -2886,11 +2913,13 @@ mod tests {
         assert_eq!(own.streams[0].kind, MediaStreamKind::Microphone);
     }
 
-    /// Local state is cleared even when the transport retraction fails: that
-    /// only happens when the room is already closed, which retracts every
-    /// publication anyway, so keeping the stream on the roster would be wrong.
+    /// A failed retraction keeps the publication: the transport already maps
+    /// the room-closed case to success, so a failure means the room is live
+    /// and the track is still published at the SFU. Dropping local state then
+    /// would leave a stream peers keep rendering but that nothing can mute or
+    /// retract anymore — for a screen share, a privacy bug.
     #[tokio::test]
-    async fn unpublish_clears_the_roster_even_if_the_transport_errors() {
+    async fn unpublish_keeps_the_publication_when_the_transport_errors() {
         let mut fx = fixture();
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
@@ -2912,6 +2941,29 @@ mod tests {
                 .is_err()
         );
 
+        // The stream is still on our roster and the publication still usable.
+        assert_eq!(
+            fx.engine
+                .participants()
+                .into_iter()
+                .find(|p| p.is_local)
+                .expect("we are on our own roster")
+                .streams
+                .len(),
+            1
+        );
+        fx.engine
+            .set_local_muted(MediaStreamKind::Microphone, true)
+            .await
+            .expect("the engine still holds the publication");
+        let _ = next_event(&mut fx.events).await; // StreamMuted
+
+        // A retry once the transport recovers retracts it for real.
+        fx.state.fail_unpublish.store(false, Ordering::SeqCst);
+        fx.engine
+            .unpublish(MediaStreamKind::Microphone)
+            .await
+            .expect("the retry should succeed");
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::StreamStopped {
@@ -2919,12 +2971,9 @@ mod tests {
                 kind: MediaStreamKind::Microphone,
             }
         );
-        assert!(
-            fx.engine
-                .set_local_muted(MediaStreamKind::Microphone, true)
-                .await
-                .is_err(),
-            "the engine no longer holds the publication",
+        assert_eq!(
+            *fx.state.unpublished.lock().unwrap(),
+            vec![MediaStreamKind::Microphone],
         );
     }
 

@@ -444,12 +444,14 @@ impl MediaSession {
     /// of rendering an empty tile — what a stopped screen share needs, since
     /// unlike a camera a screen has no "off" state a mute could represent.
     ///
-    /// Peers see the stream removed, and our own roster entry drops it
-    /// (`StreamStopped` against our `member_id`). The `FfiLocalTrack` from
-    /// [`MediaSession::publish`] is dead afterwards: `captureAudio` /
+    /// On success peers see the stream removed, our own roster entry drops
+    /// it (`StreamStopped` against our `member_id`), and the `FfiLocalTrack`
+    /// from [`MediaSession::publish`] is dead: `captureAudio` /
     /// `captureVideo` fail with a transport error (they never crash, so a
     /// capture thread still mid-call is safe — it should stop on the first
-    /// error). `ScreenShare` and `ScreenShareAudio` are separate
+    /// error). On failure the publication is still live and stays on the
+    /// roster, usable and retryable — treat the stream as still visible to
+    /// peers. `ScreenShare` and `ScreenShareAudio` are separate
     /// publications; unpublish each. Re-publishing the same kind later is a
     /// fresh [`MediaSession::publish`].
     ///
