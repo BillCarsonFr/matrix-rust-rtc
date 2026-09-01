@@ -104,8 +104,11 @@ impl PublishOptions {
 
 /// A live local publication: push captured frames into it.
 ///
-/// Handles are cheap `Arc`s. There is no explicit unpublish yet — the
-/// publication ends with its connection (leave/close).
+/// Handles are cheap `Arc`s. A publication ends with its connection
+/// (leave/close) or when retracted through
+/// [`CallEngine::unpublish`](crate::engine::CallEngine::unpublish); after
+/// that, `capture_*` calls on the handle error rather than silently
+/// succeeding, so a capture loop learns to stop.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait LocalTrackHandle: MaybeSend {
@@ -119,6 +122,16 @@ pub trait LocalTrackHandle: MaybeSend {
     fn set_muted(&self, _muted: bool) -> Result<(), TransportError> {
         Err(TransportError::Unsupported(
             "this publication cannot be muted".into(),
+        ))
+    }
+
+    /// Retract this publication at the transport, so peers drop the stream
+    /// entirely — unlike a mute, which keeps the publication up and tells
+    /// them why it is silent. Already-retracted is success (the room may
+    /// have closed and taken every publication with it).
+    async fn unpublish(&self) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this publication cannot be unpublished".into(),
         ))
     }
 

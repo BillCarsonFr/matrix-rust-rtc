@@ -30,6 +30,7 @@
 //! connection.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -366,6 +367,8 @@ impl TransportConnection for LiveKitTransportConnection {
                     kind,
                     source: LocalSource::Audio(source),
                     track: published,
+                    session: Arc::clone(&self.session),
+                    closed: AtomicBool::new(false),
                 }))
             }
             MediaStreamKind::Camera | MediaStreamKind::ScreenShare => {
@@ -408,6 +411,8 @@ impl TransportConnection for LiveKitTransportConnection {
                     kind,
                     source: LocalSource::Video(source),
                     track: published,
+                    session: Arc::clone(&self.session),
+                    closed: AtomicBool::new(false),
                 }))
             }
             MediaStreamKind::Data => Err(TransportError::Unsupported(
@@ -518,6 +523,14 @@ struct LiveKitLocalTrack {
     /// The published track, kept so it can be muted. Cheap to clone — LiveKit's
     /// track types are handles.
     track: LocalTrack,
+    /// The session this was published on, kept so the publication can be
+    /// retracted. The room never holds this wrapper, so no cycle.
+    session: Arc<LiveKitSession>,
+    /// Set by `unpublish`. Captures still land in a live source until the
+    /// retraction completes, which is harmless — the frames go nowhere —
+    /// but a capture loop must see an error rather than silent success, or
+    /// it never learns the publication is gone.
+    closed: AtomicBool,
 }
 
 #[async_trait]
@@ -536,7 +549,34 @@ impl LocalTrackHandle for LiveKitLocalTrack {
         Ok(())
     }
 
+    /// Idempotent for the same reason `close` is: "track not found" means the
+    /// publication is already gone (a second unpublish, or the room closed and
+    /// retracted everything), and the postcondition callers want holds.
+    async fn unpublish(&self) -> Result<(), TransportError> {
+        self.closed.store(true, Ordering::Release);
+        let sid = self.track.sid();
+        match self
+            .session
+            .room()
+            .local_participant()
+            .unpublish_track(&sid)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(livekit::RoomError::Internal(message)) if message.contains("track not found") => {
+                log::debug!("{sid} was already unpublished; treating as success");
+                Ok(())
+            }
+            Err(error) => Err(TransportError::Closed(error.to_string())),
+        }
+    }
+
     async fn capture_audio(&self, frame: AudioFrame) -> Result<(), TransportError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed(
+                "this publication was unpublished".into(),
+            ));
+        }
         let LocalSource::Audio(source) = &self.source else {
             return Err(TransportError::Unsupported(
                 "this publication does not accept audio frames".into(),
@@ -555,6 +595,11 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     fn capture_video(&self, frame: VideoFrame) -> Result<(), TransportError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed(
+                "this publication was unpublished".into(),
+            ));
+        }
         let LocalSource::Video(source) = &self.source else {
             return Err(TransportError::Unsupported(
                 "this publication does not accept video frames".into(),

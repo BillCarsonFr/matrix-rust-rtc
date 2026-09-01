@@ -316,6 +316,13 @@ pub struct FfiVideoFrameData {
 
 /// A live local publication: push captured frames into it. Obtained from
 /// [`MediaSession::publish`](super::MediaSession::publish).
+///
+/// This is only a handle: dropping it (Kotlin/Swift `close()`/`destroy()`)
+/// releases the wrapper and does NOT retract the publication — peers keep
+/// seeing the stream. Retract it with
+/// [`MediaSession::unpublish`](super::MediaSession::unpublish); the capture
+/// methods then fail with a transport error instead of crashing, so a
+/// capture thread racing the unpublish is safe.
 #[derive(uniffi::Object)]
 pub struct FfiLocalTrack {
     inner: Arc<dyn LocalTrackHandle>,
