@@ -1,0 +1,348 @@
+// Copyright 2026 Valere Fedronic
+//
+// This file is part of matrix-rust-rtc.
+//
+// matrix-rust-rtc is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// matrix-rust-rtc is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+/**
+ * The call model for web apps: the wasm session manager's roster and
+ * connection lifecycle, joined with livekit-js participants.
+ *
+ * This is the thin JS half of the web media session. Rust owns the protocol
+ * (membership reconciliation, the multi-focus pool, MSC4195 identities, token
+ * request shapes, key bookkeeping); this wrapper owns what only JS can:
+ * `fetch`, the livekit-js `Room`, and the RoomEvent-to-sink translation. Every
+ * roster entry is a plain object from Rust plus `livekitParticipant` — the
+ * live livekit-js participant, when the room knows the entry's `rtc_identity`.
+ *
+ * `livekit-client` is not imported here: the app passes its module (or a
+ * compatible mock) to the constructor, keeping it a peer dependency and this
+ * file testable without it.
+ */
+
+/** livekit-js `Track.Source` values that map onto roster stream kinds. */
+const KNOWN_KINDS = new Set([
+  'microphone',
+  'camera',
+  'screen_share',
+  'screen_share_audio',
+]);
+
+export class MatrixRtcCall {
+  /**
+   * @param {object} options
+   * @param {object} options.manager - a `WasmRtcSessionManager` whose command
+   *   sender is set up and which is being fed sticky events / room state.
+   * @param {object} options.bindings - the wasm module (for
+   *   `HEARTBEAT_INTERVAL_MS`).
+   * @param {object} options.livekit - the `livekit-client` module (peer
+   *   dependency): `Room`, `RoomEvent`, `ExternalE2EEKeyProvider` are used.
+   * @param {() => Promise<object>} options.getOpenIdToken - resolves with a
+   *   Matrix OpenID token (`matrix-js-sdk`: `client.getOpenIdToken()`).
+   * @param {(url: string, body: object) => Promise<{status: number, body: string}>}
+   *   [options.fetchJson] - the token POST; defaults to global `fetch`.
+   * @param {object} [options.roomOptions] - extra livekit-js `Room` options,
+   *   merged under the E2EE ones (pass `e2ee.worker` here to enable frame
+   *   encryption).
+   * @param {ManagerOpQueue} [options.managerOps] - the queue serializing every
+   *   wasm-manager call; pass the app's own when it also calls the manager.
+   */
+  constructor({ manager, bindings, livekit, getOpenIdToken, fetchJson, roomOptions, managerOps }) {
+    this.manager = manager;
+    this.bindings = bindings;
+    this.livekit = livekit;
+    this.getOpenIdToken = getOpenIdToken;
+    this.fetchJson = fetchJson ?? defaultFetchJson;
+    this.roomOptions = roomOptions ?? {};
+    /** connectionKey -> Room */
+    this.rooms = new Map();
+    this.keyProvider = null;
+    this.session = null;
+    this.heartbeatTimer = null;
+    /**
+     * Serializes every manager call: the wasm object allows one in-flight
+     * call at a time (a second one throws "recursive use of an object"), and
+     * both the heartbeat and the rotation flush await the app's Matrix client
+     * mid-call. An app that calls the manager itself (feeding sync state,
+     * join/leave) must pass ONE shared queue here and route its own calls
+     * through it too.
+     */
+    this.managerOps = managerOps ?? new ManagerOpQueue();
+    /** @type {(participants: object[]) => void} */
+    this.onParticipants = () => {};
+    /** @type {(event: object) => void} */
+    this.onEvent = () => {};
+    /**
+     * Invoked with each livekit-js `Room` when it is created, BEFORE it
+     * connects: `TrackSubscribed` and friends can fire while `connect()` is
+     * still awaiting, so a listener added any later misses them.
+     * @type {(room: object, connectionKey: string) => void}
+     */
+    this.onRoomCreated = () => {};
+  }
+
+  /**
+   * Attach media to a slot this manager has already joined. Resolves once the
+   * own-focus room is connected; roster changes then arrive via
+   * `onParticipants` and call events via `onEvent`.
+   *
+   * @param {object} config - `{ roomId, slotId, userId, deviceId,
+   *   livekitServiceUrl, keyRingSize?, elementCallCompat? }`
+   */
+  async connect(config) {
+    if (this.session) throw new Error('already connected');
+    this.config = config;
+    this.keyProvider = makePerParticipantKeyProvider(this.livekit);
+
+    this.session = await this.managerOps.enqueue(() =>
+      this.manager.connectMedia(
+        {
+          room_id: config.roomId,
+          slot_id: config.slotId,
+          user_id: config.userId,
+          device_id: config.deviceId,
+          livekit_service_url: config.livekitServiceUrl,
+          key_ring_size: config.keyRingSize,
+          element_call_compat: config.elementCallCompat,
+        },
+        this.delegate(),
+      ),
+    );
+
+    // The page owns the keep-alive clock.
+    const interval = this.bindings.HEARTBEAT_INTERVAL_MS();
+    this.heartbeatTimer = setInterval(() => {
+      this.managerOps
+        .enqueue(() => this.manager.heartbeat(config.roomId, config.slotId))
+        .catch((error) => console.warn('matrix-rtc: heartbeat failed:', error));
+    }, interval);
+
+    return this.participants();
+  }
+
+  /** The current roster, each entry with its `livekitParticipant` when live. */
+  participants() {
+    return this.withLivekitParticipants(this.session.participants());
+  }
+
+  /** Close every room, stop the timers, and shut the session down. */
+  async disconnect() {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.session) {
+      // Closes peer-focus rooms via the engine and the own focus through the
+      // delegate's handle.
+      await this.session.disconnect();
+      this.session = null;
+    }
+    this.rooms.clear();
+  }
+
+  /** The delegate the wasm transport drives (see the transport module docs). */
+  delegate() {
+    const call = this;
+    return {
+      getOpenIdToken: () => call.getOpenIdToken(),
+      fetchJson: (url, body) => call.fetchJson(url, body),
+      connect: (request, sink) => call.connectRoom(request, sink),
+      setKey: (identity, index, key) =>
+        // livekit-js's provider: material, participant identity, key index.
+        Promise.resolve(call.keyProvider.setKey(key, identity, index)).then(
+          (accepted) => accepted ?? true,
+        ),
+      // livekit-js moves the local sender with `setKey` for the local
+      // participant; nothing further to do. Kept as a seam for versions (or
+      // providers) where the sender index is a separate call.
+      setLocalKeyIndex: () => {},
+      // The push half: roster changes, call events, and the moment a key's
+      // delayBeforeUse window closes (when a coalesced rotation falls due).
+      onParticipants: (roster) =>
+        call.onParticipants(call.withLivekitParticipants(roster)),
+      onEvent: (event) => call.onEvent(event),
+      onSwitchComplete: () =>
+        call.managerOps
+          .enqueue(() =>
+            call.manager.flushDueKeyRotation(call.config.roomId, call.config.slotId),
+          )
+          .catch((error) => console.warn('matrix-rtc: rotation flush failed:', error)),
+    };
+  }
+
+  /**
+   * One livekit-js room per focus: connect it, register the RoomEvent
+   * translation onto the sink, and hand back the close handle.
+   */
+  async connectRoom(request, sink) {
+    const e2ee = this.roomOptions.e2ee
+      ? { keyProvider: this.keyProvider, ...this.roomOptions.e2ee }
+      : undefined;
+    const room = new this.livekit.Room({ ...this.roomOptions, e2ee });
+    if (e2ee) {
+      // Constructing the room with `e2ee` only arms *decryption*; without
+      // this, everything we publish goes out (and is signalled) in the clear —
+      // peers show it with a "not encrypted" warning while it decodes fine.
+      await room.setE2EEEnabled(true);
+    }
+    this.registerSink(room, sink, request.connectionKey);
+    this.onRoomCreated(room, request.connectionKey);
+    await room.connect(request.sfuUrl, request.jwt);
+    this.rooms.set(request.connectionKey, room);
+    return {
+      close: async () => {
+        this.rooms.delete(request.connectionKey);
+        await room.disconnect();
+      },
+    };
+  }
+
+  /** The RoomEvent → sink translation table. */
+  registerSink(room, sink, connectionKey) {
+    const { RoomEvent } = this.livekit;
+    const kindOf = (publication) =>
+      KNOWN_KINDS.has(publication?.source) ? publication.source : null;
+
+    room.on(RoomEvent.ParticipantConnected, (participant) =>
+      sink.remoteJoined(participant.identity),
+    );
+    room.on(RoomEvent.ParticipantDisconnected, (participant) =>
+      sink.remoteLeft(participant.identity),
+    );
+    room.on(RoomEvent.TrackSubscribed, (_track, publication, participant) => {
+      const kind = kindOf(publication);
+      if (kind) sink.trackAdded(participant.identity, kind);
+    });
+    room.on(RoomEvent.TrackUnsubscribed, (_track, publication, participant) => {
+      const kind = kindOf(publication);
+      if (kind) sink.trackRemoved(participant.identity, kind);
+    });
+    // Local publications too, so our own roster entry carries our streams.
+    room.on(RoomEvent.LocalTrackPublished, (publication) => {
+      const kind = kindOf(publication);
+      if (kind) sink.trackAdded(room.localParticipant.identity, kind);
+    });
+    room.on(RoomEvent.LocalTrackUnpublished, (publication) => {
+      const kind = kindOf(publication);
+      if (kind) sink.trackRemoved(room.localParticipant.identity, kind);
+    });
+    room.on(RoomEvent.TrackMuted, (publication, participant) => {
+      const kind = kindOf(publication);
+      if (kind) sink.trackMuted(participant.identity, kind, true);
+    });
+    room.on(RoomEvent.TrackUnmuted, (publication, participant) => {
+      const kind = kindOf(publication);
+      if (kind) sink.trackMuted(participant.identity, kind, false);
+    });
+    room.on(RoomEvent.ActiveSpeakersChanged, (speakers) =>
+      sink.activeSpeakers(
+        speakers.map((speaker) => ({
+          identity: speaker.identity,
+          level: speaker.audioLevel ?? 0,
+        })),
+      ),
+    );
+    room.on(RoomEvent.Reconnecting, () => sink.reconnecting());
+    room.on(RoomEvent.Reconnected, () => sink.reconnected());
+    room.on(RoomEvent.Disconnected, (reason) => {
+      this.rooms.delete(connectionKey);
+      sink.closed(String(reason ?? 'disconnected'));
+      sink.free?.();
+    });
+  }
+
+  /** Join roster entries to live livekit-js participants by rtc_identity. */
+  withLivekitParticipants(roster) {
+    return roster.map((entry) => ({
+      ...entry,
+      livekitParticipant: entry.rtc_identity
+        ? this.findParticipant(entry.rtc_identity)
+        : undefined,
+    }));
+  }
+
+  findParticipant(identity) {
+    for (const room of this.rooms.values()) {
+      if (room.localParticipant?.identity === identity) {
+        return room.localParticipant;
+      }
+      const participant = room.getParticipantByIdentity?.(identity);
+      if (participant) return participant;
+    }
+    return undefined;
+  }
+}
+
+/**
+ * A per-participant key provider over the injected livekit-client module.
+ *
+ * NOT `ExternalE2EEKeyProvider`: that one is "a single shared passphrase
+ * between all participants" — with it, the local sender encrypts with
+ * whichever key was set *last* (usually a peer's), and nobody decrypts us.
+ * MSC4195 keys are per participant identity, so this subclasses
+ * `BaseKeyProvider` with `sharedKey: false` and hands each raw key to the
+ * E2EE worker as HKDF material under its identity and index — the exact
+ * mirror of the native `KeyProvider::set_key`.
+ */
+function makePerParticipantKeyProvider(livekit) {
+  class PerParticipantKeyProvider extends livekit.BaseKeyProvider {
+    constructor() {
+      // No ratcheting: MSC4143 rotates by distributing whole new keys at new
+      // indices. failureTolerance -1 keeps the cryptor trying (a key may
+      // simply not have arrived yet).
+      super({ sharedKey: false, ratchetWindowSize: 0, failureTolerance: -1 });
+    }
+
+    /** The `FrameKeyRing` shape: raw bytes, participant identity, key index. */
+    async setKey(material, participantIdentity, keyIndex) {
+      const cryptoKey = await livekit.createKeyMaterialFromBuffer(material.buffer);
+      this.onSetEncryptionKey(cryptoKey, participantIdentity, keyIndex);
+      return true;
+    }
+  }
+  return new PerParticipantKeyProvider();
+}
+
+/**
+ * Serializes calls into the wasm manager: it allows one in-flight call at a
+ * time (a second concurrent call throws "recursive use of an object"), and
+ * several of its methods await the app's Matrix client mid-call. Everything
+ * that touches the manager — this wrapper, the app's sync feeding, join/leave —
+ * must go through one shared instance.
+ */
+export class ManagerOpQueue {
+  constructor() {
+    this.queue = Promise.resolve();
+  }
+
+  /** Run `op` once every earlier op has settled; resolves/rejects as `op` does. */
+  enqueue(op) {
+    const result = this.queue.then(op);
+    // The chain itself never rejects; each caller handles its own result.
+    this.queue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+}
+
+async function defaultFetchJson(url, body) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.text() };
+}

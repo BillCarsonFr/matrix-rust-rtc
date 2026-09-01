@@ -901,28 +901,8 @@ impl RtcSessionManagerHandle {
             legacy_state_events.len(),
         );
 
-        let mut current: Vec<RawStickyEvent> = member_events
-            .into_iter()
-            .filter_map(|event| compat::to_core_member_event(&room_id, event))
-            .collect();
-        let from_sticky = current.len();
-
-        if !legacy_state_events.is_empty() {
-            let seen: Vec<String> = current
-                .iter()
-                .map(|event| event.content.sticky_key.clone())
-                .collect();
-            current.extend(
-                compat::to_core_state_memberships(&room_id, legacy_state_events)
-                    .into_iter()
-                    .filter(|event| !seen.contains(&event.content.sticky_key)),
-            );
-        }
-
-        log::debug!(
-            "manager: [{room_id}] {from_sticky} sticky + {} pre-sticky membership(s) applied",
-            current.len() - from_sticky,
-        );
+        let current =
+            compat::merge_current_membership(&room_id, member_events, legacy_state_events);
 
         let mut manager = self.inner.lock().await;
         manager

@@ -27,7 +27,7 @@ use tokio::sync::broadcast;
 use matrix_rtc_bridge::compat::ElementCallCompat;
 use matrix_rtc_livekit::{
     LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
-    identity_mapper, msc4195_key_provider,
+    identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, OwnMemberClaims,
@@ -114,7 +114,7 @@ async fn build_media_session(
     // (keys are indexed by the participant identity, globally unique per
     // membership) and the bridge that imports keys the core signals.
     let provider = msc4195_key_provider();
-    let bridge = Arc::new(MediaKeyBridge::with_provider(provider.clone()));
+    let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
 
     // Wire the core's encryption manager to the bridge and to the MSC4195
     // identity derivation, and take the membership snapshot channel the engine

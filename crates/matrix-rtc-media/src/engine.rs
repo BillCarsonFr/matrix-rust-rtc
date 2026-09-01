@@ -54,7 +54,6 @@ use std::time::Duration;
 
 use matrix_rtc_core::{DiscardedKey, JoinedMembership};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
 
 use crate::constraints::MediaConstraints;
 use crate::event::{
@@ -62,6 +61,7 @@ use crate::event::{
 };
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
+use crate::rt;
 use crate::stats::ReceiveStats;
 use crate::transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
@@ -232,7 +232,7 @@ pub struct CallEngine {
     events_tx: broadcast::Sender<CallEvent>,
     participants_rx: watch::Receiver<Vec<Participant>>,
     tracks: TrackMap,
-    task: JoinHandle<()>,
+    task: rt::TaskHandle,
 }
 
 impl Drop for CallEngine {
@@ -246,8 +246,9 @@ impl CallEngine {
     /// (`RtcSession::subscribe_membership_snapshots`). The current snapshot is
     /// applied immediately.
     ///
-    /// Must be called within a tokio runtime (spawns the actor task, which is
-    /// `Send` — no `LocalSet` needed).
+    /// Must be called within a tokio runtime off `wasm32` (spawns the actor
+    /// task, which is `Send` there — no `LocalSet` needed). On `wasm32` the
+    /// actor runs on the JS microtask queue via `spawn_local`.
     pub fn new(
         config: EngineConfig,
         memberships: watch::Receiver<Vec<JoinedMembership>>,
@@ -255,6 +256,9 @@ impl CallEngine {
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (participants_tx, participants_rx) = watch::channel(Vec::new());
+        // On wasm32 the map is `!Send` (track handles hold JS values), but it
+        // is still shared — engine and actor — so `Arc` stays, uncontended.
+        #[cfg_attr(target_arch = "wasm32", expect(clippy::arc_with_non_send_sync))]
         let tracks: TrackMap = Arc::new(Mutex::new(HashMap::new()));
 
         let actor = Actor {
@@ -281,7 +285,7 @@ impl CallEngine {
             degraded_keys: HashSet::new(),
             ended: false,
         };
-        let task = tokio::spawn(actor.run(memberships, messages_rx));
+        let task = rt::spawn(actor.run(memberships, messages_rx));
 
         CallEngine {
             messages: messages_tx,
@@ -641,7 +645,7 @@ impl Actor {
                 if let Some(entry) = self.pool.remove(&connection_key)
                     && let ConnState::Up { connection } = entry.state
                 {
-                    tokio::spawn(async move {
+                    rt::spawn(async move {
                         if let Err(error) = connection.close().await {
                             log::debug!("closing idle connection failed: {error}");
                         }
@@ -707,7 +711,7 @@ impl Actor {
                         // shadow the state to render itself truthfully.
                         let kind = options.kind;
                         let messages = self.messages_tx.clone();
-                        tokio::spawn(async move {
+                        rt::spawn(async move {
                             let outcome = connection.publish(options).await;
                             if let Ok(track) = &outcome {
                                 let _ = messages.send(ActorMessage::LocalPublished {
@@ -760,8 +764,8 @@ impl Actor {
                 entry.1 += 1;
                 let generation = entry.1;
                 let messages = self.messages_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(CONSTRAINTS_DEBOUNCE).await;
+                rt::spawn(async move {
+                    rt::sleep(CONSTRAINTS_DEBOUNCE).await;
                     let _ = messages.send(ActorMessage::ApplyConstraints {
                         member_id,
                         kind,
@@ -813,7 +817,7 @@ impl Actor {
             return;
         };
         let kind_copy = kind;
-        tokio::spawn(async move {
+        rt::spawn(async move {
             if let Err(error) = connection
                 .apply_constraints(&identity, kind_copy, resolved)
                 .await
@@ -906,8 +910,8 @@ impl Actor {
                 let idle_generation = entry.idle_generation;
                 let messages = self.messages_tx.clone();
                 let key = key.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(IDLE_GRACE).await;
+                rt::spawn(async move {
+                    rt::sleep(IDLE_GRACE).await;
                     let _ = messages.send(ActorMessage::CloseIfIdle {
                         connection_key: key,
                         idle_generation,
@@ -954,7 +958,7 @@ impl Actor {
         let ctx = self.ctx.clone();
         let messages = self.messages_tx.clone();
         let key = key.to_owned();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             let result = backend.connect(&key, &ctx).await;
             let _ = messages.send(ActorMessage::ConnectFinished {
                 connection_key: key,
@@ -967,7 +971,7 @@ impl Actor {
     fn connect_finished(&mut self, key: &str, attempt: u32, result: ConnectOutcome) {
         let close_stray = |result: ConnectOutcome| {
             if let Ok((connection, _events)) = result {
-                tokio::spawn(async move {
+                rt::spawn(async move {
                     let _ = connection.close().await;
                 });
             }
@@ -1014,8 +1018,8 @@ impl Actor {
                 let delay = backoff_delay(next);
                 let messages = self.messages_tx.clone();
                 let key = key.to_owned();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
+                rt::spawn(async move {
+                    rt::sleep(delay).await;
                     let _ = messages.send(ActorMessage::RetryConnect {
                         connection_key: key,
                         attempt: next,
@@ -1061,8 +1065,8 @@ impl Actor {
         entry.state = ConnState::Backoff { attempt: 0 };
         let messages = self.messages_tx.clone();
         let key = key.to_owned();
-        tokio::spawn(async move {
-            tokio::time::sleep(backoff_delay(0)).await;
+        rt::spawn(async move {
+            rt::sleep(backoff_delay(0)).await;
             let _ = messages.send(ActorMessage::RetryConnect {
                 connection_key: key,
                 attempt: 0,
@@ -1077,7 +1081,7 @@ impl Actor {
         mut events: mpsc::UnboundedReceiver<ConnectionEvent>,
     ) {
         let forward = self.messages_tx.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             while let Some(event) = events.recv().await {
                 if forward
                     .send(ActorMessage::Connection {
@@ -1529,7 +1533,7 @@ impl Actor {
             if let ConnState::Up { connection } = entry.state
                 && !entry.is_own
             {
-                tokio::spawn(async move {
+                rt::spawn(async move {
                     if let Err(error) = connection.close().await {
                         log::debug!("closing connection on call end failed: {error}");
                     }

@@ -28,15 +28,16 @@
 //! focus share a room while every other focus needs its own subscribe-side
 //! connection.
 //!
-//! Everything here is `Send + Sync`; transports must never require the
-//! engine's tasks to be pinned to a `LocalSet`.
+//! Everything here is `Send + Sync` off `wasm32`, where transports must never
+//! require the engine's tasks to be pinned to a `LocalSet`. On `wasm32` the
+//! bounds vanish ([`MaybeSend`]): a browser transport wraps livekit-js through
+//! `JsValue`s, which are `!Send`, and the engine runs on the JS event loop.
 
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_core::stream::BoxStream;
-use matrix_rtc_core::{JoinedMembership, RtcTransport};
+use matrix_rtc_core::{JoinedMembership, MaybeSend, RtcTransport};
 use tokio::sync::mpsc;
 
 use crate::constraints::ResolvedConstraints;
@@ -45,6 +46,15 @@ use crate::frame::{AudioFrame, VideoFrame};
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::MediaStreamKind;
 use crate::stats::ReceiveStats;
+
+/// A boxed frame stream: `Send` off `wasm32` (frames cross into the engine's
+/// tasks), locally boxed on it (one thread, and JS-backed streams are `!Send`).
+#[cfg(not(target_arch = "wasm32"))]
+pub type FrameStream<'a, T> = futures_core::stream::BoxStream<'a, T>;
+/// A boxed frame stream: `Send` off `wasm32` (frames cross into the engine's
+/// tasks), locally boxed on it (one thread, and JS-backed streams are `!Send`).
+#[cfg(target_arch = "wasm32")]
+pub type FrameStream<'a, T> = futures_core::stream::LocalBoxStream<'a, T>;
 
 /// Errors produced by media transports.
 #[derive(Debug, thiserror::Error)]
@@ -82,18 +92,19 @@ pub struct ConnectionContext {
 ///
 /// Handles are cheap `Arc`s; a stream borrows nothing — dropping it stops
 /// frame delivery for that consumer only.
-#[async_trait]
-pub trait RemoteTrackHandle: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait RemoteTrackHandle: MaybeSend {
     fn kind(&self) -> MediaStreamKind;
 
     /// A stream of decoded audio frames, for audio tracks.
-    fn audio_frames(&self) -> Option<BoxStream<'static, AudioFrame>> {
+    fn audio_frames(&self) -> Option<FrameStream<'static, AudioFrame>> {
         None
     }
 
     /// A stream of decoded video frames, for video tracks. Delivery is
     /// latest-frame-wins: slow consumers drop frames instead of buffering.
-    fn video_frames(&self) -> Option<BoxStream<'static, VideoFrame>> {
+    fn video_frames(&self) -> Option<FrameStream<'static, VideoFrame>> {
         None
     }
 
@@ -220,8 +231,9 @@ impl fmt::Debug for ConnectionEvent {
 }
 
 /// A media transport backend (LiveKit today; P2P/WebTransport later).
-#[async_trait]
-pub trait MediaTransport: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait MediaTransport: MaybeSend {
     /// Stable name of the backend, matching the MSC4143 transport `type`
     /// (e.g. `"livekit"`). Used for logging and `can_subscribe` matching.
     fn transport_type(&self) -> &'static str;
@@ -254,8 +266,9 @@ pub trait MediaTransport: Send + Sync {
 }
 
 /// A live connection to one focus.
-#[async_trait]
-pub trait TransportConnection: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait TransportConnection: MaybeSend {
     /// The grouping key this connection serves.
     fn connection_key(&self) -> &str;
 

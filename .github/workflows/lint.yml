@@ -92,3 +92,21 @@ jobs:
         run: >
           cargo clippy -p matrix-rtc-wasm --target wasm32-unknown-unknown
           --all-targets -- -D warnings
+
+      # The shared layers a browser build sits on. Lib only (no --all-targets):
+      # their test suites are native (tokio `rt-multi-thread`/`time` dev-deps)
+      # and neither builds nor runs on wasm32.
+      - name: Run clippy (shared crates)
+        run: >
+          cargo clippy -p matrix-rtc-media -p matrix-rtc-bridge
+          -p matrix-rtc-livekit-proto
+          --target wasm32-unknown-unknown -- -D warnings
+
+      # The crate's wasm-bindgen tests, under node: the only place the
+      # wasm-only paths (JS command dispatch, the Date.now()-backed clock on
+      # the join path) actually execute.
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Run wasm-bindgen tests
+        run: wasm-pack test --node crates/matrix-rtc-wasm

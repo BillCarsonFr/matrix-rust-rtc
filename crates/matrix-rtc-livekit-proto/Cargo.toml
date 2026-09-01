@@ -1,0 +1,36 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+[package]
+name = "matrix-rtc-livekit-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The pure MSC4195 LiveKit control plane: identity derivations, token exchange shapes, and dialect selection. No IO, no libwebrtc — compiles for wasm32."
+
+[dependencies]
+# `RtcIdentityMapper`, the identity seam `identity_mapper` produces.
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+# `OpenIdToken` (what the token request carries) and the pre-2026 `compat`
+# dialects the identity/endpoint choices key on. Base build only — no
+# `matrix-sdk` feature, so this stays wasm-clean.
+matrix-rtc-bridge = { path = "../matrix-rtc-bridge" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror.workspace = true
+sha2 = "0.10"
+base64 = "0.22"

@@ -45,6 +45,19 @@ spec-current one: the actually-current 2026 format is
 counterpart here and `e2e_call` remains its only test. The UI strings live in
 one place, `RTC_MODE_LABEL` in `helpers/element-web.ts`.
 
+### The web peer
+
+`web-peer-rust.spec.ts` runs a third kind of peer: the **web stack** —
+`web/demo` in test mode (wasm bindings + matrix-js-sdk + livekit-js in a
+browser page, served by the `webServer` in `playwright.config.ts` and driven
+through `helpers/web-peer.ts`, the page-shaped sibling of `rust-peer.ts`).
+It shares a call with the Rust peer in the spec-current dialect
+(`ElementCallCompat::Off`), asserting both directions: membership, key
+import under the SFU identity, the video pattern read back from a `<video>`,
+and audio energy. This is the web stack's only test against a real
+homeserver, authorisation service, and SFU — everything else it has runs
+against fakes.
+
 ## Running it
 
 ```sh

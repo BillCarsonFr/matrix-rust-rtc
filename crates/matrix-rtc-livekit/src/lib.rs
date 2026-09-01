@@ -39,7 +39,12 @@
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
-pub mod identity;
+// The pure control plane — hash derivations, token shapes, dialect choices —
+// lives in `matrix-rtc-livekit-proto`, which the web binding shares; this crate
+// re-exports it under the paths it always had.
+pub use matrix_rtc_livekit_proto::identity;
+pub use matrix_rtc_livekit_proto::{LiveKitTransportConfig, TokenEndpoint, identity_mapper};
+
 pub mod keys;
 // Audio helpers. Recording a subscribed track and writing WAVs is shipped API
 // (the recording-bot use case); the synthetic-tone generator and frequency
@@ -62,6 +67,7 @@ pub use matrix_rtc_bridge::compat;
 pub use keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
     ParticipantKey, SwitchCompleteListener, msc4195_key_provider, msc4195_key_provider_options,
+    msc4195_media_key_bridge,
 };
 pub use session::{LiveKitConnection, LiveKitSession};
 pub use token::{MemberClaims, SfuToken};
@@ -89,66 +95,6 @@ pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_sl
 // host driving a call keeps one dependency.
 #[cfg(feature = "matrix-sdk")]
 pub use matrix_rtc_bridge::{SdkCommandSender, run_sticky_bridge};
-
-/// The participant-identity derivation a MatrixRTC generation's authorisation
-/// service uses.
-///
-/// One of the two things [`compat`] deliberately cannot own — the other being
-/// [`TokenEndpoint`] — because the modern derivation hashes per MSC4195, which is
-/// a LiveKit document rather than a Matrix wire format. The `compat` module
-/// decides *which generation*; this decides *what that means for an identity*.
-///
-/// Call it once per call and share the returned `Arc`: it has four uses (the core's
-/// encryption manager, the media transport, our own identity, and the key ring —
-/// see `call::Call::join`), and they must not skew. That matters more than it
-/// looks, because a divergence is not an error but a silence: peers appear in the
-/// roster with no media, their keys land under an identity the SFU never assigned,
-/// and nothing anywhere logs a problem.
-pub fn identity_mapper(compat: compat::ElementCallCompat) -> matrix_rtc_core::RtcIdentityMapper {
-    use std::sync::Arc;
-
-    use crate::compat::ElementCallCompat;
-
-    match compat {
-        ElementCallCompat::Off | ElementCallCompat::StickyEvents => {
-            Arc::new(identity::pseudonymous_identity)
-        }
-        // That generation's authorisation service issues the unhashed
-        // `{user}:{device}` string, and has no session component at all.
-        ElementCallCompat::StateEvents => {
-            Arc::new(|user_id: &str, device_id: &str, _member_id: &str| {
-                crate::compat::element_call_state::participant_identity(user_id, device_id)
-            })
-        }
-    }
-}
-
-/// Which authorisation-service dialect to speak.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TokenEndpoint {
-    /// MSC4195 `POST /get_token`.
-    #[default]
-    Msc4195,
-    /// Pre-MSC4195 `POST /sfu/get`, for Element Call builds older than MSC4354.
-    /// Temporary; see [`compat`].
-    LegacyElementCall,
-}
-
-/// Configuration identifying the MatrixRTC slot to connect to.
-#[derive(Clone, Debug)]
-pub struct LiveKitTransportConfig {
-    /// `livekit_service_url` advertised by the transport (the authorisation
-    /// service base URL, e.g. `https://matrix-rtc.example.com/livekit/jwt`).
-    pub livekit_service_url: String,
-    /// Matrix room ID hosting the `m.rtc.member` event.
-    pub room_id: String,
-    /// MatrixRTC slot ID.
-    pub slot_id: String,
-    /// `member` claims identifying this membership to the authorisation service.
-    pub member: MemberClaims,
-    /// Which authorisation-service dialect to speak. Defaults to MSC4195.
-    pub token_endpoint: TokenEndpoint,
-}
 
 /// Obtain a fresh OpenID token and exchange it for an SFU JWT.
 ///
@@ -246,9 +192,10 @@ pub enum Error {
     #[error("HTTP error talking to the LiveKit authorisation service: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// The authorisation service rejected the request (non-2xx response).
-    #[error("LiveKit authorisation service returned {status}: {body}")]
-    Service { status: u16, body: String },
+    /// The authorisation service rejected the request or answered with a body
+    /// that does not decode.
+    #[error(transparent)]
+    Service(#[from] matrix_rtc_livekit_proto::TokenServiceError),
 
     /// Obtaining the Matrix OpenID token from the host failed.
     #[error(transparent)]

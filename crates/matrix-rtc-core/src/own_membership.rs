@@ -67,7 +67,12 @@
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+// `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
+// is the same API over `Date.now()`.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;

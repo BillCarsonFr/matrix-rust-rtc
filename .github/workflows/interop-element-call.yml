@@ -67,6 +67,9 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # wasm32 for the web peer's bindings, alongside the host target.
+          targets: wasm32-unknown-unknown
 
       # webrtc-sys's build script shells out to pkg-config for glib-2.0 (the
       # prebuilt linux libwebrtc links it dynamically).
@@ -85,6 +88,14 @@ jobs:
       - name: Build the interop peer
         run: cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer
 
+      # The web peer's wasm bindings. The rust-cache step above covers the
+      # cargo half of this build too.
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build the wasm bindings
+        run: ./web/scripts/build-bindings.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -93,6 +104,12 @@ jobs:
       # it pins @playwright/test, which is the only dependency here).
       - name: Install Playwright dependencies
         working-directory: interop
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      # The web peer page; Playwright's webServer builds and serves it.
+      - name: Install web peer dependencies
+        working-directory: web/demo
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
 

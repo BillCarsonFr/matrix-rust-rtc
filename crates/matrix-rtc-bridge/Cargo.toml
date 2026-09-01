@@ -75,6 +75,17 @@ matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "3
 # `crypto` re-export.
 matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["e2e-encryption"] }
 
+# `std::time::SystemTime::now()` PANICS on wasm32-unknown-unknown; web-time is
+# the drop-in that reads `Date.now()` instead. The compat dialects stamp
+# `created_ts` on outbound legacy content, so this is on the wasm send path.
+#
+# This target block MUST stay below the plain `[dependencies]` entries: in TOML
+# every key after a table header belongs to that table, so a dependency written
+# under it silently becomes wasm32-only (that exact mistake once made
+# `matrix-sdk` vanish from native builds).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "1"
+
 [features]
 # The SDK-backed half: `sdk` (command sender + sticky/room-state bridge into
 # matrix-rtc-core) and the default `OpenIdTokenSource` impl for

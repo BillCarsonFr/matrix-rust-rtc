@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::CommandError;
+use crate::maybe_send::MaybeSend;
 
 /// One device a to-device message is addressed to.
 ///
@@ -102,9 +103,12 @@ impl ToDeviceDelivery {
 ///
 /// Native being `Send` is not incidental — it is what lets a uniffi async
 /// export return one of these futures, since uniffi spawns them.
+///
+/// The implementing type is held to the same split by [`MaybeSend`]: `Send +
+/// Sync` on native, unconstrained on `wasm32`, where a sender holds a `JsValue`.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait RtcCommandSender: Send + Sync {
+pub trait RtcCommandSender: MaybeSend {
     /// Send a sticky event to a Matrix room.
     ///
     /// The event will be sent as a sticky event (using the appropriate MSC or

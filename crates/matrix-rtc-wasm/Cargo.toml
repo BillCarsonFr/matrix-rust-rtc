@@ -26,6 +26,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The media roster/pool engine (its actor runs on `spawn_local` here) and the
+# shared key handler; `bridge` for the compat dialects and `OpenIdToken`;
+# `proto` for the MSC4195 identity derivation and token shapes. None of these
+# pull livekit/libwebrtc — the browser's media is livekit-js.
+matrix-rtc-media = { path = "../matrix-rtc-media" }
+matrix-rtc-bridge = { path = "../matrix-rtc-bridge" }
+matrix-rtc-livekit-proto = { path = "../matrix-rtc-livekit-proto" }
 serde.workspace = true
 serde_json.workspace = true
 wasm-bindgen.workspace = true
@@ -44,12 +51,6 @@ console_error_panic_hook = "0.1"
 # `RUST_LOG`-style filter specs, so the same spec works here and over the FFI.
 # No regex: it is a large dependency to put in a wasm bundle.
 env_filter = { version = "0.1", default-features = false }
-
-[target.'cfg(target_family = "wasm")'.dependencies]
-# `matrix-rtc-core` uses `rand` for key generation, which reaches getrandom 0.2.
-# That has no wasm entropy source unless its `js` feature is on, and refuses to
-# compile for wasm32-unknown-unknown without it.
-getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 serde_json.workspace = true

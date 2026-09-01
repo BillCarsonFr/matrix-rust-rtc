@@ -1,0 +1,63 @@
+<!doctype html>
+<!--
+  Copyright 2026 Valere Fedronic
+
+  This file is part of matrix-rust-rtc, released under the GNU Affero
+  General Public License v3.0 or later; see the repository root.
+
+  The call page over the wasm bindings + livekit-js. Two modes, one code
+  path: a human-usable demo (this form and the tiles), and — with ?test=1 —
+  the Playwright-drivable web interop peer (window.webPeer, see
+  src/peer-api.mjs).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MatrixRTC Web Peer</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 1rem; background: #fafafa; color: #111; }
+      fieldset { border: 1px solid #ccc; margin-bottom: 1rem; max-width: 48rem; }
+      label { display: inline-block; margin: 0.15rem 0.75rem 0.15rem 0; }
+      input { font: inherit; }
+      button { font: inherit; margin-right: 0.5rem; }
+      #tiles { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+      .tile { border: 1px solid #ccc; background: #fff; padding: 0.5rem; width: 21rem; }
+      .tile video { width: 20rem; height: 11.25rem; background: #000; display: block; }
+      .tile .who { font-weight: 600; margin-top: 0.25rem; }
+      .tile .meta { color: #555; font-size: 12px; overflow-wrap: anywhere; }
+      #log { font: 12px ui-monospace, monospace; white-space: pre-wrap; background: #111;
+             color: #cde; padding: 0.5rem; max-height: 18rem; overflow-y: auto; max-width: 60rem; }
+    </style>
+  </head>
+  <body>
+    <h1>MatrixRTC web peer</h1>
+    <fieldset id="controls">
+      <legend>Call</legend>
+      <div>
+        <label>Homeserver <input id="homeserver" size="34" value="https://synapse.m.localhost" /></label>
+        <label>User <input id="user" placeholder="localpart or blank to register" /></label>
+        <label>Password <input id="password" type="password" /></label>
+      </div>
+      <div>
+        <label>Room ID <input id="room" size="34" placeholder="!room:server (blank: create one)" /></label>
+        <label>Invite <input id="invite" placeholder="@friend:server (when creating)" /></label>
+      </div>
+      <div>
+        <label>Mode
+          <select id="mode">
+            <option value="state_events" selected>Element Call default (state events, pre-2025)</option>
+            <option value="sticky_events">Element Call "Matrix 2.0" (sticky 2025)</option>
+            <option value="off">Spec-current (MSC4143)</option>
+          </select>
+        </label>
+        <button id="joinBtn">Join call</button>
+        <button id="leaveBtn" disabled>Leave</button>
+      </div>
+    </fieldset>
+    <div id="tiles"></div>
+    <h2>Log</h2>
+    <div id="log"></div>
+    <script type="module" src="/src/main.mjs"></script>
+  </body>
+</html>
