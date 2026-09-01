@@ -436,6 +436,7 @@ mod tests {
             content: serde_json::json!({
                 "application": "m.call",
                 "call_id": "",
+                "created_ts": now - 5_000,
                 "device_id": "ALICEDEVICE",
                 "expires": 14_400_000_u64,
                 "membershipID": "@alice:example.org:ALICEDEVICE",
@@ -455,6 +456,10 @@ mod tests {
             Some("@alice:example.org:ALICEDEVICE"),
         );
         assert_eq!(converted[0].origin.sender_device_id(), Some("ALICEDEVICE"));
+        // The member id is reused across this dialect's joins, so the join
+        // timestamp must survive the translation — it is what key distribution
+        // uses to tell a rejoined session from the join it already served.
+        assert_eq!(converted[0].content.created_ts, Some(now - 5_000));
     }
 
     #[test]

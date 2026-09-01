@@ -168,6 +168,16 @@ pub struct RawStickyEventContent {
     /// Optional leave reason, for `membership = leave` (MSC4143).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leave_reason: Option<LeaveReason>,
+    /// When this participation began (ms since the epoch).
+    ///
+    /// Not an MSC4143 field: a native membership is `None`, and its per-join
+    /// `member.id` is identity enough. The pre-sticky Element Call dialect
+    /// reuses `{user}:{device}` as the member id across joins, so its
+    /// translation carries the event's `created_ts` through here to keep two
+    /// joins by the same device distinguishable (see
+    /// [`JoinedMembership::membership_ts`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_ts: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +280,7 @@ impl RawStickyEvent {
             origin: self.origin,
             sticky_key: self.content.sticky_key,
             member_id,
+            membership_ts: self.content.created_ts,
             application: application_type,
             transports: transports
                 .published
@@ -334,6 +345,7 @@ impl RawStickyEventContent {
             // anything it can receive.
             transports: (!transports.is_empty()).then_some(transports),
             leave_reason: None,
+            created_ts: None,
         }
     }
 
@@ -356,6 +368,7 @@ impl RawStickyEventContent {
             application: ApplicationInfo::default(),
             transports: None,
             leave_reason,
+            created_ts: None,
         }
     }
 }

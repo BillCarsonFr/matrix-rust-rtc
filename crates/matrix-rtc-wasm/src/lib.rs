@@ -1268,6 +1268,7 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                         can_subscribe: t.can_subscribe,
                     }),
                 leave_reason: value.content.leave_reason.map(Into::into),
+                created_ts: None,
             },
         }
     }

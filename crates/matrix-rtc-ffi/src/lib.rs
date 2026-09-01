@@ -1148,6 +1148,7 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
             member,
             transports,
             leave_reason: event.leave_reason.map(Into::into),
+            created_ts: None,
         },
     }
 }
