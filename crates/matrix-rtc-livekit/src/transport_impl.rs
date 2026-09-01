@@ -30,6 +30,7 @@
 //! connection.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -366,6 +367,9 @@ impl TransportConnection for LiveKitTransportConnection {
                     kind,
                     source: LocalSource::Audio(source),
                     track: published,
+                    session: Arc::clone(&self.session),
+                    closed: AtomicBool::new(false),
+                    retraction_failed: AtomicBool::new(false),
                 }))
             }
             MediaStreamKind::Camera | MediaStreamKind::ScreenShare => {
@@ -408,6 +412,9 @@ impl TransportConnection for LiveKitTransportConnection {
                     kind,
                     source: LocalSource::Video(source),
                     track: published,
+                    session: Arc::clone(&self.session),
+                    closed: AtomicBool::new(false),
+                    retraction_failed: AtomicBool::new(false),
                 }))
             }
             MediaStreamKind::Data => Err(TransportError::Unsupported(
@@ -518,6 +525,22 @@ struct LiveKitLocalTrack {
     /// The published track, kept so it can be muted. Cheap to clone — LiveKit's
     /// track types are handles.
     track: LocalTrack,
+    /// The session this was published on, kept so the publication can be
+    /// retracted. The room never holds this wrapper, so no cycle.
+    session: Arc<LiveKitSession>,
+    /// Set once `unpublish` succeeds — not before: a failed retraction
+    /// leaves the publication live at the SFU, and the handle must stay
+    /// usable to feed, mute, and retry it. Captures landing in the source
+    /// while a retraction is in flight are harmless — the frames go
+    /// nowhere — but once the publication is gone a capture loop must see
+    /// an error rather than silent success, or it never learns to stop.
+    closed: AtomicBool,
+    /// Set when an `unpublish` attempt fails. LiveKit drops the publication
+    /// from its local map *before* the fallible transport work, with no
+    /// rollback, so after a failure a retry sees "track not found" — which
+    /// must not be mistaken for the benign already-retracted case, because
+    /// the track may still be live at the SFU.
+    retraction_failed: AtomicBool,
 }
 
 #[async_trait]
@@ -536,7 +559,47 @@ impl LocalTrackHandle for LiveKitLocalTrack {
         Ok(())
     }
 
+    /// Idempotent for the same reason `close` is: "track not found" means the
+    /// publication is already gone (a second unpublish, or the room closed and
+    /// retracted everything), and the postcondition callers want holds — with
+    /// one exception. After a *failed* attempt on this handle, "track not
+    /// found" only reflects LiveKit's local map (emptied before the fallible
+    /// work, without rollback), not the SFU, so it stays an error rather than
+    /// reporting a retraction that may never have happened.
+    async fn unpublish(&self) -> Result<(), TransportError> {
+        let sid = self.track.sid();
+        match self
+            .session
+            .room()
+            .local_participant()
+            .unpublish_track(&sid)
+            .await
+        {
+            Ok(_) => {
+                self.closed.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(livekit::RoomError::Internal(message))
+                if message.contains("track not found")
+                    && !self.retraction_failed.load(Ordering::Acquire) =>
+            {
+                log::debug!("{sid} was already unpublished; treating as success");
+                self.closed.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.retraction_failed.store(true, Ordering::Release);
+                Err(TransportError::Closed(error.to_string()))
+            }
+        }
+    }
+
     async fn capture_audio(&self, frame: AudioFrame) -> Result<(), TransportError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed(
+                "this publication was unpublished".into(),
+            ));
+        }
         let LocalSource::Audio(source) = &self.source else {
             return Err(TransportError::Unsupported(
                 "this publication does not accept audio frames".into(),
@@ -555,6 +618,11 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     fn capture_video(&self, frame: VideoFrame) -> Result<(), TransportError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportError::Closed(
+                "this publication was unpublished".into(),
+            ));
+        }
         let LocalSource::Video(source) = &self.source else {
             return Err(TransportError::Unsupported(
                 "this publication does not accept video frames".into(),

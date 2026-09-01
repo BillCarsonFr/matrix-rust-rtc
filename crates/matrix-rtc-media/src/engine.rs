@@ -172,9 +172,22 @@ enum ActorMessage {
         kind: MediaStreamKind,
         track: Arc<dyn LocalTrackHandle>,
     },
+    /// A local retraction resolved at the transport; the roster must drop it.
+    /// `track` identifies which publication was retracted, so a same-kind
+    /// publish that landed while the retraction was in flight is not the one
+    /// removed.
+    LocalUnpublished {
+        kind: MediaStreamKind,
+        track: Arc<dyn LocalTrackHandle>,
+    },
     SetLocalMuted {
         kind: MediaStreamKind,
         muted: bool,
+        respond: oneshot::Sender<Result<(), TransportError>>,
+    },
+    /// Retract one of our own publications.
+    Unpublish {
+        kind: MediaStreamKind,
         respond: oneshot::Sender<Result<(), TransportError>>,
     },
     /// Publish a local track on the own-focus connection.
@@ -388,6 +401,31 @@ impl CallEngine {
                 muted,
                 respond,
             })
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
+        response
+            .await
+            .map_err(|_| TransportError::Closed("the engine is gone".into()))?
+    }
+
+    /// Retract one of our own publications at the transport.
+    ///
+    /// Where a mute keeps the publication up so peers can tell a deliberate
+    /// off from a wedged sender, unpublish removes it: peers drop the stream
+    /// (their transport reports it removed) instead of rendering an empty
+    /// tile — what a stopped screen share needs, since a screen has no "off"
+    /// state worth showing. On success the own roster entry drops the stream
+    /// and [`CallEvent::StreamStopped`] is emitted, and the handle obtained
+    /// from [`CallEngine::publish`] is dead: `capture_*` calls on it error.
+    ///
+    /// On failure the publication stays on the roster and stays usable
+    /// (mute, capture, retry this call): the retraction can fail while the
+    /// room is live, and dropping local state then would leave a still-live
+    /// publication nothing can retract. Errors if nothing of that kind is
+    /// published.
+    pub async fn unpublish(&self, kind: MediaStreamKind) -> Result<(), TransportError> {
+        let (respond, response) = oneshot::channel();
+        self.messages
+            .send(ActorMessage::Unpublish { kind, respond })
             .map_err(|_| TransportError::Closed("the engine is gone".into()))?;
         response
             .await
@@ -750,6 +788,40 @@ impl Actor {
                     self.set_member_muted(&own_member_id, kind, muted);
                 }
                 let _ = respond.send(outcome);
+            }
+            ActorMessage::Unpublish { kind, respond } => {
+                let Some(track) = self.local_tracks.get(&kind) else {
+                    let _ = respond.send(Err(TransportError::Unsupported(format!(
+                        "nothing of kind {kind:?} is published locally"
+                    ))));
+                    return;
+                };
+                // Awaited off-actor like the publish itself, and the actor
+                // learns the outcome through `LocalUnpublished`: a retraction
+                // can fail while the room is live (the room-closed case comes
+                // back as success from the transport), and clearing local
+                // state on a failed attempt would leave a still-live
+                // publication that nothing can mute or retract anymore.
+                let track = Arc::clone(track);
+                let messages = self.messages_tx.clone();
+                rt::spawn(async move {
+                    let outcome = track.unpublish().await;
+                    if outcome.is_ok() {
+                        let _ = messages.send(ActorMessage::LocalUnpublished { kind, track });
+                    }
+                    let _ = respond.send(outcome);
+                });
+            }
+            ActorMessage::LocalUnpublished { kind, track } => {
+                if self
+                    .local_tracks
+                    .get(&kind)
+                    .is_some_and(|current| Arc::ptr_eq(current, &track))
+                {
+                    self.local_tracks.remove(&kind);
+                    let own_member_id = self.own_member_id.clone();
+                    self.remove_stream(&own_member_id, kind);
+                }
             }
             ActorMessage::SetConstraints {
                 member_id,
@@ -1571,7 +1643,7 @@ fn select_transport(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
     use futures_core::stream::BoxStream;
@@ -1584,6 +1656,7 @@ mod tests {
 
     use super::*;
     use crate::frame::AudioFrame;
+    use crate::local::VideoSourceConfig;
     use crate::transport::{OwnMemberClaims, SpeakingParticipant};
 
     const OWN_FOCUS: &str = "https://sfu.example.org";
@@ -1604,6 +1677,10 @@ mod tests {
         applied: StdMutex<Vec<(String, MediaStreamKind, crate::ResolvedConstraints)>>,
         /// `(kind, muted)` of every local mute call that reached the transport.
         local_mutes: StdMutex<Vec<(MediaStreamKind, bool)>>,
+        /// Kind of every unpublish call that reached the transport.
+        unpublished: StdMutex<Vec<MediaStreamKind>>,
+        /// Makes the next unpublish calls fail at the transport.
+        fail_unpublish: AtomicBool,
     }
 
     struct FakeTransport {
@@ -1711,6 +1788,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((self.kind, muted));
+            Ok(())
+        }
+
+        async fn unpublish(&self) -> Result<(), TransportError> {
+            if self.state.fail_unpublish.load(Ordering::SeqCst) {
+                return Err(TransportError::Closed("fake unpublish failure".into()));
+            }
+            self.state.unpublished.lock().unwrap().push(self.kind);
             Ok(())
         }
     }
@@ -2717,6 +2802,178 @@ mod tests {
                 .set_local_muted(MediaStreamKind::Camera, true)
                 .await
                 .is_err()
+        );
+    }
+
+    /// Unpublishing must reach the transport (so peers drop the stream rather
+    /// than rendering an empty tile — the stopped-screen-share case) *and*
+    /// remove it from our own roster entry.
+    #[tokio::test]
+    async fn unpublishing_removes_the_stream_from_our_roster_and_reaches_the_transport() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::screen_share(VideoSourceConfig {
+                width: 1920,
+                height: 1080,
+            }))
+            .await
+            .expect("publish should succeed");
+        let _ = next_event(&mut fx.events).await; // StreamStarted
+
+        fx.engine
+            .unpublish(MediaStreamKind::ScreenShare)
+            .await
+            .expect("unpublishing a live publication should succeed");
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStopped {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::ScreenShare,
+            }
+        );
+        assert_eq!(
+            *fx.state.unpublished.lock().unwrap(),
+            vec![MediaStreamKind::ScreenShare],
+            "the unpublish must reach the transport, or peers keep the stream",
+        );
+        assert!(
+            fx.engine
+                .participants()
+                .into_iter()
+                .find(|p| p.is_local)
+                .expect("we are on our own roster")
+                .streams
+                .is_empty()
+        );
+    }
+
+    /// Unpublishing something we never published is an error, mirroring mute.
+    #[tokio::test]
+    async fn unpublishing_an_unpublished_kind_fails() {
+        let fx = fixture();
+        let _connection = adopt(&fx);
+
+        assert!(
+            fx.engine
+                .unpublish(MediaStreamKind::ScreenShare)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A fresh publish of the same kind after an unpublish must come back on
+    /// the roster — nothing of the retracted publication may linger.
+    #[tokio::test]
+    async fn republishing_after_unpublish_puts_the_stream_back() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+        let _ = next_event(&mut fx.events).await; // StreamStarted
+        fx.engine
+            .unpublish(MediaStreamKind::Microphone)
+            .await
+            .expect("unpublish should succeed");
+        let _ = next_event(&mut fx.events).await; // StreamStopped
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("re-publishing after an unpublish should succeed");
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        assert_eq!(fx.state.published.lock().unwrap().len(), 2);
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .expect("we are on our own roster");
+        assert_eq!(own.streams.len(), 1);
+        assert_eq!(own.streams[0].kind, MediaStreamKind::Microphone);
+    }
+
+    /// A failed retraction keeps the publication: the transport already maps
+    /// the room-closed case to success, so a failure means the room is live
+    /// and the track is still published at the SFU. Dropping local state then
+    /// would leave a stream peers keep rendering but that nothing can mute or
+    /// retract anymore — for a screen share, a privacy bug.
+    #[tokio::test]
+    async fn unpublish_keeps_the_publication_when_the_transport_errors() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+        let _ = next_event(&mut fx.events).await; // StreamStarted
+
+        fx.state.fail_unpublish.store(true, Ordering::SeqCst);
+        assert!(
+            fx.engine
+                .unpublish(MediaStreamKind::Microphone)
+                .await
+                .is_err()
+        );
+
+        // The stream is still on our roster and the publication still usable.
+        assert_eq!(
+            fx.engine
+                .participants()
+                .into_iter()
+                .find(|p| p.is_local)
+                .expect("we are on our own roster")
+                .streams
+                .len(),
+            1
+        );
+        fx.engine
+            .set_local_muted(MediaStreamKind::Microphone, true)
+            .await
+            .expect("the engine still holds the publication");
+        let _ = next_event(&mut fx.events).await; // StreamMuted
+
+        // A retry once the transport recovers retracts it for real.
+        fx.state.fail_unpublish.store(false, Ordering::SeqCst);
+        fx.engine
+            .unpublish(MediaStreamKind::Microphone)
+            .await
+            .expect("the retry should succeed");
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStopped {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        assert_eq!(
+            *fx.state.unpublished.lock().unwrap(),
+            vec![MediaStreamKind::Microphone],
         );
     }
 

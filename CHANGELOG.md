@@ -158,6 +158,20 @@ single integrator, rather than dripped out over several:
 
 ### Added
 
+- **`MediaSession.unpublish(kind)`, so a stopped screen share can be retracted
+  rather than left muted.** Muting keeps the publication up on purpose — that
+  is right for a camera, where peers should tell a deliberate off from a
+  wedged sender — but a screen has no "off" state, and peers kept rendering
+  an empty tile for a muted share. Unpublishing removes the publication at
+  the SFU (peers drop the stream), removes it from our own roster entry, and
+  emits `StreamStopped`; underneath it are the new `CallEngine::unpublish`
+  and `LocalTrackHandle::unpublish`. The `FfiLocalTrack` from `publish` is
+  dead afterwards: `captureAudio`/`captureVideo` fail with a transport error
+  instead of silently succeeding (and never crash, so a capture thread still
+  mid-call during the unpublish is safe). Clarified in the docs what
+  integrators had to find out by trying: dropping/`close()`-ing the
+  `FfiLocalTrack` wrapper never retracts the publication.
+
 - **MSC4075 call notifications, so a call can ring.** A membership says who is
   *in* a session; it never said who should be *summoned* to one, which is why a
   mobile client had nothing to raise an incoming call from. Passing `notify` on a

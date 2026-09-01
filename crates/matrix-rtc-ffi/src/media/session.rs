@@ -399,7 +399,8 @@ impl MediaSession {
     }
 
     /// Publish a local track on our focus; push captured frames into the
-    /// returned handle.
+    /// returned handle. Retract it with [`MediaSession::unpublish`] — closing
+    /// the returned handle does not.
     pub async fn publish(
         &self,
         options: FfiPublishOptions,
@@ -437,6 +438,31 @@ impl MediaSession {
                 log::warn!("media: local mute failed: {error}");
                 MediaFfiError::Transport(error.to_string())
             })
+    }
+
+    /// Retract one of our own publications, so peers drop the stream instead
+    /// of rendering an empty tile — what a stopped screen share needs, since
+    /// unlike a camera a screen has no "off" state a mute could represent.
+    ///
+    /// On success peers see the stream removed, our own roster entry drops
+    /// it (`StreamStopped` against our `member_id`), and the `FfiLocalTrack`
+    /// from [`MediaSession::publish`] is dead: `captureAudio` /
+    /// `captureVideo` fail with a transport error (they never crash, so a
+    /// capture thread still mid-call is safe — it should stop on the first
+    /// error). On failure the publication is still live and stays on the
+    /// roster, usable and retryable — treat the stream as still visible to
+    /// peers. `ScreenShare` and `ScreenShareAudio` are separate
+    /// publications; unpublish each. Re-publishing the same kind later is a
+    /// fresh [`MediaSession::publish`].
+    ///
+    /// Errors if nothing of that kind is currently published.
+    pub async fn unpublish(&self, kind: FfiStreamKind) -> Result<(), MediaFfiError> {
+        log::info!("media: unpublishing our own {kind:?}");
+
+        self.engine.unpublish(kind.into()).await.map_err(|error| {
+            log::warn!("media: unpublish failed: {error}");
+            MediaFfiError::Transport(error.to_string())
+        })
     }
 
     /// End the media session: emits `Ended { Left }`, closes every
