@@ -264,11 +264,19 @@ pub fn translate_state_memberships(
                 application.insert("m.call.intent".to_owned(), intent.clone());
             }
 
+            // `created_ts` rides along because this dialect's member id is
+            // `{user}:{device}`, reused across joins: the timestamp is the only
+            // thing that tells a rejoined session — which holds no keys — apart
+            // from the join we may already have served keys to. `joined_at` is
+            // pinned for the life of one join (a refresh keeps `created_ts` and
+            // the minimum with `origin_server_ts` does not move), so it changes
+            // exactly when the participation does.
             let mut content = json!({
                 "slot_id": member.slot_id,
                 "msc4354_sticky_key": member.member_id,
                 "member": { "id": member.member_id, "membership": "join" },
                 "application": application,
+                "created_ts": member.joined_at,
             });
 
             // The focus object goes through **verbatim**: `RawRtcTransport`
@@ -727,6 +735,7 @@ mod tests {
                 "msc4354_sticky_key": "@alice:example.io:V5cP8FErcB",
                 "member": { "id": "@alice:example.io:V5cP8FErcB", "membership": "join" },
                 "application": { "type": "m.call", "m.call.intent": "video" },
+                "created_ts": CREATED,
                 "transports": {
                     "published": [{
                         "type": "livekit",

@@ -916,10 +916,8 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // (MSC4143), so a stale membership of *our own* device — we died without
         // leaving and rejoined inside its sticky lifetime — reads as a peer, and
         // we would send our own key to ourselves. Olm has no session with the
-        // sending device, so that send fails; and because a repeat of our own
-        // user+device under a new `member_id` also trips `any_membership_changed`
-        // below, the ghost forces a rotation *and* breaks it, for as long as it
-        // stays visible.
+        // sending device, so that send fails, on every rollout for as long as
+        // the ghost stays visible.
         //
         // Other devices of our own user are ordinary recipients and stay.
         let current_participants: Vec<ParticipantDeviceInfo> = current_memberships
@@ -934,6 +932,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
                 user_id: m.sender.clone(),
                 device_id: m.origin.sender_device_id().unwrap_or_default().to_owned(),
                 member_id: m.member_id.clone(),
+                membership_ts: m.membership_ts,
             })
             .collect();
 
@@ -954,34 +953,26 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let current_key = current_key.unwrap();
         let already_shared_with = current_key.shared_with.clone();
 
-        // Find participants who left (were previously shared with but are no longer present)
+        // Both diffs compare participations with `same_join`, never `member_id`
+        // alone: the pre-sticky Element Call dialect reuses `{user}:{device}` as
+        // the member id, so a device that leaves and rejoins is a *new*
+        // participation — a fresh session holding no keys — under the id we
+        // already served. Matched by id alone, the return lands in neither list:
+        // nothing is sent, and the rejoined member can never decrypt us. Matched
+        // by join, the old participation stays in `left` (its rotation stays
+        // owed) and the new one is in `joined` (it is served the current key).
+
+        // Find participations that ended (previously shared with but no longer present)
         let left: Vec<&ParticipantDeviceInfo> = already_shared_with
             .iter()
-            .filter(|x| {
-                !current_participants
-                    .iter()
-                    .any(|o| o.member_id == x.member_id)
-            })
+            .filter(|x| !current_participants.iter().any(|o| o.same_join(x)))
             .collect();
 
-        // Find new participants (present now but not previously shared with)
+        // Find new participations (present now but not previously shared with)
         let joined: Vec<&ParticipantDeviceInfo> = current_participants
             .iter()
-            .filter(|x| {
-                !already_shared_with
-                    .iter()
-                    .any(|o| o.member_id == x.member_id)
-            })
+            .filter(|x| !already_shared_with.iter().any(|o| o.same_join(x)))
             .collect();
-
-        // Check if any membership timestamps changed (user rotated their device/fingerprint)
-        // This requires tracking timestamps, which we'll add to ParticipantDeviceInfo later
-        // For now, we'll check if the membership has changed by comparing with shared_with
-        let any_membership_changed = current_participants.iter().any(|x| {
-            already_shared_with.iter().any(|o| {
-                o.user_id == x.user_id && o.device_id == x.device_id && o.member_id != x.member_id
-            })
-        });
 
         // Does anyone actually still holding the outgoing key stand to be
         // disrupted by us switching away from it?
@@ -998,7 +989,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         let outgoing_key_is_live = current_participants.iter().any(|participant| {
             already_shared_with
                 .iter()
-                .any(|holder| holder.member_id == participant.member_id)
+                .any(|holder| holder.same_join(participant))
         });
 
         // Kept past the branch below, which may consume `current_key`.
@@ -1037,9 +1028,10 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             )
         });
 
-        if !left.is_empty() || any_membership_changed {
-            // A member who holds this key is gone, so it has to be replaced — but
-            // not necessarily this instant. Pulling the expiry back to the end of
+        if !left.is_empty() {
+            // A participation that holds this key has ended — its member left, or
+            // rejoined as a fresh session — so it has to be replaced, but not
+            // necessarily this instant. Pulling the expiry back to the end of
             // freshness does both cases at once: while the key is fresh that is in
             // the future, which defers and coalesces every other change until then;
             // once it has settled that is in the past, which rotates now.
@@ -1050,17 +1042,17 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             // and it makes a burst cost two rotations however large it is: the one
             // that minted this key, and the one that expires it.
             //
-            // The members who left are not forgotten by deferring: they stay in
-            // `shared_with` (only served recipients are ever added to it), so every
-            // later rollout still sees them in `left` and keeps the expiry pulled
-            // in. Nothing has to remember *why* a rotation is owed, only when.
+            // The participations that ended are not forgotten by deferring: they
+            // stay in `shared_with` (only served recipients are ever added to it),
+            // so every later rollout still sees them in `left` and keeps the
+            // expiry pulled in. Nothing has to remember *why* a rotation is owed,
+            // only when.
             expires_at = expires_at.min(current_key.creation_ts.saturating_add(freshness_ms));
             reason = reason.or_else(|| {
-                Some(if left.is_empty() {
-                    "a member's participation changed".to_owned()
-                } else {
-                    format!("{} member(s) who held the key have left", left.len())
-                })
+                Some(format!(
+                    "{} member(s) who held the key have left",
+                    left.len()
+                ))
             });
         } else if !joined.is_empty() && !key_is_fresh {
             // An arrival is a reason to rotate only once the key has settled:
@@ -1316,15 +1308,17 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         } else {
             // Reusing the existing key: record only the recipients we reached,
             // so the rest are retried on the next rollout.
+            //
+            // Deduplicated per *join*, not per member id: a rejoined device is a
+            // new participation under an old id, and its entry must land here or
+            // every later rollout would re-send to it. The ended participation's
+            // entry stays alongside it — that is what keeps the rotation it made
+            // owed (via `left`) until the rotation mints a clean `shared_with`.
             {
                 let mut guard = self.outbound_key.write().unwrap();
                 if let Some(ref mut key) = *guard {
                     for recipient in &served {
-                        if !key
-                            .shared_with
-                            .iter()
-                            .any(|x| x.member_id == recipient.member_id)
-                        {
+                        if !key.shared_with.iter().any(|x| x.same_join(recipient)) {
                             key.shared_with.push(recipient.clone());
                         }
                     }
@@ -2038,6 +2032,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some("device456".to_string())),
             sticky_key: "bob-device456-uuid".to_string(),
             member_id: "bob-device456-uuid".to_string(),
+            membership_ts: None,
             application: Some("m.call".to_string()),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
@@ -2540,6 +2535,159 @@ mod tests {
             manager.rotation_due_at_ms(),
             Some(clock.now() + lifetime),
             "the replacement is nobody's dirty key, so it expires on the lifetime cap again"
+        );
+    }
+
+    /// The pre-sticky Element Call dialect reuses `{user}:{device}` as the
+    /// member id, so a device that leaves and rejoins comes back under the id we
+    /// already served — as a fresh session holding no keys. Matched by member id
+    /// alone, the return reads as "already holds the key": nothing is sent, and
+    /// the far end can never decrypt us again. The membership timestamp is what
+    /// tells the two joins apart.
+    #[tokio::test]
+    async fn a_rejoin_under_the_same_member_id_is_resent_the_current_key() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
+            membership_ts: Some(1_000),
+            ..bob_membership()
+        }]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        let first_index = manager
+            .get_outbound_key()
+            .map(|key| key.key_index)
+            .expect("joining mints a key");
+        assert_eq!(
+            sender
+                .to_device_messages_for("@bob:example.org", "device456")
+                .len(),
+            1,
+        );
+
+        // Bob's client dies without leaving; the departure is seen, but the key
+        // is fresh, so the rotation it owes is deferred rather than performed.
+        memberships.lock().unwrap().clear();
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|k| k.key_index),
+            Some(first_index)
+        );
+
+        // Bob rejoins: the same user, device and member id, but a new
+        // `created_ts` — and a fresh session that holds nothing from before.
+        clock.advance(2_000);
+        *memberships.lock().unwrap() = vec![JoinedMembership {
+            membership_ts: Some(3_000),
+            ..bob_membership()
+        }];
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        let sent_to_bob = sender.to_device_messages_for("@bob:example.org", "device456");
+        assert_eq!(
+            sent_to_bob.len(),
+            2,
+            "the rejoined session holds no keys and must be re-sent the current one"
+        );
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(first_index),
+            "the key is still fresh, so the rejoin is served it rather than a rotation"
+        );
+
+        // The previous join held this key while outside the call, so the
+        // rotation owed to its departure must still fall due — the rejoin must
+        // not read as the leaver coming back and cancel it.
+        clock.advance(EncryptionConfig::default().key_rotation_grace_period_ms);
+        manager
+            .flush_due_rotation()
+            .await
+            .expect("flush should succeed");
+        assert_ne!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(first_index),
+            "the rotation owed to the departure was cancelled by the rejoin"
+        );
+        assert_eq!(
+            sender
+                .to_device_messages_for("@bob:example.org", "device456")
+                .len(),
+            3,
+            "the rotation must hand the rejoined session the replacement key"
+        );
+    }
+
+    /// A leave and rejoin can both happen between two membership feeds, so no
+    /// rollout ever sees the member absent — only the membership timestamp
+    /// moves. That alone must read as a new participation.
+    #[tokio::test]
+    async fn a_rejoin_no_feed_ever_saw_leave_is_still_served() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
+            membership_ts: Some(1_000),
+            ..bob_membership()
+        }]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        *memberships.lock().unwrap() = vec![JoinedMembership {
+            membership_ts: Some(4_000),
+            ..bob_membership()
+        }];
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            sender
+                .to_device_messages_for("@bob:example.org", "device456")
+                .len(),
+            2,
+            "a moved membership timestamp is a rejoin and must be served the key"
+        );
+    }
+
+    /// A membership re-sent to extend its lifetime keeps its `created_ts`: the
+    /// same participation restated must not read as a rejoin and cost a send or
+    /// an owed rotation.
+    #[tokio::test]
+    async fn a_membership_refresh_with_an_unchanged_timestamp_distributes_nothing() {
+        let sender = Arc::new(MockCommandSender::new());
+        let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
+            membership_ts: Some(1_000),
+            ..bob_membership()
+        }]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        for _ in 0..3 {
+            manager
+                .on_memberships_update()
+                .await
+                .expect("update should succeed");
+        }
+
+        assert_eq!(
+            sender
+                .to_device_messages_for("@bob:example.org", "device456")
+                .len(),
+            1,
+            "an unchanged participation must be sent the key exactly once"
         );
     }
 

@@ -216,6 +216,21 @@ Three further consequences fall out rather than being designed in:
    are simply sent it) or a stable one (which rotates at once). Only a departure
    makes a key dirty, which is what the asymmetry above says it should be.
 
+### What counts as the same participation
+
+Every rule above compares participations, and a participation is
+`(member_id, membership_ts)`, not the member id alone. Under MSC4143 the
+distinction is invisible — `member.id` is fresh on every join and the timestamp is
+unstated — but the pre-sticky Element Call dialect reuses `{user}:{device}` as the
+member id, so a device that leaves and rejoins comes back under the id already in
+`shared_with`, as a fresh session holding no keys. Compared by id alone, that
+return is neither a departure nor an arrival: nothing is sent, and the rejoined
+member can never decrypt us. Compared by join, the old participation stays in
+`left` — the rotation it made owed stays owed — and the new one is an ordinary
+arrival, served the current key. The timestamp is the dialect's `created_ts`,
+pinned for the life of one join and new on the next (the js-sdk keys on the same
+value as `membershipTs`).
+
 ### Why the deadline is not uniform per leaver
 
 Freshness is measured from the key's mint, so a member who leaves early in the

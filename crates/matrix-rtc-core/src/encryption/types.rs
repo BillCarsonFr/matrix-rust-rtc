@@ -35,6 +35,13 @@ pub struct ParticipantDeviceInfo {
     /// The `member.id` from the `m.rtc.member` event (MSC4143)
     /// This is globally unique per member instance
     pub member_id: String,
+    /// When this participation began, where the dialect states it.
+    ///
+    /// `None` under native MSC4143, whose `member_id` is fresh per join. The
+    /// pre-sticky Element Call dialect reuses `{user}:{device}` as the member
+    /// id across joins, and this timestamp is then what tells two joins by the
+    /// same device apart — see [`Self::same_join`].
+    pub membership_ts: Option<u64>,
 }
 
 impl ParticipantDeviceInfo {
@@ -43,6 +50,20 @@ impl ParticipantDeviceInfo {
     /// MSC4143 uses member_id as the primary key for participants.
     pub fn map_key(&self) -> String {
         self.member_id.clone()
+    }
+
+    /// Whether `other` is the same *join*, not merely the same member id.
+    ///
+    /// Key bookkeeping must compare participations by
+    /// `(member_id, membership_ts)`: under the pre-sticky Element Call dialect
+    /// a device that leaves and rejoins comes back under the member id it had
+    /// before, with a fresh session holding no keys — matching on `member_id`
+    /// alone would read the return as "already holds the key" and never send
+    /// it. The membership timestamp is new on each join, so it is what keeps
+    /// the two participations apart (the js-sdk compares `membershipTs` the
+    /// same way).
+    pub fn same_join(&self, other: &ParticipantDeviceInfo) -> bool {
+        self.member_id == other.member_id && self.membership_ts == other.membership_ts
     }
 }
 
@@ -404,6 +425,7 @@ mod tests {
             user_id: "@alice:example.org".to_string(),
             device_id: "device123".to_string(),
             member_id: "xyzABCDEF0123".to_string(),
+            membership_ts: None,
         };
 
         assert_eq!(info.map_key(), "xyzABCDEF0123");

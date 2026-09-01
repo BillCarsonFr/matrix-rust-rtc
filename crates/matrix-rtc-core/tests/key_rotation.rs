@@ -380,6 +380,7 @@ impl Peer {
             origin: EventOrigin::encrypted(Some(self.device_id.clone())),
             sticky_key: self.member_id.clone(),
             member_id: self.member_id.clone(),
+            membership_ts: None,
             application: Some("m.call".to_owned()),
             transports: Vec::new(),
             can_subscribe: Vec::new(),

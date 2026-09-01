@@ -1346,6 +1346,17 @@ pub struct JoinedMembership {
     pub sticky_key: String,
     /// `member.id` — identifies this participation, unique per join.
     pub member_id: String,
+    /// When this participation began (ms since the epoch), if the dialect
+    /// states it.
+    ///
+    /// `None` for a native MSC4143 membership, whose `member_id` is already
+    /// fresh per join. The pre-sticky Element Call dialect reuses
+    /// `{user}:{device}` as the member id across joins, and there this is the
+    /// event's `created_ts` — pinned for the life of one join, new on the
+    /// next — so `(member_id, membership_ts)` distinguishes two joins by the
+    /// same device where `member_id` alone cannot. The js-sdk's encryption
+    /// manager keys on the same value as `membershipTs`.
+    pub membership_ts: Option<u64>,
     /// Application type from `content.application.type`.
     pub application: Option<String>,
     /// Transports this member publishes on (`content.transports.published`).

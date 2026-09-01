@@ -105,6 +105,7 @@ mod tests {
                 member,
                 transports: None,
                 leave_reason,
+                created_ts: None,
             },
         }
     }
@@ -1265,6 +1266,7 @@ mod tests {
                     extra_fields,
                 })),
                 leave_reason: None,
+                created_ts: None,
             },
         };
 
@@ -1319,6 +1321,7 @@ mod tests {
                     extra_fields,
                 })),
                 leave_reason: None,
+                created_ts: None,
             },
         };
 
