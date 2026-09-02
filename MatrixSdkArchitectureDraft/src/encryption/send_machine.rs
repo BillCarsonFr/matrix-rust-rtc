@@ -337,6 +337,8 @@ mod tests {
             display_name: None,
             avatar_url: None,
             intent: None,
+            application_type: None,
+            transports: Default::default(),
         }
     }
 

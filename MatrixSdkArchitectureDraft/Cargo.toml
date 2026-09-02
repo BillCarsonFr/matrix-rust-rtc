@@ -28,15 +28,24 @@ serde_json = "1"
 thiserror = "2"
 log = "0.4"
 async-trait = "0.1"
-# sync-only: watch/mpsc channels work on wasm32 too.
-tokio = { version = "1", features = ["sync"] }
+# The SAME feature set on every target, on purpose: the ubrn-generated wasm
+# shim crate is edition 2018 (cargo feature resolver v1), which unifies
+# target-specific features into every build — a native-only
+# `rt-multi-thread` there breaks the wasm build with "Only features
+# sync,macros,io-util,rt,time are supported on wasm". `sync`, `rt` and
+# `time` are all in tokio's wasm-allowed set; `executor` uses `rt`/`time`
+# natively only (a current-thread runtime on its own thread) and never on
+# wasm, where tokio timers would panic.
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+# Key material and rotation jitter. getrandom 0.2 needs `js` to build for
+# wasm32-unknown-unknown (0.3 would need an extra --cfg the ubrn build does
+# not set); the feature is a no-op elsewhere, so it is on unconditionally —
+# the ubrn shim's v1 resolver would unify it anyway.
+getrandom = { version = "0.2", features = ["js"] }
+base64 = "0.22"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uniffi = { version = "=0.31.2", features = ["tokio"], optional = true }
-# `executor`: the crate-owned runtime that hosts detached tasks and timers
-# (see src/executor.rs). Only the runtime + timer features; nothing else of
-# tokio is used.
-tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # What uniffi-bindgen-react-native's wasm mode builds on: no tokio runtime,
