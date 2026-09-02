@@ -170,28 +170,55 @@ The join/leave state machine for *our* membership. Talks only to the
 
 ### `encryption`
 
-Per-member media key exchange over to-device messages (MSC4143). Split into a
-send machine and an owning machine that also holds received keys.
+Per-member media key exchange over to-device messages (MSC4143). Plan,
+challenges, test list and status: `src/encryption/README.md`. In short:
 
-- `KeyMap = HashMap<member_id, MediaKey>`; `MediaKey` carries key bytes +
-  index so hosts can feed any LiveKit key provider.
-- `SendMachine::new(driver: ToDeviceSendDriver, session, config,
-  on_key_for_own_member_change)` — chunks the call into intervals; session
-  changes inside an interval trigger key rotation (rate-limited; joiners get
-  the current key within a configurable "leak window", leavers force a
-  rotation). Distribution is per-device with per-recipient delivery results:
-  only recipients that actually got the key are recorded as served.
-- `Machine::new(driver: ToDeviceDriver, session, own_member,
-  on_key_map_change)` — owns the `SendMachine` and the `KeyMap`.
-- **Inbound verification kept from today**: cleartext keys discarded; the
-  to-device sender+device must match the named member event (keys arriving
-  early are buffered *with their origin* and verified when the membership
-  lands); non-cross-signed senders rejected unless configured otherwise
-  (MSC4153); an outdated-key filter stops replays from occupying a
-  `(member, index)` slot.
-- `JoinStatus { has_distributed_initial_keys, has_received_all_member_keys }`;
-  `ConnectedStatus { left_members_with_keys, fully_settled, last_rotation_ts }`
-  (UI can show "members possibly still listening" and the join leak window).
+- `KeyMap = HashMap<member_id, Vec<MediaKey>>` — one entry per key *index*
+  per member (frames carry the index; a peer's previous key stays needed for
+  in-flight frames after they rotate). `MediaKey` carries key bytes + index
+  so hosts can feed any LiveKit key provider; the change callback carries the
+  single changed key.
+- Rotation policy = matrix-js-sdk PR #5505 ("rotation slow down"): a shared
+  per-minute to-device contingent (default 3000) gives every client a grace
+  period `60 s · N(N−1) / contingent`; a change while unblocked starts a
+  *jittered* block and defers the rotation to its end, changes while blocked
+  coalesce into that same deadline, joiners get the current key at once, the
+  rotated key is used `use_key_delay` after it was sent, and an owed rotation
+  waits for that switch rather than minting over a propagating key. No hard
+  participant limit: the contingent is the only brake. Implemented as a **pure state
+  machine** (`send_machine.rs`: `now` and jitter are inputs, sends/key
+  switches are outputs, the next deadline is a query) driven by one task
+  (`pump.rs`) that owns the session `watch`, the to-device stream, the timer
+  and the driver sends.
+- **Inbound verification kept from today**: cleartext or origin-less keys
+  discarded; the to-device sender+device must match the member event (a
+  claimed MSC3401 device narrows, never widens; keys arriving early are held
+  *with their origin* and verified when the membership lands); non-cross-signed
+  senders rejected unless configured otherwise (MSC4153); an outdated-key
+  filter stops replays from occupying a `(member, index)` slot.
+- `Machine::new(driver: ToDeviceDriver, room, slot, compat, session,
+  own_member, manage_media_keys, config, send_config, on_key_map_change)` —
+  **one machine per participation**: it works from construction and dropping
+  it is leaving. The facade constructs it in `join()` *before* the
+  own-membership machine sends the join event and drops it in `leave()`.
+- One `status()`: `Status::Joining { has_distributed_initial_keys,
+  has_received_all_member_keys }` until both hold, then `Status::Connected {
+  left_members_with_keys, fully_settled, last_rotation_ts }` for good (UI can
+  show "members possibly still listening" and the join leak window).
+
+### `executor`
+
+The platform seam for the two things the crate must do on its own clock:
+run a detached task and wait for a deadline (`spawn`, `sleep_ms`, `now_ms`).
+Native: a crate-owned current-thread tokio runtime on its own thread (tasks
+start from synchronous constructors and sink `emit`s, where no runtime
+context exists). wasm32: `wasm_bindgen_futures::spawn_local`, `setTimeout`
+via gloo-timers, `Date.now()` via web-time. Nothing else in the crate may
+touch tokio `rt`/`time` or wasm-bindgen; `tokio::sync` is fine everywhere.
+The tokio feature set is identical on every target on purpose (the ubrn
+shim's v1 feature resolver unifies target-specific features into the wasm
+build). Verified through the real wasm bindings by
+`src/uniffi_api/runtime_probe.rs` + `web-test-app/test/runtimeProbe.test.ts`.
 
 ### `participation`
 
@@ -276,6 +303,9 @@ generated bindings cost nothing where it matters.
 - On `wasm32` the crate builds against uniffi's
   `wasm-unstable-single-threaded` feature (no tokio runtime; futures are
   `?Send`, hence the dual `async_trait` cfg pattern on the driver traits).
+  Background work runs through `executor` (`spawn_local` on wasm), so a sink
+  `emit` only *wakes* the consuming pump: processing happens on the microtask
+  queue after `emit` returns, and web tests `await` a tick after injecting.
 - Logging: everything through the `log` facade; bindings install the sink
   (console / logcat / host callback) with `RUST_LOG`-style filters. Key
   material, JWTs and OpenID tokens are never logged.
@@ -339,11 +369,11 @@ on_join_pressed(matrix_room) {
     });
 
     // 3. Keys: route each changed key to the LK room(s) of that member.
-    manager.on_key_map_change(|key_map, changes| {
-        for m in manager.memberships().filter(|m| changes.has(m.member.member_id)) {
-            let key = key_map[m.member.member_id];
+    manager.on_key_map_change(|key_map, change| {
+        // one changed key per callback: (member_id, key bytes, index)
+        if let Some(m) = manager.memberships().find(|m| m.member.member_id == change.member_id) {
             for ws_url in m.connections {
-                lk_rooms[ws_url].set_key_for_participant(m.transport_identity, key.key, key.index);
+                lk_rooms[ws_url].set_key_for_participant(m.transport_identity, change.key.key, change.key.index);
             }
         }
     });
