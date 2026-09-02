@@ -12,6 +12,12 @@ use crate::types::{LeaveReason, RtcTransport, TransportIntent};
 use std::sync::Arc;
 use tokio::sync::watch;
 
+pub enum Status{
+    Joining(JoinStatus),
+    Connected(ConnectedStatus),
+    Leaveing(LeaveStatus),
+}
+
 /// Join progress, step by step (drives `participation::Status::Joining`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct JoinStatus {
@@ -108,25 +114,7 @@ impl OwnMembershipManager {
         todo!()
     }
 
-    /// One keep-alive tick: MSC4140 `restart` + sticky re-send when due.
-    pub async fn heartbeat(&self) {
-        todo!()
-    }
-
-    /// The member id of the current join, if any.
-    pub fn member_id(&self) -> Option<String> {
-        todo!()
-    }
-
-    pub fn join_status(&self) -> JoinStatus {
-        todo!()
-    }
-
-    pub fn connected_status(&self) -> ConnectedStatus {
-        todo!()
-    }
-
-    pub fn leave_status(&self) -> LeaveStatus {
+    pub fn status(&self) -> Status {
         todo!()
     }
 

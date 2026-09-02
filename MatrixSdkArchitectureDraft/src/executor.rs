@@ -3,12 +3,13 @@
 //! deadline**. Everything else is either a pure state transition or a driver
 //! call.
 //!
-//! - native: a crate-owned multi-thread tokio runtime (`RUNTIME`). It is
-//!   deliberately *not* the runtime uniffi runs exported `async fn`s on —
-//!   tasks are spawned from synchronous constructors and sink `emit`s, where
-//!   no runtime context exists — the same pattern as matrix-rust-sdk's FFI.
-//!   `sleep_ms` creates its timer under `RUNTIME.enter()`, so it is driven by
-//!   this runtime's timer wheel wherever the future is eventually polled.
+//! - native: a crate-owned current-thread tokio runtime parked on its own OS
+//!   thread (`HANDLE`). It is deliberately *not* the runtime uniffi runs
+//!   exported `async fn`s on — tasks are spawned from synchronous
+//!   constructors and sink `emit`s, where no runtime context exists — the
+//!   same pattern as matrix-rust-sdk's FFI. `sleep_ms` creates its timer
+//!   under `HANDLE.enter()`, so it is driven by this runtime's timer wheel
+//!   wherever the future is eventually polled.
 //! - wasm32: `wasm_bindgen_futures::spawn_local` (the future runs on the JS
 //!   microtask queue), `setTimeout` via gloo-timers, `Date.now()` via
 //!   web-time. There is one thread, so nothing here is `Send`.
@@ -24,15 +25,23 @@ mod imp {
     use super::*;
     use std::sync::LazyLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::runtime::Runtime;
+    use tokio::runtime::{Builder, Handle};
 
-    static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("matrix-rtc")
+    /// A current-thread runtime parked on its own OS thread. Current-thread
+    /// (feature `rt`) rather than multi-thread on purpose: `rt-multi-thread`
+    /// is not in tokio's wasm-allowed feature set, and the ubrn shim's v1
+    /// feature resolver would unify it into the wasm build (see Cargo.toml).
+    static HANDLE: LazyLock<Handle> = LazyLock::new(|| {
+        let runtime = Builder::new_current_thread()
             .enable_time()
             .build()
-            .expect("matrix-rtc: failed to build the tokio runtime")
+            .expect("matrix-rtc: failed to build the tokio runtime");
+        let handle = runtime.handle().clone();
+        std::thread::Builder::new()
+            .name("matrix-rtc".into())
+            .spawn(move || runtime.block_on(std::future::pending::<()>()))
+            .expect("matrix-rtc: failed to spawn the runtime thread");
+        handle
     });
 
     /// Run `future` to completion in the background.
@@ -40,13 +49,13 @@ mod imp {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        RUNTIME.spawn(future);
+        HANDLE.spawn(future);
     }
 
     /// Resolve after `ms` milliseconds.
     pub async fn sleep_ms(ms: u64) {
         let sleep = {
-            let _guard = RUNTIME.enter();
+            let _guard = HANDLE.enter();
             tokio::time::sleep(Duration::from_millis(ms))
         };
         sleep.await

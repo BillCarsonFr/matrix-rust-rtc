@@ -185,13 +185,15 @@ export class MockMatrixDriver implements MatrixDriverCallback {
 }
 
 // ---------------------------------------------------------------------------
-// Inbound event fabrication — plausible MSC4143/MSC4354 wire shapes. If the
-// todo!() implementations settle on different field names, adjust here (one
-// place), not in every test.
+// Inbound event fabrication — the MSC4143/MSC4354 wire shapes the session's
+// dispatch reads (see src/session/dispatch.rs for the accessor contract and
+// src/session/test_support.rs for the Rust twin of these builders, kept in
+// sync by a fixture test). Adjust here (one place), not in every test.
 // ---------------------------------------------------------------------------
 
 export const ROOM_ID = "!room:example.org";
-export const SLOT_ID = "m.call";
+// MSC4143: a slot id is `{application_type}#{id}`; a bare "m.call" resolves closed.
+export const SLOT_ID = "m.call#ROOM";
 
 let eventCounter = 0;
 
@@ -210,6 +212,8 @@ export function memberJoinEvent(opts: {
     msc4354_sticky: { duration_ms: 240_000 },
     content: {
       slot_id: SLOT_ID,
+      // MSC4354: the sticky key lives in the content and equals member.id.
+      msc4354_sticky_key: opts.memberId,
       member: { id: opts.memberId, membership: "join" },
       application: { type: "m.call" },
       transports: {
@@ -232,6 +236,7 @@ export function memberLeaveEvent(opts: { userId: string; memberId: string }): st
     msc4354_sticky: { duration_ms: 240_000 },
     content: {
       slot_id: SLOT_ID,
+      msc4354_sticky_key: opts.memberId,
       member: { id: opts.memberId, membership: "leave" },
       leave_reason: { code: "m.user_hangup" },
     },

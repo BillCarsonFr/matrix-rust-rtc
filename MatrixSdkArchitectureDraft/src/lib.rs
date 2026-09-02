@@ -9,7 +9,9 @@
 //! uniffi-bindgen-react-native — so the generated (and documented) API is
 //! identical on all of them.
 //!
-//! Every method body is `todo!()` — see `../MatrixSdkArchitecture.md`.
+//! `session` and `encryption` are implemented; the other modules' method
+//! bodies are still `todo!()` — see `../MatrixSdkArchitecture.md` and
+//! `src/session/SessionImplementationPlan.md`.
 #![allow(dead_code, unused_variables)]
 
 pub mod connections;

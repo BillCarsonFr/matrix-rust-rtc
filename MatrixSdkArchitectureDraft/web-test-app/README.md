@@ -12,9 +12,12 @@ npm run dev        # demo webapp on vite
 npm test           # acceptance tests (vitest)
 ```
 
-## Status: tests fail on purpose
+## Status: participation tests fail on purpose
 
-The Rust crate is a skeleton — every method is `todo!()`, so each test dies
+`test/runtimeProbe.test.ts` passes. The `session` module is implemented
+(`FfiMatrixDriver` with its sinks, `computeSessionsFromEvents`, and the live
+`Session` behind the manager), but the `ParticipationManager` facade is
+still a skeleton — its methods are `todo!()`, so each participation test dies
 with a wasm panic (`RuntimeError: unreachable`) at the first `todo!()` it
 reaches. `test/participation.test.ts` defines the expected behavior of
 `ParticipationManager` end to end (inject events through the TS
@@ -35,8 +38,19 @@ make the tests pass one by one.
 | `src/mockDriver.ts` | `MatrixDriverCallback` implemented in TS + inbound event fabrication |
 | `src/app.ts`, `index.html` | demo: tiles from memberships, connections/key-map/status panels, inject buttons |
 | `test/participation.test.ts` | the acceptance tests |
+| `test/runtimeProbe.test.ts` | runtime-assumption probes against the wasm build (`tokio::sync::watch` wake-ups, detached tasks, timers) — **passing**; see `src/encryption/README.md` |
 
 ## Gotchas
+
+- **Feature resolver v1 in the generated shim**: `rust_modules/wasm` is
+  `edition = "2018"`, so cargo unifies *target-specific* features into the
+  wasm build. Any native-only tokio feature outside `sync, macros, io-util,
+  rt, time` (e.g. `rt-multi-thread`) fails the wasm build with "Only features
+  sync,macros,io-util,rt,time are supported on wasm". The crate therefore
+  declares one tokio feature set for all targets.
+- `ubrn.config.yaml` enables the crate's `runtime-probe` feature: a test-only
+  FFI surface (`RuntimeProbe`) that `test/runtimeProbe.test.ts` exercises.
+  Shipping builds must not enable it.
 
 - **wasm-bindgen pin**: wasm-bindgen's macro crate and CLI must match
   *exactly* (unstable schema), and ubrn bundles its CLI half at 0.2.100
@@ -47,5 +61,8 @@ make the tests pass one by one.
 - **uniffi version**: the crate pins `uniffi = "=0.31.2"` to match
   ubrn 0.31.0-5. Upgrading ubrn means bumping the pin.
 - The wire shapes fabricated in `src/mockDriver.ts` are the tests' single
-  source of truth for event JSON — if the implementation settles on different
-  field names, adjust them there, not in every test.
+  source of truth for event JSON. The Rust side mirrors them in
+  `src/session/test_support.rs` (a fixture test parses the TS builder's
+  output), so change both together. Two things the session insists on:
+  member content carries `msc4354_sticky_key` (== `member.id`, MSC4354), and
+  a slot id is `{application_type}#{id}` (a bare `m.call` resolves closed).

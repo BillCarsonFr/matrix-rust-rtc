@@ -13,7 +13,8 @@
 #[cfg(feature = "runtime-probe")]
 pub mod runtime_probe;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::driver::{
     DelegatedDelayedLeaveRequest, DriverError, LivekitTokenRequest, LivekitTokenResponse,
@@ -22,9 +23,10 @@ use crate::driver::{
     TokenDriver,
 };
 use crate::participation::ParticipationManager;
-use crate::types::{RawMatrixEvent, RtcTransport};
+use crate::session::{self, ElementCallCompat, SessionConfig, SessionSnapshot};
+use crate::types::{DeviceAttribution, EventOrigin, Member, RawMatrixEvent, RtcTransport};
 use serde_json::Value;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 #[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum RtcError {
@@ -36,14 +38,60 @@ pub enum RtcError {
     Rejected(String),
 }
 
+impl From<RtcError> for DriverError {
+    fn from(error: RtcError) -> Self {
+        match error {
+            RtcError::InvalidInput(message) => DriverError::Other(message),
+            RtcError::Driver(message) => DriverError::Other(message),
+            RtcError::Rejected(message) => DriverError::Unauthorized(message),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiDeviceAttribution {
+    Verified,
+    Claimed,
+    Unknown,
+}
+
+impl From<DeviceAttribution> for FfiDeviceAttribution {
+    fn from(attribution: DeviceAttribution) -> Self {
+        match attribution {
+            DeviceAttribution::Verified => Self::Verified,
+            DeviceAttribution::Claimed => Self::Claimed,
+            DeviceAttribution::Unknown => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiMember {
     pub member_id: String,
     pub user_id: String,
     pub device_id: Option<String>,
+    pub device_attribution: FfiDeviceAttribution,
+    /// `origin_server_ts` of the event that started this participation, where
+    /// the dialect needs it to tell joins apart (MSC3401 compat).
+    pub membership_ts: Option<u64>,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub intent: Option<String>,
+}
+
+impl From<&Member> for FfiMember {
+    fn from(member: &Member) -> Self {
+        Self {
+            member_id: member.member_id.clone(),
+            user_id: member.user_id.clone(),
+            device_id: member.device_id.clone(),
+            device_attribution: member.device_attribution.into(),
+            membership_ts: member.membership_ts,
+            display_name: member.display_name.clone(),
+            avatar_url: member.avatar_url.clone(),
+            intent: member.intent.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -111,6 +159,16 @@ pub enum FfiEventOrigin {
     Unknown,
 }
 
+impl From<FfiEventOrigin> for EventOrigin {
+    fn from(origin: FfiEventOrigin) -> Self {
+        match origin {
+            FfiEventOrigin::Encrypted { sender_device_id } => EventOrigin::Encrypted { sender_device_id },
+            FfiEventOrigin::Cleartext => EventOrigin::Cleartext,
+            FfiEventOrigin::Unknown => EventOrigin::Unknown,
+        }
+    }
+}
+
 /// Pre-2026 Element Call interop, selected per call (session read side +
 /// own-membership write side).
 #[derive(Clone, Debug, uniffi::Enum)]
@@ -118,6 +176,16 @@ pub enum FfiElementCallCompat {
     Off,
     StickyEvents,
     StateEvents,
+}
+
+impl From<FfiElementCallCompat> for ElementCallCompat {
+    fn from(compat: FfiElementCallCompat) -> Self {
+        match compat {
+            FfiElementCallCompat::Off => ElementCallCompat::Off,
+            FfiElementCallCompat::StickyEvents => ElementCallCompat::StickyEvents,
+            FfiElementCallCompat::StateEvents => ElementCallCompat::StateEvents,
+        }
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -191,6 +259,72 @@ pub struct FfiSessionSnapshot {
     pub encrypted: Option<bool>,
 }
 
+impl From<&SessionSnapshot> for FfiSessionSnapshot {
+    fn from(snapshot: &SessionSnapshot) -> Self {
+        Self {
+            room_id: snapshot.room_id.clone(),
+            slot_id: snapshot.slot_id.clone(),
+            members: snapshot.members.iter().map(FfiMember::from).collect(),
+            member_count: snapshot.member_count() as u32,
+            is_active: snapshot.is_active(),
+            start_ts: snapshot.start_ts,
+            application_type: snapshot.application_type.clone(),
+            slot_open: snapshot.slot_state.as_ref().map(|s| s.is_open()),
+            encrypted: snapshot.negotiated_encryption,
+        }
+    }
+}
+
+/// Parse one host-supplied event JSON string into the crate's raw event.
+fn parse_raw_event(event_json: &str, origin: EventOrigin) -> Result<RawMatrixEvent, RtcError> {
+    let event: Value = serde_json::from_str(event_json)
+        .map_err(|error| RtcError::InvalidInput(format!("event is not valid JSON: {error}")))?;
+    Ok(RawMatrixEvent { event, origin })
+}
+
+/// Parse a batch, skipping (and logging) strings that are not JSON — one
+/// malformed entry must not poison the rest.
+fn parse_raw_events(events_json: &[String], origin: EventOrigin) -> Vec<RawMatrixEvent> {
+    events_json
+        .iter()
+        .filter_map(|json| match parse_raw_event(json, origin.clone()) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                log::warn!("skipping an event the host handed over: {error}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Fan-out of one host-emitted stream to any number of Rust subscribers —
+/// the Rust side of "single-sink semantics". `emit` returns `false` once
+/// every subscriber that ever existed is gone, which is the drop-guard
+/// signal for the host to unhook its handler.
+struct FanOut<T> {
+    subscribers: Mutex<Vec<UnboundedSender<T>>>,
+    ever_subscribed: AtomicBool,
+}
+
+impl<T: Clone> FanOut<T> {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { subscribers: Mutex::new(Vec::new()), ever_subscribed: AtomicBool::new(false) })
+    }
+
+    fn subscribe(&self) -> UnboundedReceiver<T> {
+        let (tx, rx) = unbounded_channel();
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        self.ever_subscribed.store(true, Ordering::Release);
+        rx
+    }
+
+    fn emit(&self, item: T) -> bool {
+        let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        subscribers.retain(|tx| tx.send(item.clone()).is_ok());
+        !subscribers.is_empty() || !self.ever_subscribed.load(Ordering::Acquire)
+    }
+}
+
 /// One end of a driver event stream: Rust-exported objects handed to the
 /// foreign driver through the `subscribe_*` methods. The host calls `emit`
 /// from its own event handlers (e.g. matrix-js-sdk listeners); `false` means
@@ -198,20 +332,30 @@ pub struct FfiSessionSnapshot {
 /// role of matrix-rust-sdk's `EventHandlerDropGuard`).
 #[derive(uniffi::Object)]
 pub struct RoomEventSink {
-    tx: UnboundedSender<RawMatrixEvent>,
+    fan_out: Arc<FanOut<RawMatrixEvent>>,
 }
 
 #[uniffi::export]
 impl RoomEventSink {
     /// Any room event — sticky or state; the session dispatches on type.
+    /// `event_json` is the full event object (see `session::dispatch`), the
+    /// *decrypted* one for encrypted events, with `origin` carrying the
+    /// decryption metadata. Returns `false` once no consumer is left.
     pub fn emit(&self, event_json: String, origin: FfiEventOrigin) -> bool {
-        todo!()
+        match parse_raw_event(&event_json, origin.into()) {
+            Ok(event) => self.fan_out.emit(event),
+            Err(error) => {
+                // Not a drop signal: the stream is alive, the input was bad.
+                log::warn!("RoomEventSink::emit ignored an event: {error}");
+                true
+            }
+        }
     }
 }
 
 #[derive(uniffi::Object)]
 pub struct ToDeviceSink {
-    tx: UnboundedSender<ToDeviceMessage>,
+    fan_out: Arc<FanOut<ToDeviceMessage>>,
 }
 
 #[uniffi::export]
@@ -224,20 +368,35 @@ impl ToDeviceSink {
         content_json: String,
         origin: FfiEventOrigin,
     ) -> bool {
-        todo!()
+        let content: Value = match serde_json::from_str(&content_json) {
+            Ok(content) => content,
+            Err(error) => {
+                log::warn!("ToDeviceSink::emit ignored a {event_type} from {sender}: not valid JSON ({error})");
+                return true;
+            }
+        };
+        self.fan_out.emit(ToDeviceMessage {
+            event_type,
+            sender,
+            content,
+            origin: origin.into(),
+            sender_cross_signed: None,
+        })
     }
 }
 
 #[derive(uniffi::Object)]
 pub struct StateUpdateSink {
-    tx: UnboundedSender<Vec<RawMatrixEvent>>,
+    fan_out: Arc<FanOut<Vec<RawMatrixEvent>>>,
 }
 
 #[uniffi::export]
 impl StateUpdateSink {
-    /// A batch of changed room-state events.
+    /// A batch of changed room-state events (applied atomically by the
+    /// session: one snapshot per batch). State events are never encrypted,
+    /// so their origin is `Cleartext`.
     pub fn emit(&self, events_json: Vec<String>) -> bool {
-        todo!()
+        self.fan_out.emit(parse_raw_events(&events_json, EventOrigin::Cleartext))
     }
 }
 
@@ -351,6 +510,9 @@ pub trait MatrixDriverCallback: Send + Sync {
 #[derive(uniffi::Object)]
 pub struct FfiMatrixDriver {
     callback: Arc<dyn MatrixDriverCallback>,
+    room_events: Arc<FanOut<RawMatrixEvent>>,
+    to_device: Arc<FanOut<ToDeviceMessage>>,
+    state_updates: Arc<FanOut<Vec<RawMatrixEvent>>>,
 }
 
 #[uniffi::export]
@@ -359,7 +521,20 @@ impl FfiMatrixDriver {
     /// (synchronously, exactly once).
     #[uniffi::constructor]
     pub fn new(callback: Arc<dyn MatrixDriverCallback>) -> Arc<Self> {
-        todo!()
+        let room_events = FanOut::new();
+        let to_device = FanOut::new();
+        let state_updates = FanOut::new();
+        callback.subscribe_room_events(Arc::new(RoomEventSink { fan_out: room_events.clone() }));
+        callback.subscribe_to_device_events(Arc::new(ToDeviceSink { fan_out: to_device.clone() }));
+        callback.subscribe_state_updates(Arc::new(StateUpdateSink { fan_out: state_updates.clone() }));
+        Arc::new(Self { callback, room_events, to_device, state_updates })
+    }
+}
+
+fn ffi_state_key(selector: StateKeySelector) -> Option<String> {
+    match selector {
+        StateKeySelector::Key(key) => Some(key),
+        StateKeySelector::Any => None,
     }
 }
 
@@ -435,20 +610,27 @@ impl ToDeviceSendDriver for FfiMatrixDriver {
 
 impl ToDeviceDriver for FfiMatrixDriver {
     fn subscribe_to_device_events(&self) -> UnboundedReceiver<ToDeviceMessage> {
-        todo!()
+        self.to_device.subscribe()
     }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl RoomEventsDriver for FfiMatrixDriver {
+    /// Events come back as JSON strings without decryption metadata, so
+    /// their origin is `Unknown` (origin-dependent conditions are skipped
+    /// for seeded members).
     async fn read_events(
         &self,
         event_type: String,
         state_key: Option<StateKeySelector>,
         limit: u32,
     ) -> Result<Vec<RawMatrixEvent>, DriverError> {
-        todo!()
+        let events = self
+            .callback
+            .read_events(event_type, state_key.and_then(ffi_state_key), limit)
+            .await?;
+        Ok(parse_raw_events(&events, EventOrigin::Unknown))
     }
 
     async fn read_state(
@@ -456,15 +638,16 @@ impl RoomEventsDriver for FfiMatrixDriver {
         event_type: String,
         state_key: StateKeySelector,
     ) -> Result<Vec<RawMatrixEvent>, DriverError> {
-        todo!()
+        let events = self.callback.read_state(event_type, ffi_state_key(state_key)).await?;
+        Ok(parse_raw_events(&events, EventOrigin::Cleartext))
     }
 
     fn subscribe_room_events(&self) -> UnboundedReceiver<RawMatrixEvent> {
-        todo!()
+        self.room_events.subscribe()
     }
 
     fn subscribe_state_updates(&self) -> UnboundedReceiver<Vec<RawMatrixEvent>> {
-        todo!()
+        self.state_updates.subscribe()
     }
 }
 
@@ -594,5 +777,93 @@ pub fn compute_sessions_from_events(
     events_json: Vec<String>,
     compat: FfiElementCallCompat,
 ) -> Result<Vec<FfiSessionSnapshot>, RtcError> {
-    todo!()
+    let events = events_json
+        .iter()
+        .map(|json| parse_raw_event(json, EventOrigin::Unknown))
+        .collect::<Result<Vec<_>, _>>()?;
+    let config = SessionConfig { compat: compat.into() };
+    Ok(session::compute_sessions_from_events(&events, &config).iter().map(FfiSessionSnapshot::from).collect())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fan_out_reports_false_only_once_every_subscriber_is_gone() {
+        let fan_out: Arc<FanOut<u32>> = FanOut::new();
+        // No consumer yet: the stream is not "dropped", just unobserved.
+        assert!(fan_out.emit(1));
+        let mut a = fan_out.subscribe();
+        let mut b = fan_out.subscribe();
+        assert!(fan_out.emit(2));
+        assert_eq!(a.try_recv().unwrap(), 2);
+        assert_eq!(b.try_recv().unwrap(), 2);
+        drop(a);
+        assert!(fan_out.emit(3), "one subscriber left");
+        assert_eq!(b.try_recv().unwrap(), 3);
+        drop(b);
+        assert!(!fan_out.emit(4), "the last subscriber is gone: unhook");
+    }
+
+    #[test]
+    fn room_event_sink_parses_and_bad_json_is_not_a_drop_signal() {
+        let fan_out = FanOut::new();
+        let sink = RoomEventSink { fan_out: fan_out.clone() };
+        let mut rx = fan_out.subscribe();
+        assert!(sink.emit("not json".into(), FfiEventOrigin::Unknown));
+        assert!(rx.try_recv().is_err());
+        assert!(sink.emit(
+            r#"{ "type": "m.rtc.member", "sender": "@a:x", "content": {} }"#.into(),
+            FfiEventOrigin::Encrypted { sender_device_id: Some("DEV".into()) },
+        ));
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event["type"], "m.rtc.member");
+        assert_eq!(event.origin, EventOrigin::Encrypted { sender_device_id: Some("DEV".into()) });
+    }
+
+    #[test]
+    fn state_update_sink_skips_malformed_entries_and_keeps_the_batch() {
+        let fan_out = FanOut::new();
+        let sink = StateUpdateSink { fan_out: fan_out.clone() };
+        let mut rx = fan_out.subscribe();
+        assert!(sink.emit(vec!["{}".into(), "garbage".into(), r#"{ "type": "m.rtc.slot" }"#.into()]));
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(batch.iter().all(|e| e.origin == EventOrigin::Cleartext));
+    }
+
+    #[test]
+    fn compute_sessions_from_events_maps_to_the_ffi_record() {
+        let now = crate::executor::now_ms();
+        let join = format!(
+            r#"{{ "type": "m.rtc.member", "sender": "@remote:example.org", "event_id": "$1",
+                  "room_id": "!room:example.org", "origin_server_ts": {now},
+                  "msc4354_sticky": {{ "duration_ms": 240000 }},
+                  "content": {{ "slot_id": "m.call#ROOM", "msc4354_sticky_key": "m-1",
+                                "member": {{ "id": "m-1", "membership": "join" }},
+                                "application": {{ "type": "m.call" }},
+                                "transports": {{ "published": [{{ "type": "livekit", "livekit_service_url": "https://lk" }}], "can_subscribe": ["livekit"] }} }} }}"#
+        );
+        let slot = format!(
+            r#"{{ "type": "m.rtc.slot", "sender": "@admin:example.org", "state_key": "m.call#ROOM",
+                  "room_id": "!room:example.org", "origin_server_ts": {now},
+                  "content": {{ "status": "open", "application": {{ "type": "m.call" }} }} }}"#
+        );
+        let snapshots = compute_sessions_from_events(vec![join, slot], FfiElementCallCompat::Off).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let s = &snapshots[0];
+        assert_eq!(s.member_count, 1);
+        assert!(s.is_active);
+        assert_eq!(s.slot_open, Some(true));
+        assert_eq!(s.encrypted, Some(false));
+        assert_eq!(s.application_type.as_deref(), Some("m.call"));
+        assert_eq!(s.members[0].member_id, "m-1");
+        assert!(matches!(s.members[0].device_attribution, FfiDeviceAttribution::Unknown), "origins are unknown on this path");
+
+        assert!(matches!(
+            compute_sessions_from_events(vec!["nope".into()], FfiElementCallCompat::Off),
+            Err(RtcError::InvalidInput(_))
+        ));
+    }
 }

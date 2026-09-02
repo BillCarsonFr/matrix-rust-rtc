@@ -23,16 +23,19 @@ use crate::session::{Session, SessionConfig};
 use crate::types::{LeaveReason, Member, TransportIntent};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct JoinStatus {
     pub own_membership: own_membership::JoinStatus,
-    pub encryption: encryption::JoinStatus,
+    /// `encryption::Status::Joining` while keys are still being exchanged;
+    /// `None` for unencrypted calls (no machine).
+    pub encryption: Option<encryption::Status>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ConnectedStatus {
     pub own_membership: own_membership::ConnectedStatus,
-    pub encryption: encryption::ConnectedStatus,
+    /// `encryption::Status::Connected`; `None` for unencrypted calls.
+    pub encryption: Option<encryption::Status>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,7 +83,21 @@ pub struct ParticipationManager {
     session: Session,
     own_membership: OwnMembershipManager,
     connections: ConnectionsManager,
-    encryption: encryption::Machine,
+    /// One `encryption::Machine` per participation, `None` while not joined
+    /// (and for unencrypted calls). Ordering in `join()` matters:
+    ///
+    /// 1. generate the fresh `member_id` (`types::generate_member_id`);
+    /// 2. construct the encryption machine with that member **before** the
+    ///    own-membership machine sends the join event — it starts distributing
+    ///    our key at once, so peers hold it by the time our member event lands
+    ///    (they buffer keys that arrive early), and it is already subscribed
+    ///    to the to-device stream when their keys come back;
+    /// 3. then `own_membership.join(..)`.
+    ///
+    /// `leave()` drops it (after or before the leave event, either is fine):
+    /// dropping forgets every key and stops the pump. There is no
+    /// `join`/`leave` on the machine itself; a rejoin is a new machine.
+    encryption: Option<encryption::Machine>,
 }
 
 impl ParticipationManager {
@@ -92,6 +109,8 @@ impl ParticipationManager {
     pub fn new(
         room_id: String,
         slot_id: String,
+        user_id: String,
+        device_id: String,
         driver: Arc<dyn MatrixDriver>,
         config: SessionConfig,
     ) -> Self {
