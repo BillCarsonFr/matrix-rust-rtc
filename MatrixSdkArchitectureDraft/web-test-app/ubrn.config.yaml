@@ -7,3 +7,5 @@ web:
   manifestPatchFile: Cargo.patch.toml
   features:
     - uniffi
+    # test-only: runtime assumptions probe (test/runtimeProbe.test.ts)
+    - runtime-probe

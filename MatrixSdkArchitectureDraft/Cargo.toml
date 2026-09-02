@@ -16,6 +16,11 @@ default = []
 # The single binding surface (src/uniffi_api): Swift and Kotlin via
 # uniffi-bindgen, React Native and web/wasm via uniffi-bindgen-react-native.
 uniffi = ["dep:uniffi"]
+# Test-only FFI surface (`uniffi_api::runtime_probe`) that exercises the
+# runtime assumptions the crate rests on — `tokio::sync::watch` wake-ups,
+# detached tasks and timers — through the real bindings. Enabled by the
+# web-test-app harness, never by a shipping build.
+runtime-probe = ["uniffi"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,8 +33,20 @@ tokio = { version = "1", features = ["sync"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uniffi = { version = "=0.31.2", features = ["tokio"], optional = true }
+# `executor`: the crate-owned runtime that hosts detached tasks and timers
+# (see src/executor.rs). Only the runtime + timer features; nothing else of
+# tokio is used.
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # What uniffi-bindgen-react-native's wasm mode builds on: no tokio runtime,
 # Send/Sync requirements relaxed for the single-threaded JS environment.
 uniffi = { version = "=0.31.2", features = ["wasm-unstable-single-threaded"], optional = true }
+# `executor` on wasm: detached tasks run on the JS microtask queue, timers are
+# `setTimeout`, the clock is `Date.now()` (`std::time::SystemTime::now()`
+# panics on wasm32-unknown-unknown). wasm-bindgen-futures is pinned to the
+# release that pairs with wasm-bindgen 0.2.100 — the version ubrn's bundled
+# CLI dictates (see web-test-app/Cargo.patch.toml); bump them together.
+wasm-bindgen-futures = "=0.4.50"
+gloo-timers = { version = "0.3", features = ["futures"] }
+web-time = "1"

@@ -15,6 +15,7 @@
 pub mod connections;
 pub mod driver;
 pub mod encryption;
+pub mod executor;
 pub mod own_membership;
 pub mod participation;
 pub mod session;

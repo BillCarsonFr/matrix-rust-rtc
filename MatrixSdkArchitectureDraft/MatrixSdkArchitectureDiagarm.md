@@ -60,9 +60,6 @@ MatrixDriverRetryWrapper(MatrixDriver)
                ▼ callbacks → host renders tiles, holds LK rooms, sets keys
 ```
 
-Add emoji reactions to the rust-core crate.
-rtc crate should be for ANY rtc application not just m.call
-
 - **Session sits at the top and is the only part touching the driver's
   event streams** — it holds the `RoomEventsDriver` slice itself: it seeds
   its state via `read_state`/`read_events` and consumes the live streams,

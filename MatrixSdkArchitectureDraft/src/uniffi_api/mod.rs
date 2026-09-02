@@ -10,6 +10,9 @@
 //! *foreign* trait — a matrix-rust-sdk-backed driver on mobile, a
 //! matrix-js-sdk-backed one on web, implement the same contract.
 
+#[cfg(feature = "runtime-probe")]
+pub mod runtime_probe;
+
 use std::sync::Arc;
 
 use crate::driver::{

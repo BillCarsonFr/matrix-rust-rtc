@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import initAsync from "../src/generated/wasm-bindgen/index.js";
-import bindings from "../src/generated/matrix_rtc";
+import bindings from "../src/generated/matrix_rtc.js";
 
 let initialized = false;
 

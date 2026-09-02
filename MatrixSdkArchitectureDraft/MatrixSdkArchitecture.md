@@ -1,30 +1,70 @@
 # Matrix RTC SDK Architecture (Draft)
 
-A plan for a single crate — `matrix-rtc` — that replaces the current
-multi-crate workspace while behaving the same. Two ideas drive it:
+A plan for `matrix-rtc` crate that has clear responsibility: Do everything that needs to be done to
+participate in an RTC session. It should NOT do any call specific work but be the foundation for any
+rtc app. See [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143).
+Input and output interfaces:
+ - the input is compleatly covered by a matrix-rtc-driver interface.
+ - The output is a simple api exposing:
+  - connections - metadata (SFU URL + JWT) needed to directly connect to a media stream. Currently Livekit room
+  - member - metadata for each rtc member. What participant Ids to subscribe to in the livekit rooms
+  - KeyMap` (member → media key) - all keys that are currently in use. For encryption on publish and decryption on retrival)
 
-1. **The media plane leaves the SDK.** The crate produces exactly two things a
-   host needs to run a call with *any* LiveKit SDK (livekit-js, Swift, Kotlin,
-   Rust): the list of `ConnectionData` (SFU URL + JWT) to connect to, and the
-   `KeyMap` (member → media key) to feed into frame encryption. No libwebrtc,
+1. **The media plane leaves the SDK.**  No libwebrtc,
    no transport engine, wasm-compatible everywhere.
 2. **One Matrix seam: `MatrixDriver`.** The trait mirrors the widget
    `MatrixDriver` in matrix-rust-sdk so that implementation drops in
    unchanged; the same trait is exported through UniFFI as a foreign trait,
    so a matrix-js-sdk-backed driver can be written later.
 
-```
-                 host app (any platform)
-        │ MatrixDriver impl        ▲ ConnectionData[] + KeyMap
-        ▼                          │  → host's own LiveKit SDK
-┌──────────────────────────────────────────────────┐
-│ matrix-rtc                                       │
-│  participation ── owns ──┬─ session              │
-│   (facade)               ├─ connections          │
-│                          ├─ own_membership       │
-│                          └─ encryption           │
-│  driver (MatrixDriver traits)        bindings    │
-└──────────────────────────────────────────────────┘
+```text
+                                host application
+┌──────────────────────────────────────────────────────────────────────────────┐
+│               MatrixDriver — implemented by the host, one per room           │
+│                                                                              │
+│   send    sticky / state / delayed events (MSC4354 · MSC4140                 │
+│           restart/cancel) · delegate delayed leave to the SFU (MSC4195)      │
+│   send    to-device messages (per-recipient delivery results)                │
+│   read    timeline events · room state                                       │
+│   sfu_endpoints OpenID · GET /rtc/transports · LiveKit get_token             │
+│   emit    live streams: room events · state updates · to-device              │
+└──────────────┬───────────────────────────────────────────▲───────────────────┘
+               │ streams in                                │ commands out
+               ▼                                           │ (one trait slice per part)
+┌─ ParticipationManager::new(room_id, slot_id, driver, config) ────────────────┐
+│                                                                              │
+│  ┌─ Session ────────────────────────────────────────────────────┐            │
+│  │ feeds itself: RoomEventsDriver slice — seeds via reads,      │            │
+│  │ then consumes the live streams. The single converter:        │            │
+│  │ every event type → Member candidates; joined projection      │            │
+│  │ (slot · encryption · room conditions). All reads are         │            │
+│  │ SessionSnapshots (same values as the static path ⇓)          │            │
+│  └─────────┬────────────────────────┬──────────────────────┬────┘            │
+│            │                        │                      │                 │
+│            │ subscribe()            │ subscribe()          │ subscribe()     │
+│            ▼                        ▼                      ▼                 │
+│   ┌─ OwnMembership ────┐  ┌─ Connections ──────┐  ┌─ Encryption ──────┐      │ Connection = Established/ResolvedTransport, TransportConnection
+│   │ join / leave state │  │ ConnectionData per │  │ SendMachine:      │      │
+│   │ machine · delayed  │  │ ws_url (multi-     │  │ rotation +        │      │
+│   │ leave · heartbeat  │  │ focus) · mint /    │  │ distribution;     │      │
+│   │                    │  │ reuse tokens       │  │ KeyMap: verify +  │      │
+│   │ ⇅ OwnMembership-   │  │                    │  │ store inbound keys│      │
+│   │   Driver           │  │ ⇅ TokenDriver      │  │                   │      │
+│   │                    │─▶│                    │  │ ⇅ ToDeviceDriver  │      │
+│   └────────────────────┘  └────────────────────┘  │ ◀ to-device stream│      │
+│     on_transport_created → add_own_transport      └───────────────────┘      │
+│                                                                              │
+├─ public surface ─────────────────────────────────────────────────────────────┤
+│   join(intent, params) · leave(reason)                                       │
+│                                                                              │
+│   memberships() + on_memberships_change    one tile per entry: Session's     │
+│                                            joined set ∪ Encryption's         │
+│                                            left-with-keys members            │
+│   connections() + on_connections_change    the LK rooms to hold              │
+│   key_map()     + on_key_map_change        feed into frame encryption        │
+│   status()      + on_status_change         Joining / Connected / Leaving     │
+└──────────────────────────────────────────────────────────────────────────────┘
+               ▼ callbacks → host renders tiles, holds LK rooms, sets keys
 ```
 
 ## Modules
@@ -33,9 +73,10 @@ multi-crate workspace while behaving the same. Two ideas drive it:
 
 Pure projection of Matrix events into session state. No I/O. The session is
 the **single converter** from raw Matrix events to the Member
-representation — sticky *and* state, modern *and* legacy. Nothing is
-pre-translated into synthetic sticky events; hosts feed everything into one
-funnel and the session dispatches on event type:
+representation — sticky *and* state, modern (member via sticky events) *and* legacy (member via state events). Nothing is
+pre-translated into synthetic sticky events; This implies, that this module is the only one doing compoatibity.
+Compatibilty should be encapsulated into seperate files, so that removing the compat later is low risk.
+Hosts (via `MatrixDriver`) feeds everything into one funnel and the session dispatches on event type:
 
 | event type | converted to |
 |---|---|
@@ -47,14 +88,14 @@ funnel and the session dispatches on event type:
 - **All reads go through `SessionSnapshot`** — a plain, cloneable value
   carrying the joined projection plus its metadata (`slot_state`,
   `negotiated_encryption`, `start_ts`, `excluded_candidates`) and the
-  conveniences (`member_count()`, `is_active()`).
+  conveniences functions (`member_count()`, `is_active()`).
 - `compute_sessions_from_events(events, config) -> Vec<SessionSnapshot>` —
-  static, cheap, and returns *values, not subscriptions*: nothing updates
-  unless you pass a driver (i.e. build a `Session`). This is the room-info
-  path: matrix-rust-sdk's `room_info` computation calls it on every room
-  update and populates its fields from the snapshot. One slice of all
-  events, many rooms at once; grouped by `(room_id, slot_id)` — MSC3401
-  candidates land in the well-known `LEGACY_SLOT_ID`.
+  static, cheap, and returns *values, not subscriptions*: nothing updates.
+  A observable session will be created by passing a driver (i.e. build a `Session` see below).
+  `compute_sessions_from_events` is the room-info path: matrix-rust-sdk's `room_info` computation
+  calls it on every room update and populates its fields from the snapshot. One slice of all
+  events, can even be many rooms at once (probably not helpful in reality);
+  A list of `SessionSnapshot` is returned to allow mutliple slots per room.
 - `Session::new(room_id, slot_id, driver: RoomEventsDriver, config)` — the
   **live** entry point: the session seeds itself (`read_state` /
   `read_events`) and consumes the driver's streams; consumers use
@@ -64,7 +105,8 @@ funnel and the session dispatches on event type:
   producing the normalized internal candidate (member + source generation +
   origin + one `expires_at` from either the sticky duration or MSC3401's
   `expires`). Deleting a legacy generation = deleting its file plus one
-  dispatch arm.
+  dispatch arm. We keep an enum `matrix_rtc_generation` for the sake of
+  using different methods to compute the connection and member ID.
 - **Join-condition projection** (behavior kept from today): candidates are
   re-projected whenever inputs move; exclusions carry a reason. Two
   conditions are **scoped by generation**: `SlotClosed` and

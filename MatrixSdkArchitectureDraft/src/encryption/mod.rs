@@ -130,22 +130,6 @@ impl SendMachine {
         todo!()
     }
 
-    /// Distribute the current key to every joined member's device that has
-    /// not received it; per-recipient results decide who is recorded as
-    /// served (failures are retried on the next rollout).
-    async fn ensure_key_distribution(&self) -> Result<(), DriverError> {
-        todo!()
-    }
-
-    /// When the next deferred rotation is due (for host scheduling).
-    fn rotation_due_at_ms(&self) -> Option<u64> {
-        todo!()
-    }
-
-    /// Perform a due rotation now, if any.
-    async fn flush_due_rotation(&self) -> Result<(), DriverError> {
-        todo!()
-    }
 }
 
 /// The full encryption machine: owns the [`SendMachine`], verifies and

@@ -202,12 +202,3 @@ pub fn compute_sessions_from_events(
 // room_info
 // is computed from required state
 // and in the future it will also have sticky events
-           ----------------------> Manager2
-Sync Data  --->    someManager
-  |                    |
-  |                    |
-  v                    |
-RoomListRenderData     |
-                       |
-                       |
-extendedRoomList <-----
