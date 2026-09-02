@@ -6,6 +6,52 @@ described in `MatrixSdkArchitecture.md`. Everything else (`own_membership`,
 `watch::Receiver<SessionSnapshot>`, so this module can be finished and tested
 on its own first.
 
+## Implementation status (2026-09-02)
+
+Phases 1–4 and 6 are implemented and tested natively (`cargo test`: 147
+tests in `session`/`types`, plus 4 FFI tests with `--features uniffi`); the
+crate also type-checks for `wasm32-unknown-unknown --features uniffi`. Of
+Phase 5, the FFI glue is done (`RoomEventSink`/`StateUpdateSink`/
+`ToDeviceSink::emit`, `FfiMatrixDriver::new` with Rust-side fan-out,
+`read_events`/`read_state`, `compute_sessions_from_events`). **Not done:**
+5.3 and §4.9 — the wasm acceptance tests go through `FfiParticipationManager`,
+whose `participation::Manager` is still `todo!()`; that is outside this plan.
+
+Where the code deviates from the text below, the code is right and the reason
+is one of these:
+
+- `MemberCandidate` carries `slot_id`, `origin_server_ts`, `leave_reason` and
+  an `Option<LegacyDetails>` (call id, state key, `joined_at`, focus data);
+  transports live only in `member.transports` (no duplicate field). MSC3401
+  transports are assigned at projection time (`msc3401::assign_transports`).
+- `dispatch::classify(event, config, now)` computes the MSC4354 `end_time`
+  (`sticky::end_time`) and puts it in the candidate; converters take no clock.
+  "Already expired on arrival" is judged in `RoomState::ingest` for both
+  generations (`expires_at <= now`, deadline inclusive).
+- Removals are kept as tombstones until their `end_time` so a stale join
+  arriving after a removal cannot resurrect the entry — required for the
+  order-independence test in §4.4. Both member type spellings key the same
+  map entry.
+- `Member.member_id` is `member.id` (falling back to the sticky key when a
+  leave omits it); the sticky key is the *map* identity, and a mismatch is
+  logged. `RtcTransport.properties` is the transport object minus `type`.
+- Room-member condition: the live path enforces it only after the seed
+  supplied the set (a single live `m.room.member` is not a roster), and an
+  **empty** `read_state(m.room.member)` counts as unsupplied — a readable room
+  always contains the reader, so an empty answer is a host with nothing to
+  offer. The static path infers the set from the slice.
+- `start_ts` uses the MSC3401 `joined_at` for legacy members (a re-sent state
+  event moves `origin_server_ts`, not the join). `members` and
+  `excluded_candidates` are sorted by `(user_id, member_id)`.
+- The transition after an expiry publishes once more to clear the one-shot
+  `Expired` entry (1.6): that is a real change of `excluded_candidates`.
+- Time is injected through a `Clock` trait (`Session::with_clock`); the
+  system clock is `executor`.
+- Fixtures: `mockDriver.ts` now puts `msc4354_sticky_key` into member content
+  and uses `SLOT_ID = "m.call#ROOM"`; both were required by MSC4143/MSC4354
+  and the previous values made every member event a non-membership and every
+  slot closed.
+
 What we can port from `../crates` (the current implementation):
 
 | current code | what to take | where it lands |
@@ -14,7 +60,7 @@ What we can port from `../crates` (the current implementation):
 | `matrix-rtc-core/src/event.rs` | MSC4143 content rules (`join` needs `member.id` + `application.type`; unknown membership = left; sticky_key both spellings) + tests | `session/convert/msc4143.rs` |
 | `matrix-rtc-core/src/session.rs` | `join_condition`, `refresh` (publish only on change), `negotiated_encryption`, `debug_snapshot`, and the *batch does not publish per event* rule | `session/state.rs` |
 | `matrix-rtc-core/src/manager.rs` | room-state bookkeeping: "unsupplied vs. supplied-but-absent" slot knowledge, per-room scoping, seeding a session created after state was known | `session/state.rs` |
-| `matrix-rtc-core/src/wire.rs` | `wire_event_type` table + tests | `types.rs` (already declared there) |
+| `matrix-rtc-core/src/wire.rs` | only the `wire_event_type` tests (the table is already implemented in `types.rs`) | `types.rs` |
 | `matrix-rtc-bridge/src/compat/element_call.rs` | the 2025-dialect normaliser (`normalize_member_content`, `claimed_device_id`) + tests | `session/convert/msc4143.rs` (`fill_from_2025_dialect`) |
 | `matrix-rtc-bridge/src/compat/element_call_state.rs` | MSC3401 state-event → memberships + tests | `session/convert/msc3401.rs` |
 | matrix-rust-sdk `matrix-sdk-base/src/sticky/{map,extract}.rs` | the MSC4354 map rules (key, end-time, tie-break, removal) — *not* the code, it is ruma-typed | `session/sticky.rs` |
@@ -59,6 +105,11 @@ path order-independent):
 - already-expired on arrival → ignored.
 - `received_ts` = `executor::now_ms()` at ingest; the static path uses the
   call time.
+- a member event with **no** sticky metadata anywhere (no duration, no ttl)
+  is not a sticky event: the converter still yields a candidate
+  (`expires_at = None`) but the map refuses it (`Unchanged`, one debug line).
+  Admitting it would create an entry that never expires and cannot be
+  ordered against real ones.
 
 Consequence: `MemberCandidate.expires_at` is the map's `end_time`, and the
 live session needs one timer for the earliest expiry (see 1.3).
@@ -96,8 +147,29 @@ Two ways to make the tests honest:
 - Alternative: change the acceptance tests to `await tick()` everywhere and
   keep a pure pump. Simpler code, weaker guarantee for hosts.
 
-Whichever is chosen, the mod-level doc comment on `Session::new` ("an `emit`
-is fully processed before it returns") must be made true or rewritten.
+Whichever is chosen, three places currently describe three different
+behaviours and must end up saying the same thing: the mod-level doc on
+`Session::new` ("an `emit` is fully processed before it returns"),
+`MatrixSdkArchitecture.md`'s FFI section ("`emit` only *wakes* the pump …
+web tests `await` a tick") and this plan.
+
+Two consequences of the recommended option that the skeleton does not show:
+
+- **Lock model.** `UnboundedReceiver::recv()` borrows the receiver across an
+  await, so the pump cannot hold the state mutex while waiting and the
+  receivers cannot be shared with `snapshot()` through `tokio::select!`.
+  Instead the pump is one `poll_fn`: lock, `poll_recv` both receivers and
+  poll the expiry sleep, ingest everything that is ready, publish, unlock,
+  return `Pending` when nothing was ready (the wakers are registered under
+  the lock). `snapshot()` locks and loops `try_recv`. Both paths go through
+  the same lock and the same `ingest`, so an event is processed exactly once.
+  This settles Phase 3.3: no `tokio::select!`, no `macros` feature.
+- **Getters above the session.** The web test reads
+  `manager.memberships()`, not `Session::snapshot()`. Drain-on-read only
+  helps if `participation::Manager` (and every FFI getter that reflects
+  session state) builds its answer from `session.snapshot()` rather than
+  from the last value it saw on its `watch` receiver. That is a
+  `participation` obligation and is noted in §5.
 
 ### 1.4 The `RawMatrixEvent.event` contract
 Fix it in one place (`types.rs` doc + `mockDriver.ts`): the *full* event
@@ -106,37 +178,47 @@ object as the host SDK holds it — `type`, `sender`, `event_id`, `room_id`,
 `msc4354_sticky`, optional `unsigned`. For encrypted events this is the
 *decrypted* event (the host resolves `m.room.encrypted` before handing it
 over); `origin` carries the decryption metadata. `read_state` returns the same
-shape. Nothing else in the crate parses event JSON, so these accessors live in
-`session/dispatch.rs` (`event_type()`, `sender()`, `state_key()`,
+shape. Nothing else in the crate parses *room event* JSON (`encryption` parses
+to-device content, `uniffi_api` only deserialises strings into `Value`), so
+these accessors live in `session/dispatch.rs` (`event_type()`, `sender()`, `state_key()`,
 `origin_server_ts()`, `content()`, `sticky_duration_ms()`, `event_id()`).
 
-### 1.5 Gaps in `types::Member` / `SessionSnapshot`
-The downstream modules need per-member data the current `Member` cannot carry:
+### 1.5 `types::Member` — what exists, what is missing
+Fields `Member` already has and that this module must fill correctly:
+
+- `device_attribution: DeviceAttribution` (`Verified | Claimed | Unknown`).
+  This is how "claimed, never verified" is expressed; `encryption::inbound`
+  matches on it. `EventOrigin` stays as it is — three variants, also used for
+  to-device key origin — so **no `EventOrigin::Claimed`**. The converters set
+  `device_attribution`: `Verified` when the origin is
+  `Encrypted { sender_device_id: Some }`, `Claimed` when the device comes
+  from MSC3401 content or the 2025 dialect's `member.device_id`, `Unknown`
+  otherwise (precedence in 6.1). `MemberCandidate.origin` keeps the raw
+  `EventOrigin` for the encryption condition.
+- `membership_ts: Option<u64>`. `encryption::send_machine` uses a change in
+  it to tell a leave-and-rejoin from an unchanged membership. The MSC3401
+  converter sets it to `joined_at` (6.2); MSC4143 leaves it `None` (fresh
+  `member_id` per join). `start_ts` is computed from the candidate's
+  `origin_server_ts`, which stays on `MemberCandidate` (internal).
+
+Fields the downstream modules need and `Member` cannot carry yet:
 
 - `connections::members_for_connection_data` groups members by their
   published transports' `livekit_service_url` → `Member` needs
   `transports: MemberTransports` (the snapshot's `transports` union alone
   does not say who publishes where).
-- `participation::SessionMembership.transport_identity` needs
-  `user_id`/`device_id`/`member_id` — present.
-- `start_ts` needs each candidate's `origin_server_ts` → keep it on
-  `MemberCandidate` (internal), not on `Member`.
 - `application_type` on `Member` (MSC4143 requires it on a join) — add it, so
   a slot-less MSC3401 session can still report an application type.
-- MSC3401 and the 2025 dialect attribute a device the event merely *claims*.
-  The draft's `EventOrigin` has no `Claimed` variant; the skeleton's comment
-  on `MemberCandidate.origin` says the device is "claimed, never verified"
-  but has nowhere to say so. Recommendation: add
-  `EventOrigin::Claimed { device_id }` exactly as in the current core
-  (`was_encrypted() == None`, `sender_device_id() == Some`) — the
-  `encryption` module's inbound rules already assume this distinction.
 
 ### 1.6 Where `Expired` shows up
-Expired sticky entries leave the map. To keep the diagnostics promised by
-`excluded_candidates`, the projection reports a candidate as
-`(member, Expired)` in the snapshot published by the very transition that
-drops it (live) and for any past-`expires_at` candidate in the static path
-(which has no later transition). It is not retained beyond that.
+Expiry is a map concern, not a projection condition. An entry that is already
+expired on arrival is ignored (1.1; the MSC3401 map applies the same rule),
+and a live entry that reaches its `expires_at` is removed by the expiry
+timer. To keep the diagnostics promised by `excluded_candidates`, that
+removal reports the dropped candidates and the snapshot published by the very
+transition that drops them lists them as `(member, Expired)`. Nothing is
+retained beyond that, and the static path — one `now`, nothing arrives later
+— never reports `Expired`.
 
 ### 1.7 `compute_sessions_from_events` result set
 Return one snapshot per `(room_id, slot_id)` that has **either** a slot state
@@ -175,11 +257,12 @@ src/session/
 
 ```
 Member(MemberCandidate)              // m.rtc.member / org.matrix.msc4143.rtc.member
-MemberRemoval(StickyKey)             // sticky removal (content = sticky key only, or 2025 bare leave)
-LegacyMembers { user, Vec<MemberCandidate> }   // org.matrix.msc3401.call.member (StateEvents only)
+MemberRemoval(StickyKey)             // MSC4354 removal: content = sticky key only (1.1)
+LegacyMember(MemberCandidate)        // org.matrix.msc3401.call.member (StateEvents only), one per event
+LegacyMemberRemoval { state_key }    // same type, empty content
 Slot { slot_id, RawSlot }            // m.rtc.slot / org.matrix.msc4143.rtc.slot
 RoomMember { user_id, joined: bool } // m.room.member
-RoomEncryption(bool)                 // m.room.encryption (presence => encrypted)
+RoomEncryption                       // m.room.encryption with an algorithm; empty content is Ignored
 Ignored(&'static str)                // logged at trace
 ```
 
@@ -188,7 +271,7 @@ slot, the static path holds a `HashMap<room_id, RoomState>`):
 
 ```
 sticky: sticky::Map<MemberCandidate>          // MSC4143 candidates, keyed per 1.1
-legacy: HashMap<(user, device), MemberCandidate> // MSC3401 candidates (StateEvents)
+legacy: HashMap<state_key, MemberCandidate>     // MSC3401 candidates (StateEvents); state key = per user+device+call
 slots: HashMap<slot_id, RawSlot>, slot_state_supplied: bool
 room_encryption: Option<bool>
 room_members: Option<HashSet<user_id>>       // None = unenforced
@@ -202,7 +285,7 @@ Projection (`project(&self, slot_id, now) -> SessionSnapshot`) is the port of
 | slot closed (only when slot state supplied) | `SlotClosed` | not applied |
 | cleartext in encrypted room (`origin.was_encrypted()==Some(false)`) | `UnencryptedInEncryptedRoom` | not applied |
 | sender not in `room_members` (only when supplied) | `SenderNotInRoom` | `SenderNotInRoom` |
-| `expires_at <= now` | `Expired` | `Expired` |
+| dropped by the expiry timer in this transition (1.6) | `Expired` | `Expired` |
 
 (No own-device rule — see 1.2.)
 
@@ -228,9 +311,9 @@ Order is chosen so every phase has a test harness without the later ones.
    origin, expires_at: None (filled by sticky layer), transports,
    origin_server_ts }`.
 3. `slot.rs`: port `resolve`.
-4. `types.rs`: `wire_event_type` (port), `generate_member_id` (needs
-   `rand`/`getrandom` with the `js` feature for wasm — add deps), the
-   `Member`/`EventOrigin` additions from 1.5.
+4. `types.rs`: `generate_member_id` (needs `rand`/`getrandom` with the `js`
+   feature for wasm — add deps), the `wire_event_type` tests, the `Member`
+   additions from 1.5 (`transports`, `application_type`).
 
 ### Phase 2 — pure state + static path
 1. `sticky.rs` with the 1.1 rules and `next_expiry()`.
@@ -251,47 +334,41 @@ Order is chosen so every phase has a test harness without the later ones.
    `StateEvents`: `read_state(org.matrix.msc3401.call.member, Any)`. Each read
    failure is logged and leaves that condition **unenforced** (matches
    today's opt-in semantics). One publish at the end of seeding, not per read.
-3. Pump loop: whichever of {room event, state batch, expiry deadline}
-   arrives; a state batch is ingested whole and published once. Use
-   `futures`-free selection: a small `select` over two `UnboundedReceiver`s
-   and `sleep_ms` — either `tokio::select!` (needs the `macros` feature on
-   both targets; it is runtime-independent) or a hand-rolled `poll_fn`.
-   Decide once and note it in `executor.rs`.
+3. Pump loop: the `poll_fn` of 1.3 — lock, `poll_recv` both receivers and
+   poll the pending `sleep_ms` for the next expiry, ingest whatever is
+   ready, publish once, return `Pending`. A state batch is ingested whole
+   and published once. No `tokio::select!`; note the pattern in
+   `executor.rs`.
 4. Drain-on-read (1.3) in `snapshot()`; `subscribe()` returns
-   `snapshot_tx.subscribe()`; `Drop` closes the receivers so the driver's
-   sink `emit` returns `false` (the drop-guard contract) and the pump exits.
+   `snapshot_tx.subscribe()`; `Drop` closes this session's receivers and
+   ends the pump. Whether the host-facing sink `emit` then returns `false`
+   depends on the driver's fan-out: it does once the *last* subscriber is
+   gone (one manager per driver in the acceptance tests, so 4.9 can assert
+   it directly).
 5. Publish only when the projected snapshot differs (`PartialEq` on
    `SessionSnapshot`; derive it).
 
 ### Phase 4 — compat read side
 1. `msc4143.rs::fill_from_2025_dialect` (always on, only fills absent modern
-   fields) + bare-leave → `MemberRemoval`, claimed device → `EventOrigin::Claimed`
-   when the event's origin names none.
-2. `dispatch` MSC3401 arm gated on `config.compat == StateEvents`;
-   `msc3401.rs::member_candidate(event, now)` (singular — see §6.2: one
-   per-device state event is one membership). **The oldest generation, where
-   one state event carried a `memberships[]` array for all of a user's
-   devices, is out of scope: it is not implemented, not a compat mode, and
-   must not be added.** Content carrying that array is ignored (one debug
-   log line, no candidate). Produces the candidate with `expires_at`,
-   `EventOrigin::Claimed`, `LEGACY_SLOT_ID`, plus the *inputs* to focus
-   resolution (`own_focus`, `prefers_own_focus`, `joined_at`).
-   `RoomState.legacy` is keyed by `state_key` (i.e. per sender+device); an
-   event with empty content removes that key.
-3. Legacy focus resolution (`oldest_membership`) is cross-member, so it runs
-   in `project()` over the slot's surviving legacy candidates, filling
-   `Member.transports` with the resolved focus as
-   `RtcTransport { transport_type: "livekit", properties: <focus verbatim> }`.
-   Keep it in `msc3401.rs` as a pure `resolve_focus(candidates) -> Vec<..>`
-   so the file still deletes cleanly.
+   fields); bare sticky-key leave is the MSC4354 removal of 1.1 and needs no
+   dialect code; claimed device → `Member.device_id` +
+   `DeviceAttribution::Claimed` when the event's origin names none.
+2. `dispatch` MSC3401 arm gated on `config.compat == StateEvents`:
+   `msc3401.rs::member_candidate(event, now)` → `Ingest::LegacyMember`
+   (one per-device state event is at most one membership; the
+   `memberships[]` array generation is out of scope, see the callout in
+   §6.2), empty content → `Ingest::LegacyMemberRemoval { state_key }`.
+   `RoomState.legacy` is keyed by `state_key`. Field mappings: §6.2.
+3. Legacy focus resolution is cross-member, so it runs in `project()` over
+   the slot's surviving legacy candidates (rules in §6.2). Keep it in
+   `msc3401.rs` as a pure `resolve_focus(candidates) -> Vec<..>` so the file
+   still deletes cleanly.
 4. Legacy expiry uses the same timer as sticky expiry (`next_expiry` over
    both maps). No 30 s poll is needed any more: the session knows every
    `expires_at`.
 5. The legacy slot (`LEGACY_SLOT_ID`) never gets a `slot_state`: it stays
    `None` even when the room has `m.rtc.slot` state (today's bridge passes no
    slot snapshot in `StateEvents` mode for the same reason).
-6. Skeleton already fixed: `msc3401.rs` now declares the singular
-   `member_candidate` and its doc names the array generation as unsupported.
 
 (Exact field mappings: see §6, filled from the current bridge code.)
 
@@ -302,7 +379,7 @@ Order is chosen so every phase has a test harness without the later ones.
    (`slot_open`, `encrypted`, `member_count`, `is_active`).
 2. `FfiMatrixDriver::read_events/read_state` parse the JSON string vectors.
 3. Make the existing two session-relevant acceptance tests pass and add the
-   ones in §4.6.
+   ones in §4.9.
 
 ### Phase 6 — hardening
 - Malformed input never panics (`serde_json::Value` probing, no `unwrap`).
@@ -324,9 +401,9 @@ test sleeps.
 
 ### 4.1 `dispatch.rs`
 - classifies `m.rtc.member` **and** `org.matrix.msc4143.rtc.member` as Member;
-  same for the two slot ids; `m.room.member`, `m.room.encryption`.
+  same for the two slot types; `m.room.member`, `m.room.encryption`.
 - `org.matrix.msc3401.call.member` → `Ignored` with `Off`/`StickyEvents`,
-  `LegacyMembers` with `StateEvents`.
+  `LegacyMember` / `LegacyMemberRemoval` (empty content) with `StateEvents`.
 - unknown type → `Ignored`; missing `type`/`sender`/`content` → `Ignored`
   (never an error that aborts a batch).
 - `m.room.member` with `membership: join` → joined=true; `leave`/`ban`/
@@ -336,7 +413,8 @@ test sleeps.
   be un-encrypted).
 - sticky metadata: `msc4354_sticky.duration_ms`, `sticky.duration_ms`,
   `unsigned.msc4354_sticky_duration_ttl_ms`; a member event without any
-  sticky object still converts (candidate with `expires_at = None`, logged).
+  sticky metadata still converts (candidate with `expires_at = None`) — the
+  map refuses it (1.1, tested in 4.4).
 
 ### 4.2 `convert/msc4143.rs` (port of core `event.rs` tests + new)
 - spec-shaped join parses (member id, application, transports, can_subscribe,
@@ -371,7 +449,8 @@ recognised; (skip the two `for_open/for_close` builder tests — they belong to
   lower/equal → ignored (returns `Unchanged`).
 - removal: supersedes only when it wins the tie-break; stale removal keeps the
   live join.
-- expired on arrival → ignored.
+- expired on arrival → ignored; `expires_at = None` (no sticky metadata) →
+  ignored.
 - `end_time` math: `min(origin_server_ts, received_ts)`; duration clamped to
   1h; `unsigned` ttl preferred when present.
 - `expire(now)` removes exactly the due entries and reports them;
@@ -465,17 +544,19 @@ Snapshot metadata
 - `content_missing_everything_is_left_to_fail_normally` — no slot id, no
   sticky key → ordinary "not a membership" (`None`).
 - `membership_is_not_inferred_without_an_application`.
-- `claimed_device_is_read_only_when_stated`; plus the origin ranking from
-  `ingest.rs`: `prefers_the_decrypted_device_over_the_claimed_one`,
-  `falls_back_to_the_claimed_device_when_nothing_decrypted`, cleartext +
-  claimed → `Claimed`, unknown + claimed → `Claimed`.
+- `claimed_device_is_read_only_when_stated`; plus the attribution ranking
+  from `ingest.rs`: `prefers_the_decrypted_device_over_the_claimed_one`
+  (`Verified`), `falls_back_to_the_claimed_device_when_nothing_decrypted`,
+  cleartext + claimed → `Claimed`, unknown + claimed → `Claimed`, nothing
+  anywhere → `device_id: None`, `Unknown`.
 - `rtc_transports: []` inserts no `transports`; elements without a string
   `type` are skipped from `can_subscribe`.
 
 MSC3401 (`msc3401.rs`, port from `element_call_state.rs` + `ingest.rs`):
 - `a_join_becomes_msc4143_member_content` — exact `Member` + candidate fields
-  (slot id `m.call#ROOM`, member id, application type, intent, `Claimed`
-  device, `expires_at`, `joined_at`).
+  (slot id `LEGACY_SLOT_ID`, `legacy_call_id` `m.call#ROOM`, member id,
+  application type `m.call`, intent, `device_id` with
+  `DeviceAttribution::Claimed`, `membership_ts == joined_at`, `expires_at`).
 - `the_empty_call_id_becomes_the_room_sentinel` — `""` → `#ROOM`,
   `standup` → `#standup`.
 - `an_empty_content_is_dropped_as_a_leave` — removes that state key's
@@ -500,15 +581,15 @@ MSC3401 (`msc3401.rs`, port from `element_call_state.rs` + `ingest.rs`):
   `an_expired_member_does_not_get_to_be_the_oldest`,
   `the_translation_is_deterministic_under_reordering` (state-key tie-break),
   `the_focus_object_is_passed_through_verbatim` (`livekit_alias` kept).
-- generation scoping (new): a legacy candidate in an encrypted room with a
-  `Claimed` origin is **not** excluded; a closed `m.rtc.slot` in the room
+- generation scoping (new): a legacy candidate in an encrypted room
+  (`origin: Unknown`, attribution `Claimed`) is **not** excluded; a closed `m.rtc.slot` in the room
   does **not** close the legacy slot.
 - `dispatch`: the MSC3401 type is `Ignored` unless `StateEvents`.
 - mixed rooms: with `StateEvents`, a sticky MSC4143 member and a legacy
-  state member coexist in the static output under different slot ids
-  (`m.call#ROOM` vs `""`) — replaces today's "sticky wins on a shared key"
-  merge, which is no longer needed because generations no longer share a
-  map.
+  state member coexist in the static output under different slot ids (the
+  sticky event's `slot_id` vs `LEGACY_SLOT_ID`) — replaces today's "sticky
+  wins on a shared key" merge, which is no longer needed because generations
+  no longer share a map.
 
 ### 4.9 wasm acceptance (`web-test-app/test/participation.test.ts`, run through the real bindings)
 Keep the existing two ("remote member join shows up", "starts disconnected")
@@ -533,8 +614,14 @@ Things the other modules will rely on and that this plan fixes:
   roster/slot change (the current core's encryption manager depends on
   exactly this to avoid useless rotations).
 - `Member.transports` (1.5) is what `connections` groups on.
-- `EventOrigin::Claimed` (1.5) is what `encryption` must treat as
-  "addressable but not authenticated".
+- `Member.device_attribution == Claimed` (1.5) is what `encryption` treats
+  as "addressable but not authenticated"; `EventOrigin` gains no variant.
+- `Member.membership_ts` is what `encryption` uses to tell a rejoin under
+  the same member id from an unchanged membership; only the MSC3401
+  converter sets it.
+- `participation::Manager::memberships()` and the FFI getters must read
+  through `Session::snapshot()` (drain-on-read, 1.3) — a cached `watch`
+  value is stale right after an `emit`.
 - `negotiated_encryption` is read by `participation` at join time to override
   `EncryptionConfig.manage_media_keys`; it is not renegotiated mid-call
   (same as today).
@@ -556,9 +643,9 @@ modern field that is absent:
 | dialect field | spec field | rule |
 |---|---|---|
 | `member: { user_id, device_id, id }` (no `membership`) | `member: { id, membership }` | insert `membership: "join"` iff `application.type` is a non-empty string, `member` is an object, `member.membership` is absent and `member.id` is a non-empty string. Never infer `leave`. |
-| leave = content is **only** `{ msc4354_sticky_key }` (no `slot_id`) | full content with `member.membership: "leave"` | classify as a sticky **removal** (`Ingest::MemberRemoval`); with neither `slot_id` nor a sticky key it is simply not a membership |
+| leave = content is **only** `{ msc4354_sticky_key }` (no `slot_id`) | full content with `member.membership: "leave"` | nothing dialect-specific: this *is* the MSC4354 removal of 1.1 (`Ingest::MemberRemoval`). With neither `slot_id` nor a sticky key it is simply not a membership |
 | `rtc_transports: [ { type, livekit_service_url, … } ]` | `transports: { published, can_subscribe }` | iff `transports` absent and the array non-empty: `published` = array verbatim, `can_subscribe` = deduped `type` strings (elements without a string `type` skipped) |
-| `member.device_id` (self-asserted) | device from decryption metadata | `claimed_device_id` = non-empty `member.device_id`; used **only** when the origin names no device: `Encrypted{None}` → `Claimed`, `Cleartext` → `Claimed`, `Unknown` → `Claimed`; `Encrypted{Some}` always wins |
+| `member.device_id` (self-asserted) | device from decryption metadata | `claimed_device_id` = non-empty `member.device_id`; used **only** when the origin names no device: `Encrypted{None}` / `Cleartext` / `Unknown` + claim → `device_id = claim`, `DeviceAttribution::Claimed`; `Encrypted{Some}` always wins → `Verified`; neither → `None`, `Unknown` |
 | `versions: []`, `m.relation` | — | ignored |
 | `msc4354_sticky_key` **or** `sticky_key` | `msc4354_sticky_key` | both accepted (unstable first) |
 
@@ -568,8 +655,9 @@ expiry logic of its own — the sticky map's `duration_ms` rules it.
 ### 6.2 MSC3401 state dialect (`StateEvents` only)
 
 Event type `org.matrix.msc3401.call.member`, state key
-`_{user}_{device}_{application}{call_id}` (not parsed; used only for logging
-and the focus tie-break). **One state event = at most one membership.**
+`_{user}_{device}_{application}{call_id}` (not parsed; it is the
+`RoomState.legacy` key, appears in logs and breaks focus ties). **One state
+event = at most one membership.**
 
 > **Out of scope, do not implement:** the generation before this one put a
 > `memberships[]` array (all devices of a user) into a single state event.
@@ -585,9 +673,10 @@ livekit_alias}`), `focus_active: { type, focus_selection }`. Not read:
 `scope`, `expires_ts`.
 
 Drop rules (each logged, except the leave): empty content `{}` = leave →
-remove the state key's candidate; has `memberships` → drop; `application`
-not a non-empty string → drop; `device_id` missing/empty → drop; expired →
-`Expired`.
+`LegacyMemberRemoval`; has `memberships` → drop; `application` not a
+non-empty string → drop; `device_id` missing/empty → drop; already expired
+at ingest → ignored (1.6; a live candidate that later expires surfaces once
+as `Expired`).
 
 Derivations:
 
@@ -595,9 +684,11 @@ Derivations:
 |---|---|
 | `joined_at` | `min(created_ts, origin_server_ts)` if `created_ts` present, else `origin_server_ts` |
 | `expires_at` | `joined_at + (expires or 14_400_000 /* 4 h */)`; expired when `expires_at <= now` (deadline itself counts as expired) |
-| `slot_id` of the candidate | `LEGACY_SLOT_ID` (`""`) for the session key; the dialect's own `"{application}#{call_id or ROOM}"` is kept as `Member.application_type` + a `legacy_call_id` field on the candidate so multiple legacy call ids can be told apart in `excluded_candidates`/debug |
+| `slot_id` of the candidate | `LEGACY_SLOT_ID` (`""`) — the session key. The dialect's own `"{application}#{call_id or ROOM}"` is kept only as `legacy_call_id` on the candidate (diagnostics: tells several legacy call ids apart in `excluded_candidates`/debug) |
+| `Member.application_type` | `application` verbatim (`m.call`) |
 | `member_id` | `membershipID` if non-empty, else `"{sender}:{device_id}"` (this string is also the LiveKit participant identity in this generation — see `connections::legacy_participant_identity`) |
-| `origin` | `EventOrigin::Claimed { device_id }` |
+| `device_id` / `device_attribution` | `content.device_id` / `DeviceAttribution::Claimed`; `MemberCandidate.origin` = the event's `EventOrigin` unchanged (state events arrive `Unknown`/`Cleartext`) |
+| `membership_ts` | `joined_at` (rejoin detection in `encryption`, 1.5) |
 | `intent` | `m.call.intent` |
 | `own_focus` | `foci_preferred[0]` verbatim |
 | `prefers_own_focus` | `focus_active.focus_selection == "multi_sfu"` |
@@ -615,8 +706,7 @@ Note for `own_membership`: in `StateEvents` mode *our own* member id must be
 as the LiveKit participant identity.
 
 ### 6.3 What today's bridge does that this plan drops on purpose
-- Any support for the `memberships[]`-array generation (see the callout in
-  6.2) — the same non-support as today, stated explicitly.
+- The `memberships[]`-array generation stays unsupported (callout in 6.2).
 - Fabricating `RawStickyEvent`s with a rewritten `m.rtc.member` type — the
   converters produce `MemberCandidate`s directly.
 - The 30 s state-membership poll — `expires_at` is known, so the expiry
