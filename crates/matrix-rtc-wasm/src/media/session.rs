@@ -185,6 +185,12 @@ impl WasmRtcSessionManager {
             .ok_or_else(|| {
                 JsError::new("no session for the slot — join it before connecting media")
             })?;
+        let raised_hands = self
+            .inner
+            .subscribe_raised_hands(&config.room_id, &config.slot_id);
+        let reactions = self
+            .inner
+            .subscribe_reactions(&config.room_id, &config.slot_id);
 
         // Mapper before handler: the replay below derives identities through
         // it, and installing it second would replay peer keys under the raw
@@ -230,6 +236,8 @@ impl WasmRtcSessionManager {
                 own_member_id: member_id.clone(),
                 ctx: ctx.clone(),
                 own_connection_key: Some(config.livekit_service_url.clone()),
+                raised_hands,
+                reactions,
             },
             memberships,
         );
@@ -452,6 +460,7 @@ fn to_wasm_participant(
         is_local: participant.is_local,
         reachable: participant.reachable,
         rtc_identity,
+        hand_raised_at_ms: participant.hand_raised_at_ms,
         streams: participant
             .streams
             .iter()
@@ -482,6 +491,9 @@ struct WasmParticipant {
     /// `room.getParticipantByIdentity()`.
     rtc_identity: Option<String>,
     streams: Vec<WasmStreamState>,
+    /// When the participant raised their hand (ms since the epoch); `None`
+    /// while it is down.
+    hand_raised_at_ms: Option<u64>,
 }
 
 /// A call event, as JS sees it: `{ type, ...fields }`, snake_case throughout
@@ -514,6 +526,20 @@ enum WasmCallEvent {
     },
     ActiveSpeakers {
         speakers: Vec<WasmSpeaker>,
+    },
+    HandRaised {
+        member_id: String,
+        raised_at_ms: u64,
+    },
+    HandLowered {
+        member_id: String,
+    },
+    /// Transient; `sound` is the asset base name to play, `None` for silence.
+    Reaction {
+        member_id: String,
+        emoji: String,
+        name: String,
+        sound: Option<String>,
     },
     KeyImported {
         member_id: String,
@@ -643,6 +669,25 @@ impl From<CallEvent> for WasmCallEvent {
                 sender_device_id,
                 reason_code: rejection_code(&reason),
                 reason: reason.to_string(),
+            },
+            CallEvent::HandRaised {
+                member_id,
+                raised_at_ms,
+            } => Self::HandRaised {
+                member_id,
+                raised_at_ms,
+            },
+            CallEvent::HandLowered { member_id } => Self::HandLowered { member_id },
+            CallEvent::Reaction {
+                member_id,
+                emoji,
+                name,
+                sound,
+            } => Self::Reaction {
+                member_id,
+                emoji,
+                name,
+                sound,
             },
             CallEvent::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
             CallEvent::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },

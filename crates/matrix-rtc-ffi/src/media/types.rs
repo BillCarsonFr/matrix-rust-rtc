@@ -75,6 +75,9 @@ pub struct FfiParticipant {
     /// Whether any transport can reach this member's media.
     pub reachable: bool,
     pub streams: Vec<FfiStreamState>,
+    /// When this participant raised their hand (ms since the epoch), or
+    /// `None` while it is down. Sort ascending to order speakers.
+    pub hand_raised_at_ms: Option<u64>,
 }
 
 impl From<matrix_rtc_media::Participant> for FfiParticipant {
@@ -85,6 +88,7 @@ impl From<matrix_rtc_media::Participant> for FfiParticipant {
             device_id: participant.device_id,
             is_local: participant.is_local,
             reachable: participant.reachable,
+            hand_raised_at_ms: participant.hand_raised_at_ms,
             streams: participant
                 .streams
                 .into_iter()
@@ -366,6 +370,27 @@ pub enum FfiCallEvent {
         sender_device_id: Option<String>,
         reason: FfiKeyRejection,
     },
+    /// A participant raised their hand. Also on the roster as
+    /// `FfiParticipant.hand_raised_at_ms`.
+    HandRaised {
+        member_id: String,
+        raised_at_ms: u64,
+    },
+    /// A participant lowered their hand, or left with it up.
+    HandLowered {
+        member_id: String,
+    },
+    /// A participant sent an emoji reaction. Transient: show `emoji` for a
+    /// few seconds (Element Call uses three) and, if reaction sounds are on,
+    /// play the asset named by `sound` (`clap`, `party`, …, `generic` for a
+    /// name outside the catalogue; see `reactionCatalog()`). `None` is a
+    /// silent reaction.
+    Reaction {
+        member_id: String,
+        emoji: String,
+        name: String,
+        sound: Option<String>,
+    },
     /// A transport-level participant with no signalled membership; it gets
     /// no subscription. Diagnostics only.
     UnknownParticipant {
@@ -442,6 +467,25 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                 sender_user_id,
                 sender_device_id,
                 reason: reason.into(),
+            },
+            Event::HandRaised {
+                member_id,
+                raised_at_ms,
+            } => Self::HandRaised {
+                member_id,
+                raised_at_ms,
+            },
+            Event::HandLowered { member_id } => Self::HandLowered { member_id },
+            Event::Reaction {
+                member_id,
+                emoji,
+                name,
+                sound,
+            } => Self::Reaction {
+                member_id,
+                emoji,
+                name,
+                sound,
             },
             Event::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
             Event::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },

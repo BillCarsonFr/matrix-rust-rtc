@@ -64,6 +64,18 @@ const SCENARIOS: Scenario[] = [
 
 const DISPLAY_NAME = "Rust Peer";
 
+/**
+ * Open Element Call's reactions popup (the icon-only "Reactions" button in the
+ * call footer; a second click closes it). The popup holds the raise-hand
+ * toggle and one button per catalogue reaction, each labelled by its name.
+ */
+async function openReactionsMenu(frame: ReturnType<typeof callFrame>): Promise<void> {
+  const raiseHand = frame.getByRole("button", { name: /Raise hand|Lower hand/ });
+  if (await raiseHand.first().isVisible().catch(() => false)) return;
+  await frame.getByRole("button", { name: "Reactions" }).click({ timeout: 30_000 });
+  await expect(raiseHand.first()).toBeVisible({ timeout: 10_000 });
+}
+
 for (const scenario of SCENARIOS) {
   test(`Rust client and Element Call share a call — ${scenario.title}`, async ({
     browser,
@@ -142,6 +154,64 @@ for (const scenario of SCENARIOS) {
         `Element Call's audio decoded to near-silence (rms ${audio.value}); ` +
           `the recording is attached as element-call-audio.wav`,
       ).toBeGreaterThan(audio.floor as number);
+
+      // ---- Reactions and raised hands, both directions --------------------
+      // Unspecced: an `m.reaction` annotation of the sender's membership event
+      // (hand) and an `io.element.call.reaction` relating to it (emoji). Both
+      // directions matter — Element Call validates a reaction against the
+      // membership event id it holds for us, which in the sticky dialect is
+      // the id of our *latest* sticky event.
+      const joined = await peer.waitFor("joined");
+      const ownMemberId = joined.membership_id as string;
+
+      // Rust raises: Element Call shows the hand on our tile, then drops it
+      // when we redact the annotation.
+      const peerHandOnTile = frame
+        .getByRole("img", { name: "Reaction" })
+        .filter({ hasText: "✋" });
+      peer.send("raise_hand");
+      await peer.waitFor("hand_raised_sent", { timeout: 30_000 });
+      await expect(peerHandOnTile).toBeVisible({ timeout: 30_000 });
+      peer.send("lower_hand");
+      await peer.waitFor("hand_lowered_sent", { timeout: 30_000 });
+      await expect(peerHandOnTile).toHaveCount(0, { timeout: 30_000 });
+
+      // Element Call raises: the Rust roster shows a hand on a member that is
+      // not us, and lowers it when Element Call does.
+      await openReactionsMenu(frame);
+      await frame.getByRole("button", { name: "Raise hand" }).click();
+      const ecHand = await peer.waitFor("hand_raised", {
+        timeout: 30_000,
+        predicate: (event) => event.member_id !== ownMemberId,
+      });
+      await openReactionsMenu(frame);
+      await frame.getByRole("button", { name: "Lower hand" }).first().click();
+      await peer.waitFor("hand_lowered", {
+        timeout: 30_000,
+        predicate: (event) => event.member_id === ecHand.member_id,
+      });
+
+      // Rust reacts: Element Call shows the emoji on our tile (for its
+      // three-second window, hence the wait starts before the send lands).
+      const peerClapOnTile = frame
+        .getByRole("img", { name: "Reaction" })
+        .filter({ hasText: "👏" });
+      peer.send("react 👏 clapping");
+      const sent = await peer.waitFor("reaction_sent", { timeout: 30_000 });
+      expect(sent.emoji).toBe("👏");
+      await expect(peerClapOnTile).toBeVisible({ timeout: 30_000 });
+
+      // Element Call reacts: the Rust side gets the emoji, the name it picks a
+      // sound by, and the resolved sound asset.
+      await openReactionsMenu(frame);
+      await frame.getByRole("button", { name: "party" }).first().click();
+      const reaction = await peer.waitFor("reaction", {
+        timeout: 30_000,
+        predicate: (event) => event.member_id !== ownMemberId,
+      });
+      expect(reaction.emoji).toBe("🎉");
+      expect(reaction.name).toBe("party");
+      expect(reaction.sound).toBe("party");
 
       // ---- Teardown -------------------------------------------------------
       peer.send("leave");

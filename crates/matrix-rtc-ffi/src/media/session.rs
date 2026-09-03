@@ -119,7 +119,7 @@ async fn build_media_session(
     // Wire the core's encryption manager to the bridge and to the MSC4195
     // identity derivation, and take the membership snapshot channel the engine
     // consumes.
-    let (memberships, member_id) = {
+    let (memberships, raised_hands, reactions, member_id) = {
         let mut mgr = manager.inner.lock().await;
         // Read the `member.id` from the join rather than taking one from the
         // host: it is what our MSC4195 participant identity is derived from, so
@@ -138,6 +138,8 @@ async fn build_media_session(
                     config.room_id, config.slot_id
                 ))
             })?;
+        let raised_hands = mgr.subscribe_raised_hands(&config.room_id, &config.slot_id);
+        let reactions = mgr.subscribe_reactions(&config.room_id, &config.slot_id);
         let memberships = mgr
             .subscribe_membership_snapshots(&config.room_id, &config.slot_id)
             .ok_or_else(|| {
@@ -172,7 +174,7 @@ async fn build_media_session(
             ));
         }
 
-        (memberships, member_id)
+        (memberships, raised_hands, reactions, member_id)
     };
 
     let transport = Arc::new(
@@ -207,6 +209,8 @@ async fn build_media_session(
             own_member_id: member_id.clone(),
             ctx: ctx.clone(),
             own_connection_key: Some(config.livekit_service_url.clone()),
+            raised_hands,
+            reactions,
         },
         memberships,
     );

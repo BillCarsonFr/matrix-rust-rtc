@@ -229,6 +229,39 @@ pub struct FfiJoinSessionParams {
     /// the session, but the intent to summon anyone at all is yours to state.
     #[uniffi(default = None)]
     pub notify: Option<FfiNotifyConfig>,
+    /// How this session handles Element Call reactions and the raised hand.
+    /// Unset is enabled with Element Call's three-second window.
+    #[uniffi(default = None)]
+    pub reactions: Option<FfiReactionsConfig>,
+}
+
+/// FFI-friendly reactions configuration (mirrors
+/// `matrix_rtc_core::ReactionsConfig`).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiReactionsConfig {
+    /// Whether reactions are handled at all. Off, inbound reactions and raised
+    /// hands are ignored and sending fails.
+    #[uniffi(default = true)]
+    pub enabled: bool,
+    /// How long a received reaction counts as active, in milliseconds
+    /// (default 3000): repeats from the same member inside it are dropped, and
+    /// a host should keep the emoji on screen this long.
+    #[uniffi(default = 3000)]
+    pub active_window_ms: u64,
+    /// The least time between two reactions we send, in milliseconds (default
+    /// 3000). A send inside it fails without reaching the homeserver.
+    #[uniffi(default = 3000)]
+    pub send_cooldown_ms: u64,
+}
+
+impl From<FfiReactionsConfig> for matrix_rtc_core::ReactionsConfig {
+    fn from(value: FfiReactionsConfig) -> Self {
+        matrix_rtc_core::ReactionsConfig {
+            enabled: value.enabled,
+            active_window_ms: value.active_window_ms,
+            send_cooldown_ms: value.send_cooldown_ms,
+        }
+    }
 }
 
 /// FFI-friendly leave session parameters.
@@ -345,6 +378,7 @@ impl FfiJoinSessionParams {
             degraded_lifetime_ms: self.degraded_lifetime_ms,
             encryption_config,
             notify: self.notify.map(Into::into),
+            reactions: self.reactions.map(Into::into),
         })
     }
 }
@@ -581,6 +615,51 @@ pub trait CommandSenderCallback: Send + Sync {
         message_type: String,
         content_json: String,
     ) -> Result<Vec<FfiToDeviceDelivery>, CommandSenderError>;
+
+    /// Called when a plain room event — message-like, neither sticky nor state
+    /// — needs to be sent.
+    ///
+    /// Used for Element Call reactions (`io.element.call.reaction`) and the
+    /// raised-hand `m.reaction` annotation. In an encrypted room the event must
+    /// go out encrypted like any other message, which the SDK's ordinary room
+    /// send (matrix-rust-sdk: `room.send(...)` / `sendRaw`) does on its own.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID where the event should be sent
+    /// * `event_type` - The event type, to send verbatim
+    /// * `content_json` - The event content as a JSON string
+    ///
+    /// # Returns
+    /// The event id the homeserver assigned, on the same terms as
+    /// `sendStickyEvent`. A raised hand is lowered by redacting this very
+    /// event, so the id must come back.
+    ///
+    /// Throw a CommandSenderError on failure.
+    async fn send_room_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content_json: String,
+    ) -> Result<String, CommandSenderError>;
+
+    /// Called when one of our own room events needs to be redacted.
+    ///
+    /// Only used to lower a raised hand: Element Call has no "hand lowered"
+    /// event, the annotation is redacted instead.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room the event was sent to
+    /// * `event_id` - The event to redact, as returned by `sendRoomEvent`
+    /// * `reason` - Optional reason to put in the redaction (matrix-rust-sdk:
+    ///   `room.redact(eventId, reason, null)`)
+    ///
+    /// Throw a CommandSenderError on failure.
+    async fn redact_event(
+        &self,
+        room_id: String,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), CommandSenderError>;
 }
 
 /// One device a to-device message is addressed to.
@@ -867,6 +946,45 @@ impl RtcCommandSender for FfiCommandSender {
         )
     }
 
+    async fn send_room_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+    ) -> Result<String, CommandError> {
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+        // Verbatim, not through `wire_type`: a reaction is not a MatrixRTC type
+        // and has no unstable alias in that table.
+        let what = format!("room event [{room_id}] type={event_type}");
+        trace_command_content(&what, &content_json);
+
+        log_command(
+            &what,
+            self.callback
+                .send_room_event(room_id, event_type, content_json)
+                .await
+                .map_err(CommandError::from),
+        )
+    }
+
+    async fn redact_event(
+        &self,
+        room_id: String,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), CommandError> {
+        let what = format!("redact [{room_id}] event_id={event_id}");
+        log_command(
+            &what,
+            self.callback
+                .redact_event(room_id, event_id, reason)
+                .await
+                .map_err(CommandError::from),
+        )
+    }
+
     async fn send_to_device_message(
         &self,
         recipients: Vec<matrix_rtc_core::ToDeviceRecipient>,
@@ -1128,6 +1246,26 @@ mod tests {
             Ok(())
         }
 
+        async fn send_room_event(
+            &self,
+            _room_id: String,
+            event_type: String,
+            _content_json: String,
+        ) -> Result<String, CommandSenderError> {
+            self.record(&event_type);
+            Ok("$room-event".to_owned())
+        }
+
+        async fn redact_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+            _reason: Option<String>,
+        ) -> Result<(), CommandSenderError> {
+            self.record("m.room.redaction");
+            Ok(())
+        }
+
         async fn send_to_device_message(
             &self,
             recipients: Vec<FfiToDeviceRecipient>,
@@ -1224,6 +1362,26 @@ mod tests {
             delay_id: String,
         ) -> Result<(), CommandSenderError> {
             (**self).cancel_delayed_event(room_id, delay_id).await
+        }
+
+        async fn send_room_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            content_json: String,
+        ) -> Result<String, CommandSenderError> {
+            (**self)
+                .send_room_event(room_id, event_type, content_json)
+                .await
+        }
+
+        async fn redact_event(
+            &self,
+            room_id: String,
+            event_id: String,
+            reason: Option<String>,
+        ) -> Result<(), CommandSenderError> {
+            (**self).redact_event(room_id, event_id, reason).await
         }
 
         async fn send_to_device_message(
@@ -1355,6 +1513,7 @@ mod tests {
             encryption_config: None,
             element_call_compat: None,
             notify: None,
+            reactions: None,
         }
     }
 
@@ -1486,6 +1645,7 @@ mod tests {
     fn joined_sticky(user_id: &str, device_id: &str, member_id: &str) -> crate::StickyEvent {
         crate::StickyEvent {
             room_id: "!room:example.org".to_owned(),
+            event_id: None,
             sender: user_id.to_owned(),
             sender_device_id: Some(device_id.to_owned()),
             was_encrypted: Some(true),

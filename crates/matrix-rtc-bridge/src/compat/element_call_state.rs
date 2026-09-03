@@ -165,6 +165,10 @@ pub fn participant_identity(user_id: &str, device_id: &str) -> String {
 /// event-level fields the translation needs and the content does not carry.
 #[derive(Clone, Debug)]
 pub struct StateMemberEvent {
+    /// The event's id, when known. Carried through untouched: Element Call
+    /// relates reactions to it, so a translated membership keeps the id of the
+    /// state event it came from.
+    pub event_id: Option<String>,
     /// The event's `sender`. Homeserver-authenticated, and the only trustworthy
     /// identity in the whole event.
     pub sender: String,
@@ -186,6 +190,8 @@ pub struct StateMemberEvent {
 /// — is inside `content`, where the core's own `RawStickyEventContent` reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateMembership {
+    /// The state event's id, verbatim.
+    pub event_id: Option<String>,
     /// The state event's sender, verbatim.
     pub sender: String,
     /// `content.device_id`. Self-asserted and unauthenticated: state events
@@ -200,6 +206,7 @@ pub struct StateMembership {
 /// One surviving membership, after the per-event rules and before the
 /// cross-member focus resolution.
 struct Parsed<'a> {
+    event_id: Option<&'a str>,
     sender: &'a str,
     state_key: &'a str,
     device_id: String,
@@ -299,6 +306,7 @@ pub fn translate_state_memberships(
             }
 
             StateMembership {
+                event_id: member.event_id.map(str::to_owned),
                 sender: member.sender.to_owned(),
                 claimed_device_id: member.device_id.clone(),
                 content,
@@ -399,6 +407,7 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
         .unwrap_or_else(|| participant_identity(&event.sender, device_id));
 
     Some(Parsed {
+        event_id: event.event_id.as_deref(),
         sender: &event.sender,
         state_key: &event.state_key,
         device_id: device_id.to_owned(),
@@ -683,6 +692,7 @@ mod tests {
 
     fn event_at(json: &str, origin_server_ts: u64) -> StateMemberEvent {
         StateMemberEvent {
+            event_id: None,
             sender: "@alice:example.io".to_owned(),
             state_key: "_@alice:example.io_V5cP8FErcB_m.call".to_owned(),
             origin_server_ts,
@@ -713,6 +723,7 @@ mod tests {
         let events: Vec<StateMemberEvent> = contents
             .iter()
             .map(|(state_key, origin_server_ts, content)| StateMemberEvent {
+                event_id: None,
                 sender: "@alice:example.io".to_owned(),
                 state_key: (*state_key).to_owned(),
                 origin_server_ts: *origin_server_ts,

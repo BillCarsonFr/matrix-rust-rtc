@@ -61,6 +61,9 @@ pub(crate) fn parse_compat(value: Option<&str>) -> Result<ElementCallCompat, JsE
 /// feeds every membership through here regardless of generation.
 #[derive(Debug, Deserialize)]
 pub(crate) struct WasmRawMemberEvent {
+    /// The event's id; reactions and the raised hand relate to it.
+    #[serde(default)]
+    event_id: Option<String>,
     sender: String,
     #[serde(default)]
     sender_device_id: Option<String>,
@@ -75,6 +78,7 @@ pub(crate) struct WasmRawMemberEvent {
 impl From<WasmRawMemberEvent> for ingest::RawMemberEventIn {
     fn from(event: WasmRawMemberEvent) -> Self {
         Self {
+            event_id: event.event_id,
             sender: event.sender,
             sender_device_id: event.sender_device_id,
             was_encrypted: event.was_encrypted,
@@ -90,6 +94,9 @@ impl From<WasmRawMemberEvent> for ingest::RawMemberEventIn {
 /// decoration.
 #[derive(Debug, Deserialize)]
 pub(crate) struct WasmLegacyStateMemberEvent {
+    /// The event's id; reactions and the raised hand relate to it.
+    #[serde(default)]
+    event_id: Option<String>,
     sender: String,
     state_key: String,
     origin_server_ts: u64,
@@ -99,6 +106,7 @@ pub(crate) struct WasmLegacyStateMemberEvent {
 impl From<WasmLegacyStateMemberEvent> for ingest::LegacyStateMemberEventIn {
     fn from(event: WasmLegacyStateMemberEvent) -> Self {
         Self {
+            event_id: event.event_id,
             sender: event.sender,
             state_key: event.state_key,
             origin_server_ts: event.origin_server_ts,

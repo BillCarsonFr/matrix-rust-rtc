@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::commands::RtcCommandSender;
 use crate::encryption::types::ReceivedEncryptionKey;
@@ -37,6 +37,11 @@ use crate::notification::{
     notification_sticky_duration_ms,
 };
 use crate::own_membership::{MembershipTimings, OwnMembershipMachine, now_ms, transport_to_json};
+use crate::reactions::{
+    ANNOTATION_EVENT_TYPE, REACTION_EVENT_TYPE, RaisedHand, RawTimelineEvent, ReactionError,
+    ReactionsConfig, ReactionsState, ReceivedReaction, RelationLookup, build_raised_hand_content,
+    build_reaction_content, first_grapheme,
+};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -127,6 +132,7 @@ impl JoinCondition {
 /// user needs the device too.
 #[derive(Clone, Debug)]
 struct OwnParticipation {
+    room_id: String,
     user_id: String,
     device_id: String,
     member_id: String,
@@ -158,6 +164,8 @@ pub struct RtcSession<T: RtcCommandSender> {
     own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
     encryption_manager: Option<EncryptionManager<T>>,
+    /// Element Call reactions and raised hands, ours and our peers'.
+    reactions: ReactionsState,
     /// `room_id/slot_id`, prefixed to this session's log lines.
     ///
     /// A session does not otherwise know which slot it belongs to — the manager
@@ -180,6 +188,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             encryption_manager: None,     // Don't clone the encryption manager
             own_participation: None,      // A clone holds no machine, so it is not joined
+            reactions: ReactionsState::new(), // Not joined, so no hand of ours to carry
             log_tag: self.log_tag.clone(),
         }
     }
@@ -201,6 +210,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             own_membership_machine: None,
             encryption_manager: None,
             own_participation: None,
+            reactions: ReactionsState::new(),
             log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
     }
@@ -220,6 +230,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             own_membership_machine: None,
             encryption_manager: None,
             own_participation: None,
+            reactions: ReactionsState::new(),
             log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
     }
@@ -419,10 +430,13 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         // Store the machine
         self.own_membership_machine = Some(machine);
         self.own_participation = Some(OwnParticipation {
+            room_id: params.room_id.clone(),
             user_id: params.user_id.clone(),
             device_id: params.device_id.clone(),
             member_id: membership_id.clone(),
         });
+        self.reactions.configure(params.reactions());
+        self.reactions.reset_own();
 
         // Name ourselves in the log tag from here on. Until now `room/slot` was
         // enough, because one process meant one session per slot. A host that
@@ -668,6 +682,19 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             params.leave_reason,
         );
 
+        // Lower our hand first, while the membership it annotates still stands.
+        // Best effort: peers drop the hand with the membership anyway, so a
+        // failed redaction costs nothing but a stale annotation in the timeline.
+        if self.reactions.own_raised_hand().is_some()
+            && let Err(error) = self.lower_hand().await
+        {
+            log::warn!(
+                "[{}] the raised hand was not lowered before leaving ({error}); peers drop it \
+                 with the membership",
+                self.log_tag,
+            );
+        }
+
         // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
         machine
             .leave(params.leave_reason.clone())
@@ -679,6 +706,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             encryption_manager.leave();
         }
         self.own_participation = None;
+        self.reactions.reset_own();
 
         // Republish the roster now that we are no longer part of it, rather than
         // waiting for the host's next sticky delta. Room state and peer
@@ -706,6 +734,10 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         if let Some(machine) = self.own_membership_machine.as_ref() {
             log::trace!("[{}] heartbeat", self.log_tag);
             machine.heartbeat().await;
+
+            // The heartbeat may have refreshed our membership event, which is
+            // what our raised hand annotates; see `reannotate_hand_if_moved`.
+            self.reannotate_hand_if_moved().await;
 
             // A rotation coalesced into a key's `delayBeforeUse` window needs
             // somebody to come back for it once the window closes, and in a call
@@ -746,6 +778,256 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         self.own_membership_machine
             .as_ref()
             .map(|machine| machine.sticky_key())
+    }
+
+    /// The event id of our current membership event, or `None` while not
+    /// joined.
+    ///
+    /// This is what our own reactions and raised hand relate to. It moves on
+    /// every sticky refresh, so read it at the moment of use.
+    pub fn own_membership_event_id(&self) -> Option<String> {
+        self.own_membership_machine
+            .as_ref()
+            .and_then(OwnMembershipMachine::membership_event_id)
+    }
+
+    // ---- Reactions and raised hands (see `crate::reactions`) ----
+
+    #[cfg(test)]
+    pub(crate) fn set_reactions_clock(&mut self, clock: crate::reactions::Clock) {
+        self.reactions.set_clock(clock);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn own_raised_hand(&self) -> Option<crate::reactions::OwnRaisedHand> {
+        self.reactions.own_raised_hand().cloned()
+    }
+
+    /// How this session handles reactions, as set by the current join.
+    pub fn reactions_config(&self) -> &ReactionsConfig {
+        self.reactions.config()
+    }
+
+    /// The raised hands of this session's members, oldest first. Updated as a
+    /// whole on every change.
+    pub fn subscribe_raised_hands(&self) -> watch::Receiver<Vec<RaisedHand>> {
+        self.reactions.subscribe_raised_hands()
+    }
+
+    /// Emoji reactions as they arrive, our own echo included. A lagging
+    /// subscriber loses the oldest ones, which for a three-second visual is
+    /// the right trade.
+    pub fn subscribe_reactions(&self) -> broadcast::Receiver<ReceivedReaction> {
+        self.reactions.subscribe_reactions()
+    }
+
+    /// The raised hands right now, oldest first.
+    pub fn raised_hands(&self) -> Vec<RaisedHand> {
+        self.reactions.raised_hands()
+    }
+
+    /// Applies one message-like room event. Anything that is not a reaction or
+    /// a raised hand relating to a member of this session is ignored, so a
+    /// host may forward every event of the two types without filtering by
+    /// slot.
+    pub fn on_timeline_event(&mut self, event: &RawTimelineEvent) {
+        self.reactions.ingest(event, &self.members, false);
+    }
+
+    /// Applies the annotations of a member's membership event, as fetched by
+    /// the host in answer to [`Self::pending_relation_lookups`]. Only raised
+    /// hands are taken from them: an old emoji reaction is not replayed.
+    pub fn on_relations_received(&mut self, target_event_id: &str, events: &[RawTimelineEvent]) {
+        self.reactions
+            .on_relations_received(target_event_id, events, &self.members);
+    }
+
+    /// Lowers whichever hand `event_id` raised, if it raised one.
+    pub fn on_event_redacted(&mut self, event_id: &str) {
+        if self.reactions.on_event_redacted(event_id) {
+            log::info!(
+                "[{}] our raised hand was lowered by a redaction from elsewhere",
+                self.log_tag
+            );
+        }
+    }
+
+    /// Membership events whose annotations the host has not fetched yet.
+    ///
+    /// Answer each with the event's `/relations` (`rel_type=m.annotation`,
+    /// `event_type=m.reaction`) through [`Self::on_relations_received`]; that
+    /// is how hands raised before we joined become visible. Asking is what
+    /// marks an id as fetched, so a failed fetch is retried by asking again.
+    pub fn pending_relation_lookups(&self) -> Vec<RelationLookup> {
+        self.reactions
+            .pending_relation_lookups(&self.members, self.own_member_id())
+    }
+
+    /// Where our reactions relate to: our room and current membership event.
+    fn own_relation_target(&self) -> Result<(OwnParticipation, String), ReactionError> {
+        let own = self
+            .own_participation
+            .clone()
+            .ok_or(ReactionError::NotJoined)?;
+        let membership_event_id = self
+            .own_membership_event_id()
+            .ok_or(ReactionError::NotJoined)?;
+        Ok((own, membership_event_id))
+    }
+
+    fn reaction_command_sender(&self) -> Result<Arc<T>, ReactionError> {
+        self.command_sender.clone().ok_or_else(|| {
+            ReactionError::Command(CommandError::from_message("no command sender configured"))
+        })
+    }
+
+    /// Sends an emoji reaction, relating it to our current membership event.
+    ///
+    /// `name` is what peers select a sound by (see
+    /// [`KNOWN_REACTIONS`](crate::reactions::KNOWN_REACTIONS)); an unknown
+    /// name plays Element Call's generic sound. Only the first grapheme of
+    /// `emoji` is sent. Returns the event id.
+    ///
+    /// Refused inside the send cooldown: peers would drop the reaction anyway.
+    pub async fn send_reaction(
+        &mut self,
+        emoji: &str,
+        name: &str,
+    ) -> Result<String, ReactionError> {
+        let emoji = first_grapheme(emoji);
+        if emoji.is_empty() {
+            return Err(ReactionError::EmptyEmoji);
+        }
+        self.reactions.check_send_allowed()?;
+        let (own, membership_event_id) = self.own_relation_target()?;
+        let command_sender = self.reaction_command_sender()?;
+
+        let event_id = command_sender
+            .send_room_event(
+                own.room_id,
+                REACTION_EVENT_TYPE.to_owned(),
+                build_reaction_content(&membership_event_id, emoji, name),
+            )
+            .await?;
+        self.reactions.record_sent();
+        log::debug!(
+            "[{}] sent reaction {emoji} ({name}) as {event_id}",
+            self.log_tag
+        );
+        Ok(event_id)
+    }
+
+    /// Raises our hand: annotates our current membership event with
+    /// [`RAISED_HAND_KEY`](crate::reactions::RAISED_HAND_KEY). Idempotent
+    /// while it is up. Shows in [`Self::raised_hands`] right away rather than
+    /// waiting for the echo.
+    pub async fn raise_hand(&mut self) -> Result<(), ReactionError> {
+        if !self.reactions.config().enabled {
+            return Err(ReactionError::Disabled);
+        }
+        if self.reactions.own_raised_hand().is_some() {
+            return Ok(());
+        }
+        let (own, membership_event_id) = self.own_relation_target()?;
+        let command_sender = self.reaction_command_sender()?;
+
+        let event_id = command_sender
+            .send_room_event(
+                own.room_id,
+                ANNOTATION_EVENT_TYPE.to_owned(),
+                build_raised_hand_content(&membership_event_id),
+            )
+            .await?;
+        log::info!("[{}] hand raised ({event_id})", self.log_tag);
+        self.reactions.set_own_raised_hand(
+            &own.member_id,
+            &own.user_id,
+            event_id,
+            membership_event_id,
+        );
+        Ok(())
+    }
+
+    /// Lowers our hand by redacting the annotation. A no-op when it is not up.
+    pub async fn lower_hand(&mut self) -> Result<(), ReactionError> {
+        let Some(hand) = self.reactions.own_raised_hand().cloned() else {
+            return Ok(());
+        };
+        let own = self
+            .own_participation
+            .clone()
+            .ok_or(ReactionError::NotJoined)?;
+        let command_sender = self.reaction_command_sender()?;
+
+        command_sender
+            .redact_event(own.room_id, hand.reaction_event_id.clone(), None)
+            .await?;
+        log::info!(
+            "[{}] hand lowered ({} redacted)",
+            self.log_tag,
+            hand.reaction_event_id
+        );
+        self.reactions.clear_own_raised_hand(&own.member_id);
+        Ok(())
+    }
+
+    /// Raises our hand again on our new membership event after a sticky
+    /// refresh, and redacts the annotation on the old one.
+    ///
+    /// Element Call drops a raised hand whose membership event has moved on
+    /// and looks for one on the new event instead, so a hand that stayed on
+    /// the join event would be lowered for us at the first refresh. Peers may
+    /// see the hand drop for one round trip in between; that is inherent to
+    /// the protocol. A failed re-send is retried on the next heartbeat, since
+    /// the ids still differ.
+    async fn reannotate_hand_if_moved(&mut self) {
+        let Some(hand) = self.reactions.own_raised_hand().cloned() else {
+            return;
+        };
+        let Ok((own, current)) = self.own_relation_target() else {
+            return;
+        };
+        if current == hand.annotated_membership_event_id {
+            return;
+        }
+        let Ok(command_sender) = self.reaction_command_sender() else {
+            return;
+        };
+
+        log::debug!(
+            "[{}] our membership event moved ({} -> {current}); raising the hand on it again",
+            self.log_tag,
+            hand.annotated_membership_event_id,
+        );
+        match command_sender
+            .send_room_event(
+                own.room_id.clone(),
+                ANNOTATION_EVENT_TYPE.to_owned(),
+                build_raised_hand_content(&current),
+            )
+            .await
+        {
+            Ok(event_id) => {
+                self.reactions
+                    .set_own_raised_hand(&own.member_id, &own.user_id, event_id, current);
+                if let Err(error) = command_sender
+                    .redact_event(own.room_id, hand.reaction_event_id.clone(), None)
+                    .await
+                {
+                    log::warn!(
+                        "[{}] the previous raised-hand annotation {} was not redacted ({error}); \
+                         it relates to a superseded membership event, so peers ignore it",
+                        self.log_tag,
+                        hand.reaction_event_id,
+                    );
+                }
+            }
+            Err(error) => log::warn!(
+                "[{}] could not raise the hand again on the refreshed membership ({error}); \
+                 retrying on the next heartbeat",
+                self.log_tag,
+            ),
+        }
     }
 
     /// Whether a dead man's switch is protecting our membership.
@@ -991,15 +1273,28 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
         let joined = sticky_keys(&members);
         let previous = sticky_keys(&self.members);
-        log::info!(
-            "[{}] membership changed: {} -> {} joined (+{:?} -{:?}) of {} candidate(s)",
-            self.log_tag,
-            self.members.len(),
-            members.len(),
-            difference(&joined, &previous),
-            difference(&previous, &joined),
-            self.candidates.len(),
-        );
+        let added = difference(&joined, &previous);
+        let removed = difference(&previous, &joined);
+        if added.is_empty() && removed.is_empty() {
+            // Same members, different events: a peer refreshed its sticky
+            // entry, or republished with new transports. Routine, so not
+            // reported as a change of membership.
+            log::debug!(
+                "[{}] membership set unchanged ({} joined); member event(s) updated",
+                self.log_tag,
+                members.len(),
+            );
+        } else {
+            log::info!(
+                "[{}] membership changed: {} -> {} joined (+{:?} -{:?}) of {} candidate(s)",
+                self.log_tag,
+                self.members.len(),
+                members.len(),
+                added,
+                removed,
+                self.candidates.len(),
+            );
+        }
         if !excluded.is_empty() {
             log::debug!(
                 "[{}] {} candidate(s) excluded: {}",
@@ -1010,6 +1305,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
 
         self.members = members;
+        self.reactions.sync_roster(&self.members);
         self.membership_snapshots_tx
             .send_replace(self.members.clone());
 
@@ -1158,6 +1454,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                 .own_membership_machine
                 .as_ref()
                 .map(|machine| machine.sticky_key()),
+            "own_membership_event_id": self.own_membership_event_id(),
             "delayed_leave_supported": self
                 .own_membership_machine
                 .as_ref()
@@ -1346,6 +1643,16 @@ pub struct JoinedMembership {
     pub sticky_key: String,
     /// `member.id` — identifies this participation, unique per join.
     pub member_id: String,
+    /// Event id of the *latest* member event of this participation, when the
+    /// host reported one.
+    ///
+    /// Latest, not first: a sticky refresh re-sends the membership and the new
+    /// event replaces the old one in the sticky map, so this moves on every
+    /// refresh — exactly as matrix-js-sdk's `CallMembership.eventId` does.
+    /// Element Call relates its reactions and raised hand to this id, and drops
+    /// a raised hand whose membership event has moved on; see
+    /// [`crate::reactions`].
+    pub membership_event_id: Option<String>,
     /// When this participation began (ms since the epoch), if the dialect
     /// states it.
     ///

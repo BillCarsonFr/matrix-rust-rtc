@@ -30,6 +30,7 @@ mod manager;
 mod maybe_send;
 mod notification;
 mod own_membership;
+pub mod reactions;
 mod session;
 mod slot;
 mod transport;
@@ -59,6 +60,12 @@ pub use notification::{
 pub use own_membership::{
     DelayedLeaveSupport, KeepAliveInfo, MembershipTimings, OwnMembershipMachine,
     OwnMembershipState, transport_to_json,
+};
+pub use reactions::{
+    ANNOTATION_EVENT_TYPE, DEFAULT_REACTION_ACTIVE_MS, GENERIC_SOUND, KNOWN_REACTIONS,
+    RAISED_HAND_KEY, REACTION_EVENT_TYPE, RaisedHand, RawTimelineEvent, ReactionError,
+    ReactionKind, ReactionSound, ReactionsConfig, ReceivedReaction, RelationLookup,
+    build_raised_hand_content, build_reaction_content, first_grapheme, reaction_kind, sound_for,
 };
 pub use session::{
     ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,
@@ -92,6 +99,7 @@ mod tests {
     ) -> RawStickyEvent {
         RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
+            event_id: None,
             sender: sender.to_owned(),
             origin: EventOrigin::default(),
             event_type: EVENT_TYPE_RTC_MEMBER.to_owned(),
@@ -1247,6 +1255,7 @@ mod tests {
 
         let event = RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             origin: EventOrigin::default(),
             event_type: "m.rtc.member".to_owned(),
@@ -1302,6 +1311,7 @@ mod tests {
 
         let event = RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             origin: EventOrigin::default(),
             event_type: "m.rtc.member".to_owned(),

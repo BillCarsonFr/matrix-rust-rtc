@@ -131,6 +131,32 @@ export class MatrixRtcCall {
     return this.participants();
   }
 
+  /**
+   * Send an Element Call emoji reaction. `name` is what peers pick a sound by
+   * (`reactionCatalog()` in the bindings); only the first grapheme of `emoji`
+   * is sent. Resolves with the event id; rejects inside the send cooldown.
+   */
+  sendReaction(emoji, name) {
+    return this.managerOps.enqueue(() =>
+      this.manager.sendReaction(this.config.roomId, this.config.slotId, emoji, name),
+    );
+  }
+
+  /** Raise our hand (idempotent while it is up). Shows on our roster entry at once. */
+  raiseHand() {
+    return this.managerOps.enqueue(() => this.manager.raiseHand(this.config.roomId, this.config.slotId));
+  }
+
+  /** Lower our hand (a no-op when it is down). */
+  lowerHand() {
+    return this.managerOps.enqueue(() => this.manager.lowerHand(this.config.roomId, this.config.slotId));
+  }
+
+  /** The raised hands right now, oldest first (`RaisedHand[]`). */
+  raisedHands() {
+    return this.managerOps.enqueue(() => this.manager.raisedHands(this.config.roomId, this.config.slotId));
+  }
+
   /** The current roster, each entry with its `livekitParticipant` when live. */
   participants() {
     return this.withLivekitParticipants(this.session.participants());

@@ -273,6 +273,24 @@ impl RtcCommandSender for PeerSender {
         Ok("delay-id".to_owned())
     }
 
+    async fn send_room_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _content: Value,
+    ) -> Result<String, CommandError> {
+        Ok("$room".to_owned())
+    }
+
+    async fn redact_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+        _reason: Option<String>,
+    ) -> Result<(), CommandError> {
+        Ok(())
+    }
+
     async fn restart_delayed_event(
         &self,
         _room_id: String,
@@ -380,6 +398,7 @@ impl Peer {
             origin: EventOrigin::encrypted(Some(self.device_id.clone())),
             sticky_key: self.member_id.clone(),
             member_id: self.member_id.clone(),
+            membership_event_id: None,
             membership_ts: None,
             application: Some("m.call".to_owned()),
             transports: Vec::new(),

@@ -36,6 +36,10 @@ async-trait.workspace = true
 rand = "0.8"
 rand_core = "0.6"
 base64 = "0.21"
+# Element Call keeps only the first grapheme of a reaction's emoji; a grapheme
+# is not a `char` (one visible emoji can be several code points joined), so
+# this pure-Rust, wasm-safe segmenter does the split.
+unicode-segmentation = "1"
 
 # `rand` reaches getrandom 0.2, which has no wasm entropy source unless its
 # `js` feature is on and refuses to compile for wasm32-unknown-unknown without

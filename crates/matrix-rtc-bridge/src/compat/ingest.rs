@@ -50,6 +50,9 @@ use super::{
 /// room feeds them all through here.
 #[derive(Clone, Debug)]
 pub struct RawMemberEventIn {
+    /// The event's id. Element Call relates reactions and the raised hand to
+    /// it; a member fed without one cannot be reacted for.
+    pub event_id: Option<String>,
     /// Sender user ID of the event.
     pub sender: String,
     /// Device that sent the event, from its decryption metadata.
@@ -76,6 +79,9 @@ pub struct RawMemberEventIn {
 /// [`ElementCallCompat::StateEvents`] mode.
 #[derive(Clone, Debug)]
 pub struct LegacyStateMemberEventIn {
+    /// The event's id, carried through to the translated membership so
+    /// reactions can relate to it.
+    pub event_id: Option<String>,
     /// The event's `sender`. Homeserver-authenticated, and the only
     /// trustworthy identity in the whole event.
     pub sender: String,
@@ -195,6 +201,7 @@ pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<Ra
 
     Some(RawStickyEvent {
         room_id: room_id.to_owned(),
+        event_id: event.event_id,
         sender: event.sender,
         origin,
         event_type: event.event_type,
@@ -227,6 +234,7 @@ pub fn to_core_state_memberships(
                 })
                 .ok()?;
             Some(element_call_state::StateMemberEvent {
+                event_id: event.event_id,
                 sender: event.sender,
                 state_key: event.state_key,
                 origin_server_ts: event.origin_server_ts,
@@ -261,6 +269,7 @@ pub fn to_core_state_memberships(
             };
             Some(RawStickyEvent {
                 room_id: room_id.to_owned(),
+                event_id: membership.event_id,
                 sender: membership.sender,
                 // The self-asserted device, which is all such a peer can state
                 // and all we can read — a state event carries no decryption
@@ -357,6 +366,7 @@ mod tests {
 
     fn raw(content: serde_json::Value) -> RawMemberEventIn {
         RawMemberEventIn {
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             sender_device_id: Some("ALICEDEVICE".to_owned()),
             was_encrypted: Some(true),
@@ -430,6 +440,7 @@ mod tests {
     fn translates_pre_sticky_room_state() {
         let now = element_call_state::now_ms();
         let events = vec![LegacyStateMemberEventIn {
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             state_key: "_@alice:example.org_ALICEDEVICE_m.call".to_owned(),
             origin_server_ts: now,
@@ -465,6 +476,7 @@ mod tests {
     #[test]
     fn drops_an_expired_pre_sticky_membership() {
         let events = vec![LegacyStateMemberEventIn {
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             state_key: "_@alice:example.org_ALICEDEVICE_m.call".to_owned(),
             origin_server_ts: 1,
@@ -491,6 +503,7 @@ mod tests {
             "member": { "id": "@alice:example.org:ALICEDEVICE" },
         }));
         let state = LegacyStateMemberEventIn {
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             state_key: "_@alice:example.org_ALICEDEVICE_m.call".to_owned(),
             origin_server_ts: now,

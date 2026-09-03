@@ -65,10 +65,14 @@ use tokio::task::JoinHandle;
 use matrix_rtc_bridge::compat::{
     self, ElementCallCompat, ElementCallDialect, ElementCallStateDialect, OutboundDialect,
 };
-use matrix_rtc_bridge::{SdkCommandSender, run_sticky_bridge};
+use matrix_rtc_bridge::{
+    SdkCommandSender, TimelineIngest, register_timeline_receiver, run_sticky_bridge,
+    run_timeline_bridge,
+};
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, NotifyConfig,
-    ReceivedEncryptionKey, RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
+    EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, NotifyConfig, RaisedHand,
+    ReactionError, ReactionsConfig, ReceivedEncryptionKey, RtcSessionManager, RtcTransport,
+    SlotEncryption, generate_member_id,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
@@ -101,6 +105,11 @@ pub enum CallError {
     /// MatrixRTC signalling through the core failed (membership, slot, keys).
     #[error("MatrixRTC signalling failed: {0}")]
     Signalling(String),
+
+    /// A reaction or raised hand could not be sent (see
+    /// [`matrix_rtc_core::reactions`]).
+    #[error(transparent)]
+    Reaction(#[from] ReactionError),
 }
 
 fn signalling_error(error: impl std::fmt::Display) -> CallError {
@@ -190,6 +199,14 @@ pub struct CallOptions {
     /// core still suppresses the notification if anybody is already in the
     /// session, but the intent to summon anyone at all is the caller's.
     pub notify: Option<NotifyConfig>,
+    /// How this call handles Element Call reactions and the raised hand.
+    ///
+    /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
+    /// Element Call's three-second window. Reactions arrive as
+    /// [`CallEvent::Reaction`], hands as [`CallEvent::HandRaised`] and on the
+    /// roster; send with [`Call::send_reaction`], [`Call::raise_hand`] and
+    /// [`Call::lower_hand`].
+    pub reactions: Option<ReactionsConfig>,
 }
 
 impl Default for CallOptions {
@@ -206,6 +223,7 @@ impl Default for CallOptions {
             auto_subscribe: true,
             element_call_compat: ElementCallCompat::default(),
             notify: None,
+            reactions: None,
         }
     }
 }
@@ -252,8 +270,10 @@ pub struct Call {
     key_pump: AbortOnDrop,
     rotation_pump: AbortOnDrop,
     _sticky_bridge: AbortOnDrop,
+    _timeline_bridge: AbortOnDrop,
     _key_handler: EventHandlerDropGuard,
     _legacy_key_handler: EventHandlerDropGuard,
+    _timeline_handler: EventHandlerDropGuard,
 }
 
 impl Call {
@@ -319,6 +339,19 @@ impl Call {
             room.clone(),
             manager.clone(),
             options.element_call_compat.reads_state_membership(),
+        )));
+
+        // Reactions and raised hands are ordinary room events, which the sticky
+        // bridge does not see. Same shape as the key path below: a `Send` sync
+        // handler forwards over a channel to a `spawn_local` pump that drives
+        // the `!Send` manager.
+        let (timeline_tx, timeline_rx) = unbounded_channel::<TimelineIngest>();
+        let timeline_handler =
+            client.event_handler_drop_guard(register_timeline_receiver(room, timeline_tx));
+        let timeline_bridge = AbortOnDrop(tokio::task::spawn_local(run_timeline_bridge(
+            room_id.clone(),
+            manager.clone(),
+            timeline_rx,
         )));
 
         // Frame encryption: a single shared KeyProvider handle feeds both the
@@ -404,7 +437,8 @@ impl Call {
         params.sticky_duration_ms = options.sticky_duration_ms;
         params.degraded_lifetime_ms = options.degraded_lifetime_ms;
         params.notify = options.notify.clone();
-        let memberships = {
+        params.reactions = options.reactions.clone();
+        let (memberships, raised_hands, reactions) = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;
             // The same `Arc` that produced `own_identity` above and that the
@@ -430,10 +464,14 @@ impl Call {
                     "failed to register encryption signal handler".into(),
                 ));
             }
-            mgr.subscribe_membership_snapshots(&room_id, &options.slot_id)
+            let raised_hands = mgr.subscribe_raised_hands(&room_id, &options.slot_id);
+            let reactions = mgr.subscribe_reactions(&room_id, &options.slot_id);
+            let memberships = mgr
+                .subscribe_membership_snapshots(&room_id, &options.slot_id)
                 .ok_or_else(|| {
                     CallError::Signalling("joined session is not tracked by the manager".into())
-                })?
+                })?;
+            (memberships, raised_hands, reactions)
         };
 
         let key_pump = AbortOnDrop(spawn_key_pump(manager.clone(), key_rx));
@@ -505,6 +543,8 @@ impl Call {
                 own_member_id: membership_id.clone(),
                 ctx: ctx.clone(),
                 own_connection_key: Some(livekit.livekit_service_url.clone()),
+                raised_hands,
+                reactions,
             },
             memberships,
         );
@@ -622,9 +662,58 @@ impl Call {
             key_pump,
             rotation_pump,
             _sticky_bridge: sticky_bridge,
+            _timeline_bridge: timeline_bridge,
             _key_handler: key_handler,
             _legacy_key_handler: legacy_key_handler,
+            _timeline_handler: timeline_handler,
         })
+    }
+
+    /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
+    /// by (see [`matrix_rtc_core::KNOWN_REACTIONS`]); only the first grapheme
+    /// of `emoji` is sent. Returns the event id.
+    ///
+    /// Fails with [`ReactionError::Cooldown`] inside the send cooldown, since
+    /// peers would drop the reaction anyway.
+    pub async fn send_reaction(&self, emoji: &str, name: &str) -> Result<String, CallError> {
+        Ok(self
+            .manager
+            .lock()
+            .await
+            .send_reaction(&self.room_id, &self.slot_id, emoji, name)
+            .await?)
+    }
+
+    /// Raises our hand. Idempotent while it is up; it follows our membership
+    /// across sticky refreshes on its own. Shows on our roster entry at once.
+    pub async fn raise_hand(&self) -> Result<(), CallError> {
+        Ok(self
+            .manager
+            .lock()
+            .await
+            .raise_hand(&self.room_id, &self.slot_id)
+            .await?)
+    }
+
+    /// Lowers our hand by redacting the annotation. A no-op when it is down.
+    pub async fn lower_hand(&self) -> Result<(), CallError> {
+        Ok(self
+            .manager
+            .lock()
+            .await
+            .lower_hand(&self.room_id, &self.slot_id)
+            .await?)
+    }
+
+    /// The raised hands right now, oldest first. The same information is on
+    /// each [`Participant::hand_raised_at_ms`] and arrives as
+    /// [`CallEvent::HandRaised`] / [`CallEvent::HandLowered`].
+    pub async fn raised_hands(&self) -> Vec<RaisedHand> {
+        self.manager
+            .lock()
+            .await
+            .raised_hands(&self.room_id, &self.slot_id)
+            .unwrap_or_default()
     }
 
     /// The unified call event stream: membership changes, media streams

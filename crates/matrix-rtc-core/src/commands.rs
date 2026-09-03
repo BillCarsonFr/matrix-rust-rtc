@@ -270,6 +270,51 @@ pub trait RtcCommandSender: MaybeSend {
         state_key: String,
         content: Value,
     ) -> Result<String, CommandError>;
+
+    /// Send a plain room event: message-like, neither sticky nor state.
+    ///
+    /// Used for the Element Call reactions (`io.element.call.reaction`) and the
+    /// raised-hand `m.reaction` annotation. In an encrypted room the event must
+    /// go out encrypted like any other message; a client SDK's ordinary send
+    /// does that on its own.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID where the event should be sent
+    /// * `event_type` - The event type, sent verbatim (nothing here is a
+    ///   MatrixRTC type with an unstable alias)
+    /// * `content` - The event content as a JSON value
+    ///
+    /// # Returns
+    ///
+    /// The event id the homeserver assigned, on the same terms as
+    /// [`send_sticky_event`](Self::send_sticky_event). A raised hand is lowered
+    /// by redacting this very event, so the id has to come back.
+    async fn send_room_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+    ) -> Result<String, CommandError>;
+
+    /// Redact one of our own room events.
+    ///
+    /// Used to lower a raised hand: Element Call has no "hand lowered" event,
+    /// the annotation is simply redacted.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room the event was sent to
+    /// * `event_id` - The event to redact, as returned by
+    ///   [`send_room_event`](Self::send_room_event)
+    /// * `reason` - Optional human-readable reason, put in the redaction's
+    ///   content
+    async fn redact_event(
+        &self,
+        room_id: String,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), CommandError>;
 }
 
 /// A no-op implementation of `RtcCommandSender` for testing purposes.
@@ -337,6 +382,24 @@ impl RtcCommandSender for NoopCommandSender {
     ) -> Result<String, CommandError> {
         Ok("$mock-state-event".to_string())
     }
+
+    async fn send_room_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _content: Value,
+    ) -> Result<String, CommandError> {
+        Ok("$mock-room-event".to_string())
+    }
+
+    async fn redact_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+        _reason: Option<String>,
+    ) -> Result<(), CommandError> {
+        Ok(())
+    }
 }
 
 /// A mock implementation of `RtcCommandSender` that captures sent events for testing.
@@ -351,6 +414,10 @@ pub struct MockCommandSender {
     pub cancelled_events: std::sync::Mutex<Vec<(String, String)>>,
     pub to_device_messages: std::sync::Mutex<Vec<(String, String, String, Value)>>,
     pub state_events: std::sync::Mutex<Vec<(String, String, String, Value)>>,
+    /// `(room_id, event_type, content)` of every plain room event sent.
+    pub room_events: std::sync::Mutex<Vec<(String, String, Value)>>,
+    /// `(room_id, event_id, reason)` of every redaction requested.
+    pub redactions: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
 }
 
 #[cfg(test)]
@@ -472,5 +539,31 @@ impl RtcCommandSender for MockCommandSender {
         let mut guard = self.state_events.lock().unwrap();
         guard.push((room_id, event_type, state_key, content));
         Ok(format!("$state-{}", guard.len()))
+    }
+
+    async fn send_room_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+    ) -> Result<String, CommandError> {
+        let mut guard = self.room_events.lock().unwrap();
+        guard.push((room_id, event_type, content));
+        // Numbered by send order, so a test can name the event a redaction is
+        // expected to target.
+        Ok(format!("$room-{}", guard.len()))
+    }
+
+    async fn redact_event(
+        &self,
+        room_id: String,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), CommandError> {
+        self.redactions
+            .lock()
+            .unwrap()
+            .push((room_id, event_id, reason));
+        Ok(())
     }
 }

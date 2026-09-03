@@ -269,6 +269,14 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     /// The join content and when we last sent it, so the heartbeat can re-send
     /// it before the sticky entry expires. `None` until we join.
     last_sticky: Arc<Mutex<Option<SentSticky>>>,
+    /// The event id of the member event currently representing us in the
+    /// sticky map: the join's, then each refresh's. `None` until we join and
+    /// again once we leave.
+    ///
+    /// Element Call relates reactions and the raised hand to this id and drops
+    /// a raised hand whose membership event has moved on, so a refresh is what
+    /// makes the session re-annotate its hand (see [`crate::reactions`]).
+    latest_event_id: Arc<Mutex<Option<String>>>,
 }
 
 /// The membership event we last put in the sticky map, and when.
@@ -318,6 +326,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             delayed_support: Arc::new(Mutex::new(DelayedLeaveSupport::Unknown)),
             published_lifetime_ms: AtomicU64::new(sticky_duration_ms),
             last_sticky: Arc::new(Mutex::new(None)),
+            latest_event_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -383,6 +392,15 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     }
 
     /// Gets the delayed event ID, if one is active.
+    /// The event id of the member event currently representing us in the
+    /// sticky map, or `None` while not joined.
+    ///
+    /// Moves on every sticky refresh; read it when needed rather than caching
+    /// it.
+    pub fn membership_event_id(&self) -> Option<String> {
+        self.latest_event_id.lock().unwrap().clone()
+    }
+
     pub fn delayed_event_id(&self) -> Option<String> {
         self.keep_alive_info
             .lock()
@@ -524,6 +542,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 sent_at_ms: now_ms(),
             });
         }
+        *self.latest_event_id.lock().unwrap() = Some(event_id.clone());
 
         // Both steps completed successfully, transition to Joined state
         {
@@ -631,6 +650,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             let mut guard = self.last_sticky.lock().unwrap();
             *guard = None;
         }
+        *self.latest_event_id.lock().unwrap() = None;
 
         // Cancel the delayed leave event if one exists
         if let Some(event_id) = self.delayed_event_id() {
@@ -847,10 +867,10 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             )
             .await
         {
-            // The refresh's own event id is dropped: the only reader of one is
-            // the MSC4075 notification, which is sent once at join and relates
-            // to the event that existed then.
-            Ok(_) => {
+            // The refresh replaces our entry in the sticky map, so from here on
+            // *this* is the event a peer's reaction must relate to.
+            Ok(event_id) => {
+                *self.latest_event_id.lock().unwrap() = Some(event_id);
                 let mut guard = self.last_sticky.lock().unwrap();
                 // Only advance the clock if we are still tracking the same
                 // content: a concurrent join/leave may have replaced it while
@@ -1320,6 +1340,24 @@ mod tests {
             Ok(format!("delay-{scheduled}"))
         }
 
+        async fn send_room_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            _content: Value,
+        ) -> Result<String, CommandError> {
+            Ok("$room".to_string())
+        }
+
+        async fn redact_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+            _reason: Option<String>,
+        ) -> Result<(), CommandError> {
+            Ok(())
+        }
+
         async fn restart_delayed_event(
             &self,
             _room_id: String,
@@ -1436,6 +1474,24 @@ mod tests {
             _event_id: String,
         ) -> Result<(), CommandError> {
             *self.restarts.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        async fn send_room_event(
+            &self,
+            _room_id: String,
+            _event_type: String,
+            _content: Value,
+        ) -> Result<String, CommandError> {
+            Ok("$room".to_string())
+        }
+
+        async fn redact_event(
+            &self,
+            _room_id: String,
+            _event_id: String,
+            _reason: Option<String>,
+        ) -> Result<(), CommandError> {
             Ok(())
         }
 

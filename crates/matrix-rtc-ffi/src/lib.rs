@@ -58,11 +58,27 @@ pub enum MatrixRtcFfiError {
     InvalidInput(String),
     #[error("internal lock poisoned")]
     InternalLockPoisoned,
+    /// A reaction or raised hand could not be sent: not joined, reactions
+    /// disabled, inside the send cooldown, or the host's send failed. The
+    /// message says which.
+    #[error("reaction: {0}")]
+    Reaction(String),
+}
+
+impl From<matrix_rtc_core::ReactionError> for MatrixRtcFfiError {
+    fn from(error: matrix_rtc_core::ReactionError) -> Self {
+        Self::Reaction(error.to_string())
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct StickyEvent {
     pub room_id: String,
+    /// The event's id. Element Call relates its reactions and raised hand to
+    /// the reacting member's membership event, so a member fed without one can
+    /// neither be reacted for nor have their reactions validated. Supply it.
+    #[uniffi(default = None)]
+    pub event_id: Option<String>,
     pub sender: String,
     /// Device that sent the event, from its decryption metadata. MSC4143 has no
     /// self-asserted device field, so the host must supply this for key
@@ -237,6 +253,148 @@ impl From<&matrix_rtc_core::RtcTransport> for FfiRtcTransport {
     }
 }
 
+/// One message-like room event for the reactions intake
+/// ([`RtcSessionManagerHandle::on_room_timeline_events`]).
+///
+/// Feed every `io.element.call.reaction` and `m.reaction` event of a room
+/// with a joined session, decrypted; anything else is ignored, so no filtering
+/// by slot or sender is needed. Redactions go through
+/// [`RtcSessionManagerHandle::on_event_redacted`] instead.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTimelineEvent {
+    pub room_id: String,
+    pub event_id: String,
+    pub sender: String,
+    /// Device that sent the event, from its decryption metadata.
+    #[uniffi(default = None)]
+    pub sender_device_id: Option<String>,
+    /// Whether the event arrived encrypted. `None` if unknown.
+    #[uniffi(default = None)]
+    pub was_encrypted: Option<bool>,
+    /// The event type: `io.element.call.reaction` or `m.reaction`.
+    pub event_type: String,
+    /// The event's `origin_server_ts`: when a raised hand counts as raised.
+    pub origin_server_ts: u64,
+    /// The event's whole `content` object as JSON.
+    pub content_json: String,
+}
+
+impl FfiTimelineEvent {
+    fn into_core(self) -> Option<matrix_rtc_core::RawTimelineEvent> {
+        let content = serde_json::from_str(&self.content_json)
+            .inspect_err(|error| {
+                log::warn!(
+                    "ignoring a {} from {} whose content is not JSON: {error}",
+                    self.event_type,
+                    self.sender,
+                );
+            })
+            .ok()?;
+        Some(matrix_rtc_core::RawTimelineEvent {
+            room_id: self.room_id,
+            event_id: self.event_id,
+            sender: self.sender,
+            origin: event_origin(self.was_encrypted, self.sender_device_id),
+            event_type: self.event_type,
+            origin_server_ts: self.origin_server_ts,
+            content,
+        })
+    }
+}
+
+/// How an event reached us, from what the host reported.
+fn event_origin(
+    was_encrypted: Option<bool>,
+    sender_device_id: Option<String>,
+) -> matrix_rtc_core::EventOrigin {
+    match was_encrypted {
+        Some(true) => matrix_rtc_core::EventOrigin::encrypted(sender_device_id),
+        Some(false) => matrix_rtc_core::EventOrigin::Cleartext,
+        None => matrix_rtc_core::EventOrigin::Unknown,
+    }
+}
+
+/// A membership event whose annotations the host should fetch (see
+/// [`RtcSessionManagerHandle::pending_relation_lookups`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRelationLookup {
+    pub member_id: String,
+    pub membership_event_id: String,
+}
+
+impl From<matrix_rtc_core::RelationLookup> for FfiRelationLookup {
+    fn from(lookup: matrix_rtc_core::RelationLookup) -> Self {
+        Self {
+            member_id: lookup.member_id,
+            membership_event_id: lookup.membership_event_id,
+        }
+    }
+}
+
+/// A member whose hand is up (mirrors `matrix_rtc_core::RaisedHand`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRaisedHand {
+    /// `member.id` of the membership the hand belongs to.
+    pub member_id: String,
+    /// The member's user id.
+    pub sender: String,
+    /// The `m.reaction` event that raised it.
+    pub reaction_event_id: String,
+    /// When it was raised (ms since the epoch, by the server's clock). Sort
+    /// ascending to order speakers.
+    pub raised_at_ms: u64,
+}
+
+impl From<matrix_rtc_core::RaisedHand> for FfiRaisedHand {
+    fn from(hand: matrix_rtc_core::RaisedHand) -> Self {
+        Self {
+            member_id: hand.member_id,
+            sender: hand.sender,
+            reaction_event_id: hand.reaction_event_id,
+            raised_at_ms: hand.raised_at_ms,
+        }
+    }
+}
+
+/// One entry of Element Call's reaction catalogue (see [`reaction_catalog`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiReactionKind {
+    /// The `name` to send, and the key peers pick a sound by.
+    pub name: String,
+    /// The emoji Element Call shows for it.
+    pub emoji: String,
+    /// Base name of the sound asset Element Call plays for it (`clap`,
+    /// `party`, …), or `None` for a silent reaction.
+    pub sound: Option<String>,
+}
+
+/// Element Call's reaction catalogue, in the order its picker shows them.
+///
+/// The names are the interoperable part: a reaction sent with one of these
+/// names plays the same sound on Element Call as on a host that bundles the
+/// assets under the `sound` base names here, plus `generic` for names outside
+/// the catalogue. The SDK plays nothing itself.
+#[uniffi::export]
+pub fn reaction_catalog() -> Vec<FfiReactionKind> {
+    matrix_rtc_core::KNOWN_REACTIONS
+        .iter()
+        .map(|kind| FfiReactionKind {
+            name: kind.name.to_owned(),
+            emoji: kind.emoji.to_owned(),
+            sound: kind.sound.map(str::to_owned),
+        })
+        .collect()
+}
+
+/// The sound asset to play for a reaction `name`: a catalogue entry's sound,
+/// `generic` for a name outside the catalogue, or `None` for a silent one.
+#[uniffi::export]
+pub fn reaction_sound_for(name: String) -> Option<String> {
+    matrix_rtc_core::sound_for(&name)
+        .asset_name()
+        .map(str::to_owned)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct JoinedMembership {
     pub room_id: String,
@@ -245,6 +403,9 @@ pub struct JoinedMembership {
     pub sender_device_id: Option<String>,
     pub sticky_key: String,
     pub member_id: String,
+    /// Event id of the member's latest membership event, when the host supplied
+    /// one on the sticky event. Moves on every sticky refresh.
+    pub membership_event_id: Option<String>,
     pub application: Option<String>,
     /// Transports this member publishes media on (MSC4143).
     pub transports: Vec<FfiRtcTransport>,
@@ -750,6 +911,167 @@ impl RtcSessionManagerHandle {
         Ok(manager.own_member_id(&room_id, &slot_id))
     }
 
+    /// The event id of our current membership event in one session, or `None`
+    /// if there is no such session or it has not joined. Moves on every sticky
+    /// refresh, so read it at the moment of use.
+    pub async fn own_membership_event_id(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<Option<String>, MatrixRtcFfiError> {
+        let manager = self.inner.lock().await;
+        Ok(manager.own_membership_event_id(&room_id, &slot_id))
+    }
+
+    // ---- Reactions and raised hands ----
+    //
+    // Element Call's reactions are ordinary room events relating to the
+    // reacting member's membership event; the SDK validates, de-duplicates and
+    // tracks them, the host feeds them in and plays any sound. Three host
+    // obligations, for every room with a joined session:
+    //
+    // 1. Forward every decrypted `io.element.call.reaction` and `m.reaction`
+    //    event through `on_room_timeline_events`, and every redaction through
+    //    `on_event_redacted`.
+    // 2. After each `set_current_sticky_state`, ask `pending_relation_lookups`
+    //    and answer each entry with the event's `/relations`
+    //    (`rel_type=m.annotation`, `event_type=m.reaction`) through
+    //    `on_relations_received`. That is how hands raised before we joined
+    //    become visible.
+    // 3. Supply `event_id` on every `StickyEvent` fed in: the id is what a
+    //    reaction relates to.
+    //
+    // Results surface on the media session as `FfiCallEvent::HandRaised` /
+    // `HandLowered` / `Reaction` and on `FfiParticipant.hand_raised_at_ms`,
+    // and here as `raised_hands`.
+
+    /// Feeds message-like room events to every session of `room_id`. Only
+    /// `io.element.call.reaction` and `m.reaction` are read; forward without
+    /// filtering. An event whose content is not JSON is skipped with a log
+    /// line.
+    pub async fn on_room_timeline_events(
+        &self,
+        room_id: String,
+        events: Vec<FfiTimelineEvent>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let events: Vec<matrix_rtc_core::RawTimelineEvent> = events
+            .into_iter()
+            .filter_map(FfiTimelineEvent::into_core)
+            .collect();
+        log::debug!(
+            "manager: [{room_id}] {} timeline event(s) in for reactions",
+            events.len()
+        );
+        let mut manager = self.inner.lock().await;
+        manager.on_room_timeline_events(&room_id, &events);
+        Ok(())
+    }
+
+    /// Lowers whichever hand the redacted `event_id` raised, in every session
+    /// of `room_id`. Feed every redaction of the room; unrelated ones are
+    /// ignored.
+    pub async fn on_event_redacted(
+        &self,
+        room_id: String,
+        event_id: String,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let mut manager = self.inner.lock().await;
+        manager.on_event_redacted(&room_id, &event_id);
+        Ok(())
+    }
+
+    /// Membership events in `room_id` whose annotations have not been fetched
+    /// yet. Answer each with `GET /rooms/{room_id}/relations/{membership_event_id}/m.annotation/m.reaction`
+    /// through [`Self::on_relations_received`]. Asking marks an id as fetched,
+    /// so a failed fetch is retried by asking again after the next
+    /// `set_current_sticky_state`.
+    pub async fn pending_relation_lookups(
+        &self,
+        room_id: String,
+    ) -> Result<Vec<FfiRelationLookup>, MatrixRtcFfiError> {
+        let manager = self.inner.lock().await;
+        Ok(manager
+            .pending_relation_lookups(&room_id)
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Feeds the annotations of one membership event back, as fetched for a
+    /// [`Self::pending_relation_lookups`] entry. Pass an empty list when there
+    /// were none. Only raised hands are taken from them.
+    pub async fn on_relations_received(
+        &self,
+        room_id: String,
+        target_event_id: String,
+        events: Vec<FfiTimelineEvent>,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let events: Vec<matrix_rtc_core::RawTimelineEvent> = events
+            .into_iter()
+            .filter_map(FfiTimelineEvent::into_core)
+            .collect();
+        let mut manager = self.inner.lock().await;
+        manager.on_relations_received(&room_id, &target_event_id, &events);
+        Ok(())
+    }
+
+    /// Sends an Element Call emoji reaction from one session. `name` is what
+    /// peers pick a sound by (see [`reaction_catalog`]); only the first
+    /// grapheme of `emoji` is sent. Returns the event id.
+    ///
+    /// Fails inside the send cooldown (Element Call's three seconds by
+    /// default), since peers would drop the reaction anyway.
+    pub async fn send_reaction(
+        &self,
+        room_id: String,
+        slot_id: String,
+        emoji: String,
+        name: String,
+    ) -> Result<String, MatrixRtcFfiError> {
+        let mut manager = self.inner.lock().await;
+        Ok(manager
+            .send_reaction(&room_id, &slot_id, &emoji, &name)
+            .await?)
+    }
+
+    /// Raises our hand in one session. Idempotent while it is up; the hand
+    /// follows our membership across sticky refreshes on its own.
+    pub async fn raise_hand(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let mut manager = self.inner.lock().await;
+        Ok(manager.raise_hand(&room_id, &slot_id).await?)
+    }
+
+    /// Lowers our hand in one session by redacting the annotation. A no-op
+    /// when it is down.
+    pub async fn lower_hand(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<(), MatrixRtcFfiError> {
+        let mut manager = self.inner.lock().await;
+        Ok(manager.lower_hand(&room_id, &slot_id).await?)
+    }
+
+    /// The raised hands of one session, oldest first; empty if there is no
+    /// such session.
+    pub async fn raised_hands(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<Vec<FfiRaisedHand>, MatrixRtcFfiError> {
+        let manager = self.inner.lock().await;
+        Ok(manager
+            .raised_hands(&room_id, &slot_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Restarts the keep-alive for one session: reschedules the delayed leave,
     /// and re-sends the membership if its sticky entry is halfway to expiring.
     ///
@@ -1134,6 +1456,7 @@ fn to_core_event(event: StickyEvent) -> matrix_rtc_core::RawStickyEvent {
 
     RawStickyEvent {
         room_id: event.room_id,
+        event_id: event.event_id,
         sender: event.sender,
         origin: match event.was_encrypted {
             Some(true) => matrix_rtc_core::EventOrigin::encrypted(event.sender_device_id),
@@ -1165,6 +1488,7 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         sender_device_id: member.origin.sender_device_id().map(str::to_owned),
         sticky_key: member.sticky_key,
         member_id: member.member_id,
+        membership_event_id: member.membership_event_id,
         application: member.application,
         transports: member.transports.iter().map(Into::into).collect(),
         can_subscribe: member.can_subscribe,
@@ -1284,6 +1608,7 @@ mod tests {
     fn join_event() -> StickyEvent {
         StickyEvent {
             room_id: "!room:example.org".to_owned(),
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             sender_device_id: Some("DEVICEID".to_owned()),
             was_encrypted: Some(true),
@@ -1395,6 +1720,7 @@ mod tests {
         let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
 
         let spec = RawMemberEvent {
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             sender_device_id: Some("ALICEDEV".to_owned()),
             was_encrypted: Some(true),
@@ -1413,6 +1739,7 @@ mod tests {
         };
         // No `membership`, no `transports` — that generation states neither.
         let legacy_sticky = RawMemberEvent {
+            event_id: None,
             sender: "@bob:example.org".to_owned(),
             sender_device_id: Some("BOBDEV".to_owned()),
             was_encrypted: Some(true),
@@ -1428,6 +1755,7 @@ mod tests {
             .to_string(),
         };
         let pre_sticky = LegacyStateMemberEvent {
+            event_id: None,
             sender: "@carl:example.org".to_owned(),
             state_key: "_@carl:example.org_CARLDEV_m.call".to_owned(),
             origin_server_ts: matrix_rtc_bridge::compat::element_call_state::now_ms(),
@@ -1496,6 +1824,7 @@ mod tests {
         let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
 
         let sticky = RawMemberEvent {
+            event_id: None,
             sender: "@carl:example.org".to_owned(),
             sender_device_id: Some("CARLDEV".to_owned()),
             was_encrypted: Some(true),
@@ -1513,6 +1842,7 @@ mod tests {
             .to_string(),
         };
         let same_member_in_state = LegacyStateMemberEvent {
+            event_id: None,
             sender: "@carl:example.org".to_owned(),
             state_key: "_@carl:example.org_CARLDEV_m.call".to_owned(),
             origin_server_ts: matrix_rtc_bridge::compat::element_call_state::now_ms(),

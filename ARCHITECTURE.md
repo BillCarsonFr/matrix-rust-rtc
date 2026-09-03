@@ -419,7 +419,8 @@ when the host set `JoinSessionParams::notify`. Three decisions are worth knowing
 - **The relation is what forced a breaking host change.** MSC4075 requires an
   `m.reference` to the sender's own `m.rtc.member` event, and nothing in this
   workspace had ever seen an event id — `send_sticky_event` returned `()` and
-  `RawStickyEvent` carries no id either. Both `send_sticky_event` and
+  `RawStickyEvent` carried no id either (it does now, for reactions; see
+  below). Both `send_sticky_event` and
   `send_state_event` now return `String`, filled from the send response at every
   implementation site, and `OwnMembershipMachine::join` hands the membership's id
   back to its caller. Not `Option<String>`: every Matrix send responds with an
@@ -453,6 +454,65 @@ Receiving is not implemented: the MSC's ring conditions, lifetime expiry against
 `origin_server_ts`, `m.call.ring.ack` acknowledgements and the sender-side
 "still ringing" indication are all absent, and on mobile the first signal is a
 push notification that never passes through this workspace anyway.
+
+### Reactions and the raised hand (Element Call, unspecced)
+
+Element Call's reactions are ordinary room events that *relate to the reacting
+member's own membership event*: an emoji reaction is an `io.element.call.reaction`
+with an `m.reference` and `emoji` / `name` fields, a raised hand is an
+`m.reaction` annotation with key `🖐️`, lowered by redacting it. Nothing in the
+content is trusted beyond that relation — the receiver checks that the reaction's
+sender is the membership's sender, which the homeserver authenticated. The
+protocol lives in `reactions.rs` and is exercised through `RtcSession`; the
+decisions worth knowing:
+
+- **Only the protocol is in the SDK; sound and display are the host's.** The
+  media crate has no playout path, and capture and render are platform-side by
+  design, so a received reaction carries a sound *hint* (`ReactionSound`,
+  resolved from Element Call's catalogue by `name`; unknown names map to the
+  generic sound) and the host plays its bundled asset. Element Call's "play
+  reaction sounds" toggle is therefore a host setting; what the SDK owns is the
+  gating — an enable flag, the three-second per-member active window Element Call
+  applies on receipt, and a send cooldown that refuses what peers would drop.
+- **The membership event id moves, and the hand follows it.** A sticky refresh
+  re-sends the membership and the new event replaces the old in the sticky map;
+  matrix-js-sdk's `CallMembership.eventId` follows it, and Element Call drops a
+  raised hand whose membership event has moved on, re-querying the new event's
+  relations. So `OwnMembershipMachine` now tracks the latest event id, and the
+  heartbeat re-annotates our hand onto the new event (redacting the old
+  annotation) whenever it has moved — every 30 minutes at the default lifetime.
+  Peers may see the hand drop for one round trip in between; that is the
+  protocol's, not ours. As a *receiver* we are more lenient: a hand stays up for
+  as long as the member is in the call, and a reaction is validated against every
+  membership event id seen for that member, not only the latest.
+- **Event ids had to reach the core.** `RawStickyEvent` and `JoinedMembership`
+  carry the membership event id (optional in the DTO, so a host that cannot
+  supply one still compiles — but its members cannot then be reacted for). The
+  roster republishes when only ids moved; nothing downstream churns on it, since
+  the media engine and key distribution diff by `member_id` and `membership_ts`.
+- **Hands raised before we joined come from `/relations`.** The timeline we see
+  live starts at our join; the annotation lives in the relations of the member's
+  membership event. The session lists membership events whose relations it has
+  not seen (`pending_relation_lookups`), the host answers each with
+  `rel_type=m.annotation`, `event_type=m.reaction` (`on_relations_received`), and
+  only hands are taken from the answer — an hour-old applause is not replayed.
+  The matrix-sdk bridge and the `matrix-js-sdk` host module do this on every
+  tick; an FFI host does it itself, one request per new membership event id.
+- **Inbound needed a new intake.** The core only ever saw sticky, slot and
+  to-device traffic. `RawTimelineEvent` (`on_room_timeline_events`) and
+  `on_event_redacted` are routed by *room* — a reaction names no slot — to every
+  session of the room, each keeping what relates to its own members. The matrix-sdk
+  bridge feeds them from a room event handler (`register_timeline_receiver` →
+  `run_timeline_bridge`, the same `Send`-handler-to-`spawn_local`-pump shape as
+  media keys); the web host from `RoomEvent.Timeline`, `MatrixEventEvent.Decrypted`
+  and `RoomEvent.Redaction`.
+- **Outbound needed two commands.** `RtcCommandSender::send_room_event` (a plain
+  message-like send, encrypted by the client SDK in an encrypted room) and
+  `redact_event`, mirrored on the uniffi callback and the JS host object.
+
+The media layer merges the result onto the roster: `Participant.hand_raised_at_ms`
+plus `CallEvent::HandRaised` / `HandLowered` / `Reaction`, so a UI can order
+tiles by who asked first without touching the core.
 
 ### Slots and the join conditions
 

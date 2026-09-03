@@ -57,7 +57,10 @@ pub mod compat;
 pub mod sdk;
 
 #[cfg(feature = "matrix-sdk")]
-pub use sdk::{SdkCommandSender, run_sticky_bridge};
+pub use sdk::{
+    SdkCommandSender, TimelineIngest, register_timeline_receiver, run_sticky_bridge,
+    run_timeline_bridge, timeline_ingest_from_raw,
+};
 
 pub use compat::{
     ElementCallCompat, ElementCallDialect, ElementCallStateDialect, LEGACY_KEY_EVENT_TYPE,

@@ -85,12 +85,14 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use matrix_rtc_core::SlotEncryption;
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
-use matrix_rtc_media::{I420Buffer, PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig};
+use matrix_rtc_media::{
+    CallEvent, I420Buffer, PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
+};
 
 /// Hard cap on a whole run, so a wedged stack fails the Playwright test with
 /// this process's own diagnosis rather than a bare timeout.
@@ -318,6 +320,44 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
                 None => eprintln!("[peer] not joined, ignoring leave"),
             },
+            // Reactions: each is acknowledged once the homeserver accepted the
+            // event, so the test can wait for Element Call to render it.
+            "raise_hand" => match joined.as_ref() {
+                Some(active) => {
+                    active.call.raise_hand().await?;
+                    emit(serde_json::json!({ "event": "hand_raised_sent" }));
+                }
+                None => eprintln!("[peer] not joined, ignoring raise_hand"),
+            },
+            "lower_hand" => match joined.as_ref() {
+                Some(active) => {
+                    active.call.lower_hand().await?;
+                    emit(serde_json::json!({ "event": "hand_lowered_sent" }));
+                }
+                None => eprintln!("[peer] not joined, ignoring lower_hand"),
+            },
+            // `react <emoji> <name>`, e.g. `react 👏 clapping`.
+            reaction if reaction.starts_with("react ") => match joined.as_ref() {
+                Some(active) => {
+                    let mut parts = reaction.splitn(3, ' ');
+                    parts.next();
+                    let emoji = parts.next().unwrap_or_default();
+                    let name = parts.next().unwrap_or_default();
+                    match active.call.send_reaction(emoji, name).await {
+                        Ok(event_id) => emit(serde_json::json!({
+                            "event": "reaction_sent",
+                            "event_id": event_id,
+                            "emoji": emoji,
+                            "name": name,
+                        })),
+                        Err(error) => emit(serde_json::json!({
+                            "event": "reaction_refused",
+                            "reason": error.to_string(),
+                        })),
+                    }
+                }
+                None => eprintln!("[peer] not joined, ignoring react"),
+            },
             "quit" => break,
             other => eprintln!("[peer] unknown command {other:?}"),
         }
@@ -341,6 +381,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
 /// dropping either handle stops the media Element Call is rendering.
 struct Joined {
     call: Call,
+    /// The unified call event stream, for Element Call's reactions and raised
+    /// hands; subscribed at join so nothing is missed.
+    events: broadcast::Receiver<CallEvent>,
     _tone: media::ToneHandle,
     video: tokio::task::JoinHandle<()>,
 }
@@ -556,6 +599,7 @@ async fn join_call(
         },
     )
     .await?;
+    let events = call.subscribe_call_events();
 
     // Publish both: Element Call sits on "Waiting for media..." until it has
     // something it can decode, and video is the half that has historically
@@ -570,6 +614,7 @@ async fn join_call(
     }));
     Ok(Joined {
         call,
+        events,
         _tone: tone,
         video,
     })
@@ -638,6 +683,7 @@ async fn watch_call(
     const POLL: Duration = Duration::from_millis(500);
 
     let call = &mut joined.call;
+    let call_events = &mut joined.events;
     let mut last_members = 0usize;
     // The identity the *SFU* assigned the peer, not one we derived. Getting
     // that derivation wrong is the failure mode with no error message: tracks
@@ -669,6 +715,37 @@ async fn watch_call(
         let event = tokio::select! {
             biased;
             command = commands.recv() => return Ok(command),
+            call_event = call_events.recv() => {
+                // Element Call's reactions and raised hands, as the roster
+                // saw them; everything else on this stream is reported through
+                // the raw SFU events below.
+                match call_event {
+                    Ok(CallEvent::HandRaised { member_id, raised_at_ms }) => {
+                        emit(serde_json::json!({
+                            "event": "hand_raised",
+                            "member_id": member_id,
+                            "raised_at_ms": raised_at_ms,
+                        }));
+                    }
+                    Ok(CallEvent::HandLowered { member_id }) => {
+                        emit(serde_json::json!({ "event": "hand_lowered", "member_id": member_id }));
+                    }
+                    Ok(CallEvent::Reaction { member_id, emoji, name, sound }) => {
+                        emit(serde_json::json!({
+                            "event": "reaction",
+                            "member_id": member_id,
+                            "emoji": emoji,
+                            "name": name,
+                            "sound": sound,
+                        }));
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err("call event stream ended (call over)".into());
+                    }
+                }
+                continue;
+            }
             event = tokio::time::timeout(POLL, call.events().recv()) => event,
         };
         let event = match event {
