@@ -1,0 +1,29 @@
+{
+  "name": "matrix-rtc-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "uniffi-generated npm bindings + demo webapp for the matrix-rtc draft crate",
+  "type": "module",
+  "browser": "src/index.web.ts",
+  "scripts": {
+    "ubrn:web": "ubrn build web --config ubrn.config.yaml",
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "uniffi-bindgen-react-native": "0.31.0-5",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11",
+    "wasm-pack": "^0.15.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/element-hq/matrix-rust-rtc.git"
+  },
+  "dependencies": {
+    "@ubjs/core": "^0.31.0-5",
+    "matrix-js-sdk": "^42.3.0"
+  }
+}
