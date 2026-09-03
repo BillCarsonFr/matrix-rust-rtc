@@ -5,6 +5,8 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   FfiEventOrigin,
+  FfiDisconnectCause,
+  FfiKeepAlive,
   FfiMembershipState,
   FfiStatus,
   type FfiMembership,
@@ -23,7 +25,7 @@ const encrypted = (deviceId: string) =>
 describe("ParticipationManager", () => {
   it("starts disconnected with no memberships", () => {
     const { manager } = newManager();
-    expect(manager.status()).toBe(FfiStatus.Disconnected);
+    expect(FfiStatus.Disconnected.instanceOf(manager.status())).toBe(true);
     expect(manager.memberships()).toEqual([]);
     expect(manager.connections()).toEqual([]);
     expect(manager.keyMap()).toEqual([]);
@@ -80,7 +82,7 @@ describe("ParticipationManager", () => {
     expect(sticky.durationMs).toBe(240_000n);
     expect(sticky.content.member.membership).toBe("join");
 
-    expect(manager.status()).toBe(FfiStatus.Connected);
+    expect(FfiStatus.Connected.instanceOf(manager.status())).toBe(true);
     // our own membership is in the list (the mock homeserver echoed it)
     const me = manager.memberships().find((m) => m.member.userId === OWN_USER_ID);
     expect(me?.state).toBe(FfiMembershipState.Joined);
@@ -121,10 +123,45 @@ describe("ParticipationManager", () => {
     const statuses: FfiStatus[] = [];
     manager.setStatusListener({ onStatusChange: (s) => statuses.push(s) });
     await manager.join(receiveOnly(), joinParams);
-    await waitFor("connected seen", () => statuses.at(-1) === FfiStatus.Connected);
+    await waitFor("connected seen", () => FfiStatus.Connected.instanceOf(statuses.at(-1)));
     await manager.leave("m.user_hangup", undefined);
-    await waitFor("disconnected seen", () => statuses.at(-1) === FfiStatus.Disconnected);
-    expect(manager.status()).toBe(FfiStatus.Disconnected);
+    await waitFor("disconnected seen", () => FfiStatus.Disconnected.instanceOf(statuses.at(-1)));
+    expect(FfiStatus.Disconnected.instanceOf(manager.status())).toBe(true);
+  });
+
+  // The status used to be four opaque variants with everything else behind
+  // debugSnapshot's unversioned JSON. Everything a UI needs is now typed.
+  it("the status carries the typed keep-alive, publication, roster and impairments", async () => {
+    const { manager } = newManager();
+    const before = manager.status();
+    if (!FfiStatus.Disconnected.instanceOf(before)) throw new Error("expected Disconnected");
+    expect(FfiDisconnectCause.NeverJoined.instanceOf(before.inner.cause)).toBe(true);
+    expect(manager.ownMemberId()).toBeUndefined();
+
+    await manager.join(publishLk(), joinParams);
+    const status = manager.status();
+    if (!FfiStatus.Connected.instanceOf(status)) throw new Error("expected Connected");
+    const armed = status.inner.keepAlive;
+    if (!FfiKeepAlive.Armed.instanceOf(armed)) throw new Error("expected Armed");
+    // The deadline a UI renders a countdown from, without deriving it.
+    expect(armed.inner.firesAtTs).toBe(armed.inner.lastRestartTs + armed.inner.delayMs);
+    expect(status.inner.membership.expiresAtTs).toBe(
+      status.inner.membership.lastPublishedTs + status.inner.membership.lifetimeMs,
+    );
+    expect(status.inner.membership.refreshFailingSinceTs).toBeUndefined();
+    expect(status.inner.impairments).toEqual([]);
+    expect(manager.connectionProblems()).toEqual([]);
+
+    // Identity: the member id the facade mints, and our own tile.
+    const ownId = manager.ownMemberId();
+    expect(ownId).toBeTruthy();
+    await waitFor("our echo", () => manager.ownMembership() !== undefined);
+    expect(manager.ownMembership()!.member.memberId).toBe(ownId);
+
+    // Seed honesty reaches the FFI too.
+    expect(manager.session().seeded).toBe(true);
+    expect(manager.session().failedReads).toEqual([]);
+    expect(manager.session().excludedCandidates).toEqual([]);
   });
 
   it("debugSnapshot is JSON with every part", async () => {

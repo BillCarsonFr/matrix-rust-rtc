@@ -171,7 +171,7 @@ impl Pump {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::super::{JoinParams, OwnIdentity, OwnMembershipManager, Status};
+    use super::super::{JoinParams, KeepAlive, OwnIdentity, OwnMembershipManager, Status};
     use super::*;
     use crate::driver::{DriverError, SendEventResponse};
     use crate::session::{ElementCallCompat, SlotState};
@@ -333,7 +333,9 @@ mod tests {
                         properties: json!({ "livekit_service_url": "https://resolved" }),
                     }),
                     TransportIntent::ReceiveOnly { .. } => {
-                        Err(DriverError::Other("not called for receive-only".into()))
+                        Err(super::super::ResolveTransportError::NoTransport(
+                            DriverError::Other("not called for receive-only".into()),
+                        ))
                     }
                 }
             })
@@ -430,7 +432,9 @@ mod tests {
         }
         assert_eq!(calls[2], Call::Delegate("delay-1".into()));
         assert_eq!(calls.len(), 3);
-        assert!(matches!(m.status(), Status::Connected(c) if c.delegation_setup_ts.is_some()));
+        assert!(
+            matches!(m.status(), Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Delegated { .. }))
+        );
         assert!(m.debug_snapshot()["join_event_id"].is_string());
     }
 
@@ -537,7 +541,9 @@ mod tests {
         assert!(
             matches!(driver.calls()[1], Call::Sticky { duration_ms, .. } if duration_ms == super::super::DEFAULT_DEGRADED_LIFETIME_MS)
         );
-        assert!(matches!(m.status(), Status::Connected(c) if !c.delayed_leave_supported));
+        assert!(
+            matches!(m.status(), Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Unavailable { .. }))
+        );
 
         let driver = Arc::new(MockDriver::default());
         let (_tx, rx) = watch::channel(SessionSnapshot {

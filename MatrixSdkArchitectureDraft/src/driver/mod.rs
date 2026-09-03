@@ -14,7 +14,17 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-#[derive(Clone, Debug, thiserror::Error)]
+/// What a driver call can fail with.
+///
+/// The taxonomy exists so a caller can decide *what to do next* without
+/// string matching: [`Unauthorized`](Self::Unauthorized) and
+/// [`Unsupported`](Self::Unsupported) are permanent for this homeserver (the
+/// own-membership machine reads them as "delayed events will never work
+/// here", `machine::classify_refusal`), [`RateLimited`](Self::RateLimited) is
+/// explicitly transient and carries the server's own back-off, and
+/// [`Stopped`](Self::Stopped) means the manager behind the call is gone —
+/// nothing will ever answer, and no retry helps.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum DriverError {
     #[error("http error: {0}")]
     Http(String),
@@ -22,6 +32,16 @@ pub enum DriverError {
     Unauthorized(String),
     #[error("unsupported by homeserver: {0}")]
     Unsupported(String),
+    /// `M_LIMIT_EXCEEDED`. Its own variant because it is the one error a host
+    /// must *not* retry immediately: `retry_after_ms` is the server's
+    /// `retry_after_ms` when it supplied one.
+    #[error("rate limited{}", .retry_after_ms.map(|ms| format!(" (retry after {ms}ms)")).unwrap_or_default())]
+    RateLimited { retry_after_ms: Option<u64> },
+    /// The manager that owns this call has stopped; it will never answer.
+    /// Surfaces to the host as
+    /// `DisconnectCause::ManagerStopped` (`participation`).
+    #[error("the manager has stopped")]
+    Stopped,
     #[error("{0}")]
     Other(String),
 }

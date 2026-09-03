@@ -13,6 +13,8 @@ import {
   FfiMembershipState,
   FfiParticipationManager,
   FfiStatus,
+  FfiSessionRead,
+  type FfiImpairment,
   FfiTransportIntent,
   type FfiConnectionWithMembers,
   type FfiMediaKey,
@@ -124,7 +126,7 @@ function setStatus(text: string) {
 async function teardownManager() {
   if (manager) {
     try {
-      if (manager.status() !== FfiStatus.Disconnected) await manager.leave("m.user_hangup", undefined);
+      if (!FfiStatus.Disconnected.instanceOf(manager.status())) await manager.leave("m.user_hangup", undefined);
     } catch (e) {
       logError(e);
     }
@@ -167,7 +169,15 @@ function createManager(b: Backend) {
   manager.setStatusListener({
     onStatusChange: (status) => {
       const session = manager!.session();
-      setStatus(`${FfiStatus[status]} · slot ${session.slotOpen === undefined ? "unknown" : session.slotOpen ? "open" : "closed"} · ${session.encrypted ? "encrypted" : "unencrypted"}`);
+      // `failed_reads` is what tells "not encrypted" from "we could not
+      // find out" — a padlock rendered off the latter would be a lie.
+      const unknownSlot = session.failedReads.includes(FfiSessionRead.Slot);
+      const slot = unknownSlot ? "unreadable" : session.slotOpen === undefined ? "unknown" : session.slotOpen ? "open" : "closed";
+      const encryption = unknownSlot ? "encryption unknown" : session.encrypted ? "encrypted" : "unencrypted";
+      // Everything currently wrong, most severe first.
+      const impairments: FfiImpairment[] = FfiStatus.Disconnected.instanceOf(status) ? [] : status.inner.impairments;
+      const problems = impairments.length ? ` · ⚠ ${impairments.map((i) => i.tag).join(", ")}` : "";
+      setStatus(`${status.tag} · slot ${slot} · ${encryption}${problems}`);
       $("debug").textContent = jsonish(JSON.parse(manager!.debugSnapshot()));
     },
   });

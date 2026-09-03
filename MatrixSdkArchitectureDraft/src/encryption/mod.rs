@@ -213,6 +213,23 @@ pub enum Status {
     },
 }
 
+/// Whether one member and we can hear each other, per tile.
+///
+/// Two independent booleans on purpose: they fail for different reasons (our
+/// to-device send to them vs. theirs to us), they clear independently, and a
+/// UI renders them in different places — "they cannot hear you" is a warning
+/// about your own media, "you cannot hear them" is a warning about theirs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaKeyState {
+    /// They hold our current key: they can decrypt us.
+    pub holds_our_key: bool,
+    /// We hold theirs: we can decrypt them.
+    pub have_their_key: bool,
+    /// Why their most recent key was discarded, while we still lack one.
+    /// `None` once a key from them is accepted.
+    pub rejection: Option<KeyRejection>,
+}
+
 pub type KeyMapCallback = Box<dyn Fn(&KeyMap, &MediaKeyChange) + Send + Sync>;
 pub type KeyRejectedCallback = Box<dyn Fn(&str, &KeyRejection) + Send + Sync>;
 
@@ -334,6 +351,57 @@ impl Machine {
                 );
             }
         }
+    }
+
+    /// Our own member id for this participation — what
+    /// `ParticipationManager::own_member_id` hands back.
+    pub fn own_member_id(&self) -> Option<String> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .send
+            .own()
+            .map(|o| o.member().member_id.clone())
+    }
+
+    /// Whether this participation manages media keys at all. `false` for an
+    /// unencrypted call, where per-member key state is meaningless.
+    pub fn manages_media_keys(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .inbound
+            .manages_media_keys()
+    }
+
+    /// Who can hear whom, for one member. The facade puts this on the tile
+    /// and derives the aggregate impairments from it, so there is one source
+    /// of truth rather than an aggregate that can disagree with the list.
+    pub fn key_state(&self, member_id: &str) -> MediaKeyState {
+        let state = self.inner.state.lock().unwrap();
+        let have_their_key = state.inbound.have_key_from(member_id);
+        MediaKeyState {
+            holds_our_key: state.send.holds_our_key(member_id),
+            have_their_key,
+            // A rejection only matters while it leaves us without a key from
+            // them; once one is accepted the tile is fine.
+            rejection: (!have_their_key)
+                .then(|| state.inbound.rejection(member_id).cloned())
+                .flatten(),
+        }
+    }
+
+    /// When [`MediaKeyState::rejection`] was recorded, for the impairment
+    /// that reports it.
+    pub fn key_rejected_at(&self, member_id: &str) -> Option<u64> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .inbound
+            .rejected_at(member_id)
     }
 
     pub fn set_key_rejected_callback(&self, callback: KeyRejectedCallback) {

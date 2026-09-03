@@ -125,23 +125,125 @@ pub struct JoinStatus {
     pub has_started_heartbeat: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// What is true of our membership right now, per mechanism.
+///
+/// Three independent mechanisms keep us in a call — the dead man's switch,
+/// the sticky publication, and the session's projection of our event — and
+/// each fails on its own. They were five loose timestamps once, which could
+/// not express a failing keep-alive at all and whose meaning silently
+/// inverted after delegation (`ErrorSurfaceAnalysis.md` §3.1). Each is now a
+/// value whose *state* changes when the mechanism does, so
+/// `participation::ParticipationManager::on_status_change` fires on the
+/// failure instead of the host having to poll and diff timestamps.
+///
+/// Timestamps are unix-ms; `_ts` is a point in time, `_ms` a duration.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedStatus {
-    /// When the delayed leave would fire if we stopped restarting it
-    /// (after delegation: the earliest the homeserver could fire it).
-    pub delayed_event_kick_ts: Option<u64>,
-    pub heartbeat_last_restart_ts: Option<u64>,
-    pub delegation_setup_ts: Option<u64>,
-    /// `false` = degraded: no dead man's switch, cleanup rides on expiry.
-    pub delayed_leave_supported: bool,
+    pub keep_alive: KeepAlive,
+    pub membership: MembershipPublication,
+    pub roster: RosterPresence,
+}
+
+/// The dead man's switch (MSC4140) that clears our membership if this client
+/// dies. Mutually exclusive states of one mechanism, so a host renders one
+/// of five things and never has to reconcile flags that disagree.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeepAlive {
+    /// Armed, and we restart it ourselves every `delay_ms / 3`.
+    Armed {
+        delay_ms: u64,
+        last_restart_ts: u64,
+        /// When the homeserver publishes our leave if no further restart
+        /// lands — `last_restart_ts + delay_ms`.
+        fires_at_ts: u64,
+    },
+    /// Handed to the SFU (MSC4195). We no longer restart it, so a frozen
+    /// `last_restart_ts` is expected here rather than a fault — which is
+    /// exactly why this is a variant and not a flag beside the timestamps.
+    Delegated {
+        delegated_at_ts: u64,
+        /// The earliest the homeserver could fire it. The SFU keeps it
+        /// alive while we are connected, so this passing is not a problem.
+        earliest_fire_ts: u64,
+    },
+    /// Armed, but restarts are failing — unless one succeeds, the homeserver
+    /// publishes our leave at `fires_at_ts` and we drop out of the call.
+    RestartFailing {
+        since_ts: u64,
+        fires_at_ts: u64,
+        last_error: String,
+    },
+    /// Its full delay elapsed with no successful restart, so it has in all
+    /// likelihood already fired: we are probably out of the call and have
+    /// simply not seen the leave come back yet. A replacement is being armed.
+    Expired { since_ts: u64 },
+    /// None armed. `permanent` = this homeserver refuses delayed events for
+    /// good (404/403); otherwise we re-probe at `next_probe_ts` (`Some(0)`
+    /// meaning "at the next pump beat"). Without a switch, a crashed client
+    /// leaves a ghost tile until [`MembershipPublication::expires_at_ts`].
+    Unavailable {
+        permanent: bool,
+        next_probe_ts: Option<u64>,
+    },
+}
+
+/// Our sticky membership event on the server (MSC4354). It expires unless we
+/// re-publish it, so `expires_at_ts` is the deadline a failing refresh runs
+/// against — the host no longer has to derive it from a lifetime.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MembershipPublication {
     /// The lifetime every membership event of this join is published with.
-    pub membership_lifetime_ms: u64,
+    pub lifetime_ms: u64,
+    pub last_published_ts: u64,
+    /// `last_published_ts + lifetime_ms` — when the server drops us if no
+    /// refresh lands.
+    pub expires_at_ts: u64,
+    /// Set while refreshes are failing (`None` when healthy).
+    pub refresh_failing_since_ts: Option<u64>,
+    pub last_refresh_error: Option<String>,
+}
+
+/// Whether the session projects our own membership — i.e. whether anybody
+/// can see us.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RosterPresence {
+    /// Our join event was sent, its echo has not come back yet. Not a fault.
+    AwaitingEcho,
+    Present,
+    /// It was in the roster and is gone. `republished_at_ts` is set once the
+    /// self-heal re-sent it and we are waiting for that echo.
+    Missing {
+        since_ts: u64,
+        republished_at_ts: Option<u64>,
+    },
+    /// The event is on the server but the session refuses to project it, so
+    /// nobody sees us. The self-heal deliberately does not re-send here: only
+    /// the room state that caused the exclusion changing can clear it.
+    Excluded {
+        reason: crate::session::JoinExclusionReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LeaveStatus {
     pub leave_event_sent: bool,
-    pub delayed_leave_settled: bool,
+    /// What became of the armed dead man's switch; `None` until the leave
+    /// reaches that step (or when none was armed).
+    pub delayed_leave: Option<DelayedLeaveOutcome>,
+}
+
+/// What happened to the dead man's switch when we left.
+///
+/// Cancelling it can fail, and `leave()` still returns `Ok` — correctly, the
+/// delay *is* a leave, so we are out either way. But the two outcomes are
+/// not the same on the wire, and the host used to be told nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DelayedLeaveOutcome {
+    /// Cancelled cleanly; nothing further will be published for us.
+    Cancelled,
+    /// The cancel failed — most likely because it had already fired. A
+    /// stray delayed leave event of ours may still land in the room.
+    MayStillFire,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,7 +254,10 @@ pub enum Status {
     Leaving(LeaveStatus),
 }
 
-#[derive(Debug, thiserror::Error)]
+/// `Clone` + `PartialEq` because a failed join is *carried* by
+/// `participation::DisconnectCause::JoinFailed`, which lives inside a
+/// publish-on-change `Status`.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum JoinError {
     #[error("already joined")]
     AlreadyJoined,
@@ -160,13 +265,25 @@ pub enum JoinError {
     InvalidParams(String),
     #[error("the slot is closed")]
     SlotClosed,
-    #[error("no transport to publish on: {0}")]
-    TransportUnavailable(DriverError),
+    /// The homeserver advertises no usable RTC transport — a configuration
+    /// problem; retrying will not help.
+    #[error("the homeserver advertises no usable RTC transport: {0}")]
+    NoTransport(DriverError),
+    /// A transport exists but its token could not be minted — auth or
+    /// network; retrying may help. Split from [`Self::NoTransport`] because
+    /// the two are different user-facing stories with different remedies.
+    #[error("the transport refused to mint a token: {0}")]
+    TokenRefused(DriverError),
+    /// The encryption machine could not be built. Was an
+    /// `InvalidParams("our own membership has no device id")` — a crate
+    /// precondition dressed as a caller mistake.
+    #[error("the encryption machine could not be built: {0}")]
+    EncryptionSetup(crate::encryption::MachineError),
     #[error(transparent)]
     Driver(#[from] DriverError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum LeaveError {
     #[error("not joined")]
     NotJoined,
@@ -176,9 +293,10 @@ pub enum LeaveError {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type ResolveTransportFuture =
-    Pin<Box<dyn Future<Output = Result<RtcTransport, DriverError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<RtcTransport, ResolveTransportError>> + Send>>;
 #[cfg(target_arch = "wasm32")]
-pub type ResolveTransportFuture = Pin<Box<dyn Future<Output = Result<RtcTransport, DriverError>>>>;
+pub type ResolveTransportFuture =
+    Pin<Box<dyn Future<Output = Result<RtcTransport, ResolveTransportError>>>>;
 
 /// Resolves the transport we publish on: discovers one when the intent does
 /// not name it, mints its token (MSC4195 needs our member id), records it as
@@ -190,6 +308,27 @@ pub type TransportResolver =
 pub(crate) struct Inner {
     machine: Mutex<Machine>,
     status_tx: watch::Sender<Status>,
+}
+
+/// How a `Publish` intent failed to resolve, so the facade can tell "your
+/// homeserver advertises no SFU" from "the SFU refused your token". Both
+/// used to collapse into one `DriverError` at the [`TransportResolver`]
+/// boundary.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum ResolveTransportError {
+    #[error("{0}")]
+    NoTransport(DriverError),
+    #[error("{0}")]
+    TokenRefused(DriverError),
+}
+
+impl From<ResolveTransportError> for JoinError {
+    fn from(error: ResolveTransportError) -> Self {
+        match error {
+            ResolveTransportError::NoTransport(e) => JoinError::NoTransport(e),
+            ResolveTransportError::TokenRefused(e) => JoinError::TokenRefused(e),
+        }
+    }
 }
 
 impl Inner {
@@ -306,6 +445,17 @@ impl OwnMembershipManager {
         self.inner.status_tx.borrow().clone()
     }
 
+    /// How far the last *failed* join got. The abort resets the machine to
+    /// `NotJoined`, so without this the step-by-step flags that say which
+    /// step failed would be gone by the time `join()` returns.
+    pub fn last_join_progress(&self) -> JoinStatus {
+        self.inner
+            .machine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_join_progress()
+    }
+
     /// Current status + every change (heartbeat outcomes, delegation, the
     /// automatic `slot_closed` leave, self-heal — all without a host call).
     pub fn subscribe_status(&self) -> watch::Receiver<Status> {
@@ -321,8 +471,11 @@ impl OwnMembershipManager {
     }
 }
 
+/// The pump is gone (the manager was dropped, or its task ended): typed so
+/// the facade can report it as `DisconnectCause::ManagerStopped` rather than
+/// string-matching an `Other`.
 fn stopped() -> DriverError {
-    DriverError::Other("own membership manager stopped".into())
+    DriverError::Stopped
 }
 
 impl Drop for OwnMembershipManager {

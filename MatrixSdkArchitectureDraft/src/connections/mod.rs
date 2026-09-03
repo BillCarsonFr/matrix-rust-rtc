@@ -7,7 +7,7 @@
 
 use crate::driver::{DriverError, LivekitTokenRequest, TokenDriver};
 use crate::executor::{self, now_ms, sleep_ms};
-use crate::own_membership::OwnIdentity;
+use crate::own_membership::{OwnIdentity, ResolveTransportError};
 use crate::session::{ElementCallCompat, SessionSnapshot};
 use crate::types::{Member, RtcTransport, TransportIntent};
 use base64::Engine as _;
@@ -39,6 +39,15 @@ pub struct ConnectionData {
     /// the service URL).
     pub ws_url: String,
     pub jwt_token: String,
+    /// From the JWT's `exp`; `None` when it carries none.
+    ///
+    /// A failed re-mint keeps the *old* token rather than dropping it (a
+    /// host that is still connected must not lose its credentials), so
+    /// without this a host would only discover staleness through a LiveKit
+    /// connect that fails for no stated reason
+    /// (`ErrorSurfaceAnalysis.md` §5.2). An expired token is also reported
+    /// as a [`ConnectionProblem`].
+    pub expires_at_ts: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +55,34 @@ pub struct ConnectionWithMembers {
     pub connection: ConnectionData,
     /// The members publishing on this connection.
     pub members: Vec<Member>,
+}
+
+/// A connection the session needs that a host cannot currently use.
+///
+/// A wanted key with no token is simply *absent* from
+/// [`ConnectionsManager::connections`], and a stale one is present but
+/// unusable — both silent. This names them, with the members whose media is
+/// affected and when the next attempt is due.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectionProblem {
+    pub service_url: String,
+    /// Members whose media is unavailable because of it.
+    pub member_ids: Vec<String>,
+    pub kind: ConnectionProblemKind,
+    /// The last mint failure, or a note that none has been attempted yet.
+    pub last_error: String,
+    /// When the next mint is due. `0` = at the next pump beat.
+    pub retry_at_ts: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConnectionProblemKind {
+    /// Wanted, never minted — the connection is absent from
+    /// [`ConnectionsManager::connections`] entirely.
+    NoToken,
+    /// Present in `connections()` but its JWT is past `exp`. Kept on
+    /// purpose: dropping it would break a host that is still connected.
+    TokenExpired,
 }
 
 /// `livekit_service_url` of a LiveKit transport, or `None` for other kinds.
@@ -135,6 +172,9 @@ struct State {
     tokens: BTreeMap<String, Token>,
     /// Keys whose last mint failed, with the time to try again.
     retry_after: BTreeMap<String, u64>,
+    /// The last mint failure per key, cleared by a successful mint. The
+    /// cause `connections()` used to swallow entirely.
+    last_error: BTreeMap<String, String>,
 }
 
 impl State {
@@ -162,6 +202,7 @@ impl State {
                         service_url: key.clone(),
                         ws_url: token.ws_url.clone(),
                         jwt_token: token.jwt.clone(),
+                        expires_at_ts: token.expires_at_ms,
                     },
                     members: self
                         .members
@@ -169,6 +210,43 @@ impl State {
                         .filter(|m| member_service_urls(m).contains(&key))
                         .cloned()
                         .collect(),
+                })
+            })
+            .collect()
+    }
+
+    /// The members publishing on one connection key.
+    fn members_on(&self, key: &str) -> Vec<String> {
+        self.members
+            .iter()
+            .filter(|m| member_service_urls(m).contains(&key.to_owned()))
+            .map(|m| m.member_id.clone())
+            .collect()
+    }
+
+    /// Every wanted connection a host cannot use right now, sorted by key so
+    /// the published vec is stable (it is compared by `PartialEq`).
+    fn problems(&self, now: u64) -> Vec<ConnectionProblem> {
+        self.wanted()
+            .into_iter()
+            .filter_map(|key| {
+                let kind = match self.tokens.get(&key) {
+                    None => ConnectionProblemKind::NoToken,
+                    Some(token) if token.expires_at_ms.is_some_and(|exp| exp <= now) => {
+                        ConnectionProblemKind::TokenExpired
+                    }
+                    Some(_) => return None,
+                };
+                Some(ConnectionProblem {
+                    service_url: key.clone(),
+                    member_ids: self.members_on(&key),
+                    kind,
+                    last_error: self
+                        .last_error
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| "no token has been minted yet".to_owned()),
+                    retry_at_ts: self.retry_after.get(&key).copied().unwrap_or(0),
                 })
             })
             .collect()
@@ -205,6 +283,10 @@ struct Inner {
     driver: Arc<dyn TokenDriver>,
     state: Mutex<State>,
     tx: watch::Sender<Vec<ConnectionWithMembers>>,
+    /// A separate watch, because a mint failure changes *no connection* —
+    /// the key is simply still absent — so the facade's pump would never
+    /// wake on `tx` for the one thing it most needs to report.
+    problems_tx: watch::Sender<Vec<ConnectionProblem>>,
     /// Poked when the own transport changes.
     wake: Notify,
 }
@@ -215,6 +297,7 @@ impl Inner {
     }
 
     fn publish(&self) {
+        self.publish_problems();
         let connections = self.lock().connections();
         self.tx.send_if_modified(|current| {
             if *current == connections {
@@ -230,6 +313,26 @@ impl Inner {
                     .collect::<Vec<_>>()
             );
             *current = connections;
+            true
+        });
+    }
+
+    fn publish_problems(&self) {
+        let problems = self.lock().problems(now_ms());
+        self.problems_tx.send_if_modified(|current| {
+            if *current == problems {
+                return false;
+            }
+            log::info!(
+                "[{}/{}] connection problems: {:?}",
+                self.room_id,
+                self.slot_id,
+                problems
+                    .iter()
+                    .map(|p| (&p.service_url, p.kind))
+                    .collect::<Vec<_>>()
+            );
+            *current = problems;
             true
         });
     }
@@ -274,6 +377,7 @@ impl Inner {
                 Ok(token) => {
                     let mut state = self.lock();
                     state.retry_after.remove(&key);
+                    state.last_error.remove(&key);
                     state.tokens.insert(key, token);
                 }
                 Err(error) => {
@@ -281,9 +385,11 @@ impl Inner {
                         "[{}] could not mint a token for {key}: {error}",
                         self.room_id
                     );
-                    self.lock()
+                    let mut state = self.lock();
+                    state
                         .retry_after
-                        .insert(key, now_ms() + MINT_RETRY_MS);
+                        .insert(key.clone(), now_ms() + MINT_RETRY_MS);
+                    state.last_error.insert(key, error.to_string());
                 }
             }
             self.publish();
@@ -307,6 +413,7 @@ impl ConnectionsManager {
         driver: Arc<dyn TokenDriver>,
     ) -> Self {
         let (tx, _) = watch::channel(Vec::new());
+        let (problems_tx, _) = watch::channel(Vec::new());
         let inner = Arc::new(Inner {
             room_id,
             slot_id,
@@ -319,8 +426,10 @@ impl ConnectionsManager {
                 own_transport: None,
                 tokens: BTreeMap::new(),
                 retry_after: BTreeMap::new(),
+                last_error: BTreeMap::new(),
             }),
             tx,
+            problems_tx,
             wake: Notify::new(),
         });
         let notify = Arc::new(Notify::new());
@@ -337,6 +446,21 @@ impl ConnectionsManager {
         self.inner.tx.borrow().clone()
     }
 
+    /// Every wanted connection a host cannot use right now, sorted by
+    /// `service_url`. Empty is the healthy case.
+    ///
+    /// Recomputed against the current clock, so a token that expired since
+    /// the last publish shows up here even before the pump next beats.
+    pub fn problems(&self) -> Vec<ConnectionProblem> {
+        self.inner.lock().problems(now_ms())
+    }
+
+    /// Current problems + every change. A failed mint changes no connection,
+    /// so this is the only push signal for it.
+    pub fn subscribe_problems(&self) -> watch::Receiver<Vec<ConnectionProblem>> {
+        self.inner.problems_tx.subscribe()
+    }
+
     /// Resolve the transport we publish on: a `Publish` intent naming a
     /// `livekit_service_url` is used as is, otherwise `GET /rtc/transports`
     /// supplies the first LiveKit transport; its token is minted (MSC4195,
@@ -347,7 +471,7 @@ impl ConnectionsManager {
         &self,
         member_id: String,
         intent: TransportIntent,
-    ) -> Result<RtcTransport, DriverError> {
+    ) -> Result<RtcTransport, ResolveTransportError> {
         let transport = match intent {
             TransportIntent::Publish(t)
                 if service_url(&t).is_some() || t.transport_type != LIVEKIT =>
@@ -355,12 +479,21 @@ impl ConnectionsManager {
                 t
             }
             TransportIntent::Publish(_) => {
-                let transports = self.inner.driver.get_rtc_transports().await?;
+                // Discovery: a failure here means the homeserver advertises
+                // nothing usable, which retrying will not change.
+                let transports = self
+                    .inner
+                    .driver
+                    .get_rtc_transports()
+                    .await
+                    .map_err(ResolveTransportError::NoTransport)?;
                 transports
                     .into_iter()
                     .find(|t| service_url(t).is_some())
                     .ok_or_else(|| {
-                        DriverError::Other("the homeserver advertises no LiveKit transport".into())
+                        ResolveTransportError::NoTransport(DriverError::Unsupported(
+                            "the homeserver advertises no LiveKit transport".into(),
+                        ))
                     })?
             }
             TransportIntent::ReceiveOnly { .. } => {
@@ -369,17 +502,22 @@ impl ConnectionsManager {
                 state.own_transport = None;
                 drop(state);
                 self.inner.wake.notify_one();
-                return Err(DriverError::Other(
+                return Err(ResolveTransportError::NoTransport(DriverError::Other(
                     "receive-only intents publish no transport".into(),
-                ));
+                )));
             }
         };
         // Mint first, record second: the pump never sees our transport
         // without its token (no duplicate mint, no half-published state).
+        // A failure here is the *other* story — a transport exists, its
+        // token was refused — so it is reported separately.
         let token = match service_url(&transport) {
             Some(key) => Some((
                 key.to_owned(),
-                self.inner.mint(key, member_id.clone()).await?,
+                self.inner
+                    .mint(key, member_id.clone())
+                    .await
+                    .map_err(ResolveTransportError::TokenRefused)?,
             )),
             None => None,
         };
@@ -412,6 +550,7 @@ impl ConnectionsManager {
         state.own_transport = None;
         state.tokens.clear();
         state.retry_after.clear();
+        state.last_error.clear();
         drop(state);
         self.inner.publish();
         self.inner.wake.notify_one();
@@ -474,6 +613,8 @@ mod tests {
         requests: Mutex<Vec<LivekitTokenRequest>>,
         transports: Mutex<Vec<RtcTransport>>,
         exp_secs: Mutex<Option<u64>>,
+        /// When set, every mint fails with this error.
+        refuse: Mutex<Option<DriverError>>,
     }
 
     #[async_trait]
@@ -487,6 +628,9 @@ mod tests {
         ) -> Result<LivekitTokenResponse, DriverError> {
             let url = request.url.clone();
             self.requests.lock().unwrap().push(request);
+            if let Some(error) = self.refuse.lock().unwrap().clone() {
+                return Err(error);
+            }
             let jwt = match *self.exp_secs.lock().unwrap() {
                 Some(exp) => {
                     let payload = URL_SAFE_NO_PAD.encode(json!({ "exp": exp }).to_string());
@@ -541,8 +685,12 @@ mod tests {
             .block_on(f)
     }
 
-    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn wait_until(what: &str, cond: impl FnMut() -> bool) {
+        wait_until_within(what, Duration::from_secs(5), cond);
+    }
+
+    fn wait_until_within(what: &str, within: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + within;
         while !cond() {
             assert!(Instant::now() < deadline, "timed out waiting for: {what}");
             std::thread::sleep(Duration::from_millis(5));
@@ -728,6 +876,59 @@ mod tests {
             "one mint, then the minimum interval"
         );
         assert_eq!(m.connections().len(), 1);
+    }
+
+    /// §5.1/§5.2: a key with no token is *absent* from `connections()` and a
+    /// stale one is present but unusable. Both must be nameable, and both
+    /// must clear once a mint succeeds.
+    #[test]
+    fn a_failed_mint_is_a_problem_with_a_cause_and_clears_when_it_succeeds() {
+        let driver = Arc::new(MockTokens::default());
+        *driver.refuse.lock().unwrap() = Some(DriverError::Unauthorized("openid refused".into()));
+        let (_tx, rx) = watch::channel(snapshot(vec![member("a", Some("https://a"))]));
+        let m = manager(driver.clone(), rx, ElementCallCompat::Off);
+        m.set_own_member("m-me".into());
+        wait_until("a problem", || !m.problems().is_empty());
+
+        let problems = m.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].service_url, "https://a");
+        assert_eq!(problems[0].kind, ConnectionProblemKind::NoToken);
+        assert_eq!(problems[0].member_ids, vec!["a".to_owned()]);
+        assert!(problems[0].last_error.contains("openid refused"));
+        assert!(problems[0].retry_at_ts > 0, "a retry is scheduled");
+        assert!(
+            m.connections().is_empty(),
+            "the connection itself stays absent"
+        );
+
+        // The mint succeeding clears it — a problem is never terminal.
+        // The retry is `MINT_RETRY_MS` out, so allow for it.
+        *driver.refuse.lock().unwrap() = None;
+        wait_until_within(
+            "recovery",
+            Duration::from_millis(MINT_RETRY_MS + 5_000),
+            || m.problems().is_empty(),
+        );
+        assert_eq!(m.connections().len(), 1);
+    }
+
+    /// A token past its `exp` is kept (the host may still be connected on it)
+    /// but flagged, and its expiry is on the connection for a host to check.
+    #[test]
+    fn an_expired_token_is_still_served_but_reported() {
+        let driver = Arc::new(MockTokens::default());
+        *driver.exp_secs.lock().unwrap() = Some(now_ms() / 1000 - 10);
+        let (_tx, rx) = watch::channel(snapshot(vec![]));
+        let m = manager(driver.clone(), rx, ElementCallCompat::Off);
+        block_on(m.add_own_transport("m-me".into(), TransportIntent::Publish(lk("https://own"))))
+            .unwrap();
+        let connections = m.connections();
+        assert_eq!(connections.len(), 1, "not dropped from under the host");
+        assert!(connections[0].connection.expires_at_ts.unwrap() < now_ms());
+        let problems = m.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, ConnectionProblemKind::TokenExpired);
     }
 
     #[test]

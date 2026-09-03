@@ -67,7 +67,7 @@ describe.skipIf(!enabled)("demo backend (matrix-js-sdk driver)", () => {
       await waitFor("slot open on bob", () => b.session().slotOpen === true, 20_000);
 
       await a.join(publish(), joinParams);
-      expect(a.status()).toBe(FfiStatus.Connected);
+      expect(FfiStatus.Connected.instanceOf(a.status())).toBe(true);
 
       // Alice's own connection carries a JWT minted by lk-jwt-service.
       const connections = a.connections();
@@ -92,7 +92,7 @@ describe.skipIf(!enabled)("demo backend (matrix-js-sdk driver)", () => {
       await waitFor("two members on the connection", () => a.connections()[0]?.members.length === 2, 20_000);
 
       await a.leave("m.user_hangup", undefined);
-      expect(a.status()).toBe(FfiStatus.Disconnected);
+      expect(FfiStatus.Disconnected.instanceOf(a.status())).toBe(true);
       expect(a.connections()).toEqual([]);
       await waitFor("bob sees alice gone", () => !b.memberships().some((m) => m.member.userId === alice.userId), 20_000);
       await b.leave(undefined, undefined);

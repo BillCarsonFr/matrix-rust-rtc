@@ -105,6 +105,28 @@ pub enum EncryptionMechanism {
     Unsupported(String),
 }
 
+/// One of the room-state / timeline reads the live session's seed makes.
+///
+/// A read that failed leaves the condition it feeds **unenforced**, which is
+/// not the same as the condition being absent: `slot_state: None` after a
+/// failed slot read means "we could not find out", while after a successful
+/// one it means "this room has no slot". A host rendering a padlock from
+/// `negotiated_encryption` needs that difference — it is "unknown" versus
+/// "not encrypted" (`ErrorSurfaceAnalysis.md` §1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SessionRead {
+    /// `m.rtc.slot` room state — the open-slot condition and, with it, the
+    /// negotiated encryption decision.
+    Slot,
+    /// `m.room.encryption` room state — whether the room is encrypted.
+    RoomEncryption,
+    /// `m.room.member` room state — the sender-in-room condition.
+    RoomMembers,
+    /// The `m.rtc.member` timeline (and, in `StateEvents` compat, the
+    /// MSC3401 member state) — the roster itself.
+    MemberEvents,
+}
+
 /// Why a candidate member event is not in the joined projection.
 ///
 /// Two conditions are scoped by the candidate's generation:
@@ -158,6 +180,14 @@ pub struct SessionSnapshot {
     /// `read_*` calls (even after read failures); always `true` on the static
     /// path. `own_membership` mirrors it as `has_fetched_initial_member_list`.
     pub seeded: bool,
+    /// Seed reads that failed, sorted and deduplicated. `seeded` says the
+    /// seed *finished*; this says whether it learned anything. An empty vec
+    /// is the healthy case, and an entry disappears once a live state update
+    /// supplies that value after all — so it is a live condition, not a
+    /// permanent verdict on the join.
+    ///
+    /// Always empty on the static path, which makes no reads.
+    pub failed_reads: Vec<SessionRead>,
 }
 
 impl SessionSnapshot {

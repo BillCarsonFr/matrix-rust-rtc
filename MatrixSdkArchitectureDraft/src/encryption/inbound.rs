@@ -96,6 +96,12 @@ pub struct InboundKeys {
     key_map: KeyMap,
     filter: OutdatedKeyFilter,
     early: Vec<EarlyKey>,
+    /// The most recent rejection per member, cleared when a key from that
+    /// member is accepted. The crate already computes the *why* a peer's
+    /// media is undecryptable and used to throw it away
+    /// (`ErrorSurfaceAnalysis.md` §4.1); latching it is what puts it in
+    /// `Status`, where a UI attaching late still finds it.
+    rejections: HashMap<String, (KeyRejection, u64)>,
 }
 
 impl InboundKeys {
@@ -115,6 +121,7 @@ impl InboundKeys {
             key_map: KeyMap::new(),
             filter: OutdatedKeyFilter::default(),
             early: Vec::new(),
+            rejections: HashMap::new(),
         }
     }
 
@@ -122,12 +129,62 @@ impl InboundKeys {
         &self.key_map
     }
 
+    pub fn manages_media_keys(&self) -> bool {
+        self.manage_media_keys
+    }
+
     pub fn early_key_count(&self) -> usize {
         self.early.len()
     }
 
+    /// Whether we hold at least one usable key from this member.
+    pub fn have_key_from(&self, member_id: &str) -> bool {
+        self.key_map
+            .get(member_id)
+            .is_some_and(|ring| !ring.is_empty())
+    }
+
+    /// The latched reason this member's last key was discarded.
+    pub fn rejection(&self, member_id: &str) -> Option<&KeyRejection> {
+        self.rejections.get(member_id).map(|(r, _)| r)
+    }
+
+    /// When that rejection happened — carried alongside the reason because
+    /// `Impairment::MediaKeyRejected` reports *when* the crate gave up on
+    /// this member's key, and nothing else records it.
+    pub fn rejected_at(&self, member_id: &str) -> Option<u64> {
+        self.rejections.get(member_id).map(|(_, ts)| *ts)
+    }
+
+    /// Latch or clear the rejection for `member_id` from one outcome.
+    /// `Buffered` is neither: the verdict is still pending.
+    fn record(&mut self, member_id: &str, outcome: &Result<KeyOutcome, KeyRejection>, now: u64) {
+        match outcome {
+            Ok(KeyOutcome::Stored(_) | KeyOutcome::Duplicate) => {
+                self.rejections.remove(member_id);
+            }
+            Ok(KeyOutcome::Buffered) => {}
+            Err(rejection) => {
+                self.rejections
+                    .insert(member_id.to_owned(), (rejection.clone(), now));
+            }
+        }
+    }
+
     /// One inbound key, pre-verification, against the current members.
     pub fn receive(
+        &mut self,
+        key: ReceivedEncryptionKey,
+        members: &[Member],
+        now: u64,
+    ) -> Result<KeyOutcome, KeyRejection> {
+        let member_id = key.member_id.clone();
+        let outcome = self.receive_inner(key, members, now);
+        self.record(&member_id, &outcome, now);
+        outcome
+    }
+
+    fn receive_inner(
         &mut self,
         key: ReceivedEncryptionKey,
         members: &[Member],
@@ -174,14 +231,18 @@ impl InboundKeys {
         for early in held {
             match members.iter().find(|m| m.member_id == early.key.member_id) {
                 None => self.early.push(early),
-                Some(member) => match self.accept(early.key, member, now) {
-                    Ok(KeyOutcome::Stored(change)) => changes.push(change),
-                    Ok(_) => {}
-                    Err(rejection) => log::warn!(
-                        "held key for {} rejected once its membership arrived: {rejection}",
-                        member.member_id
-                    ),
-                },
+                Some(member) => {
+                    let member_id = member.member_id.clone();
+                    let outcome = self.accept(early.key, member, now);
+                    self.record(&member_id, &outcome, now);
+                    match outcome {
+                        Ok(KeyOutcome::Stored(change)) => changes.push(change),
+                        Ok(_) => {}
+                        Err(rejection) => log::warn!(
+                            "held key for {member_id} rejected once its membership arrived: {rejection}"
+                        ),
+                    }
+                }
             }
         }
         changes
@@ -513,6 +574,44 @@ mod tests {
         assert!(i.receive(impostor, &[bob()], 5).is_err());
         // genuine key arrives *earlier* by timestamp than the impostor: must pass
         stored(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 4));
+    }
+
+    /// The *why* behind "I cannot hear Bob" has to survive the moment it is
+    /// computed, or a UI attaching later finds only a silent tile.
+    #[test]
+    fn a_rejection_is_latched_per_member_and_cleared_by_an_accepted_key() {
+        let mut i = inbound();
+        assert_eq!(i.rejection("m-@bob:x"), None);
+        assert!(!i.have_key_from("m-@bob:x"));
+
+        let mut cleartext = key_from("@bob:x", Some("BOB1"), 0, 1);
+        cleartext.origin = KeyOrigin::Cleartext;
+        assert!(i.receive(cleartext, &[bob()], 5).is_err());
+        assert_eq!(i.rejection("m-@bob:x"), Some(&KeyRejection::Cleartext));
+
+        // The latch is the *most recent* verdict, not the first.
+        let mut impostor = key_from("@bob:x", Some("MAL"), 0, 9);
+        impostor.sender_user_id = "@mallory:x".into();
+        assert!(i.receive(impostor, &[bob()], 6).is_err());
+        assert_eq!(i.rejection("m-@bob:x"), Some(&KeyRejection::SenderMismatch));
+
+        // ...and it clears the moment a genuine key lands.
+        stored(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 7));
+        assert_eq!(i.rejection("m-@bob:x"), None);
+        assert!(i.have_key_from("m-@bob:x"));
+    }
+
+    /// A buffered key is not a verdict: nothing is latched while we wait for
+    /// the membership, and the verdict on arrival is what latches.
+    #[test]
+    fn a_buffered_key_latches_nothing_until_its_membership_arrives() {
+        let mut i = inbound();
+        let mut impostor = key_from("@bob:x", Some("MAL"), 0, 9);
+        impostor.sender_user_id = "@mallory:x".into();
+        assert_eq!(i.receive(impostor, &[], 5), Ok(KeyOutcome::Buffered));
+        assert_eq!(i.rejection("m-@bob:x"), None, "no verdict yet");
+        i.on_members(&[bob()], 6);
+        assert_eq!(i.rejection("m-@bob:x"), Some(&KeyRejection::SenderMismatch));
     }
 
     #[test]

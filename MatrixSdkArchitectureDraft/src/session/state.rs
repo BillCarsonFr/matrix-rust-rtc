@@ -409,7 +409,10 @@ impl RoomState {
             negotiated_encryption,
             start_ts,
             application_type,
+            // Both filled in by the live session's `publish` (the static
+            // path makes no reads and finishes seeded by definition).
             seeded: false,
+            failed_reads: Vec::new(),
         }
     }
 

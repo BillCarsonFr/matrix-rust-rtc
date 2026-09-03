@@ -309,6 +309,13 @@ impl SendMachine {
             .collect()
     }
 
+    /// Whether this member holds the key our media is currently encrypted
+    /// with — i.e. whether they can decrypt *us*. The inverse of the key
+    /// map, which only ever says who we can hear.
+    pub fn holds_our_key(&self, member_id: &str) -> bool {
+        self.key_holders().iter().any(|m| m.member_id == member_id)
+    }
+
     /// Participations that hold the key our media is encrypted with but are
     /// no longer in the session — "left, possibly still listening".
     pub fn left_members_with_keys(&self) -> Vec<Member> {

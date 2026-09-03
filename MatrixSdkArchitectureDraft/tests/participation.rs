@@ -11,13 +11,16 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use matrix_rtc::connections::participant_identity;
 use matrix_rtc::driver::*;
 use matrix_rtc::encryption::SendMachineConfig;
-use matrix_rtc::participation::{MembershipState, SessionMembership, Status};
+use matrix_rtc::own_membership;
+use matrix_rtc::participation::{
+    DisconnectCause, Impairment, MembershipState, SessionMembership, Severity, Status,
+};
 use matrix_rtc::types::*;
 use matrix_rtc::{
     ElementCallCompat, JoinParams, OwnIdentity, ParticipationConfig, ParticipationManager,
 };
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -93,6 +96,13 @@ struct Mock {
     peers: Mutex<Vec<Peer>>,
     counter: AtomicU64,
     refuse_delayed: bool,
+    /// Fail every `restart_delayed_event` while set — the dead man's switch
+    /// silently dying, which is what this suite's regression test is about.
+    fail_restart: AtomicBool,
+    /// Fail every token mint while set.
+    fail_token: AtomicBool,
+    /// Fail every `read_state` for `m.rtc.slot` while set.
+    fail_slot_read: AtomicBool,
 }
 
 impl Mock {
@@ -315,6 +325,9 @@ impl OwnMembershipDriver for Mock {
         delay_id: String,
     ) -> Result<(), DriverError> {
         self.record(Call::Restart(delay_id));
+        if self.fail_restart.load(Ordering::Relaxed) {
+            return Err(DriverError::Http("503 Service Unavailable".into()));
+        }
         Ok(())
     }
 
@@ -391,6 +404,9 @@ impl RoomEventsDriver for Mock {
         event_type: String,
         state_key: StateKeySelector,
     ) -> Result<Vec<RawMatrixEvent>, DriverError> {
+        if event_type.contains("rtc.slot") && self.fail_slot_read.load(Ordering::Relaxed) {
+            return Err(DriverError::Http("500".into()));
+        }
         Ok(self
             .state
             .lock()
@@ -430,6 +446,9 @@ impl TokenDriver for Mock {
     ) -> Result<LivekitTokenResponse, DriverError> {
         let url = request.url.clone();
         self.record(Call::GetToken(request));
+        if self.fail_token.load(Ordering::Relaxed) {
+            return Err(DriverError::Unauthorized("openid token refused".into()));
+        }
         Ok(LivekitTokenResponse {
             jwt: format!("jwt-for-{url}"),
             url: Some(url.replace("https", "wss")),
@@ -568,7 +587,7 @@ trait Coarse {
 impl Coarse for Status {
     fn coarse(&self) -> &'static str {
         match self {
-            Status::Disconnected => "Disconnected",
+            Status::Disconnected(_) => "Disconnected",
             Status::Joining(_) => "Joining",
             Status::Connected(_) => "Connected",
             Status::Leaving(_) => "Leaving",
@@ -588,7 +607,12 @@ fn own_member(m: &ParticipationManager) -> Option<SessionMembership> {
 async fn starts_disconnected_with_nothing() {
     let mock = Mock::new(open_room());
     let m = manager(&mock);
-    assert_eq!(m.status(), Status::Disconnected);
+    assert_eq!(
+        m.status(),
+        Status::Disconnected(DisconnectCause::NeverJoined),
+        "a manager that was never joined says so, rather than a bare unit"
+    );
+    assert_eq!(m.own_member_id(), None);
     assert!(m.memberships().is_empty());
     assert!(m.connections().is_empty());
     assert!(m.key_map().is_empty());
@@ -840,6 +864,12 @@ async fn a_member_that_left_while_holding_our_key_stays_left_with_keys_until_the
             .any(|mm| mm.member.user_id == p.user_id)
     })
     .await;
+    // The peer dropping out and the new key coming into use are two steps
+    // (`use_key_delay_ms` sits between them), so wait for the second.
+    wait_for("our new key in use", || {
+        m.key_map().values().any(|ring| ring.len() == 2)
+    })
+    .await;
     let map = m.key_map();
     let own = map
         .values()
@@ -861,7 +891,10 @@ async fn a_rejoin_in_the_same_process_distributes_a_key_to_the_incumbent() {
     wait_for("first key", || mock.to_device_sends().len() == 1).await;
     m.leave(None).await.unwrap();
     assert!(m.key_map().is_empty(), "leaving forgets every key");
-    assert_eq!(m.status(), Status::Disconnected);
+    assert_eq!(
+        m.status(),
+        Status::Disconnected(DisconnectCause::LeftByHost { reason: None })
+    );
 
     m.join(receive_only(), params()).await.unwrap();
     wait_for("second key", || mock.to_device_sends().len() == 2).await;
@@ -904,7 +937,12 @@ async fn leave_sends_the_leave_then_cancels_the_delay_and_clears_everything() {
     };
     assert_eq!(content["leave_reason"]["code"], "m.user_hangup");
     assert!(matches!(&calls[leave_at + 1], Call::Cancel(_)));
-    assert_eq!(m.status(), Status::Disconnected);
+    assert_eq!(
+        m.status(),
+        Status::Disconnected(DisconnectCause::LeftByHost {
+            reason: Some(LeaveReason::new("m.user_hangup", None))
+        })
+    );
     assert!(m.key_map().is_empty());
     assert!(m.connections().is_empty());
     // Our echoed leave removed us from the roster.
@@ -918,7 +956,12 @@ async fn a_slot_closed_under_us_ends_the_participation() {
     m.join(publish(), params()).await.unwrap();
     wait_for("own key", || m.key_map().len() == 1).await;
     mock.emit_state_update(vec![slot_event("closed", true)]);
-    wait_for("left", || m.status() == Status::Disconnected).await;
+    // The slot closing under us is a *different* disconnect from our own
+    // leave, and the crate already knew which — it just never said.
+    wait_for("left", || {
+        m.status() == Status::Disconnected(DisconnectCause::SlotClosed)
+    })
+    .await;
     let leave = mock
         .sticky_sends()
         .into_iter()
@@ -1009,7 +1052,10 @@ async fn a_homeserver_without_delayed_events_still_lets_us_join_with_a_short_mem
         })
     ));
     match m.status() {
-        Status::Connected(c) => assert!(!c.own_membership.delayed_leave_supported),
+        Status::Connected(c) => assert!(matches!(
+            c.own_membership.keep_alive,
+            own_membership::KeepAlive::Unavailable { .. }
+        )),
         other => panic!("{other:?}"),
     }
 }
@@ -1063,7 +1109,10 @@ async fn slot_administration_sends_slot_state() {
     let mock = Mock::new(vec![]);
     let m = manager(&mock);
     assert!(
-        m.open_slot("m.whiteboard", false).await.is_err(),
+        matches!(
+            m.open_slot("m.whiteboard", false).await,
+            Err(matrix_rtc::participation::SlotError::InvalidSlotId(_))
+        ),
         "slot id must start with the application type"
     );
     m.open_slot("m.call", true).await.unwrap();
@@ -1105,4 +1154,310 @@ async fn dropping_the_manager_stops_every_pump_and_releases_the_driver() {
         EventOrigin::Unknown,
     );
     assert!(mock.room_events.lock().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Failure reporting
+// ---------------------------------------------------------------------------
+
+/// **The regression this whole design exists to prevent.**
+///
+/// A failing delayed-leave restart used to mutate no observable field —
+/// `last_restart_ms` moved only on success — so the single most important
+/// "you are about to be kicked out of the call" condition fired *no callback
+/// at all* and could only be found by a host polling and diffing timestamps
+/// on its own timer (`ErrorSurfaceAnalysis.md` §3.1).
+#[tokio::test]
+async fn a_failing_keep_alive_restart_fires_on_status_change_and_clears_when_it_recovers() {
+    let mock = Mock::new(open_room());
+    let m = ParticipationManager::new(
+        ROOM.into(),
+        SLOT.into(),
+        OwnIdentity {
+            user_id: ME.into(),
+            device_id: MY_DEVICE.into(),
+        },
+        mock.clone(),
+        config(ElementCallCompat::Off),
+    );
+    // A short delay so the restart beat (delay / 3) lands inside the test.
+    let params = JoinParams {
+        sticky_duration_ms: 240_000,
+        keep_alive_timeout_ms: 300,
+        ..JoinParams::new("m.call")
+    };
+    m.join(receive_only(), params).await.unwrap();
+    wait_for("connected", || matches!(m.status(), Status::Connected(_))).await;
+
+    // Only *after* joining, so the counter cannot catch join-time churn.
+    let fired: Arc<Mutex<Vec<Vec<Impairment>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = fired.clone();
+    m.on_status_change(Box::new(move |status| {
+        sink.lock().unwrap().push(status.impairments().to_vec());
+    }));
+
+    mock.fail_restart.store(true, Ordering::Relaxed);
+    wait_for("a status change naming the failing restart", || {
+        fired.lock().unwrap().iter().any(|i| {
+            i.iter()
+                .any(|i| matches!(i, Impairment::KeepAliveRestartFailing { .. }))
+        })
+    })
+    .await;
+
+    // The structured state says the same thing, with the deadline a UI
+    // renders a countdown from.
+    let Status::Connected(c) = m.status() else {
+        panic!("still connected")
+    };
+    let own_membership::KeepAlive::RestartFailing {
+        since_ts,
+        fires_at_ts,
+        last_error,
+    } = &c.own_membership.keep_alive
+    else {
+        panic!(
+            "expected RestartFailing, got {:?}",
+            c.own_membership.keep_alive
+        )
+    };
+    assert!(*fires_at_ts > *since_ts);
+    assert!(last_error.contains("503"), "{last_error}");
+    assert_eq!(
+        c.impairments
+            .iter()
+            .filter(|i| i.severity() == Severity::Critical)
+            .count(),
+        1
+    );
+
+    // And it is not terminal: one successful restart clears both.
+    mock.fail_restart.store(false, Ordering::Relaxed);
+    wait_for("recovery", || {
+        matches!(
+            m.status(),
+            Status::Connected(c)
+                if matches!(c.own_membership.keep_alive, own_membership::KeepAlive::Armed { .. })
+                    && c.impairments.is_empty()
+        )
+    })
+    .await;
+}
+
+/// The impairment vec is compared by `PartialEq` to decide whether to
+/// publish, so a stable condition must not keep firing the callback.
+#[tokio::test]
+async fn a_steady_impairment_does_not_flap_the_status_callback() {
+    let mock = Mock::new(open_room());
+    mock.fail_token.store(true, Ordering::Relaxed);
+    let m = manager(&mock);
+    m.join(receive_only(), params()).await.unwrap();
+    // A peer publishing on a connection we cannot mint a token for.
+    let p = peer(1);
+    mock.add_peer(p.clone());
+    mock.peer_joins(&p);
+    wait_for("an unreachable connection", || {
+        m.status()
+            .impairments()
+            .iter()
+            .any(|i| matches!(i, Impairment::ConnectionUnavailable { .. }))
+    })
+    .await;
+    assert_eq!(
+        m.connection_problems().len(),
+        1,
+        "and it is nameable on its own"
+    );
+    assert!(
+        m.connections().is_empty(),
+        "the connection itself stays absent"
+    );
+
+    let count = Arc::new(AtomicU64::new(0));
+    let sink = count.clone();
+    m.on_status_change(Box::new(move |_| {
+        sink.fetch_add(1, Ordering::Relaxed);
+    }));
+    // Several mint retries pass; the condition is unchanged, so nothing new
+    // is published (the keep-alive beat is 60 s out with these params).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        0,
+        "an unchanged impairment must not republish"
+    );
+
+    // It clears once a mint succeeds — no impairment is terminal.
+    mock.fail_token.store(false, Ordering::Relaxed);
+    wait_for("recovery", || {
+        m.connection_problems().is_empty() && m.connections().len() == 1
+    })
+    .await;
+}
+
+/// §4.1: "why can't I hear Bob?" is computed, typed — and used to be thrown
+/// away. It must reach the tile, the impairment list, and the callback.
+#[tokio::test]
+async fn a_rejected_media_key_reaches_the_tile_the_impairments_and_the_callback() {
+    let mock = Mock::new(encrypted_room());
+    let m = manager(&mock);
+    let rejected: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = rejected.clone();
+    m.on_key_rejected(Box::new(move |member_id, why| {
+        sink.lock()
+            .unwrap()
+            .push((member_id.to_owned(), why.to_string()));
+    }));
+    m.join(receive_only(), params()).await.unwrap();
+
+    let p = peer(1);
+    mock.peer_joins(&p);
+    wait_for("the peer's tile", || m.memberships().len() == 2).await;
+    // Their key arrives in cleartext: discarded, and we are left deaf.
+    mock.emit_to_device(ToDeviceMessage {
+        event_type: "m.rtc.encryption_key".into(),
+        sender: p.user_id.clone(),
+        content: json!({
+            "room_id": ROOM,
+            "member_id": p.member_id,
+            "media_key": { "index": 0, "key": STANDARD_NO_PAD.encode(&p.key) },
+            "format": 0,
+        }),
+        origin: EventOrigin::Cleartext,
+        sender_cross_signed: Some(true),
+    });
+
+    wait_for("the rejection on the tile", || {
+        m.memberships().iter().any(|t| {
+            t.member.member_id == p.member_id
+                && t.media_key.as_ref().is_some_and(|k| k.rejection.is_some())
+        })
+    })
+    .await;
+    assert_eq!(
+        rejected.lock().unwrap()[0].0,
+        p.member_id,
+        "the callback names the member"
+    );
+    let tile = m
+        .memberships()
+        .into_iter()
+        .find(|t| t.member.member_id == p.member_id)
+        .unwrap();
+    let key = tile.media_key.unwrap();
+    assert!(!key.have_their_key, "we cannot decrypt them");
+    assert!(
+        m.status().impairments().iter().any(|i| matches!(
+            i,
+            Impairment::MediaKeyRejected { member_id, .. } if *member_id == p.member_id
+        )),
+        "and it is in the impairment list too"
+    );
+
+    // A good key from the same member clears both the tile and the list.
+    mock.add_peer(p.clone());
+    mock.peer_sends_key(&p, 0);
+    wait_for("recovery", || {
+        m.memberships().iter().any(|t| {
+            t.member.member_id == p.member_id
+                && t.media_key
+                    .as_ref()
+                    .is_some_and(|k| k.have_their_key && k.rejection.is_none())
+        }) && !m
+            .status()
+            .impairments()
+            .iter()
+            .any(|i| matches!(i, Impairment::MediaKeyRejected { .. }))
+    })
+    .await;
+}
+
+/// §1.2: a failed slot read leaves the encryption decision *unknown*, not
+/// "no" — and the join that went ahead on it is recorded.
+#[tokio::test]
+async fn a_failed_seed_read_is_reported_and_cleared_by_a_live_update() {
+    let mock = Mock::new(open_room());
+    mock.fail_slot_read.store(true, Ordering::Relaxed);
+    let m = manager(&mock);
+    wait_for("the seed", || m.session().seeded).await;
+    assert_eq!(
+        m.session().failed_reads,
+        vec![matrix_rtc::session::SessionRead::Slot]
+    );
+    assert_eq!(
+        m.session().slot_state,
+        None,
+        "unknown, which without failed_reads is indistinguishable from absent"
+    );
+    m.join(receive_only(), params()).await.unwrap();
+    assert!(
+        m.status()
+            .impairments()
+            .iter()
+            .any(|i| matches!(i, Impairment::SessionStateUnread { .. }))
+    );
+
+    // A live state update supplies the slot after all.
+    mock.emit_state_update(vec![slot_event("open", false)]);
+    wait_for("recovery", || {
+        m.session().failed_reads.is_empty()
+            && !m
+                .status()
+                .impairments()
+                .iter()
+                .any(|i| matches!(i, Impairment::SessionStateUnread { .. }))
+    })
+    .await;
+}
+
+/// §3.4: the member id the facade minted and never handed back — every
+/// self-referential check needs it, and `(user_id, device_id)` is not a
+/// substitute.
+#[tokio::test]
+async fn own_member_id_and_own_membership_identify_us() {
+    let mock = Mock::new(open_room());
+    let m = manager(&mock);
+    assert_eq!(m.own_member_id(), None);
+    m.join(publish(), params()).await.unwrap();
+    let id = m.own_member_id().expect("joined");
+    wait_for("our echo", || m.own_membership().is_some()).await;
+    let ours = m.own_membership().unwrap();
+    assert_eq!(ours.member.member_id, id);
+    assert_eq!(ours.member.user_id, ME);
+    assert_eq!(
+        ours.transport_identity,
+        Some(participant_identity(ME, MY_DEVICE, &id))
+    );
+
+    // A rejoin mints a fresh id while (user_id, device_id) stays the same.
+    m.leave(None).await.unwrap();
+    assert_eq!(m.own_member_id(), None);
+    m.join(publish(), params()).await.unwrap();
+    assert_ne!(m.own_member_id(), Some(id));
+}
+
+/// §2: a join that fails says how far it got, instead of resetting the
+/// progress flags and leaving `Disconnected` a bare unit.
+#[tokio::test]
+async fn a_failed_join_is_disconnected_with_the_cause_and_the_progress() {
+    let mock = Mock::new(open_room());
+    mock.fail_token.store(true, Ordering::Relaxed);
+    let m = manager(&mock);
+    let error = m.join(publish(), params()).await.unwrap_err();
+    assert!(
+        matches!(error, own_membership::JoinError::TokenRefused(_)),
+        "a token refusal is not the same story as no transport at all: {error}"
+    );
+    let Status::Disconnected(DisconnectCause::JoinFailed {
+        progress, error, ..
+    }) = m.status()
+    else {
+        panic!("expected JoinFailed, got {:?}", m.status())
+    };
+    assert!(matches!(error, own_membership::JoinError::TokenRefused(_)));
+    assert!(progress.has_fetched_transports);
+    assert!(
+        !progress.has_created_transport_token,
+        "we know which step failed"
+    );
 }

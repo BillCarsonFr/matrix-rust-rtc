@@ -65,7 +65,7 @@ describe("own membership", () => {
     expect(kinds[leaveAt + 1]).toBe("cancelDelayed");
     const leave = driver.outbound[leaveAt] as Extract<(typeof driver.outbound)[number], { kind: "stickyEvent" }>;
     expect(leave.content.leave_reason).toEqual({ code: "m.user_hangup", reason: "done" });
-    expect(manager.status()).toBe(FfiStatus.Disconnected);
+    expect(FfiStatus.Disconnected.instanceOf(manager.status())).toBe(true);
     // our echoed leave took us out of the roster
     expect(manager.memberships().some((m) => m.member.userId === OWN_USER_ID)).toBe(false);
   });
@@ -83,7 +83,7 @@ describe("own membership", () => {
     const { driver, manager } = newManager();
     await manager.join(receiveOnly(), joinParams);
     driver.emitStateUpdate([slotClosedEvent()]);
-    await waitFor("left", () => manager.status() === FfiStatus.Disconnected);
+    await waitFor("left", () => FfiStatus.Disconnected.instanceOf(manager.status()));
     const leave = driver.calls("stickyEvent").find((c) => c.content.member?.membership === "leave");
     expect(leave?.content.leave_reason.code).toBe("slot_closed");
     expect(driver.calls("cancelDelayed")).toHaveLength(1);
@@ -94,7 +94,7 @@ describe("own membership", () => {
     driver.refuseDelayedEvents = true;
     await manager.join(receiveOnly(), joinParams);
     expect(driver.calls("stickyEvent")[0].durationMs).toBe(300_000n);
-    expect(manager.status()).toBe(FfiStatus.Connected);
+    expect(FfiStatus.Connected.instanceOf(manager.status())).toBe(true);
   });
 
   it("the publishing transport appears in connections() right after join resolves", async () => {

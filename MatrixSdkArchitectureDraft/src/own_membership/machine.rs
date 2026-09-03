@@ -4,13 +4,17 @@
 //! (restart cadence, half-life refresh, "must have fired", re-probe,
 //! self-heal, delegation fallback) is a unit test below.
 
+use super::ResolveTransportError;
 use super::wire::{self, Route, WireContext};
 use super::{
-    ConnectedStatus, DEFAULT_DEGRADED_LIFETIME_MS, JoinError, JoinParams, JoinStatus, LeaveError,
-    LeaveStatus, MAX_STICKY_DURATION_MS, OwnIdentity, Status,
+    ConnectedStatus, DEFAULT_DEGRADED_LIFETIME_MS, DelayedLeaveOutcome, JoinError, JoinParams,
+    JoinStatus, KeepAlive, LeaveError, LeaveStatus, MAX_STICKY_DURATION_MS, MembershipPublication,
+    OwnIdentity, RosterPresence, Status,
 };
 use crate::driver::{DriverError, SendEventResponse};
-use crate::session::{ElementCallCompat, LEGACY_SLOT_ID, SessionSnapshot, SlotState};
+use crate::session::{
+    ElementCallCompat, JoinExclusionReason, LEGACY_SLOT_ID, SessionSnapshot, SlotState,
+};
 use crate::types::{
     DeviceAttribution, LeaveReason, Member, MemberTransports, RtcTransport, TransportIntent,
 };
@@ -79,7 +83,7 @@ pub(crate) enum Action {
 
 #[derive(Debug)]
 pub(crate) enum Outcome {
-    TransportResolved(Result<RtcTransport, DriverError>),
+    TransportResolved(Result<RtcTransport, ResolveTransportError>),
     DelayedArmed(Result<String, DriverError>),
     MembershipSent {
         kind: SendKind,
@@ -148,6 +152,22 @@ impl DelayedLeave {
     fn must_have_fired(&self, now: u64) -> bool {
         now.saturating_sub(self.last_restart_ms) > self.timeout_ms
     }
+
+    /// The first instant [`Self::must_have_fired`] is true for a restart at
+    /// `last_restart_ms` — what the wake schedule and `fires_at_ts` use.
+    fn expires_at(&self, last_restart_ms: u64) -> u64 {
+        last_restart_ms + self.timeout_ms + 1
+    }
+}
+
+/// The armed delay is gone because its period elapsed: record it so
+/// `status()` can project [`super::KeepAlive::Expired`], and drop the id (a
+/// fired delay cannot be restarted). A replacement is armed by the caller.
+fn note_expired(c: &mut Connected, now: u64) {
+    c.delayed = None;
+    c.keep_alive_expired_since = Some(now);
+    // Superseded: "we are probably out" is the stronger statement.
+    c.keep_alive_failing_since = None;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -169,6 +189,12 @@ struct Joining {
     reply: Option<oneshot::Sender<Result<(), JoinError>>>,
 }
 
+/// While connected, everything that can go *wrong* and later come right
+/// again is state, not a log line: a failing restart, a failing refresh, a
+/// membership that vanished from the roster. `status()` is a pure projection
+/// over these fields, so the moment one of them changes the facade's
+/// `on_status_change` fires — which is the whole point (a failing keep-alive
+/// used to mutate nothing observable, see `ErrorSurfaceAnalysis.md` §3.1).
 struct Connected {
     plan: JoinPlan,
     delayed: Option<DelayedLeave>,
@@ -179,6 +205,29 @@ struct Connected {
     /// the echo still in flight, not a vanished membership.
     seen_in_roster: bool,
     healed_at: Option<u64>,
+    /// Start of the current *run* of failing restarts — set on the first
+    /// failure, cleared by the first success, so a UI can say "failing for
+    /// 12 s" instead of "failed once, some time".
+    keep_alive_failing_since: Option<u64>,
+    last_restart_error: Option<String>,
+    /// The delay's full period elapsed with no successful restart, so the
+    /// homeserver has in all likelihood published our leave already and a
+    /// replacement is being armed. Cleared when one is.
+    keep_alive_expired_since: Option<u64>,
+    /// Start of the current run of failing sticky refreshes; follows
+    /// `refresh_retry_at`.
+    refresh_failing_since: Option<u64>,
+    last_refresh_error: Option<String>,
+    /// Our membership was in the roster and is not any more: right now
+    /// nobody sees us.
+    roster_missing_since: Option<u64>,
+    /// When the self-heal re-sent the membership; we are awaiting its echo.
+    roster_republished_at: Option<u64>,
+    /// The membership is on the server but the session refuses to project
+    /// it. The self-heal deliberately does not fix this (see
+    /// [`Machine::heal_if_vanished`]) — only the room state that caused the
+    /// exclusion changing can.
+    roster_excluded: Option<JoinExclusionReason>,
 }
 
 struct Leaving {
@@ -203,6 +252,10 @@ pub(crate) struct Machine {
     /// Persists across joins of this manager.
     support: DelayedLeaveSupport,
     snapshot: Option<SessionSnapshot>,
+    /// The step-by-step flags of the last aborted join, kept because
+    /// `abort_join` resets the state and the facade reports them as
+    /// `DisconnectCause::JoinFailed { progress, .. }`.
+    last_join_progress: JoinStatus,
 }
 
 impl Machine {
@@ -220,6 +273,7 @@ impl Machine {
             state: State::NotJoined,
             support: DelayedLeaveSupport::Unknown,
             snapshot: None,
+            last_join_progress: JoinStatus::default(),
         }
     }
 
@@ -249,6 +303,10 @@ impl Machine {
             && c.delegated_at.is_none()
         {
             candidates.push(d.next_restart_at);
+            // The instant the delay *must* have fired. Without it the
+            // transition to `KeepAlive::Expired` would only be noticed at
+            // the next restart beat, i.e. up to a third of the delay late.
+            candidates.push(d.expires_at(d.last_restart_ms));
         }
         if c.delayed.is_none()
             && let Some(probe) = self.probe_due_at()
@@ -262,7 +320,7 @@ impl Machine {
         match &self.state {
             State::NotJoined => Status::NotJoined,
             State::Joining(j) => Status::Joining(j.flags),
-            State::Connected(c) => Status::Connected(Self::connected_status(c)),
+            State::Connected(c) => Status::Connected(self.connected_status(c)),
             State::Leaving(l) => Status::Leaving(l.flags),
         }
     }
@@ -293,18 +351,65 @@ impl Machine {
         })
     }
 
-    fn connected_status(c: &Connected) -> ConnectedStatus {
-        let kick = match (&c.delayed, c.delegated_at) {
-            (Some(d), Some(delegated_at)) => Some(delegated_at + d.timeout_ms),
-            (Some(d), None) => Some(d.last_restart_ms + d.timeout_ms),
-            (None, _) => None,
-        };
+    /// A **pure projection** of [`Connected`] — no clock, no inference. In
+    /// particular the `Armed -> Expired` transition is performed by
+    /// [`Self::on_wake`] (which does have a `now`) and merely *read* here;
+    /// deducing it from a clock inside `status()` would make the value
+    /// depend on when it was asked for rather than on what happened.
+    fn connected_status(&self, c: &Connected) -> ConnectedStatus {
         ConnectedStatus {
-            delayed_event_kick_ts: kick,
-            heartbeat_last_restart_ts: c.delayed.as_ref().map(|d| d.last_restart_ms),
-            delegation_setup_ts: c.delegated_at,
-            delayed_leave_supported: c.delayed.is_some(),
-            membership_lifetime_ms: c.plan.published_lifetime_ms,
+            keep_alive: self.keep_alive_status(c),
+            membership: MembershipPublication {
+                lifetime_ms: c.plan.published_lifetime_ms,
+                last_published_ts: c.sticky_sent_at,
+                expires_at_ts: c.sticky_sent_at + c.plan.published_lifetime_ms,
+                refresh_failing_since_ts: c.refresh_failing_since,
+                last_refresh_error: c.last_refresh_error.clone(),
+            },
+            roster: match (c.roster_excluded, c.roster_missing_since, c.seen_in_roster) {
+                (Some(reason), _, _) => RosterPresence::Excluded { reason },
+                (None, Some(since_ts), _) => RosterPresence::Missing {
+                    since_ts,
+                    republished_at_ts: c.roster_republished_at,
+                },
+                (None, None, true) => RosterPresence::Present,
+                (None, None, false) => RosterPresence::AwaitingEcho,
+            },
+        }
+    }
+
+    fn keep_alive_status(&self, c: &Connected) -> KeepAlive {
+        match (&c.delayed, c.delegated_at) {
+            // Delegated first: after delegation we stop restarting on
+            // purpose, so none of the failure states can apply.
+            (Some(d), Some(delegated_at_ts)) => KeepAlive::Delegated {
+                delegated_at_ts,
+                earliest_fire_ts: delegated_at_ts + d.timeout_ms,
+            },
+            (Some(d), None) => match (&c.keep_alive_failing_since, &c.last_restart_error) {
+                (Some(since_ts), last_error) => KeepAlive::RestartFailing {
+                    since_ts: *since_ts,
+                    fires_at_ts: d.last_restart_ms + d.timeout_ms,
+                    last_error: last_error.clone().unwrap_or_default(),
+                },
+                (None, _) => KeepAlive::Armed {
+                    delay_ms: d.timeout_ms,
+                    last_restart_ts: d.last_restart_ms,
+                    fires_at_ts: d.last_restart_ms + d.timeout_ms,
+                },
+            },
+            (None, _) => match c.keep_alive_expired_since {
+                Some(since_ts) => KeepAlive::Expired { since_ts },
+                // The tri-state the homeserver taught us, which used to
+                // reach nothing but `debug_snapshot` (analysis §3.8).
+                None => {
+                    let next_probe_ts = self.probe_due_at();
+                    KeepAlive::Unavailable {
+                        permanent: next_probe_ts.is_none(),
+                        next_probe_ts,
+                    }
+                }
+            },
         }
     }
 
@@ -550,6 +655,14 @@ impl Machine {
             },
             seen_in_roster: false,
             healed_at: None,
+            keep_alive_failing_since: None,
+            last_restart_error: None,
+            keep_alive_expired_since: None,
+            refresh_failing_since: None,
+            last_refresh_error: None,
+            roster_missing_since: None,
+            roster_republished_at: None,
+            roster_excluded: None,
         });
         // The slot may have closed while we were joining.
         if self.slot_closed() {
@@ -559,9 +672,14 @@ impl Machine {
         }
     }
 
+    pub(crate) fn last_join_progress(&self) -> JoinStatus {
+        self.last_join_progress
+    }
+
     fn abort_join(&mut self, joining: Joining, error: JoinError) -> Vec<Action> {
         let mut joining = joining;
         log::warn!("[{}/{}] join failed: {error}", self.room_id, self.slot_id);
+        self.last_join_progress = joining.flags;
         if let Some(reply) = joining.reply.take() {
             let _ = reply.send(Err(error));
         }
@@ -659,6 +777,11 @@ impl Machine {
         let id = &c.plan.member.member_id;
         if snapshot.members.iter().any(|m| &m.member_id == id) {
             c.seen_in_roster = true;
+            // Present: every roster complaint clears at once, including the
+            // echo we were waiting for after a heal.
+            c.roster_missing_since = None;
+            c.roster_republished_at = None;
+            c.roster_excluded = None;
             return Vec::new();
         }
         if let Some((_, reason)) = snapshot
@@ -670,9 +793,23 @@ impl Machine {
                 "[{}] our membership {id} is excluded from the session: {reason:?}",
                 self.room_id
             );
+            // Excluded is *not* missing: the event is on the server and
+            // re-sending it would change nothing, so it gets its own state
+            // (and its own impairment) with a different remedy.
+            c.roster_excluded = Some(*reason);
+            c.roster_missing_since = None;
+            c.roster_republished_at = None;
             return Vec::new();
         }
-        if !SELF_HEAL || !c.seen_in_roster || !seeded {
+        c.roster_excluded = None;
+        if !c.seen_in_roster || !seeded {
+            // Never seen yet: the echo is still in flight, not a vanishing.
+            return Vec::new();
+        }
+        // Vanished. Recorded whether or not the self-heal is allowed to act,
+        // because "right now nobody sees us" is true either way.
+        c.roster_missing_since.get_or_insert(now);
+        if !SELF_HEAL {
             return Vec::new();
         }
         if c.healed_at
@@ -685,12 +822,13 @@ impl Machine {
             self.room_id
         );
         c.healed_at = Some(now);
+        c.roster_republished_at = Some(now);
         let mut actions = vec![Action::SendMembership {
             route: self.membership_route(&c.plan, &c.plan.join_content, now),
             kind: SendKind::Heal,
         }];
-        if c.delayed.as_ref().is_some_and(|d| d.must_have_fired(now)) {
-            c.delayed = None;
+        if c.delegated_at.is_none() && c.delayed.as_ref().is_some_and(|d| d.must_have_fired(now)) {
+            note_expired(c, now);
             actions.push(self.arm_action(&c.plan, now));
         }
         actions
@@ -699,6 +837,26 @@ impl Machine {
     // ---- heartbeat ---------------------------------------------------------
 
     fn on_wake(&mut self, now: u64) -> Vec<Action> {
+        // The one place the `KeepAlive::Expired` transition happens.
+        // `status()` has no clock and must stay a pure projection, so the
+        // pump's wake — scheduled for exactly this instant by
+        // `next_wake_ts` — is what turns "armed" into "expired".
+        // `delegated_at` guards the footgun of analysis §3.1: after
+        // delegation we deliberately stop restarting, so a frozen
+        // `last_restart_ms` is health, not expiry.
+        if let State::Connected(c) = &mut self.state
+            && c.delegated_at.is_none()
+            && c.delayed.as_ref().is_some_and(|d| d.must_have_fired(now))
+        {
+            log::warn!(
+                "[{}] the delayed leave outlived its {}ms delay with no successful restart; it fired — arming a replacement",
+                self.room_id,
+                c.delayed.as_ref().expect("checked").timeout_ms
+            );
+            note_expired(c, now);
+            // Falls through: with no delay armed and the homeserver known to
+            // accept them, the body below arms the replacement.
+        }
         let State::Connected(c) = &self.state else {
             return Vec::new();
         };
@@ -760,7 +918,7 @@ impl Machine {
                 actions
             }
             (JoinStage::Resolving, Outcome::TransportResolved(Err(e))) => {
-                self.abort_join(joining, JoinError::TransportUnavailable(e))
+                self.abort_join(joining, e.into())
             }
             (JoinStage::Arming, Outcome::DelayedArmed(result)) => {
                 let plan = joining.plan.as_mut().expect("plan exists while arming");
@@ -860,6 +1018,11 @@ impl Machine {
                     d.last_restart_ms = now;
                     d.next_restart_at = now + d.timeout_ms / RESTARTS_PER_TIMEOUT;
                 }
+                // The dead man's switch is healthy again: clearing these is
+                // half of what makes the failure observable at all (the
+                // other half is setting them below).
+                c.keep_alive_failing_since = None;
+                c.last_restart_error = None;
                 Vec::new()
             }
             Outcome::Restarted(Err(e)) => {
@@ -867,19 +1030,25 @@ impl Machine {
                     return Vec::new();
                 };
                 d.next_restart_at = now + d.timeout_ms / RESTARTS_PER_TIMEOUT;
-                if d.must_have_fired(now) {
+                let fired = d.must_have_fired(now);
+                // Recorded *before* anything else: this is the mutation that
+                // turns a failing restart from a log line into a published
+                // status change (`ErrorSurfaceAnalysis.md` §3.1). Set once
+                // per run of failures, so the timestamp means "failing
+                // since", not "failed last at".
+                c.keep_alive_failing_since.get_or_insert(now);
+                c.last_restart_error = Some(e.to_string());
+                if fired {
                     log::warn!(
-                        "[{room_id}] delayed leave {} was not restarted for longer than its {}ms delay; it fired — arming a replacement",
-                        d.delay_id,
-                        d.timeout_ms
+                        "[{room_id}] delayed leave was not restarted for longer than its delay; it fired — arming a replacement"
                     );
-                    c.delayed = None;
+                    note_expired(c, now);
                     let plan = c.plan.clone();
                     return vec![self.arm_action(&plan, now)];
                 }
                 log::warn!(
                     "[{room_id}] failed to restart delayed leave {} ({e}); retrying on the next beat",
-                    d.delay_id
+                    c.delayed.as_ref().expect("still armed").delay_id
                 );
                 Vec::new()
             }
@@ -895,12 +1064,20 @@ impl Machine {
                     c.plan.keep_alive_timeout_ms,
                     now,
                 ));
+                // A replacement is armed: neither "expired" nor "failing"
+                // is true any more.
+                c.keep_alive_expired_since = None;
+                c.keep_alive_failing_since = None;
+                c.last_restart_error = None;
                 Vec::new()
             }
             Outcome::DelayedArmed(Err(e)) => {
                 log::warn!("[{room_id}] failed to arm a delayed leave: {e}");
                 self.support = classify_refusal(&e, now);
                 c.delayed = None;
+                // No switch armed at all now: `Unavailable`, which carries
+                // the refusal's permanence, replaces `Expired`.
+                c.keep_alive_expired_since = None;
                 Vec::new()
             }
             Outcome::MembershipSent {
@@ -909,6 +1086,8 @@ impl Machine {
             } => {
                 c.sticky_sent_at = now;
                 c.refresh_retry_at = None;
+                c.refresh_failing_since = None;
+                c.last_refresh_error = None;
                 Vec::new()
             }
             Outcome::MembershipSent {
@@ -917,6 +1096,11 @@ impl Machine {
             } => {
                 log::warn!("[{room_id}] failed to refresh the membership ({e}); retrying soon");
                 c.refresh_retry_at = Some(now + (c.plan.published_lifetime_ms / 10).max(1_000));
+                // Follows `refresh_retry_at` exactly: while a retry is
+                // pending the publication is failing, and the host can read
+                // how long it has been and against what expiry.
+                c.refresh_failing_since.get_or_insert(now);
+                c.last_refresh_error = Some(e.to_string());
                 Vec::new()
             }
             other => {
@@ -966,13 +1150,18 @@ impl Machine {
                 Vec::new()
             }
             Outcome::Cancelled(result) => {
-                if let Err(e) = result {
-                    log::debug!(
-                        "[{}] delayed leave could not be cancelled ({e}); it most likely fired already",
-                        self.room_id
-                    );
-                }
-                leaving.flags.delayed_leave_settled = true;
+                // Either way the leave is done — but say which, so a host
+                // knows whether a stray delayed event may still land.
+                leaving.flags.delayed_leave = Some(match result {
+                    Ok(()) => DelayedLeaveOutcome::Cancelled,
+                    Err(e) => {
+                        log::debug!(
+                            "[{}] delayed leave could not be cancelled ({e}); it most likely fired already",
+                            self.room_id
+                        );
+                        DelayedLeaveOutcome::MayStillFire
+                    }
+                });
                 leaving.connected.delayed = None;
                 self.finish_leave(leaving)
             }
@@ -1172,6 +1361,32 @@ mod tests {
         }
     }
 
+    // -- refusal classification -------------------------------------------------
+
+    /// `RateLimited` is explicitly transient: a homeserver that throttles us
+    /// once must still be re-probed, or one busy minute would cost us the
+    /// dead man's switch for the rest of the participation.
+    #[test]
+    fn only_unsupported_and_unauthorized_are_permanent_refusals() {
+        let permanent = |e: &DriverError| {
+            matches!(
+                classify_refusal(e, T0),
+                DelayedLeaveSupport::Unsupported {
+                    permanent: true,
+                    ..
+                }
+            )
+        };
+        assert!(permanent(&DriverError::Unsupported("404".into())));
+        assert!(permanent(&DriverError::Unauthorized("403".into())));
+        assert!(!permanent(&DriverError::Http("503".into())));
+        assert!(!permanent(&DriverError::RateLimited {
+            retry_after_ms: Some(2_000)
+        }));
+        assert!(!permanent(&DriverError::Stopped));
+        assert!(!permanent(&DriverError::Other("?".into())));
+    }
+
     // -- join ------------------------------------------------------------------
 
     #[test]
@@ -1336,20 +1551,36 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_resolver_returns_to_not_joined_with_transport_unavailable() {
+    fn a_failed_resolver_returns_to_not_joined_keeping_which_step_failed() {
+        // Discovery and token minting are different stories with different
+        // remedies, and the abort keeps how far the join got.
         let mut h = H::new(ElementCallCompat::Off);
         let (_, mut rx) = h.join(TransportIntent::Publish(lk()), params(), T0);
         let a = h.outcome(
-            Outcome::TransportResolved(Err(DriverError::Http("503".into()))),
+            Outcome::TransportResolved(Err(ResolveTransportError::TokenRefused(
+                DriverError::Http("503".into()),
+            ))),
             T0,
         );
         assert!(a.is_empty());
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(Err(JoinError::TransportUnavailable(_)))
-        ));
+        assert!(matches!(rx.try_recv(), Ok(Err(JoinError::TokenRefused(_)))));
         assert_eq!(h.m.status(), Status::NotJoined);
         assert_eq!(h.m.next_wake_ts(), None);
+        assert!(
+            h.m.last_join_progress().has_fetched_transports,
+            "the progress flags survive the abort"
+        );
+        assert!(!h.m.last_join_progress().has_created_transport_token);
+
+        let mut h = H::new(ElementCallCompat::Off);
+        let (_, mut rx) = h.join(TransportIntent::Publish(lk()), params(), T0);
+        h.outcome(
+            Outcome::TransportResolved(Err(ResolveTransportError::NoTransport(
+                DriverError::Unsupported("none advertised".into()),
+            ))),
+            T0,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Err(JoinError::NoTransport(_)))));
     }
 
     #[test]
@@ -1429,9 +1660,18 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Ok(()))));
         match h.m.status() {
             Status::Connected(c) => {
-                assert!(!c.delayed_leave_supported);
-                assert_eq!(c.membership_lifetime_ms, DEFAULT_DEGRADED_LIFETIME_MS);
-                assert_eq!(c.delayed_event_kick_ts, None);
+                assert_eq!(
+                    c.keep_alive,
+                    KeepAlive::Unavailable {
+                        permanent: true,
+                        next_probe_ts: None
+                    }
+                );
+                assert_eq!(c.membership.lifetime_ms, DEFAULT_DEGRADED_LIFETIME_MS);
+                assert_eq!(
+                    c.membership.expires_at_ts,
+                    T0 + DEFAULT_DEGRADED_LIFETIME_MS
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -1492,9 +1732,9 @@ mod tests {
         h.outcome(Outcome::DelayedArmed(Ok("late".into())), probe_at);
         match h.m.status() {
             Status::Connected(c) => {
-                assert!(c.delayed_leave_supported);
+                assert!(matches!(c.keep_alive, KeepAlive::Armed { .. }));
                 assert_eq!(
-                    c.membership_lifetime_ms, DEFAULT_DEGRADED_LIFETIME_MS,
+                    c.membership.lifetime_ms, DEFAULT_DEGRADED_LIFETIME_MS,
                     "frozen at join"
                 );
             }
@@ -1588,10 +1828,12 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Ok(()))));
         match h.m.status() {
             Status::Connected(c) => {
-                assert_eq!(c.delegation_setup_ts, Some(T0 + 1));
                 assert_eq!(
-                    c.delayed_event_kick_ts,
-                    Some(T0 + 1 + DELEGATION_MIN_DELAY_MS)
+                    c.keep_alive,
+                    KeepAlive::Delegated {
+                        delegated_at_ts: T0 + 1,
+                        earliest_fire_ts: T0 + 1 + DELEGATION_MIN_DELAY_MS,
+                    }
                 );
             }
             other => panic!("{other:?}"),
@@ -1632,13 +1874,10 @@ mod tests {
         );
         assert!(a.is_empty(), "no cancel, no replacement");
         assert!(matches!(rx.try_recv(), Ok(Ok(()))));
-        assert!(matches!(
-            h.m.status(),
-            Status::Connected(ConnectedStatus {
-                delegation_setup_ts: None,
-                ..
-            })
-        ));
+        assert!(
+            matches!(h.m.status(), Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Armed { .. })),
+            "delegation fell back: we keep restarting it ourselves"
+        );
         assert_eq!(
             h.m.next_wake_ts(),
             Some(T0 + 120_000).min(Some(T0 + DELEGATION_MIN_DELAY_MS / 3))
@@ -1718,9 +1957,17 @@ mod tests {
             }]
         );
         h.outcome(Outcome::Restarted(Ok(())), T0 + 5_000);
-        assert!(
-            matches!(h.m.status(), Status::Connected(ConnectedStatus { heartbeat_last_restart_ts: Some(t), delayed_event_kick_ts: Some(k), .. }) if t == T0 + 5_000 && k == T0 + 20_000)
-        );
+        assert!(matches!(
+            h.m.status(),
+            Status::Connected(ConnectedStatus {
+                keep_alive: KeepAlive::Armed {
+                    delay_ms: 15_000,
+                    last_restart_ts,
+                    fires_at_ts
+                },
+                ..
+            }) if last_restart_ts == T0 + 5_000 && fires_at_ts == T0 + 20_000
+        ));
         assert_eq!(h.m.next_wake_ts(), Some(T0 + 10_000));
     }
 
@@ -1740,11 +1987,17 @@ mod tests {
             Outcome::Restarted(Err(DriverError::Http("500".into()))),
             T0 + 10_000,
         );
-        h.m.step(Input::Wake, T0 + 15_001);
-        let a = h.outcome(
+        assert_eq!(h.m.next_wake_ts(), Some(T0 + 15_000), "the third beat");
+        h.m.step(Input::Wake, T0 + 15_000);
+        h.outcome(
             Outcome::Restarted(Err(DriverError::Http("500".into()))),
-            T0 + 15_001,
+            T0 + 15_000,
         );
+        // The expiry instant is itself a wake deadline, so the replacement
+        // is armed the moment the delay must have fired rather than at the
+        // next restart beat (which would be a third of the delay later).
+        assert_eq!(h.m.next_wake_ts(), Some(T0 + 15_001), "the expiry instant");
+        let a = h.m.step(Input::Wake, T0 + 15_001);
         assert!(
             matches!(
                 a[0],
@@ -1763,6 +2016,20 @@ mod tests {
                 delay_id: "delay-2".into()
             }]
         );
+    }
+
+    /// A restart call that hangs past the delay and *then* fails: the
+    /// outcome path must re-arm too, without waiting for the next wake.
+    #[test]
+    fn a_restart_failure_arriving_after_the_delay_elapsed_arms_a_replacement() {
+        let mut h = H::new(ElementCallCompat::Off);
+        h.connected(T0);
+        h.m.step(Input::Wake, T0 + 5_000);
+        let a = h.outcome(
+            Outcome::Restarted(Err(DriverError::Http("timeout".into()))),
+            T0 + 15_001,
+        );
+        assert!(matches!(a[0], Action::ArmDelayedLeave { .. }));
     }
 
     #[test]
@@ -1952,7 +2219,7 @@ mod tests {
             h.m.status(),
             Status::Leaving(LeaveStatus {
                 leave_event_sent: true,
-                delayed_leave_settled: false
+                delayed_leave: None
             })
         ));
         assert_eq!(
@@ -2116,14 +2383,73 @@ mod tests {
         assert_eq!(*content(&a[0]), json!({ "msc4354_sticky_key": "m-1" }));
     }
 
+    /// A cancel that fails still leaves us out of the call (the delay is
+    /// itself a leave), but the host must be able to tell that a stray
+    /// delayed event may still land.
+    #[test]
+    fn a_failed_cancel_still_leaves_but_says_the_delay_may_still_fire() {
+        let mut h = H::new(ElementCallCompat::Off);
+        h.connected(T0);
+        let (_, mut rx) = h.leave(T0 + 1);
+        h.outcome(
+            Outcome::MembershipSent {
+                kind: SendKind::Leave,
+                result: ok_sent(),
+            },
+            T0 + 1,
+        );
+        h.outcome(
+            Outcome::Cancelled(Err(DriverError::Http("404".into()))),
+            T0 + 2,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))), "still a clean leave");
+        assert_eq!(h.m.status(), Status::NotJoined);
+
+        // The clean path says the other thing.
+        let mut h = H::new(ElementCallCompat::Off);
+        h.connected(T0);
+        h.leave(T0 + 1);
+        h.outcome(
+            Outcome::MembershipSent {
+                kind: SendKind::Leave,
+                result: ok_sent(),
+            },
+            T0 + 1,
+        );
+        assert_eq!(
+            h.m.status(),
+            Status::Leaving(LeaveStatus {
+                leave_event_sent: true,
+                delayed_leave: None,
+            })
+        );
+    }
+
     #[test]
     fn status_publishes_only_on_change() {
         // The `watch` publish-on-change relies on `PartialEq`; the status
         // must be stable across inputs that change nothing.
         let mut h = H::new(ElementCallCompat::Off);
         h.connected(T0);
-        let before = h.m.status();
+        // Our echo arriving is a real change (`AwaitingEcho -> Present`)...
+        assert!(matches!(
+            h.m.status(),
+            Status::Connected(ConnectedStatus {
+                roster: RosterPresence::AwaitingEcho,
+                ..
+            })
+        ));
         h.m.step(Input::Session(seeded(vec!["m-1"], None)), T0 + 1);
+        let before = h.m.status();
+        assert!(matches!(
+            before,
+            Status::Connected(ConnectedStatus {
+                roster: RosterPresence::Present,
+                ..
+            })
+        ));
+        // ...but seeing the same roster again is not.
+        h.m.step(Input::Session(seeded(vec!["m-1"], None)), T0 + 2);
         assert_eq!(h.m.status(), before);
         assert!(h.m.debug_json()["delay_id"].is_string());
     }

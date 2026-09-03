@@ -19,10 +19,11 @@ use super::dispatch::{
     ROOM_MEMBER_EVENT_TYPE, SLOT_EVENT_TYPES,
 };
 use super::state::RoomState;
-use super::{ElementCallCompat, SessionConfig, SessionSnapshot};
+use super::{ElementCallCompat, SessionConfig, SessionRead, SessionSnapshot};
 use crate::driver::{RoomEventsDriver, StateKeySelector};
 use crate::executor;
 use crate::types::RawMatrixEvent;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -69,6 +70,10 @@ struct Live {
     clock: Arc<dyn Clock>,
     closed: bool,
     seeded: bool,
+    /// Seed reads that failed. A `BTreeSet` so the published vec is sorted
+    /// and deduplicated without extra work — the snapshot is compared by
+    /// `PartialEq`, and an unstable order would publish on every beat.
+    failed_reads: BTreeSet<SessionRead>,
     pump_waker: Option<Waker>,
 }
 
@@ -86,6 +91,14 @@ impl Live {
                 self.tag()
             );
             return;
+        }
+        // A live update supplying the value a seed read failed to fetch
+        // clears that failure: the condition is enforced again, so claiming
+        // it is unknown would be a stale fact.
+        if !self.failed_reads.is_empty()
+            && let Some(read) = read_of(dispatch::event_type(event))
+        {
+            self.failed_reads.remove(&read);
         }
         let ingest = dispatch::classify(event, &self.config, now);
         self.state.ingest(ingest, now);
@@ -125,6 +138,7 @@ impl Live {
     fn publish(&mut self) {
         let mut snapshot = self.state.project(&self.slot_id);
         snapshot.seeded = self.seeded;
+        snapshot.failed_reads = self.failed_reads.iter().copied().collect();
         let tag = self.tag();
         self.snapshot_tx.send_if_modified(|current| {
             if *current == snapshot {
@@ -160,6 +174,24 @@ impl Live {
             *current = snapshot;
             true
         });
+    }
+}
+
+/// Which seed read an inbound event type supplies, for clearing a recorded
+/// failure. Member events cover both dialects; `None` for types no read
+/// fetches.
+fn read_of(event_type: Option<&str>) -> Option<SessionRead> {
+    let event_type = event_type?;
+    if SLOT_EVENT_TYPES.contains(&event_type) {
+        Some(SessionRead::Slot)
+    } else if event_type == ROOM_ENCRYPTION_EVENT_TYPE {
+        Some(SessionRead::RoomEncryption)
+    } else if event_type == ROOM_MEMBER_EVENT_TYPE {
+        Some(SessionRead::RoomMembers)
+    } else if MEMBER_EVENT_TYPES.contains(&event_type) || event_type == LEGACY_MEMBER_EVENT_TYPE {
+        Some(SessionRead::MemberEvents)
+    } else {
+        None
     }
 }
 
@@ -244,6 +276,7 @@ impl Session {
             clock,
             closed: false,
             seeded: false,
+            failed_reads: BTreeSet::new(),
             pump_waker: None,
         };
         log::info!(
@@ -370,7 +403,10 @@ async fn run(inner: Arc<Mutex<Live>>, driver: Arc<dyn RoomEventsDriver>) {
 }
 
 /// Seed from room state and the recent timeline. Every read failure is
-/// logged and leaves that condition **unenforced**.
+/// logged, leaves that condition **unenforced**, and is recorded in
+/// [`SessionSnapshot::failed_reads`] so a host can tell "we could not find
+/// out" from "there is nothing there" — the difference between rendering
+/// *unknown* and rendering *unencrypted* (`ErrorSurfaceAnalysis.md` §1.2).
 async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
     let (config, tag) = {
         let live = lock(inner);
@@ -381,6 +417,9 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
         let now = live.clock.now_ms();
         live.ingest_batch(events, now);
     };
+    let failed = |read: SessionRead| {
+        lock(inner).failed_reads.insert(read);
+    };
 
     match driver
         .read_state(
@@ -390,9 +429,12 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
         .await
     {
         Ok(events) => ingest(&events),
-        Err(error) => log::warn!(
-            "[{tag}] read_state({ROOM_ENCRYPTION_EVENT_TYPE}) failed: {error}; the encryption condition is unenforced"
-        ),
+        Err(error) => {
+            log::warn!(
+                "[{tag}] read_state({ROOM_ENCRYPTION_EVENT_TYPE}) failed: {error}; the encryption condition is unenforced"
+            );
+            failed(SessionRead::RoomEncryption);
+        }
     }
 
     let mut slot_events = Vec::new();
@@ -413,7 +455,11 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
         lock(inner).state.supply_slot_state();
         ingest(&slot_events);
     } else {
+        // Both spellings failed: `slot_state` and `negotiated_encryption`
+        // stay `None`, which without this would be indistinguishable from a
+        // room that simply has no slot.
         log::warn!("[{tag}] no slot state could be read; the open-slot condition is unenforced");
+        failed(SessionRead::Slot);
     }
 
     match driver
@@ -432,9 +478,12 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
             lock(inner).state.supply_room_members();
             ingest(&events);
         }
-        Err(error) => log::warn!(
-            "[{tag}] read_state({ROOM_MEMBER_EVENT_TYPE}) failed: {error}; the sender-in-room condition is unenforced"
-        ),
+        Err(error) => {
+            log::warn!(
+                "[{tag}] read_state({ROOM_MEMBER_EVENT_TYPE}) failed: {error}; the sender-in-room condition is unenforced"
+            );
+            failed(SessionRead::RoomMembers);
+        }
     }
 
     for event_type in MEMBER_EVENT_TYPES {
@@ -443,7 +492,10 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
             .await
         {
             Ok(events) => ingest(&events),
-            Err(error) => log::warn!("[{tag}] read_events({event_type}) failed: {error}"),
+            Err(error) => {
+                log::warn!("[{tag}] read_events({event_type}) failed: {error}");
+                failed(SessionRead::MemberEvents);
+            }
         }
     }
 
@@ -454,7 +506,8 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
         {
             Ok(events) => ingest(&events),
             Err(error) => {
-                log::warn!("[{tag}] read_state({LEGACY_MEMBER_EVENT_TYPE}) failed: {error}")
+                log::warn!("[{tag}] read_state({LEGACY_MEMBER_EVENT_TYPE}) failed: {error}");
+                failed(SessionRead::MemberEvents);
             }
         }
     }
@@ -465,7 +518,7 @@ mod tests {
     use super::*;
     use crate::driver::DriverError;
     use crate::session::test_support::*;
-    use crate::session::{JoinExclusionReason, SlotState};
+    use crate::session::{JoinExclusionReason, SessionRead, SlotState};
     use crate::types::EventOrigin;
     use serde_json::json;
 
@@ -585,6 +638,58 @@ mod tests {
         assert_eq!(ids(&snapshot), vec!["m-a"]);
         assert_eq!(snapshot.slot_state, None);
         assert!(snapshot.excluded_candidates.is_empty());
+        // ...and says so, so `slot_state: None` reads as "unknown", not
+        // "this room has no slot".
+        assert_eq!(
+            snapshot.failed_reads,
+            vec![SessionRead::Slot, SessionRead::RoomMembers]
+        );
+        assert!(snapshot.seeded, "the seed finished; it just learned less");
+    }
+
+    /// The other half of the contract: a failed read is a *live* condition.
+    /// A state update that supplies the value clears it.
+    #[test]
+    fn a_live_update_clears_the_failed_read_it_supplies() {
+        let clock = FakeClock::new(NOW);
+        let driver = Arc::new(
+            FakeRoomEventsDriver::new()
+                .with_state_error(SLOT_EVENT_TYPES[0], DriverError::Http("500".into()))
+                .with_state_error(SLOT_EVENT_TYPES[1], DriverError::Http("500".into()))
+                .with_state_error(
+                    ROOM_MEMBER_EVENT_TYPE,
+                    DriverError::Unauthorized("no".into()),
+                ),
+        );
+        let session = session(&driver, &clock, ElementCallCompat::Off);
+        wait_seeded(&driver);
+        assert_eq!(
+            session.snapshot().failed_reads,
+            vec![SessionRead::Slot, SessionRead::RoomMembers]
+        );
+        assert!(driver.emit_state(vec![raw(slot_open_event(NOW), EventOrigin::Unknown)]));
+        let snapshot = session.snapshot();
+        assert_eq!(
+            snapshot.failed_reads,
+            vec![SessionRead::RoomMembers],
+            "the slot is known again; the room members are still unknown"
+        );
+        assert!(snapshot.slot_state.is_some());
+        assert!(driver.emit_state(vec![raw(
+            room_member_event("@a:x", "join", NOW),
+            EventOrigin::Unknown
+        )]));
+        assert!(session.snapshot().failed_reads.is_empty());
+    }
+
+    /// A healthy seed reports nothing, so the vec is not a permanent scar.
+    #[test]
+    fn a_clean_seed_reports_no_failed_reads() {
+        let clock = FakeClock::new(NOW);
+        let driver = driver_with_open_slot();
+        let session = session(&driver, &clock, ElementCallCompat::Off);
+        wait_seeded(&driver);
+        assert!(session.snapshot().failed_reads.is_empty());
     }
 
     #[test]

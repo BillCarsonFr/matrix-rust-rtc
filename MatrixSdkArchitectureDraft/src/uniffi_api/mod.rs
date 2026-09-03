@@ -16,18 +16,25 @@ pub mod runtime_probe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::connections::{ConnectionData, ConnectionWithMembers};
+use crate::connections::{
+    ConnectionData, ConnectionProblem, ConnectionProblemKind, ConnectionWithMembers,
+};
 use crate::driver::{
     DelegatedDelayedLeaveRequest, DriverError, LivekitTokenRequest, LivekitTokenResponse,
     OwnMembershipDriver, RoomEventsDriver, SendEventResponse, StateKeySelector, ToDeviceDelivery,
     ToDeviceDriver, ToDeviceMessage, ToDeviceRecipient, ToDeviceSendDriver, TokenDriver,
 };
-use crate::encryption::{KeyMap, MediaKey, MediaKeyChange};
-use crate::own_membership::{JoinError, JoinParams, LeaveError, OwnIdentity};
-use crate::participation::{
-    MembershipState, ParticipationConfig, ParticipationManager, SessionMembership, Status,
+use crate::encryption::{KeyMap, KeyRejection, MediaKey, MediaKeyChange, MediaKeyState};
+use crate::own_membership::{
+    self, DelayedLeaveOutcome, JoinError, JoinParams, LeaveError, OwnIdentity,
 };
-use crate::session::{self, ElementCallCompat, SessionConfig, SessionSnapshot};
+use crate::participation::{
+    Component, DisconnectCause, Impairment, MembershipState, ParticipationConfig,
+    ParticipationManager, SessionMembership, Severity, SlotError, Status,
+};
+use crate::session::{
+    self, ElementCallCompat, JoinExclusionReason, SessionConfig, SessionRead, SessionSnapshot,
+};
 use crate::types::{
     DeviceAttribution, EventOrigin, LeaveReason, Member, RawMatrixEvent, RtcTransport,
     TransportIntent,
@@ -43,18 +50,39 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 pub enum RtcError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A homeserver HTTP failure — transient as far as this crate knows.
+    #[error("http error: {0}")]
+    Http(String),
+    /// Anything the driver could not classify.
     #[error("driver error: {0}")]
     Driver(String),
     #[error("rejected: {0}")]
     Rejected(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// `M_LIMIT_EXCEEDED`: back off for `retry_after_ms` before retrying.
+    #[error("rate limited")]
+    RateLimited { retry_after_ms: Option<u64> },
+    /// The manager behind the call has stopped; build a new one.
+    #[error("the manager has stopped")]
+    Stopped,
     #[error("already joined")]
     AlreadyJoined,
     #[error("not joined")]
     NotJoined,
     #[error("slot closed")]
     SlotClosed,
+    /// The homeserver advertises no usable RTC transport — a configuration
+    /// problem; retrying will not help.
+    #[error("no usable RTC transport: {0}")]
+    NoTransport(String),
+    /// A transport exists but its token could not be minted — auth or
+    /// network; retrying may help.
+    #[error("the transport refused to mint a token: {0}")]
+    TokenRefused(String),
+    /// A crate precondition, not a caller mistake.
+    #[error("the encryption machine could not be built: {0}")]
+    EncryptionSetup(String),
 }
 
 impl From<RtcError> for DriverError {
@@ -63,8 +91,11 @@ impl From<RtcError> for DriverError {
             RtcError::InvalidInput(message) | RtcError::Driver(message) => {
                 DriverError::Other(message)
             }
+            RtcError::Http(message) => DriverError::Http(message),
             RtcError::Rejected(message) => DriverError::Unauthorized(message),
             RtcError::Unsupported(message) => DriverError::Unsupported(message),
+            RtcError::RateLimited { retry_after_ms } => DriverError::RateLimited { retry_after_ms },
+            RtcError::Stopped => DriverError::Stopped,
             other => DriverError::Other(other.to_string()),
         }
     }
@@ -75,7 +106,10 @@ impl From<DriverError> for RtcError {
         match error {
             DriverError::Unauthorized(message) => RtcError::Rejected(message),
             DriverError::Unsupported(message) => RtcError::Unsupported(message),
-            DriverError::Http(message) | DriverError::Other(message) => RtcError::Driver(message),
+            DriverError::RateLimited { retry_after_ms } => RtcError::RateLimited { retry_after_ms },
+            DriverError::Stopped => RtcError::Stopped,
+            DriverError::Http(message) => RtcError::Http(message),
+            DriverError::Other(message) => RtcError::Driver(message),
         }
     }
 }
@@ -86,7 +120,19 @@ impl From<JoinError> for RtcError {
             JoinError::AlreadyJoined => RtcError::AlreadyJoined,
             JoinError::InvalidParams(message) => RtcError::InvalidInput(message),
             JoinError::SlotClosed => RtcError::SlotClosed,
-            JoinError::TransportUnavailable(e) | JoinError::Driver(e) => e.into(),
+            JoinError::NoTransport(e) => RtcError::NoTransport(e.to_string()),
+            JoinError::TokenRefused(e) => RtcError::TokenRefused(e.to_string()),
+            JoinError::EncryptionSetup(e) => RtcError::EncryptionSetup(e.to_string()),
+            JoinError::Driver(e) => e.into(),
+        }
+    }
+}
+
+impl From<SlotError> for RtcError {
+    fn from(error: SlotError) -> Self {
+        match error {
+            SlotError::InvalidSlotId(message) => RtcError::InvalidInput(message),
+            SlotError::Driver(e) => e.into(),
         }
     }
 }
@@ -100,7 +146,7 @@ impl From<LeaveError> for RtcError {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Enum)]
+#[derive(PartialEq, Clone, Debug, uniffi::Enum)]
 pub enum FfiDeviceAttribution {
     Verified,
     Claimed,
@@ -117,7 +163,7 @@ impl From<DeviceAttribution> for FfiDeviceAttribution {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(PartialEq, Clone, Debug, uniffi::Record)]
 pub struct FfiMember {
     pub member_id: String,
     pub user_id: String,
@@ -166,6 +212,10 @@ pub struct FfiConnectionData {
     /// The SFU websocket URL to connect to.
     pub ws_url: String,
     pub jwt_token: String,
+    /// From the JWT's `exp`; `None` when it carries none. A failed re-mint
+    /// keeps the old token (a host may still be connected on it), so check
+    /// this rather than discovering staleness through a failed connect.
+    pub expires_at_ts: Option<u64>,
 }
 
 impl From<&ConnectionData> for FfiConnectionData {
@@ -174,6 +224,42 @@ impl From<&ConnectionData> for FfiConnectionData {
             service_url: c.service_url.clone(),
             ws_url: c.ws_url.clone(),
             jwt_token: c.jwt_token.clone(),
+            expires_at_ts: c.expires_at_ts,
+        }
+    }
+}
+
+/// A connection the session needs that the host cannot currently use.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiConnectionProblem {
+    pub service_url: String,
+    /// Members whose media is unavailable because of it.
+    pub member_ids: Vec<String>,
+    pub kind: FfiConnectionProblemKind,
+    pub last_error: String,
+    /// When the next mint is due; `0` = at the next beat.
+    pub retry_at_ts: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiConnectionProblemKind {
+    /// Wanted, never minted — absent from `connections()` entirely.
+    NoToken,
+    /// Present in `connections()` but its JWT is past `exp`.
+    TokenExpired,
+}
+
+impl From<&ConnectionProblem> for FfiConnectionProblem {
+    fn from(p: &ConnectionProblem) -> Self {
+        Self {
+            service_url: p.service_url.clone(),
+            member_ids: p.member_ids.clone(),
+            kind: match p.kind {
+                ConnectionProblemKind::NoToken => FfiConnectionProblemKind::NoToken,
+                ConnectionProblemKind::TokenExpired => FfiConnectionProblemKind::TokenExpired,
+            },
+            last_error: p.last_error.clone(),
+            retry_at_ts: p.retry_at_ts,
         }
     }
 }
@@ -216,6 +302,62 @@ pub struct FfiMembership {
     /// Participant identity inside those LK rooms (MSC4195 pseudonymous
     /// hash; `{user}:{device}` in legacy compat mode).
     pub transport_identity: Option<String>,
+    /// Whether this member and we can hear each other. `None` when the call
+    /// does not manage media keys, for our own tile, and while not joined.
+    pub media_key: Option<FfiMediaKeyState>,
+}
+
+/// Who can hear whom, for one tile. Two independent booleans: they fail for
+/// different reasons and a UI renders them in different places.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiMediaKeyState {
+    /// They hold our current key: they can decrypt us.
+    pub holds_our_key: bool,
+    /// We hold theirs: we can decrypt them.
+    pub have_their_key: bool,
+    /// Why their most recent key was discarded, while we still lack one.
+    pub rejection: Option<FfiKeyRejection>,
+}
+
+impl From<&MediaKeyState> for FfiMediaKeyState {
+    fn from(k: &MediaKeyState) -> Self {
+        Self {
+            holds_our_key: k.holds_our_key,
+            have_their_key: k.have_their_key,
+            rejection: k.rejection.as_ref().map(FfiKeyRejection::from),
+        }
+    }
+}
+
+/// Why an inbound media key was discarded — the answer to "why can't I hear
+/// them?", which the crate computes and used to drop on the floor.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiKeyRejection {
+    Cleartext,
+    UnknownOrigin,
+    SenderMismatch,
+    DeviceMismatch,
+    UnattributableMember,
+    NotCrossSigned,
+    WrongRoom,
+    Outdated,
+    NotManagingKeys,
+}
+
+impl From<&KeyRejection> for FfiKeyRejection {
+    fn from(r: &KeyRejection) -> Self {
+        match r {
+            KeyRejection::Cleartext => Self::Cleartext,
+            KeyRejection::UnknownOrigin => Self::UnknownOrigin,
+            KeyRejection::SenderMismatch => Self::SenderMismatch,
+            KeyRejection::DeviceMismatch => Self::DeviceMismatch,
+            KeyRejection::UnattributableMember => Self::UnattributableMember,
+            KeyRejection::NotCrossSigned => Self::NotCrossSigned,
+            KeyRejection::WrongRoom => Self::WrongRoom,
+            KeyRejection::Outdated => Self::Outdated,
+            KeyRejection::NotManagingKeys => Self::NotManagingKeys,
+        }
+    }
 }
 
 impl From<&SessionMembership> for FfiMembership {
@@ -228,6 +370,7 @@ impl From<&SessionMembership> for FfiMembership {
             },
             connections: m.connections.clone(),
             transport_identity: m.transport_identity.clone(),
+            media_key: m.media_key.as_ref().map(FfiMediaKeyState::from),
         }
     }
 }
@@ -261,7 +404,7 @@ fn ffi_key_map(map: &KeyMap) -> Vec<FfiMediaKey> {
     keys
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(PartialEq, Clone, Debug, uniffi::Record)]
 pub struct FfiRtcTransport {
     pub transport_type: String,
     /// Type-specific fields as a JSON string (LiveKit: `livekit_service_url`).
@@ -418,22 +561,639 @@ impl From<FfiJoinParams> for JoinParams {
     }
 }
 
-/// The coarse status; the sub-statuses are in `debug_snapshot`.
+/// Join progress, step by step.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Record)]
+pub struct FfiJoinProgress {
+    pub has_fetched_transports: bool,
+    pub has_fetched_initial_member_list: bool,
+    pub has_created_transport_token: bool,
+    pub has_sent_delayed_leave_event: bool,
+    pub has_sent_member_join_event: bool,
+    pub has_delegated_delayed_event: bool,
+    pub has_started_heartbeat: bool,
+}
+
+impl From<&own_membership::JoinStatus> for FfiJoinProgress {
+    fn from(j: &own_membership::JoinStatus) -> Self {
+        Self {
+            has_fetched_transports: j.has_fetched_transports,
+            has_fetched_initial_member_list: j.has_fetched_initial_member_list,
+            has_created_transport_token: j.has_created_transport_token,
+            has_sent_delayed_leave_event: j.has_sent_delayed_leave_event,
+            has_sent_member_join_event: j.has_sent_member_join_event,
+            has_delegated_delayed_event: j.has_delegated_delayed_event,
+            has_started_heartbeat: j.has_started_heartbeat,
+        }
+    }
+}
+
+/// The media-key exchange as a whole.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiEncryptionStatus {
+    Joining {
+        has_distributed_initial_keys: bool,
+        has_received_all_member_keys: bool,
+    },
+    Connected {
+        /// Members who left but still hold the key our media is encrypted
+        /// with — "possibly still listening".
+        left_members_with_keys: Vec<FfiMember>,
+        fully_settled: bool,
+        last_rotation_ts: u64,
+    },
+}
+
+impl From<&crate::encryption::Status> for FfiEncryptionStatus {
+    fn from(status: &crate::encryption::Status) -> Self {
+        match status {
+            crate::encryption::Status::Joining {
+                has_distributed_initial_keys,
+                has_received_all_member_keys,
+            } => Self::Joining {
+                has_distributed_initial_keys: *has_distributed_initial_keys,
+                has_received_all_member_keys: *has_received_all_member_keys,
+            },
+            crate::encryption::Status::Connected {
+                left_members_with_keys,
+                fully_settled,
+                last_rotation_ts,
+            } => Self::Connected {
+                left_members_with_keys: left_members_with_keys
+                    .iter()
+                    .map(FfiMember::from)
+                    .collect(),
+                fully_settled: *fully_settled,
+                last_rotation_ts: *last_rotation_ts,
+            },
+        }
+    }
+}
+
+/// The dead man's switch that clears our membership if this client dies.
+/// Mutually exclusive states of one mechanism.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiKeepAlive {
+    /// Armed, and we restart it ourselves.
+    Armed {
+        delay_ms: u64,
+        last_restart_ts: u64,
+        /// When the homeserver publishes our leave if no restart lands.
+        fires_at_ts: u64,
+    },
+    /// Handed to the SFU (MSC4195): we no longer restart it, so a frozen
+    /// `last_restart_ts` is expected here rather than a fault.
+    Delegated {
+        delegated_at_ts: u64,
+        earliest_fire_ts: u64,
+    },
+    /// Armed, but restarts are failing — we drop out at `fires_at_ts`
+    /// unless one succeeds.
+    RestartFailing {
+        since_ts: u64,
+        fires_at_ts: u64,
+        last_error: String,
+    },
+    /// Its delay elapsed with no successful restart: we are probably out
+    /// already. A replacement is being armed.
+    Expired { since_ts: u64 },
+    /// None armed. `permanent` = this homeserver refuses delayed events for
+    /// good; otherwise we re-probe at `next_probe_ts` (`Some(0)` = next beat).
+    Unavailable {
+        permanent: bool,
+        next_probe_ts: Option<u64>,
+    },
+}
+
+impl From<&own_membership::KeepAlive> for FfiKeepAlive {
+    fn from(k: &own_membership::KeepAlive) -> Self {
+        match k {
+            own_membership::KeepAlive::Armed {
+                delay_ms,
+                last_restart_ts,
+                fires_at_ts,
+            } => Self::Armed {
+                delay_ms: *delay_ms,
+                last_restart_ts: *last_restart_ts,
+                fires_at_ts: *fires_at_ts,
+            },
+            own_membership::KeepAlive::Delegated {
+                delegated_at_ts,
+                earliest_fire_ts,
+            } => Self::Delegated {
+                delegated_at_ts: *delegated_at_ts,
+                earliest_fire_ts: *earliest_fire_ts,
+            },
+            own_membership::KeepAlive::RestartFailing {
+                since_ts,
+                fires_at_ts,
+                last_error,
+            } => Self::RestartFailing {
+                since_ts: *since_ts,
+                fires_at_ts: *fires_at_ts,
+                last_error: last_error.clone(),
+            },
+            own_membership::KeepAlive::Expired { since_ts } => Self::Expired {
+                since_ts: *since_ts,
+            },
+            own_membership::KeepAlive::Unavailable {
+                permanent,
+                next_probe_ts,
+            } => Self::Unavailable {
+                permanent: *permanent,
+                next_probe_ts: *next_probe_ts,
+            },
+        }
+    }
+}
+
+/// Our sticky membership event on the server (MSC4354).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct FfiMembershipPublication {
+    pub lifetime_ms: u64,
+    pub last_published_ts: u64,
+    /// `last_published_ts + lifetime_ms` — when the server drops us if no
+    /// refresh lands.
+    pub expires_at_ts: u64,
+    pub refresh_failing_since_ts: Option<u64>,
+    pub last_refresh_error: Option<String>,
+}
+
+impl From<&own_membership::MembershipPublication> for FfiMembershipPublication {
+    fn from(m: &own_membership::MembershipPublication) -> Self {
+        Self {
+            lifetime_ms: m.lifetime_ms,
+            last_published_ts: m.last_published_ts,
+            expires_at_ts: m.expires_at_ts,
+            refresh_failing_since_ts: m.refresh_failing_since_ts,
+            last_refresh_error: m.last_refresh_error.clone(),
+        }
+    }
+}
+
+/// Whether the session projects our own membership — i.e. whether anybody
+/// can see us.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiRosterPresence {
+    /// Sent, echo not back yet. Not a fault.
+    AwaitingEcho,
+    Present,
+    /// It was in the roster and is gone.
+    Missing {
+        since_ts: u64,
+        republished_at_ts: Option<u64>,
+    },
+    /// On the server, but the session refuses to project it. The self-heal
+    /// deliberately does not re-send here.
+    Excluded {
+        reason: FfiJoinExclusionReason,
+    },
+}
+
+impl From<&own_membership::RosterPresence> for FfiRosterPresence {
+    fn from(r: &own_membership::RosterPresence) -> Self {
+        match r {
+            own_membership::RosterPresence::AwaitingEcho => Self::AwaitingEcho,
+            own_membership::RosterPresence::Present => Self::Present,
+            own_membership::RosterPresence::Missing {
+                since_ts,
+                republished_at_ts,
+            } => Self::Missing {
+                since_ts: *since_ts,
+                republished_at_ts: *republished_at_ts,
+            },
+            own_membership::RosterPresence::Excluded { reason } => Self::Excluded {
+                reason: (*reason).into(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiJoinExclusionReason {
+    SlotClosed,
+    UnencryptedInEncryptedRoom,
+    SenderNotInRoom,
+    Expired,
+}
+
+impl From<JoinExclusionReason> for FfiJoinExclusionReason {
+    fn from(reason: JoinExclusionReason) -> Self {
+        match reason {
+            JoinExclusionReason::SlotClosed => Self::SlotClosed,
+            JoinExclusionReason::UnencryptedInEncryptedRoom => Self::UnencryptedInEncryptedRoom,
+            JoinExclusionReason::SenderNotInRoom => Self::SenderNotInRoom,
+            JoinExclusionReason::Expired => Self::Expired,
+        }
+    }
+}
+
+/// One of the room-state / timeline reads the session's seed makes. A read
+/// that failed leaves its condition *unknown*, which is not the same as the
+/// condition being absent.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiSessionRead {
+    Slot,
+    RoomEncryption,
+    RoomMembers,
+    MemberEvents,
+}
+
+impl From<SessionRead> for FfiSessionRead {
+    fn from(read: SessionRead) -> Self {
+        match read {
+            SessionRead::Slot => Self::Slot,
+            SessionRead::RoomEncryption => Self::RoomEncryption,
+            SessionRead::RoomMembers => Self::RoomMembers,
+            SessionRead::MemberEvents => Self::MemberEvents,
+        }
+    }
+}
+
+/// How severe an [`FfiImpairment`] is, and therefore where to render it.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiSeverity {
+    /// We are, or are about to be, out of the call — or peers cannot use
+    /// our media.
+    Critical,
+    /// Degraded but functioning; a crash or a timeout would now hurt.
+    Degraded,
+    /// Worth surfacing in diagnostics, not in the call UI.
+    Notice,
+}
+
+impl From<Severity> for FfiSeverity {
+    fn from(severity: Severity) -> Self {
+        match severity {
+            Severity::Critical => Self::Critical,
+            Severity::Degraded => Self::Degraded,
+            Severity::Notice => Self::Notice,
+        }
+    }
+}
+
+/// A condition that is true right now and that the crate is still working
+/// on. Every variant clears by itself when the underlying operation
+/// succeeds — an impairment is never terminal; anything terminal ends the
+/// participation and appears as [`FfiDisconnectCause`] instead.
+///
+/// A host that renders one warning banner can read this list and nothing
+/// else; the structured status above is for anything that needs the details.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiImpairment {
+    KeepAliveRestartFailing {
+        since_ts: u64,
+        fires_at_ts: u64,
+        last_error: String,
+    },
+    KeepAliveExpired {
+        since_ts: u64,
+    },
+    KeepAliveUnavailable {
+        permanent: bool,
+        membership_expires_at_ts: u64,
+    },
+    MembershipRefreshFailing {
+        since_ts: u64,
+        expires_at_ts: u64,
+        last_error: String,
+    },
+    OwnMembershipMissing {
+        since_ts: u64,
+        republished_at_ts: Option<u64>,
+    },
+    OwnMembershipExcluded {
+        reason: FfiJoinExclusionReason,
+    },
+    MediaKeyNotDelivered {
+        member_ids: Vec<String>,
+    },
+    MediaKeyNotReceived {
+        member_ids: Vec<String>,
+    },
+    MediaKeyRejected {
+        member_id: String,
+        sender_user_id: String,
+        reason: FfiKeyRejection,
+        at_ts: u64,
+    },
+    ConnectionUnavailable {
+        service_url: String,
+        member_ids: Vec<String>,
+        last_error: String,
+        retry_at_ts: u64,
+    },
+    ConnectionTokenExpired {
+        service_url: String,
+        expired_at_ts: u64,
+        last_error: String,
+    },
+    SessionStateUnread {
+        reads: Vec<FfiSessionRead>,
+    },
+    JoinedBeforeSeed {
+        at_ts: u64,
+    },
+}
+
+impl From<&Impairment> for FfiImpairment {
+    fn from(i: &Impairment) -> Self {
+        match i {
+            Impairment::KeepAliveRestartFailing {
+                since_ts,
+                fires_at_ts,
+                last_error,
+            } => Self::KeepAliveRestartFailing {
+                since_ts: *since_ts,
+                fires_at_ts: *fires_at_ts,
+                last_error: last_error.clone(),
+            },
+            Impairment::KeepAliveExpired { since_ts } => Self::KeepAliveExpired {
+                since_ts: *since_ts,
+            },
+            Impairment::KeepAliveUnavailable {
+                permanent,
+                membership_expires_at_ts,
+            } => Self::KeepAliveUnavailable {
+                permanent: *permanent,
+                membership_expires_at_ts: *membership_expires_at_ts,
+            },
+            Impairment::MembershipRefreshFailing {
+                since_ts,
+                expires_at_ts,
+                last_error,
+            } => Self::MembershipRefreshFailing {
+                since_ts: *since_ts,
+                expires_at_ts: *expires_at_ts,
+                last_error: last_error.clone(),
+            },
+            Impairment::OwnMembershipMissing {
+                since_ts,
+                republished_at_ts,
+            } => Self::OwnMembershipMissing {
+                since_ts: *since_ts,
+                republished_at_ts: *republished_at_ts,
+            },
+            Impairment::OwnMembershipExcluded { reason } => Self::OwnMembershipExcluded {
+                reason: (*reason).into(),
+            },
+            Impairment::MediaKeyNotDelivered { member_ids } => Self::MediaKeyNotDelivered {
+                member_ids: member_ids.clone(),
+            },
+            Impairment::MediaKeyNotReceived { member_ids } => Self::MediaKeyNotReceived {
+                member_ids: member_ids.clone(),
+            },
+            Impairment::MediaKeyRejected {
+                member_id,
+                sender_user_id,
+                reason,
+                at_ts,
+            } => Self::MediaKeyRejected {
+                member_id: member_id.clone(),
+                sender_user_id: sender_user_id.clone(),
+                reason: reason.into(),
+                at_ts: *at_ts,
+            },
+            Impairment::ConnectionUnavailable {
+                service_url,
+                member_ids,
+                last_error,
+                retry_at_ts,
+            } => Self::ConnectionUnavailable {
+                service_url: service_url.clone(),
+                member_ids: member_ids.clone(),
+                last_error: last_error.clone(),
+                retry_at_ts: *retry_at_ts,
+            },
+            Impairment::ConnectionTokenExpired {
+                service_url,
+                expired_at_ts,
+                last_error,
+            } => Self::ConnectionTokenExpired {
+                service_url: service_url.clone(),
+                expired_at_ts: *expired_at_ts,
+                last_error: last_error.clone(),
+            },
+            Impairment::SessionStateUnread { reads } => Self::SessionStateUnread {
+                reads: reads.iter().copied().map(FfiSessionRead::from).collect(),
+            },
+            Impairment::JoinedBeforeSeed { at_ts } => Self::JoinedBeforeSeed { at_ts: *at_ts },
+        }
+    }
+}
+
+/// The severity of one impairment, so a host can sort or filter without
+/// re-deriving the table. (`impairments` already arrives sorted, most severe
+/// first.)
+#[uniffi::export]
+pub fn impairment_severity(impairment: FfiImpairment) -> FfiSeverity {
+    // Mirrors `participation::Impairment::severity`.
+    match impairment {
+        FfiImpairment::KeepAliveExpired { .. }
+        | FfiImpairment::OwnMembershipMissing { .. }
+        | FfiImpairment::OwnMembershipExcluded { .. }
+        | FfiImpairment::KeepAliveRestartFailing { .. }
+        | FfiImpairment::MembershipRefreshFailing { .. }
+        | FfiImpairment::ConnectionTokenExpired { .. }
+        | FfiImpairment::ConnectionUnavailable { .. } => FfiSeverity::Critical,
+        FfiImpairment::MediaKeyNotDelivered { .. }
+        | FfiImpairment::MediaKeyNotReceived { .. }
+        | FfiImpairment::MediaKeyRejected { .. }
+        | FfiImpairment::KeepAliveUnavailable { .. }
+        | FfiImpairment::SessionStateUnread { .. } => FfiSeverity::Degraded,
+        FfiImpairment::JoinedBeforeSeed { .. } => FfiSeverity::Notice,
+    }
+}
+
+/// Why a join failed. Typed so a host can decide what to offer next:
+/// `NoTransport` is a configuration problem, `TokenRefused` may be worth a
+/// retry.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiJoinError {
+    AlreadyJoined,
+    InvalidParams { message: String },
+    SlotClosed,
+    NoTransport { message: String },
+    TokenRefused { message: String },
+    EncryptionSetup { message: String },
+    Driver { message: String },
+}
+
+impl From<&JoinError> for FfiJoinError {
+    fn from(error: &JoinError) -> Self {
+        match error {
+            JoinError::AlreadyJoined => Self::AlreadyJoined,
+            JoinError::InvalidParams(message) => Self::InvalidParams {
+                message: message.clone(),
+            },
+            JoinError::SlotClosed => Self::SlotClosed,
+            JoinError::NoTransport(e) => Self::NoTransport {
+                message: e.to_string(),
+            },
+            JoinError::TokenRefused(e) => Self::TokenRefused {
+                message: e.to_string(),
+            },
+            JoinError::EncryptionSetup(e) => Self::EncryptionSetup {
+                message: e.to_string(),
+            },
+            JoinError::Driver(e) => Self::Driver {
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
+/// Which pump stopped, for [`FfiDisconnectCause::ManagerStopped`].
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiComponent {
+    Session,
+    OwnMembership,
+    Connections,
+    Encryption,
+    Participation,
+}
+
+impl From<Component> for FfiComponent {
+    fn from(component: Component) -> Self {
+        match component {
+            Component::Session => Self::Session,
+            Component::OwnMembership => Self::OwnMembership,
+            Component::Connections => Self::Connections,
+            Component::Encryption => Self::Encryption,
+            Component::Participation => Self::Participation,
+        }
+    }
+}
+
+/// Why we are not in a call. Terminal by construction: unlike an impairment,
+/// none of these clears on its own.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiDisconnectCause {
+    /// No join has been attempted on this manager.
+    NeverJoined,
+    /// The host called `leave()`.
+    LeftByHost {
+        code: Option<String>,
+        reason: Option<String>,
+    },
+    /// The slot was closed under us and the machine left on its own.
+    SlotClosed,
+    /// `join()` failed; the participation never started. `progress` says how
+    /// far it got.
+    JoinFailed {
+        at_ts: u64,
+        progress: FfiJoinProgress,
+        error: FfiJoinError,
+    },
+    /// A pump stopped. The manager is dead and will not recover; build a new
+    /// one.
+    ManagerStopped { component: FfiComponent },
+}
+
+impl From<&DisconnectCause> for FfiDisconnectCause {
+    fn from(cause: &DisconnectCause) -> Self {
+        match cause {
+            DisconnectCause::NeverJoined => Self::NeverJoined,
+            DisconnectCause::LeftByHost { reason } => Self::LeftByHost {
+                code: reason.as_ref().map(|r| r.code.clone()),
+                reason: reason.as_ref().and_then(|r| r.reason.clone()),
+            },
+            DisconnectCause::SlotClosed => Self::SlotClosed,
+            DisconnectCause::JoinFailed {
+                at_ts,
+                progress,
+                error,
+            } => Self::JoinFailed {
+                at_ts: *at_ts,
+                progress: progress.into(),
+                error: error.into(),
+            },
+            DisconnectCause::ManagerStopped { component } => Self::ManagerStopped {
+                component: (*component).into(),
+            },
+        }
+    }
+}
+
+/// What became of the dead man's switch when we left. A failed cancel still
+/// leaves us out of the call — the delay is itself a leave — but a stray
+/// delayed event of ours may land afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiDelayedLeaveOutcome {
+    Cancelled,
+    MayStillFire,
+}
+
+impl From<DelayedLeaveOutcome> for FfiDelayedLeaveOutcome {
+    fn from(outcome: DelayedLeaveOutcome) -> Self {
+        match outcome {
+            DelayedLeaveOutcome::Cancelled => Self::Cancelled,
+            DelayedLeaveOutcome::MayStillFire => Self::MayStillFire,
+        }
+    }
+}
+
+/// The participation status, in full.
+///
+/// This used to be four opaque variants with everything else hidden behind
+/// `debug_snapshot`'s unversioned JSON — which is a diagnostics dump, not a
+/// UI contract. Every field a host needs is now typed.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
 pub enum FfiStatus {
-    Disconnected,
-    Joining,
-    Connected,
-    Leaving,
+    Disconnected {
+        cause: FfiDisconnectCause,
+    },
+    Joining {
+        own_membership: FfiJoinProgress,
+        encryption: FfiEncryptionStatus,
+        /// Live problems already visible during the join.
+        impairments: Vec<FfiImpairment>,
+    },
+    Connected {
+        keep_alive: FfiKeepAlive,
+        membership: FfiMembershipPublication,
+        roster: FfiRosterPresence,
+        encryption: FfiEncryptionStatus,
+        /// Everything currently wrong, most severe first.
+        impairments: Vec<FfiImpairment>,
+    },
+    Leaving {
+        leave_event_sent: bool,
+        /// `None` until the leave reaches that step (or when none was armed).
+        delayed_leave: Option<FfiDelayedLeaveOutcome>,
+        impairments: Vec<FfiImpairment>,
+    },
+}
+
+fn ffi_impairments(impairments: &[Impairment]) -> Vec<FfiImpairment> {
+    impairments.iter().map(FfiImpairment::from).collect()
 }
 
 impl From<&Status> for FfiStatus {
     fn from(status: &Status) -> Self {
         match status {
-            Status::Disconnected => Self::Disconnected,
-            Status::Joining(_) => Self::Joining,
-            Status::Connected(_) => Self::Connected,
-            Status::Leaving(_) => Self::Leaving,
+            Status::Disconnected(cause) => Self::Disconnected {
+                cause: cause.into(),
+            },
+            Status::Joining(s) => Self::Joining {
+                own_membership: (&s.own_membership).into(),
+                encryption: (&s.encryption).into(),
+                impairments: ffi_impairments(&s.impairments),
+            },
+            Status::Connected(s) => Self::Connected {
+                keep_alive: (&s.own_membership.keep_alive).into(),
+                membership: (&s.own_membership.membership).into(),
+                roster: (&s.own_membership.roster).into(),
+                encryption: (&s.encryption).into(),
+                impairments: ffi_impairments(&s.impairments),
+            },
+            Status::Leaving(s) => Self::Leaving {
+                leave_event_sent: s.own_membership.leave_event_sent,
+                delayed_leave: s
+                    .own_membership
+                    .delayed_leave
+                    .map(FfiDelayedLeaveOutcome::from),
+                impairments: ffi_impairments(&s.impairments),
+            },
         }
     }
 }
@@ -454,7 +1214,29 @@ pub struct FfiSessionSnapshot {
     /// `None` while no slot state was supplied (condition unenforced).
     pub slot_open: Option<bool>,
     /// The slot-prescribed encryption decision; `None` while unknown.
+    ///
+    /// Read it together with `failed_reads`: `None` with an empty
+    /// `failed_reads` means "this call is not encrypted", `None` with
+    /// `Slot` in it means "we could not find out" — the difference between
+    /// rendering an open padlock and rendering nothing.
     pub encrypted: Option<bool>,
+    /// `true` once the live session finished seeding (even after read
+    /// failures); always `true` for a statically computed snapshot.
+    pub seeded: bool,
+    /// Seed reads that failed, so an absent value can be told from an
+    /// unknown one. Empty is the healthy case, and an entry disappears once
+    /// a live state update supplies that value.
+    pub failed_reads: Vec<FfiSessionRead>,
+    /// Member events that landed but are not in the joined projection, with
+    /// the reason — the load-bearing diagnostics for "why can nobody see
+    /// me?". Find your own entry with `own_member_id()`.
+    pub excluded_candidates: Vec<FfiExcludedCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct FfiExcludedCandidate {
+    pub member: FfiMember,
+    pub reason: FfiJoinExclusionReason,
 }
 
 impl From<&SessionSnapshot> for FfiSessionSnapshot {
@@ -469,6 +1251,21 @@ impl From<&SessionSnapshot> for FfiSessionSnapshot {
             application_type: snapshot.application_type.clone(),
             slot_open: snapshot.slot_state.as_ref().map(|s| s.is_open()),
             encrypted: snapshot.negotiated_encryption,
+            seeded: snapshot.seeded,
+            failed_reads: snapshot
+                .failed_reads
+                .iter()
+                .copied()
+                .map(FfiSessionRead::from)
+                .collect(),
+            excluded_candidates: snapshot
+                .excluded_candidates
+                .iter()
+                .map(|(member, reason)| FfiExcludedCandidate {
+                    member: member.into(),
+                    reason: (*reason).into(),
+                })
+                .collect(),
         }
     }
 }
@@ -1037,6 +1834,17 @@ pub trait StatusListener: Send + Sync {
     fn on_status_change(&self, status: FfiStatus);
 }
 
+#[uniffi::export(with_foreign)]
+pub trait KeyRejectedListener: Send + Sync {
+    /// An inbound media key was discarded: `member_id` names whose, `reason`
+    /// says why.
+    ///
+    /// **Secondary** to `FfiMembership::media_key.rejection` and
+    /// `FfiImpairment::MediaKeyRejected`, which a UI attaching late still
+    /// finds; this is for logging and telemetry.
+    fn on_key_rejected(&self, member_id: String, reason: FfiKeyRejection);
+}
+
 /// FFI wrapper around [`ParticipationManager`].
 #[derive(uniffi::Object)]
 pub struct FfiParticipationManager {
@@ -1094,6 +1902,35 @@ impl FfiParticipationManager {
     }
 
     /// Open this manager's slot (`m.per_member` encryption when `encrypted`).
+    /// Our member id for this participation; `None` while not joined.
+    ///
+    /// Every self-referential check needs it — am I in the roster
+    /// (`session().excluded_candidates`), which LiveKit participant is me
+    /// (`own_membership().transport_identity`). Matching on
+    /// `(user_id, device_id)` is not a substitute: one device may hold
+    /// several RTC members, and a rejoin mints a fresh id.
+    pub fn own_member_id(&self) -> Option<String> {
+        self.inner.own_member_id()
+    }
+
+    /// Our own entry in `memberships()`, when the session projects it.
+    pub fn own_membership(&self) -> Option<FfiMembership> {
+        self.inner
+            .own_membership()
+            .as_ref()
+            .map(FfiMembership::from)
+    }
+
+    /// Wanted connections the host cannot currently use, with the members
+    /// whose media is affected. Empty is the healthy case.
+    pub fn connection_problems(&self) -> Vec<FfiConnectionProblem> {
+        self.inner
+            .connection_problems()
+            .iter()
+            .map(FfiConnectionProblem::from)
+            .collect()
+    }
+
     pub async fn open_slot(
         &self,
         application_type: String,
@@ -1174,7 +2011,16 @@ impl FfiParticipationManager {
         }));
     }
 
-    /// Diagnostics JSON (every part's state, per-candidate join verdicts).
+    pub fn set_key_rejected_listener(&self, listener: Arc<dyn KeyRejectedListener>) {
+        self.inner
+            .on_key_rejected(Box::new(move |member_id: &str, reason: &KeyRejection| {
+                listener.on_key_rejected(member_id.to_owned(), reason.into())
+            }));
+    }
+
+    /// Diagnostics JSON: an unversioned dump for bug reports, **not** a UI
+    /// contract. Everything a UI needs is typed on `status()`,
+    /// `session()`, `memberships()` and `connection_problems()`.
     pub fn debug_snapshot(&self) -> String {
         self.inner.debug_snapshot().to_string()
     }

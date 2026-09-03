@@ -87,8 +87,16 @@ Hosts (via `MatrixDriver`) feeds everything into one funnel and the session disp
 
 - **All reads go through `SessionSnapshot`** — a plain, cloneable value
   carrying the joined projection plus its metadata (`slot_state`,
-  `negotiated_encryption`, `start_ts`, `excluded_candidates`) and the
-  conveniences functions (`member_count()`, `is_active()`).
+  `negotiated_encryption`, `start_ts`, `excluded_candidates`, `seeded`,
+  `failed_reads`) and the conveniences functions (`member_count()`,
+  `is_active()`).
+- `failed_reads: Vec<SessionRead>` is the seed's honesty: `seeded` says the
+  seed *finished*, this says whether it learned anything. `slot_state: None`
+  with an empty `failed_reads` means "this room has no slot"; with `Slot` in
+  it, "we could not find out". The same distinction decides whether
+  `negotiated_encryption: None` should render as *unencrypted* or as
+  *unknown*. Entries clear when a live state update later supplies the
+  value, so it is a live condition rather than a permanent verdict.
 - `compute_sessions_from_events(events, config) -> Vec<SessionSnapshot>` —
   static, cheap, and returns *values, not subscriptions*: nothing updates.
   A observable session will be created by passing a driver (i.e. build a `Session` see below).
@@ -157,9 +165,39 @@ as `encryption`. Plan and status: `src/own_membership/OwnMembershipImplementatio
   has_fetched_initial_member_list, has_created_transport_token,
   has_sent_delayed_leave_event, has_sent_member_join_event,
   has_delegated_delayed_event, has_started_heartbeat }`, `ConnectedStatus {
-  delayed_event_kick_ts, heartbeat_last_restart_ts, delegation_setup_ts,
-  delayed_leave_supported, membership_lifetime_ms }`, `LeaveStatus {
-  leave_event_sent, delayed_leave_settled }`.
+  keep_alive, membership, roster }`, `LeaveStatus { leave_event_sent,
+  delayed_leave: Option<DelayedLeaveOutcome> }`.
+- `ConnectedStatus` is one value per *mechanism*, because the three fail
+  independently and each has its own remedy:
+  - `KeepAlive = Armed { delay_ms, last_restart_ts, fires_at_ts } |
+    Delegated { delegated_at_ts, earliest_fire_ts } | RestartFailing {
+    since_ts, fires_at_ts, last_error } | Expired { since_ts } |
+    Unavailable { permanent, next_probe_ts }`. `Delegated` is its own variant
+    precisely because after delegation we stop restarting on purpose — a
+    frozen `last_restart_ts` is health there, and a flag beside raw
+    timestamps could not say so. `Expired` means "the delay's full period
+    elapsed with no successful restart, so it has in all likelihood fired" —
+    named for what the crate deduces, not for a removal it never observed.
+    The `Armed -> Expired` transition is performed by `on_wake`
+    (`next_wake_ts` includes the expiry instant); `status()` stays a pure
+    projection with no clock of its own.
+  - `MembershipPublication { lifetime_ms, last_published_ts, expires_at_ts,
+    refresh_failing_since_ts, last_refresh_error }` — the sticky entry the
+    server drops if no refresh lands, with the deadline precomputed.
+  - `RosterPresence = AwaitingEcho | Present | Missing { since_ts,
+    republished_at_ts } | Excluded { reason }`. `Missing` (was there, gone,
+    self-heal re-sends) and `Excluded` (on the server, refused by the
+    projection, self-heal deliberately does not) stay separate because their
+    remedies differ.
+  Because those values *change* when a mechanism starts failing, a failing
+  keep-alive restart is finally push-visible through the facade's
+  `on_status_change`. It used to mutate nothing observable
+  (`last_restart_ms` moved only on success), which made the single most
+  important "you are about to be kicked out" condition fire no callback at
+  all — see `src/participation/ErrorSurfaceAnalysis.md` §3.1.
+- A leave whose delayed-leave cancel fails still returns `Ok` — the delay is
+  itself a leave — but says so: `DelayedLeaveOutcome::MayStillFire` warns
+  that a stray delayed event of ours may still land.
 - `OwnMembershipManager::new(room_id, slot_id, own, session, driver, compat, resolve_transport)`,
   `join(member_id, intent, params)`, `leave(reason)`. The member id is minted
   by the facade (`new_member_id(compat, &own)`: fresh per join, or
@@ -254,8 +292,69 @@ The facade a calling host uses. Owns and wires the four parts above.
   `own_membership.join`. `leave(reason)` sends the leave, then drops the
   machine (forgetting every key) and the tokens. A participation the
   own-membership machine ends on its own (`slot_closed`) is reaped the same way.
-- `Status = Disconnected | Joining(JoinStatus) | Connected(ConnectedStatus) | Leaving(LeaveStatus)`
-  composing the own-membership and encryption statuses.
+- `Status = Disconnected(DisconnectCause) | Joining(JoinStatus) |
+  Connected(ConnectedStatus) | Leaving(LeaveStatus)` composing the
+  own-membership and encryption statuses. Every non-disconnected variant also
+  carries `impairments: Vec<Impairment>`, reachable uniformly through
+  `Status::impairments()`.
+- **The organising split.** A failure is one of two things, and the two get
+  different API shapes. *Recoverable* — a retry loop is live and the
+  condition clears by itself — is modelled as **state inside `Status`**, and
+  only there; it has no single moment of failure, so it can never be a return
+  value. *Terminal* — the participation is over or never started, and only a
+  host decision changes anything — belongs in the errors of the calls that
+  produced it and in `DisconnectCause`. The dividing question is "if the host
+  does nothing, can this clear on its own?".
+- `Impairment` is the recoverable vocabulary: `KeepAliveRestartFailing`,
+  `KeepAliveExpired`, `KeepAliveUnavailable`, `MembershipRefreshFailing`,
+  `OwnMembershipMissing`, `OwnMembershipExcluded`, `MediaKeyNotDelivered`,
+  `MediaKeyNotReceived`, `MediaKeyRejected`, `ConnectionUnavailable`,
+  `ConnectionTokenExpired`, `SessionStateUnread`, `JoinedBeforeSeed`. Every
+  variant clears by itself when the underlying operation succeeds — an
+  impairment is never terminal. Each has a `severity()`
+  (`Critical | Degraded | Notice`) and the vec is sorted most severe first,
+  then by a fixed variant rank, then by the ids inside, so recomputing with
+  unchanged inputs yields an identical vec and publish-on-change does not
+  flap.
+- The list is **deliberately redundant** with the structured state above, the
+  same way memberships and connections are: the structured values are
+  authoritative and carry the timestamps a UI renders countdowns from, while
+  the flat list means a host that renders one warning banner cannot *miss* a
+  condition it did not know to look for. It is a pure projection derived in
+  one place (`Inner::impairments`, over pure free functions) and never
+  carries a fact the structured fields do not.
+- `DisconnectCause = NeverJoined | LeftByHost { reason } | SlotClosed |
+  JoinFailed { at_ts, progress, error } | ManagerStopped { component }`.
+  `Disconnected` used to be a unit: an admin closing the slot, our own
+  `leave()` and a join that never completed were indistinguishable.
+  `JoinFailed` carries the step-by-step `JoinStatus` the abort used to throw
+  away, so a progress UI can say "we got a token but the membership event was
+  rejected". `ManagerStopped` is published by a drop guard on the facade
+  pump — a clean exit and an unwind both reach it. A panic inside the
+  *callback dispatch* itself remains undetectable from inside; that boundary
+  is documented rather than pretended away.
+- `JoinError` splits `TransportUnavailable` into `NoTransport` (the
+  homeserver advertises no usable SFU — a configuration problem, retrying is
+  pointless) and `TokenRefused` (auth or network — retrying may work), and
+  gains `EncryptionSetup`, which was an `InvalidParams(String)`: a crate
+  precondition dressed as a caller mistake. `open_slot`/`close_slot` return
+  `SlotError { InvalidSlotId, Driver }` so a local precondition is not
+  conflated with a homeserver failure.
+- `own_member_id()` / `own_membership()` hand back the member id the facade
+  mints. Every self-referential check needs it — am I in the roster, was I
+  excluded, which LiveKit participant is me — and `(user_id, device_id)` is
+  not a substitute: one device may hold several RTC members, and a rejoin
+  mints a fresh id.
+- `connection_problems()` names the connections a host cannot use:
+  `NoToken` (wanted, never minted — absent from `connections()` entirely) or
+  `TokenExpired` (still served, because dropping it would break a host that
+  is still connected, but past its `exp`). `ConnectionData` carries
+  `expires_at_ts` so a host can check its own token instead of discovering
+  staleness through a LiveKit connect that fails for no stated reason.
+- `on_key_rejected(cb)` fires when an inbound media key is discarded, with
+  the member and the typed `KeyRejection`. It is **secondary** to the latched
+  per-tile `SessionMembership::media_key.rejection`, which is what a UI
+  attaching late reads; the callback is for logging and telemetry.
 - Getter + change-callback pairs for the four host-facing outputs:
   **memberships** (`SessionMembership[]`), **connections**
   (`ConnectionWithMembers[]`), **`KeyMap`** (callback carries the single
@@ -269,6 +368,13 @@ The facade a calling host uses. Owns and wires the four parts above.
   (which LK rooms to hold). A `SessionMembership` carries what the tile→media
   lookup needs — the `service_url`s the member publishes on and the transport
   participant identity (MSC4195 hash; `{user}:{device}` in legacy compat).
+- `SessionMembership::media_key: Option<MediaKeyState { holds_our_key,
+  have_their_key, rejection }>` puts "who can hear whom" on the tile. `None`
+  when the call manages no media keys, for our own tile, and while not
+  joined. Two independent booleans on purpose: they fail for different
+  reasons (our to-device send to them vs. theirs to us), clear independently,
+  and a UI renders them in different places. `key_map()` is the *inbound*
+  map — it says who we can hear, never who can hear us.
 - A membership's state is `Joined` or `LeftWithKeys`: a member that left the
   session (leave/expired sticky) but still holds a not-yet-rotated copy of
   our media key stays in the list, so the UI can render "leaving — may still
@@ -291,6 +397,14 @@ receives no more than it needs; `MatrixDriver` is the sum.
   events (MSC3401 compat only), restart/cancel delayed (MSC4140), delegate
   LiveKit delayed leave. `DriverError::Unsupported | Unauthorized` from the
   delayed-event methods mean "this homeserver never will" (404 / 403).
+- `DriverError = Http | Unauthorized | Unsupported | RateLimited {
+  retry_after_ms } | Stopped | Other`. The taxonomy exists so a caller can
+  decide what to do next without string matching: `Unsupported` /
+  `Unauthorized` are permanent for this homeserver, `RateLimited`
+  (`M_LIMIT_EXCEEDED`, previously an opaque `Http(String)` no host could back
+  off from) is explicitly transient, and `Stopped` means the manager behind
+  the call is gone and no retry helps — it surfaces as
+  `DisconnectCause::ManagerStopped`.
 - `ToDeviceSendDriver`: send one to-device message to a set of devices with
   per-recipient results. `ToDeviceDriver` adds the inbound stream (decrypted,
   with origin metadata and the MSC4153 cross-signing verdict).
@@ -328,6 +442,22 @@ generated bindings cost nothing where it matters.
   change streams, `MatrixDriverCallback` as an async foreign trait — the
   same seam a matrix-rust-sdk adapter (mobile) and a matrix-js-sdk driver
   (web) implement.
+- `FfiStatus` mirrors `Status` in full — `Disconnected { cause }`,
+  `Joining { own_membership, encryption, impairments }`,
+  `Connected { keep_alive, membership, roster, encryption, impairments }`,
+  `Leaving { leave_event_sent, delayed_leave, impairments }` — with
+  `FfiKeepAlive`, `FfiMembershipPublication`, `FfiRosterPresence`,
+  `FfiImpairment`, `FfiSeverity`, `FfiDisconnectCause` and `FfiJoinError`
+  alongside. It used to be four opaque variants with the sub-statuses left
+  in `debug_snapshot`; `debug_snapshot` is diagnostics, an unversioned JSON
+  dump for bug reports, and was never a UI contract. `FfiSessionSnapshot`
+  carries `seeded`, `failed_reads` and `excluded_candidates`;
+  `FfiMembership` carries `media_key`; `FfiConnectionData` carries
+  `expires_at_ts`; `connection_problems()`, `own_member_id()`,
+  `own_membership()` and `set_key_rejected_listener()` are exported.
+  `RtcError` gained `RateLimited`, `NoTransport`, `TokenRefused`,
+  `EncryptionSetup` and `Stopped`, and stops collapsing `Http` into
+  `Driver`.
 - The FFI mirrors the Rust shape `Manager::new(MatrixDriver::new(room))`
   literally: the host wraps its `MatrixDriverCallback` in an exported
   `FfiMatrixDriver` object — the one place the foreign trait becomes a
