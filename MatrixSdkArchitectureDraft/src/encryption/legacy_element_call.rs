@@ -101,7 +101,11 @@ mod tests {
 
     #[test]
     fn legacy_content_carries_member_device_call_id_session_and_sent_ts() {
-        let key = MediaKey { key: vec![1u8; 16], index: 2, creation_ts_ms: 5 };
+        let key = MediaKey {
+            key: vec![1u8; 16],
+            index: 2,
+            creation_ts_ms: 5,
+        };
         let c = build_content("!r", "m.call#abc", "@u:x:DEV", "DEV", &key, 1234);
         assert_eq!(c["keys"]["index"], 2);
         assert_eq!(c["member"]["id"], "@u:x:DEV");

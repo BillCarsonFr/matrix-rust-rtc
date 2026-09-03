@@ -168,12 +168,24 @@ mod tests {
     use super::*;
 
     fn key() -> MediaKey {
-        MediaKey { key: vec![7u8; 32], index: 3, creation_ts_ms: 1 }
+        MediaKey {
+            key: vec![7u8; 32],
+            index: 3,
+            creation_ts_ms: 1,
+        }
     }
 
     #[test]
     fn outbound_content_declares_format_0_and_no_version() {
-        let c = build_content(ElementCallCompat::Off, "!r", "m.call#", "M1", "DEV", &key(), 0);
+        let c = build_content(
+            ElementCallCompat::Off,
+            "!r",
+            "m.call#",
+            "M1",
+            "DEV",
+            &key(),
+            0,
+        );
         assert_eq!(c["format"], 0);
         assert!(c.get("version").is_none());
         assert_eq!(c["room_id"], "!r");
@@ -185,7 +197,10 @@ mod tests {
 
     #[test]
     fn outbound_type_is_the_unstable_spelling() {
-        assert_eq!(outbound_event_type(ElementCallCompat::Off), KEY_EVENT_TYPE_UNSTABLE);
+        assert_eq!(
+            outbound_event_type(ElementCallCompat::Off),
+            KEY_EVENT_TYPE_UNSTABLE
+        );
         assert_eq!(
             outbound_event_type(ElementCallCompat::StateEvents),
             super::super::legacy_element_call::LEGACY_KEY_EVENT_TYPE
@@ -199,7 +214,9 @@ mod tests {
                 event_type: t.into(),
                 sender: "@a:x".into(),
                 content: build_content(ElementCallCompat::Off, "!r", "", "M1", "D", &key(), 0),
-                origin: EventOrigin::Encrypted { sender_device_id: Some("D".into()) },
+                origin: EventOrigin::Encrypted {
+                    sender_device_id: Some("D".into()),
+                },
                 sender_cross_signed: Some(true),
             };
             let r = to_received(&msg).unwrap();

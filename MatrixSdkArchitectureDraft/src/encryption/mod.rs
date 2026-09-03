@@ -11,11 +11,11 @@
 
 pub mod inbound;
 pub(crate) mod legacy_element_call;
+pub mod matrix_encryption_event;
 mod pump;
 #[cfg(test)]
 mod rotation_simulation;
 pub mod send_machine;
-pub mod matrix_encryption_event;
 
 use crate::driver::{ToDeviceDriver, ToDeviceMessage, ToDeviceRecipient};
 use crate::executor;
@@ -60,7 +60,10 @@ impl Participation {
     /// `None` for members without a device: nobody can send them a key.
     pub fn from_member(member: &Member) -> Option<Self> {
         let device_id = member.device_id.clone()?;
-        Some(Self { member: member.clone(), device_id })
+        Some(Self {
+            member: member.clone(),
+            device_id,
+        })
     }
 
     pub fn member(&self) -> &Member {
@@ -77,7 +80,10 @@ impl Participation {
     }
 
     pub fn recipient(&self) -> ToDeviceRecipient {
-        ToDeviceRecipient { user_id: self.member.user_id.clone(), device_id: self.device_id.clone() }
+        ToDeviceRecipient {
+            user_id: self.member.user_id.clone(),
+            device_id: self.device_id.clone(),
+        }
     }
 }
 
@@ -151,7 +157,10 @@ pub struct EncryptionConfig {
 
 impl Default for EncryptionConfig {
     fn default() -> Self {
-        Self { require_cross_signed_sender: true, manage_media_keys: true }
+        Self {
+            require_cross_signed_sender: true,
+            manage_media_keys: true,
+        }
     }
 }
 
@@ -304,6 +313,13 @@ impl Machine {
         self.inner.state.lock().unwrap().inbound.key_map().clone()
     }
 
+    /// Everyone holding the key our media is currently encrypted with. The
+    /// facade diffs this against the *fresh* session roster to list members
+    /// that left but may still be listening.
+    pub fn key_holders(&self) -> Vec<Member> {
+        self.inner.state.lock().unwrap().send.key_holders()
+    }
+
     /// Re-emit every key we hold (for hosts attaching a media session late).
     pub fn replay_key_map(&self) {
         let map = self.key_map();
@@ -311,7 +327,10 @@ impl Machine {
             for key in ring {
                 (self.inner.on_key_map_change)(
                     &map,
-                    &MediaKeyChange { member_id: member_id.clone(), key: key.clone() },
+                    &MediaKeyChange {
+                        member_id: member_id.clone(),
+                        key: key.clone(),
+                    },
                 );
             }
         }
@@ -324,7 +343,8 @@ impl Machine {
     pub fn status(&self) -> Status {
         let mut state = self.inner.state.lock().unwrap();
         let has_distributed_initial_keys = state.send.has_distributed_initial_keys();
-        let has_received_all_member_keys = state.inbound.has_received_all_member_keys(&state.members);
+        let has_received_all_member_keys =
+            state.inbound.has_received_all_member_keys(&state.members);
         if has_distributed_initial_keys && has_received_all_member_keys {
             state.connected = true;
         }
@@ -335,7 +355,10 @@ impl Machine {
                 last_rotation_ts: state.send.last_rotation_ts(),
             }
         } else {
-            Status::Joining { has_distributed_initial_keys, has_received_all_member_keys }
+            Status::Joining {
+                has_distributed_initial_keys,
+                has_received_all_member_keys,
+            }
         }
     }
 
@@ -365,7 +388,11 @@ impl Machine {
         }
     }
 
-    pub(crate) fn on_session(inner: &MachineInner, snapshot: SessionSnapshot, now: u64) -> Vec<Action> {
+    pub(crate) fn on_session(
+        inner: &MachineInner,
+        snapshot: SessionSnapshot,
+        now: u64,
+    ) -> Vec<Action> {
         let (changes, actions) = {
             let mut state = inner.state.lock().unwrap();
             state.members = snapshot.members;
@@ -382,8 +409,18 @@ impl Machine {
         inner.state.lock().unwrap().send.on_wake(now)
     }
 
-    pub(crate) fn on_delivered(inner: &MachineInner, key_index: u8, served: &[Participation], now: u64) {
-        inner.state.lock().unwrap().send.on_delivered(key_index, served, now);
+    pub(crate) fn on_delivered(
+        inner: &MachineInner,
+        key_index: u8,
+        served: &[Participation],
+        now: u64,
+    ) {
+        inner
+            .state
+            .lock()
+            .unwrap()
+            .send
+            .on_delivered(key_index, served, now);
     }
 
     pub(crate) fn use_own_key(inner: &MachineInner, key: MediaKey) {
@@ -413,7 +450,10 @@ impl Machine {
             Ok(KeyOutcome::Duplicate) => {}
             Ok(KeyOutcome::Buffered) => {}
             Err(rejection) => {
-                log::warn!("media key for {member_id} from {} rejected: {rejection}", msg.sender);
+                log::warn!(
+                    "media key for {member_id} from {} rejected: {rejection}",
+                    msg.sender
+                );
                 if let Some(cb) = inner.on_key_rejected.lock().unwrap().as_ref() {
                     cb(&member_id, &rejection);
                 }

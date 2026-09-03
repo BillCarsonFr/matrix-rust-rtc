@@ -26,29 +26,32 @@ pub enum DriverError {
     Other(String),
 }
 
-/// Matrix OpenID token (what a transport exchanges for its own credentials).
-#[derive(Clone, Debug)]
-pub struct OpenIdToken {
-    pub access_token: String,
-    pub token_type: String,
-    pub matrix_server_name: String,
-    pub expires_in_ms: u64,
-}
-
-/// MSC4195 `POST /rtc/livekit/get_token`. `member` is forwarded verbatim
-/// (MSC4533): the homeserver authorises it against actual room membership.
-#[derive(Clone, Debug)]
+/// MSC4195 `POST {url}/get_token`. The adapter obtains the OpenID token
+/// itself (that exchange is part of *how* a LiveKit token is fetched and never
+/// needed elsewhere) and posts `{ room_id, slot_id, openid_token, member }`.
+/// `member` is the MSC4195 claims object `{ id, claimed_user_id,
+/// claimed_device_id }`, forwarded verbatim.
+///
+/// With `legacy_sfu_get` the pre-MSC4195 `POST {url}/sfu/get` is used
+/// instead, body `{ room: room_id, openid_token, device_id }` (the
+/// `ElementCallCompat::StateEvents` generation — delete with it). `room` must
+/// equal the `livekit_alias` `own_membership` writes, which is the room id.
+#[derive(Clone, Debug, PartialEq)]
 pub struct LivekitTokenRequest {
-    pub server_name: Option<String>,
+    /// The transport's `livekit_service_url`.
     pub url: String,
     pub room_id: String,
     pub slot_id: String,
     pub member: Value,
+    pub legacy_sfu_get: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LivekitTokenResponse {
     pub jwt: String,
+    /// The SFU websocket URL to connect to (MSC4195 response `url`); `None`
+    /// when the service returned none — the transport URL is used then.
+    pub url: Option<String>,
 }
 
 /// MSC4195 `POST /rtc/livekit/delegate_delayed_leave` — hands the dead man's
@@ -115,7 +118,8 @@ pub trait OwnMembershipDriver: Send + Sync {
         duration_ms: u64,
     ) -> Result<SendEventResponse, DriverError>;
 
-    /// Send a room state event (`m.rtc.slot` open/close).
+    /// Send a room state event: the facade's slot administration
+    /// (`m.rtc.slot` open/close) and the MSC3401 compat dialect's membership.
     async fn send_state_event(
         &self,
         room_id: String,
@@ -125,10 +129,32 @@ pub trait OwnMembershipDriver: Send + Sync {
     ) -> Result<SendEventResponse, DriverError>;
 
     /// Schedule a delayed event (MSC4140); returns the *delay id*.
+    ///
+    /// `sticky_duration_ms` makes it a delayed **sticky** event (MSC4354 +
+    /// MSC4140 combined): the delayed leave must be sticky to clear our
+    /// sticky-map entry when it fires. An adapter that cannot express both
+    /// may ignore it (the ghost window then rides on the sticky TTL).
+    /// Transitional `Option`: once every adapter can, it becomes mandatory.
+    ///
+    /// `DriverError::Unsupported` / `Unauthorized` are read as "this
+    /// homeserver will never do delayed events" (404 `M_UNRECOGNIZED`, 403
+    /// `M_FORBIDDEN`); anything else is retried later.
     async fn send_delayed_event(
         &self,
         room_id: String,
         event_type: String,
+        content: Value,
+        delay_ms: u64,
+        sticky_duration_ms: Option<u64>,
+    ) -> Result<String, DriverError>;
+
+    /// Delayed **state** event — compat only (`ElementCallCompat::StateEvents`:
+    /// the delayed leave is an empty state event). Delete with that generation.
+    async fn send_delayed_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, DriverError>;
@@ -207,12 +233,11 @@ pub trait RoomEventsDriver: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait TokenDriver: Send + Sync {
-    async fn get_open_id(&self) -> Result<OpenIdToken, DriverError>;
-
     /// `GET /_matrix/client/v1/rtc/transports`, with well-known fallback.
     async fn get_rtc_transports(&self) -> Result<Vec<RtcTransport>, DriverError>;
 
-    /// MSC4195 LiveKit token exchange (body forwarded verbatim, MSC4533).
+    /// MSC4195 LiveKit token exchange, OpenID token included (see
+    /// [`LivekitTokenRequest`]).
     async fn get_livekit_token(
         &self,
         request: LivekitTokenRequest,

@@ -68,6 +68,7 @@ struct Live {
     snapshot_tx: watch::Sender<SessionSnapshot>,
     clock: Arc<dyn Clock>,
     closed: bool,
+    seeded: bool,
     pump_waker: Option<Waker>,
 }
 
@@ -80,7 +81,10 @@ impl Live {
         if let Some(room_id) = dispatch::room_id(event)
             && room_id != self.room_id
         {
-            log::debug!("[{}] ignoring an event for another room ({room_id})", self.tag());
+            log::debug!(
+                "[{}] ignoring an event for another room ({room_id})",
+                self.tag()
+            );
             return;
         }
         let ingest = dispatch::classify(event, &self.config, now);
@@ -119,24 +123,39 @@ impl Live {
 
     /// Publish the projection if it differs from the current value.
     fn publish(&mut self) {
-        let snapshot = self.state.project(&self.slot_id);
+        let mut snapshot = self.state.project(&self.slot_id);
+        snapshot.seeded = self.seeded;
         let tag = self.tag();
         self.snapshot_tx.send_if_modified(|current| {
             if *current == snapshot {
                 log::trace!("[{tag}] snapshot unchanged");
                 return false;
             }
-            let ids = |s: &SessionSnapshot| s.members.iter().map(|m| m.member_id.clone()).collect::<Vec<_>>();
+            let ids = |s: &SessionSnapshot| {
+                s.members
+                    .iter()
+                    .map(|m| m.member_id.clone())
+                    .collect::<Vec<_>>()
+            };
             let before = ids(current);
             let after = ids(&snapshot);
             log::info!(
                 "[{tag}] session changed: {} -> {} joined (+{:?} -{:?}), {} excluded, slot={:?}",
                 before.len(),
                 after.len(),
-                after.iter().filter(|id| !before.contains(id)).collect::<Vec<_>>(),
-                before.iter().filter(|id| !after.contains(id)).collect::<Vec<_>>(),
+                after
+                    .iter()
+                    .filter(|id| !before.contains(id))
+                    .collect::<Vec<_>>(),
+                before
+                    .iter()
+                    .filter(|id| !after.contains(id))
+                    .collect::<Vec<_>>(),
                 snapshot.excluded_candidates.len(),
-                snapshot.slot_state.as_ref().map(|s| if s.is_open() { "Open" } else { "Closed" }),
+                snapshot
+                    .slot_state
+                    .as_ref()
+                    .map(|s| if s.is_open() { "Open" } else { "Closed" }),
             );
             *current = snapshot;
             true
@@ -224,12 +243,20 @@ impl Session {
             snapshot_tx,
             clock,
             closed: false,
+            seeded: false,
             pump_waker: None,
         };
-        log::info!("[{room_id}/{slot_id}] session created (compat {:?})", config.compat);
+        log::info!(
+            "[{room_id}/{slot_id}] session created (compat {:?})",
+            config.compat
+        );
         let inner = Arc::new(Mutex::new(live));
         executor::spawn(run(inner.clone(), driver));
-        Self { room_id, slot_id, inner }
+        Self {
+            room_id,
+            slot_id,
+            inner,
+        }
     }
 
     pub fn room_id(&self) -> &str {
@@ -292,6 +319,7 @@ async fn run(inner: Arc<Mutex<Live>>, driver: Arc<dyn RoomEventsDriver>) {
         if live.closed {
             return;
         }
+        live.seeded = true;
         live.publish();
         log::debug!("[{}] seeded", live.tag());
     }
@@ -315,10 +343,16 @@ async fn run(inner: Arc<Mutex<Live>>, driver: Arc<dyn RoomEventsDriver>) {
                 }
                 Some(deadline) => {
                     if timer.as_ref().is_none_or(|(armed, _)| *armed != deadline) {
-                        log::trace!("[{}] expiry timer armed for {deadline} (in {}ms)", live.tag(), deadline.saturating_sub(now));
+                        log::trace!(
+                            "[{}] expiry timer armed for {deadline} (in {}ms)",
+                            live.tag(),
+                            deadline.saturating_sub(now)
+                        );
                         timer = Some((deadline, live.clock.sleep(deadline.saturating_sub(now))));
                     }
-                    let Some((_, sleep)) = timer.as_mut() else { unreachable!() };
+                    let Some((_, sleep)) = timer.as_mut() else {
+                        unreachable!()
+                    };
                     if sleep.as_mut().poll(cx).is_ready() {
                         // Fired: expire against a fresh `now` and re-arm.
                         timer = None;
@@ -348,15 +382,26 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
         live.ingest_batch(events, now);
     };
 
-    match driver.read_state(ROOM_ENCRYPTION_EVENT_TYPE.to_owned(), StateKeySelector::Key(String::new())).await {
+    match driver
+        .read_state(
+            ROOM_ENCRYPTION_EVENT_TYPE.to_owned(),
+            StateKeySelector::Key(String::new()),
+        )
+        .await
+    {
         Ok(events) => ingest(&events),
-        Err(error) => log::warn!("[{tag}] read_state({ROOM_ENCRYPTION_EVENT_TYPE}) failed: {error}; the encryption condition is unenforced"),
+        Err(error) => log::warn!(
+            "[{tag}] read_state({ROOM_ENCRYPTION_EVENT_TYPE}) failed: {error}; the encryption condition is unenforced"
+        ),
     }
 
     let mut slot_events = Vec::new();
     let mut slots_supplied = false;
     for event_type in SLOT_EVENT_TYPES {
-        match driver.read_state(event_type.to_owned(), StateKeySelector::Any).await {
+        match driver
+            .read_state(event_type.to_owned(), StateKeySelector::Any)
+            .await
+        {
             Ok(events) => {
                 slots_supplied = true;
                 slot_events.extend(events);
@@ -371,31 +416,46 @@ async fn seed(inner: &Arc<Mutex<Live>>, driver: &Arc<dyn RoomEventsDriver>) {
         log::warn!("[{tag}] no slot state could be read; the open-slot condition is unenforced");
     }
 
-    match driver.read_state(ROOM_MEMBER_EVENT_TYPE.to_owned(), StateKeySelector::Any).await {
+    match driver
+        .read_state(ROOM_MEMBER_EVENT_TYPE.to_owned(), StateKeySelector::Any)
+        .await
+    {
         // A room the caller can read has at least the caller in it, so an
         // empty answer is a host with no member state to offer, not an empty
         // room; enforcing it would exclude everyone.
         Ok(events) if events.is_empty() => {
-            log::warn!("[{tag}] read_state({ROOM_MEMBER_EVENT_TYPE}) returned nothing; the sender-in-room condition is unenforced")
+            log::warn!(
+                "[{tag}] read_state({ROOM_MEMBER_EVENT_TYPE}) returned nothing; the sender-in-room condition is unenforced"
+            )
         }
         Ok(events) => {
             lock(inner).state.supply_room_members();
             ingest(&events);
         }
-        Err(error) => log::warn!("[{tag}] read_state({ROOM_MEMBER_EVENT_TYPE}) failed: {error}; the sender-in-room condition is unenforced"),
+        Err(error) => log::warn!(
+            "[{tag}] read_state({ROOM_MEMBER_EVENT_TYPE}) failed: {error}; the sender-in-room condition is unenforced"
+        ),
     }
 
     for event_type in MEMBER_EVENT_TYPES {
-        match driver.read_events(event_type.to_owned(), None, MEMBER_READ_LIMIT).await {
+        match driver
+            .read_events(event_type.to_owned(), None, MEMBER_READ_LIMIT)
+            .await
+        {
             Ok(events) => ingest(&events),
             Err(error) => log::warn!("[{tag}] read_events({event_type}) failed: {error}"),
         }
     }
 
     if config.compat == ElementCallCompat::StateEvents {
-        match driver.read_state(LEGACY_MEMBER_EVENT_TYPE.to_owned(), StateKeySelector::Any).await {
+        match driver
+            .read_state(LEGACY_MEMBER_EVENT_TYPE.to_owned(), StateKeySelector::Any)
+            .await
+        {
             Ok(events) => ingest(&events),
-            Err(error) => log::warn!("[{tag}] read_state({LEGACY_MEMBER_EVENT_TYPE}) failed: {error}"),
+            Err(error) => {
+                log::warn!("[{tag}] read_state({LEGACY_MEMBER_EVENT_TYPE}) failed: {error}")
+            }
         }
     }
 }
@@ -412,27 +472,53 @@ mod tests {
     const NOW: u64 = 1_700_000_000_000;
 
     fn encrypted(device: &str) -> EventOrigin {
-        EventOrigin::Encrypted { sender_device_id: Some(device.to_owned()) }
+        EventOrigin::Encrypted {
+            sender_device_id: Some(device.to_owned()),
+        }
     }
 
     /// A driver whose room has this slot open (an empty slot read means
     /// "supplied, none" and would close it).
     fn driver_with_open_slot() -> Arc<FakeRoomEventsDriver> {
-        Arc::new(FakeRoomEventsDriver::new().with_state(SLOT_EVENT_TYPES[0], vec![raw(slot_open_event(NOW), EventOrigin::Unknown)]))
+        Arc::new(FakeRoomEventsDriver::new().with_state(
+            SLOT_EVENT_TYPES[0],
+            vec![raw(slot_open_event(NOW), EventOrigin::Unknown)],
+        ))
     }
 
-    fn session(driver: &Arc<FakeRoomEventsDriver>, clock: &FakeClock, compat: ElementCallCompat) -> Session {
+    fn session(
+        driver: &Arc<FakeRoomEventsDriver>,
+        clock: &FakeClock,
+        compat: ElementCallCompat,
+    ) -> Session {
         let driver: Arc<dyn RoomEventsDriver> = driver.clone();
-        Session::with_clock(ROOM_ID.into(), SLOT_ID.into(), driver, SessionConfig { compat }, Arc::new(clock.clone()))
+        Session::with_clock(
+            ROOM_ID.into(),
+            SLOT_ID.into(),
+            driver,
+            SessionConfig { compat },
+            Arc::new(clock.clone()),
+        )
     }
 
     fn ids(snapshot: &SessionSnapshot) -> Vec<String> {
-        snapshot.members.iter().map(|m| m.member_id.clone()).collect()
+        snapshot
+            .members
+            .iter()
+            .map(|m| m.member_id.clone())
+            .collect()
     }
 
     /// Wait until the pump has seeded (the driver logged every read).
     fn wait_seeded(driver: &FakeRoomEventsDriver) {
-        wait_until(|| driver.log().iter().filter(|l| l.starts_with("read_")).count() >= 6);
+        wait_until(|| {
+            driver
+                .log()
+                .iter()
+                .filter(|l| l.starts_with("read_"))
+                .count()
+                >= 6
+        });
     }
 
     #[test]
@@ -465,10 +551,16 @@ mod tests {
             rx.borrow_and_update().clone()
         });
         assert_eq!(ids(&snapshot), vec!["m-a"]);
-        assert_eq!(snapshot.excluded_candidates[0].1, JoinExclusionReason::SenderNotInRoom);
+        assert_eq!(
+            snapshot.excluded_candidates[0].1,
+            JoinExclusionReason::SenderNotInRoom
+        );
         assert!(snapshot.slot_state.unwrap().is_open());
         assert_eq!(snapshot.negotiated_encryption, Some(true));
-        assert!(!rx.has_changed().unwrap(), "one publish at the end of seeding, not per read");
+        assert!(
+            !rx.has_changed().unwrap(),
+            "one publish at the end of seeding, not per read"
+        );
     }
 
     #[test]
@@ -478,8 +570,14 @@ mod tests {
             FakeRoomEventsDriver::new()
                 .with_state_error(SLOT_EVENT_TYPES[0], DriverError::Http("500".into()))
                 .with_state_error(SLOT_EVENT_TYPES[1], DriverError::Http("500".into()))
-                .with_state_error(ROOM_MEMBER_EVENT_TYPE, DriverError::Unauthorized("no".into()))
-                .with_events(MEMBER_EVENT_TYPES[0], vec![raw(member_join_event("@a:x", "m-a", NOW), encrypted("A"))]),
+                .with_state_error(
+                    ROOM_MEMBER_EVENT_TYPE,
+                    DriverError::Unauthorized("no".into()),
+                )
+                .with_events(
+                    MEMBER_EVENT_TYPES[0],
+                    vec![raw(member_join_event("@a:x", "m-a", NOW), encrypted("A"))],
+                ),
         );
         let session = session(&driver, &clock, ElementCallCompat::Off);
         wait_seeded(&driver);
@@ -508,7 +606,10 @@ mod tests {
         let driver = driver_with_open_slot();
         let session = session(&driver, &clock, ElementCallCompat::Off);
         wait_seeded(&driver);
-        driver.emit_room(raw(member_join_event("@a:x", "m-a", NOW), EventOrigin::Cleartext));
+        driver.emit_room(raw(
+            member_join_event("@a:x", "m-a", NOW),
+            EventOrigin::Cleartext,
+        ));
         let mut rx = session.subscribe();
         assert_eq!(ids(&rx.borrow_and_update()), vec!["m-a"]);
         // Slot closed + room encrypted, in one batch: one wake-up.
@@ -520,9 +621,15 @@ mod tests {
         let snapshot = rx.borrow_and_update().clone();
         assert!(snapshot.members.is_empty());
         assert_eq!(snapshot.slot_state, Some(SlotState::Closed));
-        assert_eq!(snapshot.excluded_candidates[0].1, JoinExclusionReason::SlotClosed);
+        assert_eq!(
+            snapshot.excluded_candidates[0].1,
+            JoinExclusionReason::SlotClosed
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!rx.has_changed().unwrap(), "exactly one publish for the batch");
+        assert!(
+            !rx.has_changed().unwrap(),
+            "exactly one publish for the batch"
+        );
     }
 
     #[test]
@@ -543,7 +650,14 @@ mod tests {
         assert_eq!(ids(&session.snapshot()), vec!["m-a"]);
         // The other slot's state event supplies slot state for the room, so
         // this slot (with no event) is now closed.
-        driver.emit_room(raw(slot_event("m.whiteboard#ROOM", json!({ "status": "open", "application": { "type": "m.whiteboard" } }), NOW), EventOrigin::Unknown));
+        driver.emit_room(raw(
+            slot_event(
+                "m.whiteboard#ROOM",
+                json!({ "status": "open", "application": { "type": "m.whiteboard" } }),
+                NOW,
+            ),
+            EventOrigin::Unknown,
+        ));
         let snapshot = session.snapshot();
         assert!(snapshot.members.is_empty());
         assert_eq!(snapshot.slot_state, Some(SlotState::Closed));
@@ -580,7 +694,14 @@ mod tests {
         block_on(wait_for_change(&mut rx, 5_000));
         let snapshot = rx.borrow_and_update().clone();
         assert_eq!(ids(&snapshot), vec!["m-a"]);
-        assert_eq!(snapshot.excluded_candidates.iter().map(|(m, r)| (m.member_id.as_str(), *r)).collect::<Vec<_>>(), vec![("m-b", JoinExclusionReason::Expired)]);
+        assert_eq!(
+            snapshot
+                .excluded_candidates
+                .iter()
+                .map(|(m, r)| (m.member_id.as_str(), *r))
+                .collect::<Vec<_>>(),
+            vec![("m-b", JoinExclusionReason::Expired)]
+        );
         wait_until(|| clock.earliest_deadline() == Some(NOW + 1_000));
 
         // A refresh (same key, later end_time) extends it.
@@ -590,7 +711,11 @@ mod tests {
         wait_until(|| clock.earliest_deadline() == Some(NOW + 2_500));
         clock.advance(1_000);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(ids(&session.snapshot()), vec!["m-a"], "still there at the old deadline");
+        assert_eq!(
+            ids(&session.snapshot()),
+            vec!["m-a"],
+            "still there at the old deadline"
+        );
         clock.advance(1_000);
         // The transition after an expiry republishes once more to clear the
         // one-shot `Expired` entry, so wait for the roster itself.
@@ -650,7 +775,10 @@ mod tests {
         driver.emit_room(ev);
         driver.emit_state(vec![raw(slot_open_event(NOW), EventOrigin::Unknown)]);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!rx.has_changed().unwrap(), "re-asserting the open slot changes nothing");
+        assert!(
+            !rx.has_changed().unwrap(),
+            "re-asserting the open slot changes nothing"
+        );
         assert_eq!(session.debug_snapshot()["joined"], json!(["m-a"]));
         driver.emit_state(vec![raw(slot_closed_event(NOW), EventOrigin::Unknown)]);
         block_on(wait_for_change(&mut rx, 5_000)); // closing it is a change
@@ -662,17 +790,27 @@ mod tests {
         let clock = FakeClock::new(NOW);
         let driver = Arc::new(FakeRoomEventsDriver::new().with_state(
             LEGACY_MEMBER_EVENT_TYPE,
-            vec![raw(msc3401_member_event("@a:x", "DEV", NOW - 1_000, NOW - 1_000), EventOrigin::Unknown)],
+            vec![raw(
+                msc3401_member_event("@a:x", "DEV", NOW - 1_000, NOW - 1_000),
+                EventOrigin::Unknown,
+            )],
         ));
         let driver_dyn: Arc<dyn RoomEventsDriver> = driver.clone();
         let session = Session::with_clock(
             ROOM_ID.into(),
             crate::session::LEGACY_SLOT_ID.into(),
             driver_dyn,
-            SessionConfig { compat: ElementCallCompat::StateEvents },
+            SessionConfig {
+                compat: ElementCallCompat::StateEvents,
+            },
             Arc::new(clock.clone()),
         );
-        wait_until(|| driver.log().iter().any(|l| l == &format!("read_state:{LEGACY_MEMBER_EVENT_TYPE}")));
+        wait_until(|| {
+            driver
+                .log()
+                .iter()
+                .any(|l| l == &format!("read_state:{LEGACY_MEMBER_EVENT_TYPE}"))
+        });
         wait_until(|| !session.snapshot().members.is_empty());
         let snapshot = session.snapshot();
         assert_eq!(ids(&snapshot), vec!["@a:x:DEV"]);

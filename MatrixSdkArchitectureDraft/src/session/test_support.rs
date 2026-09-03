@@ -62,7 +62,12 @@ pub(crate) fn member_join_event(user_id: &str, member_id: &str, ts: u64) -> Valu
     member_join_event_with(user_id, member_id, ts, LK_SERVICE_URL)
 }
 
-pub(crate) fn member_join_event_with(user_id: &str, member_id: &str, ts: u64, lk_service_url: &str) -> Value {
+pub(crate) fn member_join_event_with(
+    user_id: &str,
+    member_id: &str,
+    ts: u64,
+    lk_service_url: &str,
+) -> Value {
     let mut event = base(
         "m.rtc.member",
         user_id,
@@ -100,7 +105,12 @@ pub(crate) fn member_leave_event(user_id: &str, member_id: &str, ts: u64) -> Val
 
 /// The 2025 dialect's leave / an MSC4354 removal: the sticky key alone.
 pub(crate) fn member_bare_leave_event(user_id: &str, member_id: &str, ts: u64) -> Value {
-    let mut event = base("m.rtc.member", user_id, ts, json!({ "msc4354_sticky_key": member_id }));
+    let mut event = base(
+        "m.rtc.member",
+        user_id,
+        ts,
+        json!({ "msc4354_sticky_key": member_id }),
+    );
     event["msc4354_sticky"] = json!({ "duration_ms": 240_000 });
     event
 }
@@ -112,27 +122,50 @@ pub(crate) fn slot_event(slot_id: &str, content: Value, ts: u64) -> Value {
 }
 
 pub(crate) fn slot_open_event(ts: u64) -> Value {
-    slot_event(SLOT_ID, json!({ "status": "open", "application": { "type": "m.call" } }), ts)
+    slot_event(
+        SLOT_ID,
+        json!({ "status": "open", "application": { "type": "m.call" } }),
+        ts,
+    )
 }
 
 pub(crate) fn slot_closed_event(ts: u64) -> Value {
-    slot_event(SLOT_ID, json!({ "status": "closed", "application": { "type": "m.call" } }), ts)
+    slot_event(
+        SLOT_ID,
+        json!({ "status": "closed", "application": { "type": "m.call" } }),
+        ts,
+    )
 }
 
 pub(crate) fn room_member_event(user_id: &str, membership: &str, ts: u64) -> Value {
-    let mut event = base("m.room.member", user_id, ts, json!({ "membership": membership }));
+    let mut event = base(
+        "m.room.member",
+        user_id,
+        ts,
+        json!({ "membership": membership }),
+    );
     event["state_key"] = json!(user_id);
     event
 }
 
 pub(crate) fn room_encryption_event(ts: u64) -> Value {
-    let mut event = base("m.room.encryption", "@admin:example.org", ts, json!({ "algorithm": "m.megolm.v1.aes-sha2" }));
+    let mut event = base(
+        "m.room.encryption",
+        "@admin:example.org",
+        ts,
+        json!({ "algorithm": "m.megolm.v1.aes-sha2" }),
+    );
     event["state_key"] = json!("");
     event
 }
 
 /// A pre-sticky Element Call room-state membership (4 h lifetime).
-pub(crate) fn msc3401_member_event(user_id: &str, device_id: &str, created_ts: u64, origin_server_ts: u64) -> Value {
+pub(crate) fn msc3401_member_event(
+    user_id: &str,
+    device_id: &str,
+    created_ts: u64,
+    origin_server_ts: u64,
+) -> Value {
     let mut event = base(
         "org.matrix.msc3401.call.member",
         user_id,
@@ -185,17 +218,26 @@ impl FakeRoomEventsDriver {
     }
 
     pub(crate) fn with_state(self, event_type: &str, events: Vec<RawMatrixEvent>) -> Self {
-        self.state.lock().unwrap().insert(event_type.to_owned(), Ok(events));
+        self.state
+            .lock()
+            .unwrap()
+            .insert(event_type.to_owned(), Ok(events));
         self
     }
 
     pub(crate) fn with_state_error(self, event_type: &str, error: DriverError) -> Self {
-        self.state.lock().unwrap().insert(event_type.to_owned(), Err(error));
+        self.state
+            .lock()
+            .unwrap()
+            .insert(event_type.to_owned(), Err(error));
         self
     }
 
     pub(crate) fn with_events(self, event_type: &str, events: Vec<RawMatrixEvent>) -> Self {
-        self.events.lock().unwrap().insert(event_type.to_owned(), Ok(events));
+        self.events
+            .lock()
+            .unwrap()
+            .insert(event_type.to_owned(), Ok(events));
         self
     }
 
@@ -231,7 +273,12 @@ impl RoomEventsDriver for FakeRoomEventsDriver {
         _limit: u32,
     ) -> Result<Vec<RawMatrixEvent>, DriverError> {
         self.record(format!("read_events:{event_type}"));
-        self.events.lock().unwrap().get(&event_type).cloned().unwrap_or_else(|| Ok(Vec::new()))
+        self.events
+            .lock()
+            .unwrap()
+            .get(&event_type)
+            .cloned()
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 
     async fn read_state(
@@ -240,7 +287,12 @@ impl RoomEventsDriver for FakeRoomEventsDriver {
         _state_key: StateKeySelector,
     ) -> Result<Vec<RawMatrixEvent>, DriverError> {
         self.record(format!("read_state:{event_type}"));
-        self.state.lock().unwrap().get(&event_type).cloned().unwrap_or_else(|| Ok(Vec::new()))
+        self.state
+            .lock()
+            .unwrap()
+            .get(&event_type)
+            .cloned()
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 
     fn subscribe_room_events(&self) -> UnboundedReceiver<RawMatrixEvent> {
@@ -277,14 +329,23 @@ pub(crate) struct FakeClock {
 
 impl FakeClock {
     pub(crate) fn new(now: u64) -> Self {
-        Self { inner: Arc::new(Mutex::new(FakeClockInner { now, ..FakeClockInner::default() })) }
+        Self {
+            inner: Arc::new(Mutex::new(FakeClockInner {
+                now,
+                ..FakeClockInner::default()
+            })),
+        }
     }
 
     pub(crate) fn advance(&self, ms: u64) {
         let wakers: Vec<Waker> = {
             let mut inner = self.inner.lock().unwrap();
             inner.now += ms;
-            inner.sleepers.values_mut().filter_map(|(_, waker)| waker.take()).collect()
+            inner
+                .sleepers
+                .values_mut()
+                .filter_map(|(_, waker)| waker.take())
+                .collect()
         };
         for waker in wakers {
             waker.wake();
@@ -297,7 +358,13 @@ impl FakeClock {
     }
 
     pub(crate) fn earliest_deadline(&self) -> Option<u64> {
-        self.inner.lock().unwrap().sleepers.values().map(|(d, _)| *d).min()
+        self.inner
+            .lock()
+            .unwrap()
+            .sleepers
+            .values()
+            .map(|(d, _)| *d)
+            .min()
     }
 }
 
@@ -312,7 +379,11 @@ impl Clock for FakeClock {
         let id = inner.next_id;
         inner.next_id += 1;
         inner.sleepers.insert(id, (deadline, None));
-        Box::pin(FakeSleep { clock: self.inner.clone(), deadline, id })
+        Box::pin(FakeSleep {
+            clock: self.inner.clone(),
+            deadline,
+            id,
+        })
     }
 }
 
@@ -355,7 +426,11 @@ impl Drop for FakeSleep {
 /// timer, for `wait_for_change`). `watch` channels need no runtime driver,
 /// so this works against the pump running on `executor`'s thread.
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(future)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 /// Await the next `changed()` on a watch receiver, panicking after `timeout_ms`.
@@ -370,7 +445,10 @@ pub(crate) async fn wait_for_change<T>(rx: &mut tokio::sync::watch::Receiver<T>,
 pub(crate) fn wait_until(mut condition: impl FnMut() -> bool) {
     let start = std::time::Instant::now();
     while !condition() {
-        assert!(start.elapsed() < std::time::Duration::from_secs(5), "condition never became true");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "condition never became true"
+        );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }

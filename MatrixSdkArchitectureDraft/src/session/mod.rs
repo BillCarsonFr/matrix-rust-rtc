@@ -154,6 +154,10 @@ pub struct SessionSnapshot {
     pub start_ts: Option<u64>,
     /// From the open slot (or the memberships' application).
     pub application_type: Option<String>,
+    /// `true` once the live session finished seeding from the driver's
+    /// `read_*` calls (even after read failures); always `true` on the static
+    /// path. `own_membership` mirrors it as `has_fetched_initial_member_list`.
+    pub seeded: bool,
 }
 
 impl SessionSnapshot {
@@ -199,7 +203,16 @@ pub fn compute_sessions_from_events(
     }
     let mut snapshots: Vec<SessionSnapshot> = rooms
         .values()
-        .flat_map(|state| state.slot_ids().into_iter().map(|slot_id| state.project(&slot_id)).collect::<Vec<_>>())
+        .flat_map(|state| {
+            state
+                .slot_ids()
+                .into_iter()
+                .map(|slot_id| SessionSnapshot {
+                    seeded: true,
+                    ..state.project(&slot_id)
+                })
+                .collect::<Vec<_>>()
+        })
         .collect();
     snapshots.sort_by(|a, b| (&a.room_id, &a.slot_id).cmp(&(&b.room_id, &b.slot_id)));
     log::debug!(
@@ -227,11 +240,16 @@ mod tests {
     }
 
     fn keys(snapshots: &[SessionSnapshot]) -> Vec<(String, String, usize)> {
-        snapshots.iter().map(|s| (s.room_id.clone(), s.slot_id.clone(), s.member_count())).collect()
+        snapshots
+            .iter()
+            .map(|s| (s.room_id.clone(), s.slot_id.clone(), s.member_count()))
+            .collect()
     }
 
     fn encrypted(device: &str) -> EventOrigin {
-        EventOrigin::Encrypted { sender_device_id: Some(device.to_owned()) }
+        EventOrigin::Encrypted {
+            sender_device_id: Some(device.to_owned()),
+        }
     }
 
     fn in_slot(mut event: Value, slot_id: &str) -> Value {
@@ -244,12 +262,30 @@ mod tests {
         let t = now();
         let events = vec![
             raw(member_join_event("@a:x", "m-a", t), encrypted("A")),
-            raw(in_slot(member_join_event("@b:x", "m-b", t), "m.whiteboard#ROOM"), encrypted("B")),
-            raw(in_room(member_join_event("@c:x", "m-c", t), "!other:x"), encrypted("C")),
-            raw(in_room(in_slot(member_join_event("@d:x", "m-d", t), "m.whiteboard#ROOM"), "!other:x"), encrypted("D")),
-            raw(in_room(member_join_event("@e:x", "m-e", t), "!other:x"), encrypted("E")),
+            raw(
+                in_slot(member_join_event("@b:x", "m-b", t), "m.whiteboard#ROOM"),
+                encrypted("B"),
+            ),
+            raw(
+                in_room(member_join_event("@c:x", "m-c", t), "!other:x"),
+                encrypted("C"),
+            ),
+            raw(
+                in_room(
+                    in_slot(member_join_event("@d:x", "m-d", t), "m.whiteboard#ROOM"),
+                    "!other:x",
+                ),
+                encrypted("D"),
+            ),
+            raw(
+                in_room(member_join_event("@e:x", "m-e", t), "!other:x"),
+                encrypted("E"),
+            ),
             // MSC3401 lands in the legacy slot only with StateEvents.
-            raw(msc3401_member_event("@f:x", "DEV", t, t), EventOrigin::Unknown),
+            raw(
+                msc3401_member_event("@f:x", "DEV", t, t),
+                EventOrigin::Unknown,
+            ),
         ];
         let snapshots = compute(events.clone(), ElementCallCompat::Off);
         assert_eq!(
@@ -263,16 +299,25 @@ mod tests {
         );
         let snapshots = compute(events, ElementCallCompat::StateEvents);
         assert_eq!(snapshots.len(), 5);
-        let legacy = snapshots.iter().find(|s| s.slot_id == LEGACY_SLOT_ID).unwrap();
+        let legacy = snapshots
+            .iter()
+            .find(|s| s.slot_id == LEGACY_SLOT_ID)
+            .unwrap();
         assert_eq!(legacy.room_id, ROOM_ID);
         assert_eq!(legacy.members[0].member_id, "@f:x:DEV");
-        assert_eq!(legacy.members[0].transports.published[0].properties["livekit_service_url"], LK_SERVICE_URL);
+        assert_eq!(
+            legacy.members[0].transports.published[0].properties["livekit_service_url"],
+            LK_SERVICE_URL
+        );
     }
 
     #[test]
     fn a_closed_empty_slot_is_reported_and_a_room_with_neither_is_not() {
         let t = now();
-        let snapshots = compute(vec![raw(slot_closed_event(t), EventOrigin::Unknown)], ElementCallCompat::Off);
+        let snapshots = compute(
+            vec![raw(slot_closed_event(t), EventOrigin::Unknown)],
+            ElementCallCompat::Off,
+        );
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].slot_state, Some(SlotState::Closed));
         assert!(!snapshots[0].is_active());
@@ -294,13 +339,28 @@ mod tests {
         let t = now();
         let snapshots = compute(
             vec![
-                raw(json!({ "type": "m.rtc.member", "room_id": ROOM_ID }), EventOrigin::Unknown),
-                raw(json!({ "type": "m.rtc.member", "room_id": ROOM_ID, "sender": "@x:x", "content": "nope" }), EventOrigin::Unknown),
-                raw(json!({ "type": "m.rtc.slot", "room_id": ROOM_ID, "sender": "@x:x", "content": { "status": 7 } }), EventOrigin::Unknown),
+                raw(
+                    json!({ "type": "m.rtc.member", "room_id": ROOM_ID }),
+                    EventOrigin::Unknown,
+                ),
+                raw(
+                    json!({ "type": "m.rtc.member", "room_id": ROOM_ID, "sender": "@x:x", "content": "nope" }),
+                    EventOrigin::Unknown,
+                ),
+                raw(
+                    json!({ "type": "m.rtc.slot", "room_id": ROOM_ID, "sender": "@x:x", "content": { "status": 7 } }),
+                    EventOrigin::Unknown,
+                ),
                 raw(json!(42), EventOrigin::Unknown),
-                raw(json!({ "type": "m.rtc.member", "sender": "@x:x", "content": {} }), EventOrigin::Unknown),
+                raw(
+                    json!({ "type": "m.rtc.member", "sender": "@x:x", "content": {} }),
+                    EventOrigin::Unknown,
+                ),
                 raw(member_join_event("@a:x", "m-a", t), encrypted("A")),
-                raw(json!({ "type": "com.example.thing", "room_id": ROOM_ID, "sender": "@x:x", "content": {} }), EventOrigin::Unknown),
+                raw(
+                    json!({ "type": "com.example.thing", "room_id": ROOM_ID, "sender": "@x:x", "content": {} }),
+                    EventOrigin::Unknown,
+                ),
             ],
             ElementCallCompat::Off,
         );
@@ -314,27 +374,55 @@ mod tests {
             raw(member_join_event("@a:x", "m-a", t - 1_000), encrypted("A")),
             raw(member_join_event("@a:x", "m-a", t - 500), encrypted("A")), // refresh
             raw(member_join_event("@b:x", "m-b", t - 2_000), encrypted("B")),
-            raw(member_bare_leave_event("@b:x", "m-b", t - 1_000), encrypted("B")),
+            raw(
+                member_bare_leave_event("@b:x", "m-b", t - 1_000),
+                encrypted("B"),
+            ),
             raw(member_join_event("@c:x", "m-c", t), EventOrigin::Cleartext),
             raw(room_encryption_event(t), EventOrigin::Unknown),
-            raw(slot_event(SLOT_ID, json!({ "status": "open", "application": { "type": "m.call" }, "encryption": { "type": "m.per_member" } }), t), EventOrigin::Unknown),
+            raw(
+                slot_event(
+                    SLOT_ID,
+                    json!({ "status": "open", "application": { "type": "m.call" }, "encryption": { "type": "m.per_member" } }),
+                    t,
+                ),
+                EventOrigin::Unknown,
+            ),
             raw(room_member_event("@a:x", "join", t), EventOrigin::Unknown),
             raw(room_member_event("@c:x", "join", t), EventOrigin::Unknown),
-            raw(msc3401_member_event("@d:x", "DEV", t - 3_000, t - 3_000), EventOrigin::Unknown),
+            raw(
+                msc3401_member_event("@d:x", "DEV", t - 3_000, t - 3_000),
+                EventOrigin::Unknown,
+            ),
         ];
         let reference = compute(events.clone(), ElementCallCompat::StateEvents);
-        assert_eq!(compute(events.clone(), ElementCallCompat::StateEvents), reference, "idempotent");
+        assert_eq!(
+            compute(events.clone(), ElementCallCompat::StateEvents),
+            reference,
+            "idempotent"
+        );
         assert_eq!(reference.len(), 2);
         let main = reference.iter().find(|s| s.slot_id == SLOT_ID).unwrap();
-        assert_eq!(main.members.iter().map(|m| m.member_id.as_str()).collect::<Vec<_>>(), vec!["m-a"]);
-        assert_eq!(main.excluded_candidates[0].1, JoinExclusionReason::UnencryptedInEncryptedRoom);
+        assert_eq!(
+            main.members
+                .iter()
+                .map(|m| m.member_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m-a"]
+        );
+        assert_eq!(
+            main.excluded_candidates[0].1,
+            JoinExclusionReason::UnencryptedInEncryptedRoom
+        );
         assert_eq!(main.negotiated_encryption, Some(true));
 
         let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
         for _ in 0..20 {
             let mut shuffled = events.clone();
             for i in (1..shuffled.len()).rev() {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let j = (seed >> 33) as usize % (i + 1);
                 shuffled.swap(i, j);
             }
@@ -366,7 +454,10 @@ mod tests {
         assert_eq!(s.member_count(), 1);
         assert_eq!(s.members[0].member_id, "m-1");
         assert_eq!(s.transports[0].transport_type, "livekit");
-        assert_eq!(s.transports[0].properties["livekit_service_url"], LK_SERVICE_URL);
+        assert_eq!(
+            s.transports[0].properties["livekit_service_url"],
+            LK_SERVICE_URL
+        );
         assert_eq!(s.slot_state, None, "no slot event in the slice");
     }
 
@@ -379,9 +470,22 @@ mod tests {
         for room in 0..500 {
             let room_id = format!("!room{room}:x");
             events.push(raw(in_room(slot_event(SLOT_ID, json!({ "status": "open", "application": { "type": "m.call" }, "encryption": { "type": "m.per_member" } }), t), &room_id), EventOrigin::Unknown));
-            events.push(raw(in_room(room_encryption_event(t), &room_id), EventOrigin::Unknown));
+            events.push(raw(
+                in_room(room_encryption_event(t), &room_id),
+                EventOrigin::Unknown,
+            ));
             for member in 0..3 {
-                events.push(raw(in_room(member_join_event(&format!("@u{member}:x"), &format!("m-{room}-{member}"), t), &room_id), encrypted("D")));
+                events.push(raw(
+                    in_room(
+                        member_join_event(
+                            &format!("@u{member}:x"),
+                            &format!("m-{room}-{member}"),
+                            t,
+                        ),
+                        &room_id,
+                    ),
+                    encrypted("D"),
+                ));
             }
         }
         let start = std::time::Instant::now();
@@ -389,6 +493,9 @@ mod tests {
         let elapsed = start.elapsed();
         assert_eq!(snapshots.len(), 500);
         assert!(snapshots.iter().all(|s| s.member_count() == 3));
-        assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
     }
 }

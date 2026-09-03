@@ -88,11 +88,16 @@ impl RawSlot {
         let content = match serde_json::from_value::<RawSlotContent>(content.clone()) {
             Ok(content) => content,
             Err(error) => {
-                log::warn!("m.rtc.slot '{slot_id}' has malformed content ({error}); treating it as closed");
+                log::warn!(
+                    "m.rtc.slot '{slot_id}' has malformed content ({error}); treating it as closed"
+                );
                 RawSlotContent::default()
             }
         };
-        Self { slot_id: slot_id.to_owned(), content }
+        Self {
+            slot_id: slot_id.to_owned(),
+            content,
+        }
     }
 
     /// Resolve into a slot state.
@@ -113,7 +118,11 @@ impl RawSlot {
     ///   value.
     pub(crate) fn resolve(&self, room_encryption: Option<bool>) -> SlotState {
         if self.content.status != Some(SlotStatus::Open) {
-            log::debug!("m.rtc.slot '{}' resolves closed: status={:?}", self.slot_id, self.content.status);
+            log::debug!(
+                "m.rtc.slot '{}' resolves closed: status={:?}",
+                self.slot_id,
+                self.content.status
+            );
             return SlotState::Closed;
         }
 
@@ -140,12 +149,12 @@ impl RawSlot {
             return SlotState::Closed;
         }
 
-        let declared = self
-            .content
-            .encryption
+        let declared = self.content.encryption.as_ref().map(|e| SlotEncryption {
+            mechanism_type: e.mechanism_type.clone(),
+        });
+        let declared_mechanism = declared
             .as_ref()
-            .map(|e| SlotEncryption { mechanism_type: e.mechanism_type.clone() });
-        let declared_mechanism = declared.as_ref().map(|e| EncryptionMechanism::from_type(&e.mechanism_type));
+            .map(|e| EncryptionMechanism::from_type(&e.mechanism_type));
 
         let mechanism = match room_encryption {
             Some(true) => match declared_mechanism {
@@ -189,7 +198,11 @@ impl RawSlot {
             self.slot_id
         );
 
-        SlotState::Open(OpenSlot { application_type: application_type.to_owned(), encryption: declared, mechanism })
+        SlotState::Open(OpenSlot {
+            application_type: application_type.to_owned(),
+            encryption: declared,
+            mechanism,
+        })
     }
 }
 
@@ -219,7 +232,10 @@ mod tests {
         );
         let open = state.open().expect("slot should be open");
         assert_eq!(open.application_type, "m.call");
-        assert_eq!(open.encryption.as_ref().map(|e| e.mechanism_type.as_str()), Some("m.per_member"));
+        assert_eq!(
+            open.encryption.as_ref().map(|e| e.mechanism_type.as_str()),
+            Some("m.per_member")
+        );
         assert_eq!(open.mechanism, Some(EncryptionMechanism::PerMember));
     }
 
@@ -232,7 +248,10 @@ mod tests {
 
     #[test]
     fn closed_status_resolves_closed() {
-        assert_eq!(slot(r#"{ "status": "closed", "application": { "type": "m.call" } }"#), SlotState::Closed);
+        assert_eq!(
+            slot(r#"{ "status": "closed", "application": { "type": "m.call" } }"#),
+            SlotState::Closed
+        );
     }
 
     /// An open status with no application is not a valid open slot.
@@ -244,13 +263,19 @@ mod tests {
     /// A status from a future revision must parse, and must not be open.
     #[test]
     fn unknown_status_parses_and_resolves_closed() {
-        assert_eq!(slot(r#"{ "status": "draining", "application": { "type": "m.call" } }"#), SlotState::Closed);
+        assert_eq!(
+            slot(r#"{ "status": "draining", "application": { "type": "m.call" } }"#),
+            SlotState::Closed
+        );
     }
 
     #[test]
     fn empty_and_malformed_content_resolve_closed() {
         assert_eq!(slot("{}"), SlotState::Closed);
-        assert_eq!(slot(r#"{ "status": 5, "application": [] }"#), SlotState::Closed);
+        assert_eq!(
+            slot(r#"{ "status": 5, "application": [] }"#),
+            SlotState::Closed
+        );
         assert_eq!(slot(r#""a string""#), SlotState::Closed);
     }
 
@@ -258,14 +283,21 @@ mod tests {
     /// admit members of an application it does not name.
     #[test]
     fn application_type_must_align_with_the_slot_id() {
-        assert_eq!(slot(r#"{ "status": "open", "application": { "type": "m.whiteboard" } }"#), SlotState::Closed);
+        assert_eq!(
+            slot(r#"{ "status": "open", "application": { "type": "m.whiteboard" } }"#),
+            SlotState::Closed
+        );
     }
 
     /// A prefix comparison, so an application type that merely starts the
     /// same does not count.
     #[test]
     fn application_type_prefix_must_end_at_the_separator() {
-        let state = RawSlot::parse("m.callisto#ROOM", &serde_json::from_str(OPEN_PLAIN).unwrap()).resolve(None);
+        let state = RawSlot::parse(
+            "m.callisto#ROOM",
+            &serde_json::from_str(OPEN_PLAIN).unwrap(),
+        )
+        .resolve(None);
         assert_eq!(state, SlotState::Closed);
     }
 
@@ -278,7 +310,10 @@ mod tests {
     #[test]
     fn slot_with_per_member_is_open_in_an_encrypted_room() {
         let state = slot_in(OPEN_ENCRYPTED, Some(true));
-        assert_eq!(state.open().expect("open").mechanism, Some(EncryptionMechanism::PerMember));
+        assert_eq!(
+            state.open().expect("open").mechanism,
+            Some(EncryptionMechanism::PerMember)
+        );
     }
 
     #[test]
@@ -300,7 +335,13 @@ mod tests {
 
     #[test]
     fn plain_slot_in_an_unencrypted_room_is_open_without_encryption() {
-        assert!(slot_in(OPEN_PLAIN, Some(false)).open().expect("open").mechanism.is_none());
+        assert!(
+            slot_in(OPEN_PLAIN, Some(false))
+                .open()
+                .expect("open")
+                .mechanism
+                .is_none()
+        );
     }
 
     /// Until a host reports the room's encryption state, neither rule applies.
@@ -308,7 +349,10 @@ mod tests {
     fn unknown_room_encryption_takes_the_slot_at_face_value() {
         assert!(slot_in(OPEN_PLAIN, None).is_open());
         assert_eq!(
-            slot_in(OPEN_ENCRYPTED, None).open().expect("open").mechanism,
+            slot_in(OPEN_ENCRYPTED, None)
+                .open()
+                .expect("open")
+                .mechanism,
             Some(EncryptionMechanism::PerMember)
         );
     }

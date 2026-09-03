@@ -31,7 +31,7 @@ Input and output interfaces:
 └──────────────┬───────────────────────────────────────────▲───────────────────┘
                │ streams in                                │ commands out
                ▼                                           │ (one trait slice per part)
-┌─ ParticipationManager::new(room_id, slot_id, driver, config) ────────────────┐
+┌─ ParticipationManager::new(room_id, slot_id, own_identity, driver, config) ──┐
 │                                                                              │
 │  ┌─ Session ────────────────────────────────────────────────────┐            │
 │  │ feeds itself: RoomEventsDriver slice — seeds via reads,      │            │
@@ -45,14 +45,14 @@ Input and output interfaces:
 │            ▼                        ▼                      ▼                 │
 │   ┌─ OwnMembership ────┐  ┌─ Connections ──────┐  ┌─ Encryption ──────┐      │ Connection = Established/ResolvedTransport, TransportConnection
 │   │ join / leave state │  │ ConnectionData per │  │ SendMachine:      │      │
-│   │ machine · delayed  │  │ ws_url (multi-     │  │ rotation +        │      │
+│   │ machine · delayed  │  │ service_url (multi-│  │ rotation +        │      │
 │   │ leave · heartbeat  │  │ focus) · mint /    │  │ distribution;     │      │
-│   │                    │  │ reuse tokens       │  │ KeyMap: verify +  │      │
+│   │                    │  │ refresh tokens     │  │ KeyMap: verify +  │      │
 │   │ ⇅ OwnMembership-   │  │                    │  │ store inbound keys│      │
 │   │   Driver           │  │ ⇅ TokenDriver      │  │                   │      │
 │   │                    │─▶│                    │  │ ⇅ ToDeviceDriver  │      │
 │   └────────────────────┘  └────────────────────┘  │ ◀ to-device stream│      │
-│     on_transport_created → add_own_transport      └───────────────────┘      │
+│     resolve_transport(member_id, intent) → add_own_transport                 │
 │                                                                              │
 ├─ public surface ─────────────────────────────────────────────────────────────┤
 │   join(intent, params) · leave(reason)                                       │
@@ -127,46 +127,64 @@ Hosts (via `MatrixDriver`) feeds everything into one funnel and the session disp
 ### `connections`
 
 Maps a `Session` to the SFU connections a host must hold (multi-focus,
-MSC4195). `ws_url` is the connection index.
+MSC4195). The connection key is the transport's `livekit_service_url`
+(`ConnectionData.service_url`); `ws_url` is the SFU websocket URL the token
+response named.
 
-- `ConnectionData { jwt_token, ws_url }`, `ConnectionWithMembers`.
-- `members_for_connection_data(conn, session) -> Vec<Member>`.
-- `ConnectionsManager`: `subscribe_connections()`,
-  `subscribe_connections_with_members()`, and `add_own_transport(intent)` —
-  which performs transport discovery (`GET /rtc/transports` via the driver)
-  and the MSC4195 `/rtc/livekit/get_token` exchange (the legacy `/sfu/get`
-  in `StateEvents` compat), or returns an existing token. Token refresh on
-  expiry lives here too.
+- `ConnectionData { service_url, ws_url, jwt_token }`, `ConnectionWithMembers`.
+- `ConnectionsManager`: `subscribe()` / `connections()` (one list, members per
+  connection), `add_own_transport(member_id, intent)` — discovers the transport
+  (`GET /rtc/transports` via the driver) when the intent names none, performs
+  the MSC4195 `get_token` exchange (the legacy `/sfu/get` in `StateEvents`
+  compat) and records it as our own — and `clear_own()` on leave. Tokens for
+  the connections the session's members publish on are minted lazily by its
+  pump and re-minted a minute before the JWT's `exp`. Nothing is published
+  before we have a member id (the token names it).
 - The participant-identity derivations as pure fns: MSC4195 pseudonymous
   hash, and the legacy `{user}:{device}` form.
 
 ### `own_membership`
 
 The join/leave state machine for *our* membership. Talks only to the
-`OwnMembershipDriver` slice of the driver.
+`OwnMembershipDriver` slice of the driver plus one async resolver hook (the
+facade's `connections.add_own_transport`). A pure machine (`machine.rs`, `now`
+is an input) stepped by one pump task that owns time and I/O — the same shape
+as `encryption`. Plan and status: `src/own_membership/OwnMembershipImplementationPlan.md`.
 
-- `JoinStatus { has_fetched_transports, has_fetched_initial_member_list,
-  has_created_transport_token, has_sent_delayed_leave_event,
-  has_sent_member_join_event, has_delegated_delayed_event,
-  has_started_heartbeat }`
-- `ConnectedStatus { delayed_event_kick_ts, heartbeat_last_restart_ts,
-  delegation_setup_ts }`, `LeaveStatus { transport_disconnected,
-  leave_event_sent }`.
-- `Manager::new(session, driver, compat, on_transport_created)`,
-  `join(intent)`, `leave(reason)`.
-- Behavior kept from today: fresh `member_id` per join; delayed leave armed
-  *before* the join event; keep-alive = MSC4140 `restart` (never
-  cancel+reschedule) plus sticky re-send before `duration_ms` elapses;
-  optional delegation of the delayed leave to the SFU (MSC4195); leave sends
-  `leave_reason {code, reason}` and cancels/settles the delayed event.
+- `Status = NotJoined | Joining(JoinStatus) | Connected(ConnectedStatus) | Leaving(LeaveStatus)`,
+  readable and observable (`subscribe_status()`); the facade maps `NotJoined`
+  to `Disconnected`. `JoinStatus { has_fetched_transports,
+  has_fetched_initial_member_list, has_created_transport_token,
+  has_sent_delayed_leave_event, has_sent_member_join_event,
+  has_delegated_delayed_event, has_started_heartbeat }`, `ConnectedStatus {
+  delayed_event_kick_ts, heartbeat_last_restart_ts, delegation_setup_ts,
+  delayed_leave_supported, membership_lifetime_ms }`, `LeaveStatus {
+  leave_event_sent, delayed_leave_settled }`.
+- `OwnMembershipManager::new(room_id, slot_id, own, session, driver, compat, resolve_transport)`,
+  `join(member_id, intent, params)`, `leave(reason)`. The member id is minted
+  by the facade (`new_member_id(compat, &own)`: fresh per join, or
+  `{user}:{device}` under `StateEvents`) so the encryption machine can be built
+  with it *before* the join event goes out.
+- Behaviour kept from today: delayed leave armed *before* the join event — as
+  a delayed **sticky** event, so it clears our sticky-map entry when it fires;
+  keep-alive = MSC4140 `restart` every `keep_alive_timeout_ms / 3` (never
+  cancel+reschedule; a replacement is armed only once the old delay must have
+  fired) plus a sticky re-send at half the published lifetime; a homeserver
+  that refuses delayed events gets a 5-minute membership instead (lifetime
+  frozen at join, MSC4354 ignores a shorter refresh); optional delegation of
+  the delayed leave to the SFU (MSC4195, delay raised to ≥ 1 h, client restarts
+  stop on success); leave sends `leave_reason {code, reason}` and cancels the
+  delayed event.
+- Reacts to the session: a slot closing under us leaves with `slot_closed`; a
+  membership that vanished from the roster after it was seen is re-published
+  (rate-limited).
 - `TransportIntent::Publish(transport)` or `ReceiveOnly { can_subscribe }` —
-  receive-only members (recorders, observers) are first-class.
+  receive-only members (recorders, observers) are first-class; only `Publish`
+  calls the resolver.
 - Owns the **write side of compat**: with `StickyEvents`/`StateEvents`
-  selected, *our own* events are rendered in that dialect (the opt-in half —
-  it changes what other clients see). The read side lives in the session's
-  converters.
-- Slot administration (`open_slot`/`close_slot` state events) rides the same
-  driver slice.
+  selected, *our own* events are rendered in that dialect (one deletable file
+  per generation; MSC3401 goes out as room state, incl. a delayed *state*
+  event for the leave). The read side lives in the session's converters.
 
 ### `encryption`
 
@@ -224,26 +242,43 @@ build). Verified through the real wasm bindings by
 
 The facade a calling host uses. Owns and wires the four parts above.
 
-- `Manager::new(driver: MatrixDriver, config)`; hands the session its
-  `RoomEventsDriver` slice (the session seeds and feeds itself) and routes
-  only the to-device stream into the encryption machine.
-- `join()` / `leave()`; `Status = Disconnected | Joining(JoinStatus) |
-  Connected(ConnectedStatus) | Leaving(LeaveStatus)` composing the
-  own-membership and encryption statuses.
+- `ParticipationManager::new(room_id, slot_id, own: OwnIdentity, driver, config: ParticipationConfig { compat, encryption, rotation })`;
+  hands the session its `RoomEventsDriver` slice (the session seeds and feeds
+  itself), own-membership its `OwnMembershipDriver` slice, connections the
+  `TokenDriver` slice, and — per participation — the encryption machine the
+  `ToDeviceDriver` slice.
+- `join(intent, params)`: waits for the session seed, checks the slot against
+  the fresh snapshot, mints the member id, builds the encryption machine with
+  the negotiated encryption (`negotiated_encryption` overrides the local
+  default; an unencrypted call gets a machine that manages no keys), then
+  `own_membership.join`. `leave(reason)` sends the leave, then drops the
+  machine (forgetting every key) and the tokens. A participation the
+  own-membership machine ends on its own (`slot_closed`) is reaped the same way.
+- `Status = Disconnected | Joining(JoinStatus) | Connected(ConnectedStatus) | Leaving(LeaveStatus)`
+  composing the own-membership and encryption statuses.
 - Getter + change-callback pairs for the four host-facing outputs:
   **memberships** (`SessionMembership[]`), **connections**
-  (`ConnectionWithMembers[]`), **`KeyMap`**, **`Status`**.
+  (`ConnectionWithMembers[]`), **`KeyMap`** (callback carries the single
+  changed key), **`Status`** — plus `session()`, the live `SessionSnapshot`
+  (is the slot open, is the call encrypted; a host reads it before `join`,
+  since a slot it just opened is open only once sync echoes the state). Getters compute from fresh inputs
+  (`Session::snapshot()` is drain-on-read); one pump task fires the callbacks
+  on change.
 - Memberships vs. connections is a deliberate redundancy: memberships is the
   UI-shaped view (one tile per entry), connections the transport-shaped view
   (which LK rooms to hold). A `SessionMembership` carries what the tile→media
-  lookup needs — the `ws_url`s the member publishes on and the transport
+  lookup needs — the `service_url`s the member publishes on and the transport
   participant identity (MSC4195 hash; `{user}:{device}` in legacy compat).
 - A membership's state is `Joined` or `LeftWithKeys`: a member that left the
   session (leave/expired sticky) but still holds a not-yet-rotated copy of
   our media key stays in the list, so the UI can render "leaving — may still
-  be listening" until the rotation settles (joining session state with
-  `encryption::ConnectedStatus::left_members_with_keys` is exactly
-  facade-level work).
+  be listening" until the rotation settles. Computed as the encryption
+  machine's key holders minus the fresh session roster.
+- Slot administration: `open_slot(application_type, encrypted)` /
+  `close_slot()` send `m.rtc.slot` state through the driver.
+- Our own membership reaches the roster through the homeserver echo, like
+  anybody else's — there is no synthetic local entry. Mock drivers (Rust tests,
+  TS mock) therefore echo accepted sticky/state events.
 
 ### `driver`
 
@@ -251,16 +286,21 @@ The only Matrix I/O boundary, shaped after matrix-rust-sdk's widget
 `MatrixDriver` so it drops in. Split into capability traits so each manager
 receives no more than it needs; `MatrixDriver` is the sum.
 
-- `OwnMembershipDriver`: send sticky / state / delayed events, restart/cancel
-  delayed (MSC4140), delegate LiveKit delayed leave.
+- `OwnMembershipDriver`: send sticky / state / delayed events (a delayed event
+  may carry `sticky_duration_ms` — the delayed leave is sticky), delayed state
+  events (MSC3401 compat only), restart/cancel delayed (MSC4140), delegate
+  LiveKit delayed leave. `DriverError::Unsupported | Unauthorized` from the
+  delayed-event methods mean "this homeserver never will" (404 / 403).
 - `ToDeviceSendDriver`: send one to-device message to a set of devices with
   per-recipient results. `ToDeviceDriver` adds the inbound stream (decrypted,
-  with origin metadata).
+  with origin metadata and the MSC4153 cross-signing verdict).
 - `RoomEventsDriver`: `read_events`/`read_state` + live room-event and
   state-update streams. Every inbound event carries an `EventOrigin`
   (encrypted+device / cleartext / unknown) from decryption metadata — the
   session and encryption rules depend on it.
-- `TokenDriver`: OpenID token, `GET /rtc/transports`, LiveKit `get_token`.
+- `TokenDriver`: `GET /rtc/transports`, LiveKit `get_token` (the adapter
+  performs the OpenID hop itself; the request names our MSC4195 member claims
+  and, in `StateEvents` compat, the legacy `/sfu/get`).
 
 ### Compat (no module of its own)
 
@@ -291,21 +331,27 @@ generated bindings cost nothing where it matters.
 - The FFI mirrors the Rust shape `Manager::new(MatrixDriver::new(room))`
   literally: the host wraps its `MatrixDriverCallback` in an exported
   `FfiMatrixDriver` object — the one place the foreign trait becomes a
-  `driver::MatrixDriver` — then hands it to any number of managers (one room
-  can hold several slots).
+  `driver::MatrixDriver` — then hands it (with the room, slot, user and
+  device id) to any number of managers (one room can hold several slots).
 - Inbound events stay a driver job across the FFI: the foreign driver's
   `subscribe_*` methods receive Rust-exported **sink objects** — called
   synchronously, exactly once, at `FfiMatrixDriver` construction — and
-  `emit` into them from the host SDK's event handlers; `emit -> false` is
-  the drop-guard signal to unhook. Hosts implement single-sink semantics;
+  `emit` into them from the host SDK's event handlers (the to-device sink
+  also takes the MSC4153 cross-signing verdict); `emit -> false` is the
+  drop-guard signal to unhook. Hosts implement single-sink semantics;
   fan-out to managers happens Rust-side, so a foreign driver is consumed
   exactly like a native one — no push inlets on the manager.
 - On `wasm32` the crate builds against uniffi's
   `wasm-unstable-single-threaded` feature (no tokio runtime; futures are
   `?Send`, hence the dual `async_trait` cfg pattern on the driver traits).
   Background work runs through `executor` (`spawn_local` on wasm), so a sink
-  `emit` only *wakes* the consuming pump: processing happens on the microtask
-  queue after `emit` returns, and web tests `await` a tick after injecting.
+  `emit` only *wakes* the consuming pump, which runs on the microtask queue
+  after `emit` returns. Getters are nevertheless fresh: the session is
+  **drain-on-read** — `Session::snapshot()` (and every FFI getter built on
+  it) first ingests whatever the sinks have queued, under the same lock the
+  pump uses, so an event is processed exactly once whoever gets to it. Only
+  listener callbacks arrive a microtask later; web tests `await` a tick
+  before asserting on a listener, never before a getter.
 - Logging: everything through the `log` facade; bindings install the sink
   (console / logcat / host callback) with `RUST_LOG`-style filters. Key
   material, JWTs and OpenID tokens are never logged.
@@ -330,12 +376,12 @@ callbacks — this should be doable with any LK SDK on any platform:
 
 ```rust
 // host state
-let mut lk_rooms: Map<ws_url, lk::Room>;      // index = ConnectionData.ws_url
+let mut lk_rooms: Map<service_url, lk::Room>; // index = ConnectionData.service_url
 let mut tiles:    Map<member_id, Tile>;       // index = Member.member_id
 
 on_join_pressed(matrix_room) {
-    let manager = participation::Manager::new(MatrixDriver::new(matrix_room), config);
-    manager.join(intent, params);
+    let manager = ParticipationManager::new(room_id, slot_id, own_identity, MatrixDriver::new(matrix_room), config);
+    manager.join(intent, params).await;
 
     // 1. Tiles: one per membership. Media may not be attachable yet — the
     //    LK room might still be connecting; attach_media is retried below.
@@ -358,13 +404,13 @@ on_join_pressed(matrix_room) {
         for gone in lk_rooms.keys_not_in(connections) {
             lk_rooms.remove(gone).disconnect();
         }
-        for conn in connections.filter(|c| !lk_rooms.has(c.connection.ws_url)) {
+        for conn in connections.filter(|c| !lk_rooms.has(c.connection.service_url)) {
             let room = lk::Room::new(conn.connection.ws_url, conn.connection.jwt_token);
             room.connect().then(|| {
                 // room is up now: attach media for tiles that were waiting on it
                 for m in manager.memberships() { attach_media(tiles[m.member.member_id], m); }
             });
-            lk_rooms.insert(conn.connection.ws_url, room);
+            lk_rooms.insert(conn.connection.service_url, room);
         }
     });
 
@@ -372,8 +418,8 @@ on_join_pressed(matrix_room) {
     manager.on_key_map_change(|key_map, change| {
         // one changed key per callback: (member_id, key bytes, index)
         if let Some(m) = manager.memberships().find(|m| m.member.member_id == change.member_id) {
-            for ws_url in m.connections {
-                lk_rooms[ws_url].set_key_for_participant(m.transport_identity, change.key.key, change.key.index);
+            for service_url in m.connections {
+                lk_rooms[service_url].set_key_for_participant(m.transport_identity, change.key.key, change.key.index);
             }
         }
     });
@@ -384,8 +430,8 @@ on_join_pressed(matrix_room) {
 
 // tile -> media: membership names the LK room and the participant in it
 attach_media(tile, membership) {
-    for ws_url in membership.connections {
-        if let Some(room) = lk_rooms.get(ws_url) && room.is_connected() {
+    for service_url in membership.connections {
+        if let Some(room) = lk_rooms.get(service_url) && room.is_connected() {
             tile.attach(room.participant(membership.transport_identity).tracks());
         }
     }
@@ -418,5 +464,6 @@ bots). Hosts that need it — Rust bots — use livekit-rust directly against
 `ConnectionData`/`KeyMap`, which is the same contract every other platform
 gets.
 
-A compilable skeleton of this plan (all methods `todo!()`) lives in
-`MatrixSdkArchitectureDraft/`.
+The implementation of this plan lives in `MatrixSdkArchitectureDraft/`
+(`README.md` there for build/test; per-module plans and status next to each
+module).

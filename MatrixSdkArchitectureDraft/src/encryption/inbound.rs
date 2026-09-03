@@ -24,7 +24,7 @@
 //! a plain unit test.
 
 use super::{
-    EncryptionConfig, KeyOrigin, KeyOutcome, KeyRejection, KeyMap, MediaKey, MediaKeyChange,
+    EncryptionConfig, KeyMap, KeyOrigin, KeyOutcome, KeyRejection, MediaKey, MediaKeyChange,
     ReceivedEncryptionKey,
 };
 use crate::types::{DeviceAttribution, Member};
@@ -54,7 +54,10 @@ impl Default for OutdatedKeyFilter {
 
 impl OutdatedKeyFilter {
     pub fn with_ttl(ttl_ms: u64) -> Self {
-        Self { seen: HashMap::new(), ttl_ms }
+        Self {
+            seen: HashMap::new(),
+            ttl_ms,
+        }
     }
 
     pub fn is_outdated(&self, member_id: &str, index: u8, candidate_ts: u64) -> bool {
@@ -153,7 +156,10 @@ impl InboundKeys {
                     key.member_id,
                     key.sender_user_id
                 );
-                self.early.push(EarlyKey { key, received_ts: now });
+                self.early.push(EarlyKey {
+                    key,
+                    received_ts: now,
+                });
                 Ok(KeyOutcome::Buffered)
             }
         }
@@ -195,7 +201,11 @@ impl InboundKeys {
         members
             .iter()
             .filter(|m| Some(&m.member_id) != self.own_member_id.as_ref() && m.device_id.is_some())
-            .all(|m| self.key_map.get(&m.member_id).is_some_and(|ring| !ring.is_empty()))
+            .all(|m| {
+                self.key_map
+                    .get(&m.member_id)
+                    .is_some_and(|ring| !ring.is_empty())
+            })
     }
 
     fn expire_early(&mut self, now: u64) {
@@ -212,7 +222,10 @@ impl InboundKeys {
         match &key.origin {
             KeyOrigin::Cleartext => Err(KeyRejection::Cleartext),
             KeyOrigin::Unknown => Err(KeyRejection::UnknownOrigin),
-            KeyOrigin::Encrypted { sender_cross_signed, .. } => {
+            KeyOrigin::Encrypted {
+                sender_cross_signed,
+                ..
+            } => {
                 if self.config.require_cross_signed_sender && *sender_cross_signed != Some(true) {
                     Err(KeyRejection::NotCrossSigned)
                 } else {
@@ -228,7 +241,10 @@ impl InboundKeys {
         member: &Member,
     ) -> Result<(), KeyRejection> {
         // Held keys arrive here without re-running `verify_origin`.
-        let KeyOrigin::Encrypted { sender_device_id, .. } = &key.origin else {
+        let KeyOrigin::Encrypted {
+            sender_device_id, ..
+        } = &key.origin
+        else {
             return Err(KeyRejection::Cleartext);
         };
         if key.sender_user_id != member.user_id {
@@ -260,7 +276,11 @@ impl InboundKeys {
         if self.filter.check_and_add(&member.member_id, key.index, now) {
             return Err(KeyRejection::Outdated);
         }
-        let media_key = MediaKey { key: key.key, index: key.index, creation_ts_ms: now };
+        let media_key = MediaKey {
+            key: key.key,
+            index: key.index,
+            creation_ts_ms: now,
+        };
         Ok(self.store(&member.member_id, media_key))
     }
 
@@ -276,7 +296,10 @@ impl InboundKeys {
         } else {
             ring.push(key.clone());
         }
-        KeyOutcome::Stored(MediaKeyChange { member_id: member_id.to_owned(), key })
+        KeyOutcome::Stored(MediaKeyChange {
+            member_id: member_id.to_owned(),
+            key,
+        })
     }
 }
 
@@ -320,7 +343,12 @@ mod tests {
     }
 
     fn inbound() -> InboundKeys {
-        InboundKeys::new(ROOM.into(), EncryptionConfig::default(), "m-own".into(), true)
+        InboundKeys::new(
+            ROOM.into(),
+            EncryptionConfig::default(),
+            "m-own".into(),
+            true,
+        )
     }
 
     fn stored(outcome: Result<KeyOutcome, KeyRejection>) -> MediaKeyChange {
@@ -335,7 +363,14 @@ mod tests {
         let mut i = inbound();
         let c = stored(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 10));
         assert_eq!(c.member_id, "m-@bob:x");
-        assert_eq!(i.key_map()["m-@bob:x"], vec![MediaKey { key: vec![1; 32], index: 0, creation_ts_ms: 10 }]);
+        assert_eq!(
+            i.key_map()["m-@bob:x"],
+            vec![MediaKey {
+                key: vec![1; 32],
+                index: 0,
+                creation_ts_ms: 10
+            }]
+        );
     }
 
     #[test]
@@ -343,7 +378,10 @@ mod tests {
         let mut i = inbound();
         let mut k = key_from("@bob:x", Some("BOB1"), 0, 1);
         k.origin = KeyOrigin::Cleartext;
-        assert_eq!(i.receive(k.clone(), &[bob()], 1), Err(KeyRejection::Cleartext));
+        assert_eq!(
+            i.receive(k.clone(), &[bob()], 1),
+            Err(KeyRejection::Cleartext)
+        );
         k.origin = KeyOrigin::Unknown;
         assert_eq!(i.receive(k, &[bob()], 1), Err(KeyRejection::UnknownOrigin));
     }
@@ -360,16 +398,31 @@ mod tests {
     #[test]
     fn cross_signing_requirement_is_configurable() {
         let mut k = key_from("@bob:x", Some("BOB1"), 0, 1);
-        k.origin = KeyOrigin::Encrypted { sender_device_id: Some("BOB1".into()), sender_cross_signed: Some(false) };
+        k.origin = KeyOrigin::Encrypted {
+            sender_device_id: Some("BOB1".into()),
+            sender_cross_signed: Some(false),
+        };
         let mut strict = inbound();
-        assert_eq!(strict.receive(k.clone(), &[bob()], 1), Err(KeyRejection::NotCrossSigned));
+        assert_eq!(
+            strict.receive(k.clone(), &[bob()], 1),
+            Err(KeyRejection::NotCrossSigned)
+        );
         // unknown counts as not cross-signed
-        k.origin = KeyOrigin::Encrypted { sender_device_id: Some("BOB1".into()), sender_cross_signed: None };
-        assert_eq!(strict.receive(k.clone(), &[bob()], 1), Err(KeyRejection::NotCrossSigned));
+        k.origin = KeyOrigin::Encrypted {
+            sender_device_id: Some("BOB1".into()),
+            sender_cross_signed: None,
+        };
+        assert_eq!(
+            strict.receive(k.clone(), &[bob()], 1),
+            Err(KeyRejection::NotCrossSigned)
+        );
 
         let mut lenient = InboundKeys::new(
             ROOM.into(),
-            EncryptionConfig { require_cross_signed_sender: false, ..Default::default() },
+            EncryptionConfig {
+                require_cross_signed_sender: false,
+                ..Default::default()
+            },
             "m-own".into(),
             true,
         );
@@ -397,7 +450,11 @@ mod tests {
         let mut i = inbound();
         let claimed = member("@bob:x", Some("BOB1"), DeviceAttribution::Claimed);
         assert_eq!(
-            i.receive(key_from("@bob:x", Some("BOB2"), 0, 1), &[claimed.clone()], 1),
+            i.receive(
+                key_from("@bob:x", Some("BOB2"), 0, 1),
+                std::slice::from_ref(&claimed),
+                1
+            ),
             Err(KeyRejection::DeviceMismatch)
         );
         stored(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[claimed], 1));
@@ -418,7 +475,10 @@ mod tests {
     #[test]
     fn key_arriving_before_the_membership_is_buffered_and_verified_when_it_lands() {
         let mut i = inbound();
-        assert_eq!(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[], 1), Ok(KeyOutcome::Buffered));
+        assert_eq!(
+            i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[], 1),
+            Ok(KeyOutcome::Buffered)
+        );
         // an impostor's early key for the same member from another device
         let mut impostor = key_from("@bob:x", Some("MAL"), 0, 9);
         impostor.sender_user_id = "@mallory:x".into();
@@ -459,13 +519,19 @@ mod tests {
     fn redelivery_rekey_and_outdated_semantics() {
         let mut i = inbound();
         stored(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 10));
-        assert_eq!(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 10), Ok(KeyOutcome::Duplicate));
+        assert_eq!(
+            i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 10),
+            Ok(KeyOutcome::Duplicate)
+        );
         // same index, different bytes, same instant: a rekey seen twice -> replaces
         let c = stored(i.receive(key_from("@bob:x", Some("BOB1"), 0, 2), &[bob()], 10));
         assert_eq!(c.key.key, vec![2; 32]);
         assert_eq!(i.key_map()["m-@bob:x"].len(), 1);
         // an *older* arrival for a filled slot is outdated
-        assert_eq!(i.receive(key_from("@bob:x", Some("BOB1"), 0, 3), &[bob()], 9), Err(KeyRejection::Outdated));
+        assert_eq!(
+            i.receive(key_from("@bob:x", Some("BOB1"), 0, 3), &[bob()], 9),
+            Err(KeyRejection::Outdated)
+        );
         // another index is another slot
         stored(i.receive(key_from("@bob:x", Some("BOB1"), 1, 3), &[bob()], 9));
         assert_eq!(i.key_map()["m-@bob:x"].len(), 2);
@@ -491,7 +557,12 @@ mod tests {
 
     #[test]
     fn keys_while_not_managing_media_keys_are_dropped() {
-        let mut i = InboundKeys::new(ROOM.into(), EncryptionConfig::default(), "m-own".into(), false);
+        let mut i = InboundKeys::new(
+            ROOM.into(),
+            EncryptionConfig::default(),
+            "m-own".into(),
+            false,
+        );
         assert_eq!(
             i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 1),
             Err(KeyRejection::NotManagingKeys)
@@ -501,14 +572,30 @@ mod tests {
     #[test]
     fn own_key_and_completeness() {
         let mut i = inbound();
-        let own = Member { member_id: "m-own".into(), ..member("@own:x", Some("OWN"), DeviceAttribution::Verified) };
+        let own = Member {
+            member_id: "m-own".into(),
+            ..member("@own:x", Some("OWN"), DeviceAttribution::Verified)
+        };
         let carol_no_device = member("@carol:x", None, DeviceAttribution::Unknown);
         assert!(!i.has_received_all_member_keys(&[own.clone(), bob()]));
         stored(i.receive(key_from("@bob:x", Some("BOB1"), 0, 1), &[bob()], 1));
         // carol has no device: nobody could ever send us a key from her device
         assert!(i.has_received_all_member_keys(&[own, bob(), carol_no_device]));
-        let c = i.set_own_key(MediaKey { key: vec![5; 32], index: 0, creation_ts_ms: 1 }).unwrap();
+        let c = i
+            .set_own_key(MediaKey {
+                key: vec![5; 32],
+                index: 0,
+                creation_ts_ms: 1,
+            })
+            .unwrap();
         assert_eq!(c.member_id, "m-own");
-        assert!(i.set_own_key(MediaKey { key: vec![5; 32], index: 0, creation_ts_ms: 1 }).is_none());
+        assert!(
+            i.set_own_key(MediaKey {
+                key: vec![5; 32],
+                index: 0,
+                creation_ts_ms: 1
+            })
+            .is_none()
+        );
     }
 }

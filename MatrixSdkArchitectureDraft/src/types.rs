@@ -119,7 +119,7 @@ pub struct MemberTransports {
 /// What we intend to publish when joining. Receive-only members (recorders,
 /// observers) are valid participants; `can_subscribe` still tells others
 /// which transport to publish on so we can hear them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TransportIntent {
     Publish(RtcTransport),
     ReceiveOnly { can_subscribe: Vec<String> },
@@ -129,7 +129,39 @@ pub enum TransportIntent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LeaveReason {
     pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+impl LeaveReason {
+    /// A voluntary leave (`leave`).
+    pub const LEAVE: &'static str = "leave";
+    /// The dead man's switch fired (`delayed_leave`).
+    pub const DELAYED_LEAVE: &'static str = "delayed_leave";
+    /// The slot was closed under us (`slot_closed`).
+    pub const SLOT_CLOSED: &'static str = "slot_closed";
+
+    pub fn new(code: impl Into<String>, reason: Option<String>) -> Self {
+        Self {
+            code: code.into(),
+            reason,
+        }
+    }
+
+    pub fn leave() -> Self {
+        Self::new(Self::LEAVE, None)
+    }
+
+    pub fn delayed_leave() -> Self {
+        Self::new(
+            Self::DELAYED_LEAVE,
+            Some("Dead man's switch: client failed to heartbeat".to_owned()),
+        )
+    }
+
+    pub fn slot_closed() -> Self {
+        Self::new(Self::SLOT_CLOSED, None)
+    }
 }
 
 /// Generate a fresh MSC4143 member id for a new join: 16 random bytes, hex.
@@ -167,7 +199,10 @@ mod tests {
 
     #[test]
     fn wire_event_type_maps_the_types_the_crate_sends() {
-        assert_eq!(wire_event_type("m.rtc.member"), "org.matrix.msc4143.rtc.member");
+        assert_eq!(
+            wire_event_type("m.rtc.member"),
+            "org.matrix.msc4143.rtc.member"
+        );
         assert_eq!(wire_event_type("m.rtc.slot"), "org.matrix.msc4143.rtc.slot");
         assert_eq!(
             wire_event_type("m.rtc.encryption_key"),
@@ -189,7 +224,12 @@ mod tests {
     /// Already-unstable ids must survive a round through the table.
     #[test]
     fn wire_event_type_is_idempotent() {
-        for stable in ["m.rtc.member", "m.rtc.slot", "m.rtc.encryption_key", "m.rtc.notification"] {
+        for stable in [
+            "m.rtc.member",
+            "m.rtc.slot",
+            "m.rtc.encryption_key",
+            "m.rtc.notification",
+        ] {
             let once = wire_event_type(stable);
             assert_eq!(wire_event_type(once), once);
         }

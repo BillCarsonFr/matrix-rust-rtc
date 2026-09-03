@@ -15,7 +15,10 @@ use crate::types::Member;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// Send `key` to these participations (one to-device batch).
-    Send { key: MediaKey, to: Vec<Participation> },
+    Send {
+        key: MediaKey,
+        to: Vec<Participation>,
+    },
     /// Start encrypting with this key now.
     UseOwnKey(MediaKey),
 }
@@ -95,7 +98,9 @@ impl SendMachine {
 
     /// The session changed. `jitter` is uniform in `[0, 2)`.
     pub fn on_session(&mut self, members: &[Member], now: u64, jitter: f64) -> Vec<Action> {
-        let Some(own) = self.own.clone() else { return Vec::new() };
+        let Some(own) = self.own.clone() else {
+            return Vec::new();
+        };
         if !self.manage_media_keys {
             return Vec::new();
         }
@@ -106,7 +111,8 @@ impl SendMachine {
             // Our own stale membership (same user *and* device, older
             // member id) is never a recipient; other devices of ours are.
             .filter(|m| {
-                !(m.user_id == own.member().user_id && m.device_id.as_deref() == Some(own.device_id()))
+                !(m.user_id == own.member().user_id
+                    && m.device_id.as_deref() == Some(own.device_id()))
             })
             .filter_map(|m| match Participation::from_member(m) {
                 Some(p) => Some(p),
@@ -126,15 +132,23 @@ impl SendMachine {
             // First key: everyone gets it, we use it at once, and the
             // jittered block starts. No wake-up: nothing is owed.
             let key = self.mint(now);
-            self.outbound = Some(OutboundKey { key: key.clone(), shared_with: Vec::new(), in_use: true });
+            self.outbound = Some(OutboundKey {
+                key: key.clone(),
+                shared_with: Vec::new(),
+                in_use: true,
+            });
             self.last_rotation_ts = now;
-            self.blocked_until_ts = now + Self::jittered(self.grace_period_ms(self.participant_count), jitter);
+            self.blocked_until_ts =
+                now + Self::jittered(self.grace_period_ms(self.participant_count), jitter);
             self.lifetime_deadline_ts = self.config.max_key_lifetime_ms.map(|l| now + l);
             actions.push(Action::UseOwnKey(key.clone()));
             if self.current.is_empty() {
                 self.initial_keys_distributed = true;
             } else {
-                actions.push(Action::Send { key, to: self.current.clone() });
+                actions.push(Action::Send {
+                    key,
+                    to: self.current.clone(),
+                });
             }
             return actions;
         };
@@ -154,12 +168,16 @@ impl SendMachine {
         }
         if !joined.is_empty() {
             // Joiners get the current key right away, whatever else happens.
-            actions.push(Action::Send { key: outbound.key.clone(), to: joined });
+            actions.push(Action::Send {
+                key: outbound.key.clone(),
+                to: joined,
+            });
         }
         if now >= self.blocked_until_ts {
             // Not blocked, but every other client saw this change at the same
             // moment: spread the rotations with a jittered block.
-            self.blocked_until_ts = now + Self::jittered(self.grace_period_ms(self.participant_count), jitter);
+            self.blocked_until_ts =
+                now + Self::jittered(self.grace_period_ms(self.participant_count), jitter);
         }
         // Blocked (or just made so): the rotation lands when the block ends.
         // Idempotent — later changes inside the block neither move the
@@ -214,7 +232,11 @@ impl SendMachine {
             Some(p) if p.in_use => self.superseded = Some(p),
             _ => {}
         }
-        self.outbound = Some(OutboundKey { key: key.clone(), shared_with: Vec::new(), in_use: alone });
+        self.outbound = Some(OutboundKey {
+            key: key.clone(),
+            shared_with: Vec::new(),
+            in_use: alone,
+        });
         self.last_rotation_ts = now;
         // An unjittered block: the next rotation waits a full grace period,
         // and is scheduled only if a change lands in it.
@@ -227,7 +249,10 @@ impl SendMachine {
             self.superseded = None;
             actions.push(Action::UseOwnKey(key));
         } else {
-            actions.push(Action::Send { key, to: self.current.clone() });
+            actions.push(Action::Send {
+                key,
+                to: self.current.clone(),
+            });
         }
     }
 
@@ -235,7 +260,9 @@ impl SendMachine {
     /// actually got it. A rotated key is used `use_key_delay_ms` after at
     /// least one recipient has it; if nobody has, the next change resends it.
     pub fn on_delivered(&mut self, key_index: u8, served: &[Participation], now: u64) {
-        let Some(outbound) = &mut self.outbound else { return };
+        let Some(outbound) = &mut self.outbound else {
+            return;
+        };
         if outbound.key.index != key_index {
             return;
         }
@@ -263,21 +290,36 @@ impl SendMachine {
             .min()
     }
 
-    /// Participations that hold the key our media is encrypted with but are
-    /// no longer in the session — "left, possibly still listening".
-    pub fn left_members_with_keys(&self) -> Vec<Member> {
+    /// Everyone who was handed the key our media is currently encrypted
+    /// with (in the session or not).
+    pub fn key_holders(&self) -> Vec<Member> {
         let in_use = match (&self.outbound, &self.superseded) {
             (Some(o), _) if o.in_use => Some(o),
             (_, Some(s)) => Some(s),
             (Some(o), None) => Some(o),
             (None, None) => None,
         };
-        let Some(in_use) = in_use else { return Vec::new() };
+        let Some(in_use) = in_use else {
+            return Vec::new();
+        };
         in_use
             .shared_with
             .iter()
-            .filter(|s| !self.current.iter().any(|c| c.same_join(s)))
             .map(|s| s.member().clone())
+            .collect()
+    }
+
+    /// Participations that hold the key our media is encrypted with but are
+    /// no longer in the session — "left, possibly still listening".
+    pub fn left_members_with_keys(&self) -> Vec<Member> {
+        self.key_holders()
+            .into_iter()
+            .filter(|holder| {
+                !self.current.iter().any(|c| {
+                    c.member().member_id == holder.member_id
+                        && c.member().membership_ts == holder.membership_ts
+                })
+            })
             .collect()
     }
 
@@ -306,7 +348,11 @@ impl SendMachine {
         super::fill_random(&mut bytes);
         let index = self.next_index;
         self.next_index = self.next_index.wrapping_add(1);
-        MediaKey { key: bytes, index, creation_ts_ms: now }
+        MediaKey {
+            key: bytes,
+            index,
+            creation_ts_ms: now,
+        }
     }
 }
 
@@ -358,9 +404,10 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Send { key, to } => {
-                    Some((key.index, to.iter().map(|p| p.member().member_id.clone()).collect()))
-                }
+                Action::Send { key, to } => Some((
+                    key.index,
+                    to.iter().map(|p| p.member().member_id.clone()).collect(),
+                )),
                 _ => None,
             })
             .collect()
@@ -391,12 +438,22 @@ mod tests {
 
     #[test]
     fn grace_period_grows_with_participant_count() {
-        for (contingent, expected) in [(2000, [1.2, 4.9, 19.9]), (3000, [0.8, 3.3, 13.2]), (5000, [0.5, 1.9, 7.9])] {
-            let cfg = SendMachineConfig { shared_per_minute_to_device_contingent: contingent, ..Default::default() };
+        for (contingent, expected) in [
+            (2000, [1.2, 4.9, 19.9]),
+            (3000, [0.8, 3.3, 13.2]),
+            (5000, [0.5, 1.9, 7.9]),
+        ] {
+            let cfg = SendMachineConfig {
+                shared_per_minute_to_device_contingent: contingent,
+                ..Default::default()
+            };
             let m = joined(cfg);
             for (n, minutes) in [50, 100, 200].into_iter().zip(expected) {
                 let got = m.grace_period_ms(n) as f64 / 60_000.0;
-                assert!((got - minutes).abs() < 0.1, "{contingent}/{n}: {got} vs {minutes}");
+                assert!(
+                    (got - minutes).abs() < 0.1,
+                    "{contingent}/{n}: {got} vs {minutes}"
+                );
             }
         }
     }
@@ -405,7 +462,14 @@ mod tests {
     fn grace_period_has_no_floor() {
         // default contingent: 0 ms alone, 40 ms for two, 120 ms for three
         let m = joined(SendMachineConfig::default());
-        assert_eq!((m.grace_period_ms(1), m.grace_period_ms(2), m.grace_period_ms(3)), (0, 40, 120));
+        assert_eq!(
+            (
+                m.grace_period_ms(1),
+                m.grace_period_ms(2),
+                m.grace_period_ms(3)
+            ),
+            (0, 40, 120)
+        );
     }
 
     #[test]
@@ -418,14 +482,14 @@ mod tests {
         m.on_session(&[own(), bob.clone()], 1000, 1.0);
         assert_eq!(m.next_wake_ts(), Some(1040));
         let a = m.on_wake(1040);
-        assert_eq!(sends(&a), vec![(1, ids(&[bob.clone()]))]);
+        assert_eq!(sends(&a), vec![(1, ids(std::slice::from_ref(&bob)))]);
         deliver_all(&mut m, &a, 1040);
         assert_eq!(m.next_wake_ts(), Some(2040), "switch pending");
         // dave joins at 1100 while key 1 propagates (block from the rotation
         // ended at 1080): gets key 1, jittered block of the 3-session -> 1220
         let dave = member("@dave:x", "D");
         let a = m.on_session(&[own(), bob.clone(), dave.clone()], 1100, 1.0);
-        assert_eq!(sends(&a), vec![(1, ids(&[dave.clone()]))]);
+        assert_eq!(sends(&a), vec![(1, ids(std::slice::from_ref(&dave)))]);
         deliver_all(&mut m, &a, 1100);
         assert_eq!(m.next_wake_ts(), Some(1220));
         // ...but a rotation never lands on a key that is not in use yet
@@ -434,7 +498,11 @@ mod tests {
         assert_eq!(m.next_wake_ts(), Some(2040), "deferred to the switch");
         let a = m.on_wake(2040);
         assert_eq!(used(&a), vec![1], "switch first");
-        assert_eq!(sends(&a), vec![(2, ids(&[bob, dave]))], "then the owed rotation");
+        assert_eq!(
+            sends(&a),
+            vec![(2, ids(&[bob, dave]))],
+            "then the owed rotation"
+        );
     }
 
     #[test]
@@ -454,7 +522,11 @@ mod tests {
     #[test]
     fn a_leave_in_a_settled_call_rotates_after_grace_times_jitter_to_the_remaining_members_only() {
         // PR: "Should do a full rotation after a jitter delay when a user leaves"
-        let (bob, bob2, carl) = (member("@bob:x", "B"), member("@bob:x", "B2"), member("@carl:x", "C"));
+        let (bob, bob2, carl) = (
+            member("@bob:x", "B"),
+            member("@bob:x", "B2"),
+            member("@carl:x", "C"),
+        );
         let jitter = 0.9 * 2.0; // the PR pins Math.random() to 0.9
         let mut m = joined(config());
         let all = [own(), bob.clone(), bob2.clone(), carl.clone()];
@@ -505,16 +577,26 @@ mod tests {
         let grace3 = m.grace_period_ms(3); // block from key 0 ends at 6 s
 
         let a = m.on_session(&[own(), bob.clone(), bob2.clone(), carl.clone()], 100, 1.0);
-        assert_eq!(sends(&a), vec![(0, ids(&[carl.clone()]))]);
+        assert_eq!(sends(&a), vec![(0, ids(std::slice::from_ref(&carl)))]);
         deliver_all(&mut m, &a, 100);
-        let a = m.on_session(&[own(), bob.clone(), bob2.clone(), carl.clone(), dave.clone()], 200, 1.0);
-        assert_eq!(sends(&a), vec![(0, ids(&[dave.clone()]))]);
+        let a = m.on_session(
+            &[own(), bob.clone(), bob2.clone(), carl.clone(), dave.clone()],
+            200,
+            1.0,
+        );
+        assert_eq!(sends(&a), vec![(0, ids(std::slice::from_ref(&dave)))]);
         deliver_all(&mut m, &a, 200);
         assert_eq!(m.next_wake_ts(), Some(grace3), "deadline anchored to key 0");
 
         assert!(m.on_wake(grace3 - 1).is_empty());
         let a = m.on_wake(grace3);
-        assert_eq!(sends(&a), vec![(1, ids(&[bob.clone(), bob2.clone(), carl.clone(), dave.clone()]))]);
+        assert_eq!(
+            sends(&a),
+            vec![(
+                1,
+                ids(&[bob.clone(), bob2.clone(), carl.clone(), dave.clone()])
+            )]
+        );
         deliver_all(&mut m, &a, grace3);
         let a = m.on_wake(grace3 + USE_DELAY);
         assert_eq!(used(&a), vec![1]);
@@ -534,8 +616,13 @@ mod tests {
     }
 
     #[test]
-    fn several_changes_while_blocked_produce_one_rotation_and_a_not_blocked_change_starts_a_jittered_block() {
-        let (bob, carl, dave) = (member("@bob:x", "B"), member("@carl:x", "C"), member("@dave:x", "D"));
+    fn several_changes_while_blocked_produce_one_rotation_and_a_not_blocked_change_starts_a_jittered_block()
+     {
+        let (bob, carl, dave) = (
+            member("@bob:x", "B"),
+            member("@carl:x", "C"),
+            member("@dave:x", "D"),
+        );
         let mut m = joined(config());
         let a = m.on_session(&[own(), bob.clone()], 0, 0.0); // jitter 0: block ends now
         deliver_all(&mut m, &a, 0);
@@ -575,8 +662,15 @@ mod tests {
         deliver_all(&mut m, &a, 0);
         bob.membership_ts = Some(2);
         let a = m.on_session(&[own(), bob.clone()], 10, 0.5);
-        assert_eq!(sends(&a), vec![(0, ids(&[bob]))], "rejoin is served the current key");
-        assert!(m.next_wake_ts().is_some(), "and the old participation left: rotation owed");
+        assert_eq!(
+            sends(&a),
+            vec![(0, ids(&[bob]))],
+            "rejoin is served the current key"
+        );
+        assert!(
+            m.next_wake_ts().is_some(),
+            "and the old participation left: rotation owed"
+        );
     }
 
     #[test]
@@ -587,7 +681,11 @@ mod tests {
         let mut own_stale = member("@own:x", "OWN");
         own_stale.member_id = "stale".into();
         let mut m = joined(config());
-        let a = m.on_session(&[own(), no_device, own_other_device.clone(), own_stale], 0, 0.5);
+        let a = m.on_session(
+            &[own(), no_device, own_other_device.clone(), own_stale],
+            0,
+            0.5,
+        );
         assert_eq!(sends(&a), vec![(0, ids(&[own_other_device]))]);
     }
 
@@ -600,7 +698,7 @@ mod tests {
         m.on_delivered(0, &[p(&bob)], 0);
         // no change in the session, but carl is still owed the key
         let a2 = m.on_session(&[own(), bob.clone(), carl.clone()], 10, 0.5);
-        assert_eq!(sends(&a2), vec![(0, ids(&[carl.clone()]))]);
+        assert_eq!(sends(&a2), vec![(0, ids(std::slice::from_ref(&carl)))]);
         // carl (never served) leaving causes no rotation
         m.on_session(&[own(), bob.clone()], 20, 0.5);
         let _ = a;
@@ -679,7 +777,10 @@ mod tests {
     #[test]
     fn not_managing_keys_does_nothing() {
         let mut m = SendMachine::new(config(), p(&own()), false);
-        assert!(m.on_session(&[own(), member("@bob:x", "B")], 0, 0.5).is_empty());
+        assert!(
+            m.on_session(&[own(), member("@bob:x", "B")], 0, 0.5)
+                .is_empty()
+        );
         assert_eq!(m.next_wake_ts(), None);
     }
 }

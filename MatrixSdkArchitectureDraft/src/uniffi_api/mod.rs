@@ -16,18 +16,29 @@ pub mod runtime_probe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::connections::{ConnectionData, ConnectionWithMembers};
 use crate::driver::{
     DelegatedDelayedLeaveRequest, DriverError, LivekitTokenRequest, LivekitTokenResponse,
-    OpenIdToken, OwnMembershipDriver, RoomEventsDriver, SendEventResponse, StateKeySelector,
-    ToDeviceDelivery, ToDeviceDriver, ToDeviceMessage, ToDeviceRecipient, ToDeviceSendDriver,
-    TokenDriver,
+    OwnMembershipDriver, RoomEventsDriver, SendEventResponse, StateKeySelector, ToDeviceDelivery,
+    ToDeviceDriver, ToDeviceMessage, ToDeviceRecipient, ToDeviceSendDriver, TokenDriver,
 };
-use crate::participation::ParticipationManager;
+use crate::encryption::{KeyMap, MediaKey, MediaKeyChange};
+use crate::own_membership::{JoinError, JoinParams, LeaveError, OwnIdentity};
+use crate::participation::{
+    MembershipState, ParticipationConfig, ParticipationManager, SessionMembership, Status,
+};
 use crate::session::{self, ElementCallCompat, SessionConfig, SessionSnapshot};
-use crate::types::{DeviceAttribution, EventOrigin, Member, RawMatrixEvent, RtcTransport};
+use crate::types::{
+    DeviceAttribution, EventOrigin, LeaveReason, Member, RawMatrixEvent, RtcTransport,
+    TransportIntent,
+};
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+/// Errors across the FFI, both directions. A foreign driver maps its
+/// homeserver errors onto these: `Rejected` = 403 `M_FORBIDDEN`,
+/// `Unsupported` = 404 `M_UNRECOGNIZED` — both read as "this homeserver will
+/// never do delayed events" by the own-membership machine.
 #[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum RtcError {
     #[error("invalid input: {0}")]
@@ -36,14 +47,55 @@ pub enum RtcError {
     Driver(String),
     #[error("rejected: {0}")]
     Rejected(String),
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+    #[error("already joined")]
+    AlreadyJoined,
+    #[error("not joined")]
+    NotJoined,
+    #[error("slot closed")]
+    SlotClosed,
 }
 
 impl From<RtcError> for DriverError {
     fn from(error: RtcError) -> Self {
         match error {
-            RtcError::InvalidInput(message) => DriverError::Other(message),
-            RtcError::Driver(message) => DriverError::Other(message),
+            RtcError::InvalidInput(message) | RtcError::Driver(message) => {
+                DriverError::Other(message)
+            }
             RtcError::Rejected(message) => DriverError::Unauthorized(message),
+            RtcError::Unsupported(message) => DriverError::Unsupported(message),
+            other => DriverError::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<DriverError> for RtcError {
+    fn from(error: DriverError) -> Self {
+        match error {
+            DriverError::Unauthorized(message) => RtcError::Rejected(message),
+            DriverError::Unsupported(message) => RtcError::Unsupported(message),
+            DriverError::Http(message) | DriverError::Other(message) => RtcError::Driver(message),
+        }
+    }
+}
+
+impl From<JoinError> for RtcError {
+    fn from(error: JoinError) -> Self {
+        match error {
+            JoinError::AlreadyJoined => RtcError::AlreadyJoined,
+            JoinError::InvalidParams(message) => RtcError::InvalidInput(message),
+            JoinError::SlotClosed => RtcError::SlotClosed,
+            JoinError::TransportUnavailable(e) | JoinError::Driver(e) => e.into(),
+        }
+    }
+}
+
+impl From<LeaveError> for RtcError {
+    fn from(error: LeaveError) -> Self {
+        match error {
+            LeaveError::NotJoined => RtcError::NotJoined,
+            LeaveError::Driver(e) => e.into(),
         }
     }
 }
@@ -77,6 +129,10 @@ pub struct FfiMember {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub intent: Option<String>,
+    pub application_type: Option<String>,
+    /// The transports this member publishes on.
+    pub published_transports: Vec<FfiRtcTransport>,
+    pub can_subscribe: Vec<String>,
 }
 
 impl From<&Member> for FfiMember {
@@ -90,14 +146,36 @@ impl From<&Member> for FfiMember {
             display_name: member.display_name.clone(),
             avatar_url: member.avatar_url.clone(),
             intent: member.intent.clone(),
+            application_type: member.application_type.clone(),
+            published_transports: member
+                .transports
+                .published
+                .iter()
+                .map(FfiRtcTransport::from)
+                .collect(),
+            can_subscribe: member.transports.can_subscribe.clone(),
         }
     }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiConnectionData {
-    pub jwt_token: String,
+    /// The connection key (`livekit_service_url`) `FfiMembership::connections`
+    /// refers to.
+    pub service_url: String,
+    /// The SFU websocket URL to connect to.
     pub ws_url: String,
+    pub jwt_token: String,
+}
+
+impl From<&ConnectionData> for FfiConnectionData {
+    fn from(c: &ConnectionData) -> Self {
+        Self {
+            service_url: c.service_url.clone(),
+            ws_url: c.ws_url.clone(),
+            jwt_token: c.jwt_token.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -106,7 +184,16 @@ pub struct FfiConnectionWithMembers {
     pub members: Vec<FfiMember>,
 }
 
-#[derive(Clone, Debug, uniffi::Enum)]
+impl From<&ConnectionWithMembers> for FfiConnectionWithMembers {
+    fn from(c: &ConnectionWithMembers) -> Self {
+        Self {
+            connection: (&c.connection).into(),
+            members: c.members.iter().map(FfiMember::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
 pub enum FfiMembershipState {
     /// In the session's joined projection.
     Joined,
@@ -131,12 +218,47 @@ pub struct FfiMembership {
     pub transport_identity: Option<String>,
 }
 
+impl From<&SessionMembership> for FfiMembership {
+    fn from(m: &SessionMembership) -> Self {
+        Self {
+            member: (&m.member).into(),
+            state: match m.state {
+                MembershipState::Joined => FfiMembershipState::Joined,
+                MembershipState::LeftWithKeys => FfiMembershipState::LeftWithKeys,
+            },
+            connections: m.connections.clone(),
+            transport_identity: m.transport_identity.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiMediaKey {
     pub member_id: String,
     pub key: Vec<u8>,
     pub index: u8,
     pub creation_ts_ms: u64,
+}
+
+impl FfiMediaKey {
+    fn new(member_id: &str, key: &MediaKey) -> Self {
+        Self {
+            member_id: member_id.to_owned(),
+            key: key.key.clone(),
+            index: key.index,
+            creation_ts_ms: key.creation_ts_ms,
+        }
+    }
+}
+
+/// One entry per `(member, index)`, sorted by member id then index.
+fn ffi_key_map(map: &KeyMap) -> Vec<FfiMediaKey> {
+    let mut keys: Vec<FfiMediaKey> = map
+        .iter()
+        .flat_map(|(member_id, ring)| ring.iter().map(move |key| FfiMediaKey::new(member_id, key)))
+        .collect();
+    keys.sort_by(|a, b| (&a.member_id, a.index).cmp(&(&b.member_id, b.index)));
+    keys
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -146,10 +268,52 @@ pub struct FfiRtcTransport {
     pub properties_json: String,
 }
 
+impl From<&RtcTransport> for FfiRtcTransport {
+    fn from(t: &RtcTransport) -> Self {
+        Self {
+            transport_type: t.transport_type.clone(),
+            properties_json: t.properties.to_string(),
+        }
+    }
+}
+
+impl TryFrom<FfiRtcTransport> for RtcTransport {
+    type Error = RtcError;
+
+    fn try_from(t: FfiRtcTransport) -> Result<Self, RtcError> {
+        let properties: Value = if t.properties_json.trim().is_empty() {
+            Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&t.properties_json).map_err(|e| {
+                RtcError::InvalidInput(format!("transport properties are not JSON: {e}"))
+            })?
+        };
+        Ok(RtcTransport {
+            transport_type: t.transport_type,
+            properties,
+        })
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiTransportIntent {
     Publish { transport: FfiRtcTransport },
     ReceiveOnly { can_subscribe: Vec<String> },
+}
+
+impl TryFrom<FfiTransportIntent> for TransportIntent {
+    type Error = RtcError;
+
+    fn try_from(intent: FfiTransportIntent) -> Result<Self, RtcError> {
+        Ok(match intent {
+            FfiTransportIntent::Publish { transport } => {
+                TransportIntent::Publish(transport.try_into()?)
+            }
+            FfiTransportIntent::ReceiveOnly { can_subscribe } => {
+                TransportIntent::ReceiveOnly { can_subscribe }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Enum)]
@@ -162,7 +326,9 @@ pub enum FfiEventOrigin {
 impl From<FfiEventOrigin> for EventOrigin {
     fn from(origin: FfiEventOrigin) -> Self {
         match origin {
-            FfiEventOrigin::Encrypted { sender_device_id } => EventOrigin::Encrypted { sender_device_id },
+            FfiEventOrigin::Encrypted { sender_device_id } => {
+                EventOrigin::Encrypted { sender_device_id }
+            }
             FfiEventOrigin::Cleartext => EventOrigin::Cleartext,
             FfiEventOrigin::Unknown => EventOrigin::Unknown,
         }
@@ -188,22 +354,25 @@ impl From<FfiElementCallCompat> for ElementCallCompat {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct FfiOpenIdToken {
-    pub access_token: String,
-    pub token_type: String,
-    pub matrix_server_name: String,
-    pub expires_in_ms: u64,
-}
-
+/// See `driver::LivekitTokenRequest`: the driver fetches the OpenID token
+/// itself and posts `{ room_id, slot_id, openid_token, member }` to
+/// `{url}/get_token` — or, with `legacy_sfu_get`, `{ room: room_id,
+/// openid_token, device_id }` to `{url}/sfu/get`.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiLivekitTokenRequest {
-    pub server_name: Option<String>,
     pub url: String,
     pub room_id: String,
     pub slot_id: String,
-    /// Forwarded verbatim (MSC4533).
+    /// MSC4195 member claims `{ id, claimed_user_id, claimed_device_id }`.
     pub member_json: String,
+    pub legacy_sfu_get: bool,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLivekitToken {
+    pub jwt: String,
+    /// The SFU websocket URL from the response, when it returned one.
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -227,17 +396,46 @@ pub struct FfiToDeviceDelivery {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiJoinParams {
     pub application_type: String,
+    /// `application["m.call.intent"]`.
+    pub intent: Option<String>,
     pub sticky_duration_ms: u64,
     pub keep_alive_timeout_ms: u64,
+    /// Lifetime when the homeserver refuses delayed events (default 5 min).
+    pub degraded_lifetime_ms: Option<u64>,
     pub delegate_delayed_leave: bool,
 }
 
-#[derive(Clone, Debug, uniffi::Enum)]
+impl From<FfiJoinParams> for JoinParams {
+    fn from(p: FfiJoinParams) -> Self {
+        JoinParams {
+            application_type: p.application_type,
+            intent: p.intent,
+            sticky_duration_ms: p.sticky_duration_ms,
+            keep_alive_timeout_ms: p.keep_alive_timeout_ms,
+            degraded_lifetime_ms: p.degraded_lifetime_ms,
+            delegate_delayed_leave: p.delegate_delayed_leave,
+        }
+    }
+}
+
+/// The coarse status; the sub-statuses are in `debug_snapshot`.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
 pub enum FfiStatus {
     Disconnected,
     Joining,
     Connected,
     Leaving,
+}
+
+impl From<&Status> for FfiStatus {
+    fn from(status: &Status) -> Self {
+        match status {
+            Status::Disconnected => Self::Disconnected,
+            Status::Joining(_) => Self::Joining,
+            Status::Connected(_) => Self::Connected,
+            Status::Leaving(_) => Self::Leaving,
+        }
+    }
 }
 
 /// One session as a plain value — what [`compute_sessions_from_events`]
@@ -308,12 +506,18 @@ struct FanOut<T> {
 
 impl<T: Clone> FanOut<T> {
     fn new() -> Arc<Self> {
-        Arc::new(Self { subscribers: Mutex::new(Vec::new()), ever_subscribed: AtomicBool::new(false) })
+        Arc::new(Self {
+            subscribers: Mutex::new(Vec::new()),
+            ever_subscribed: AtomicBool::new(false),
+        })
     }
 
     fn subscribe(&self) -> UnboundedReceiver<T> {
         let (tx, rx) = unbounded_channel();
-        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tx);
         self.ever_subscribed.store(true, Ordering::Release);
         rx
     }
@@ -361,17 +565,23 @@ pub struct ToDeviceSink {
 #[uniffi::export]
 impl ToDeviceSink {
     /// A decrypted to-device message with its origin metadata.
+    /// `sender_cross_signed` is the MSC4153 verdict on the sending device
+    /// (`None` = the host cannot tell, treated as not signed: media keys
+    /// from such devices are rejected unless configured otherwise).
     pub fn emit(
         &self,
         event_type: String,
         sender: String,
         content_json: String,
         origin: FfiEventOrigin,
+        sender_cross_signed: Option<bool>,
     ) -> bool {
         let content: Value = match serde_json::from_str(&content_json) {
             Ok(content) => content,
             Err(error) => {
-                log::warn!("ToDeviceSink::emit ignored a {event_type} from {sender}: not valid JSON ({error})");
+                log::warn!(
+                    "ToDeviceSink::emit ignored a {event_type} from {sender}: not valid JSON ({error})"
+                );
                 return true;
             }
         };
@@ -380,7 +590,7 @@ impl ToDeviceSink {
             sender,
             content,
             origin: origin.into(),
-            sender_cross_signed: None,
+            sender_cross_signed,
         })
     }
 }
@@ -396,7 +606,8 @@ impl StateUpdateSink {
     /// session: one snapshot per batch). State events are never encrypted,
     /// so their origin is `Cleartext`.
     pub fn emit(&self, events_json: Vec<String>) -> bool {
-        self.fan_out.emit(parse_raw_events(&events_json, EventOrigin::Cleartext))
+        self.fan_out
+            .emit(parse_raw_events(&events_json, EventOrigin::Cleartext))
     }
 }
 
@@ -432,17 +643,33 @@ pub trait MatrixDriverCallback: Send + Sync {
         content_json: String,
     ) -> Result<FfiSendEventResponse, RtcError>;
 
-    /// Returns the MSC4140 delay id (not an event id).
+    /// Returns the MSC4140 delay id (not an event id). `sticky_duration_ms`
+    /// makes it a delayed *sticky* event (MSC4354 + MSC4140); ignore it if
+    /// the host SDK cannot express both yet.
     async fn send_delayed_event(
         &self,
         room_id: String,
         event_type: String,
         content_json: String,
         delay_ms: u64,
+        sticky_duration_ms: Option<u64>,
     ) -> Result<String, RtcError>;
 
-    async fn restart_delayed_event(&self, room_id: String, delay_id: String)
-    -> Result<(), RtcError>;
+    /// Delayed state event — compat only (`StateEvents`).
+    async fn send_delayed_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content_json: String,
+        delay_ms: u64,
+    ) -> Result<String, RtcError>;
+
+    async fn restart_delayed_event(
+        &self,
+        room_id: String,
+        delay_id: String,
+    ) -> Result<(), RtcError>;
 
     async fn cancel_delayed_event(&self, room_id: String, delay_id: String)
     -> Result<(), RtcError>;
@@ -462,12 +689,15 @@ pub trait MatrixDriverCallback: Send + Sync {
         content_json: String,
     ) -> Result<Vec<FfiToDeviceDelivery>, RtcError>;
 
-    async fn get_open_id(&self) -> Result<FfiOpenIdToken, RtcError>;
-
+    /// `GET /_matrix/client/v1/rtc/transports`, with well-known fallback.
     async fn get_rtc_transports(&self) -> Result<Vec<FfiRtcTransport>, RtcError>;
 
-    async fn get_livekit_token(&self, request: FfiLivekitTokenRequest)
-    -> Result<String, RtcError>;
+    /// MSC4195 token exchange, OpenID token included (see
+    /// [`FfiLivekitTokenRequest`]).
+    async fn get_livekit_token(
+        &self,
+        request: FfiLivekitTokenRequest,
+    ) -> Result<FfiLivekitToken, RtcError>;
 
     /// Latest `limit` timeline events of `event_type`, as JSON strings.
     async fn read_events(
@@ -524,10 +754,21 @@ impl FfiMatrixDriver {
         let room_events = FanOut::new();
         let to_device = FanOut::new();
         let state_updates = FanOut::new();
-        callback.subscribe_room_events(Arc::new(RoomEventSink { fan_out: room_events.clone() }));
-        callback.subscribe_to_device_events(Arc::new(ToDeviceSink { fan_out: to_device.clone() }));
-        callback.subscribe_state_updates(Arc::new(StateUpdateSink { fan_out: state_updates.clone() }));
-        Arc::new(Self { callback, room_events, to_device, state_updates })
+        callback.subscribe_room_events(Arc::new(RoomEventSink {
+            fan_out: room_events.clone(),
+        }));
+        callback.subscribe_to_device_events(Arc::new(ToDeviceSink {
+            fan_out: to_device.clone(),
+        }));
+        callback.subscribe_state_updates(Arc::new(StateUpdateSink {
+            fan_out: state_updates.clone(),
+        }));
+        Arc::new(Self {
+            callback,
+            room_events,
+            to_device,
+            state_updates,
+        })
     }
 }
 
@@ -535,6 +776,13 @@ fn ffi_state_key(selector: StateKeySelector) -> Option<String> {
     match selector {
         StateKeySelector::Key(key) => Some(key),
         StateKeySelector::Any => None,
+    }
+}
+
+fn ffi_send_response(r: FfiSendEventResponse) -> SendEventResponse {
+    SendEventResponse {
+        event_id: r.event_id,
+        delay_id: r.delay_id,
     }
 }
 
@@ -548,7 +796,11 @@ impl OwnMembershipDriver for FfiMatrixDriver {
         content: Value,
         duration_ms: u64,
     ) -> Result<SendEventResponse, DriverError> {
-        todo!()
+        Ok(ffi_send_response(
+            self.callback
+                .send_sticky_event(room_id, event_type, content.to_string(), duration_ms)
+                .await?,
+        ))
     }
 
     async fn send_state_event(
@@ -558,7 +810,11 @@ impl OwnMembershipDriver for FfiMatrixDriver {
         state_key: String,
         content: Value,
     ) -> Result<SendEventResponse, DriverError> {
-        todo!()
+        Ok(ffi_send_response(
+            self.callback
+                .send_state_event(room_id, event_type, state_key, content.to_string())
+                .await?,
+        ))
     }
 
     async fn send_delayed_event(
@@ -567,8 +823,38 @@ impl OwnMembershipDriver for FfiMatrixDriver {
         event_type: String,
         content: Value,
         delay_ms: u64,
+        sticky_duration_ms: Option<u64>,
     ) -> Result<String, DriverError> {
-        todo!()
+        Ok(self
+            .callback
+            .send_delayed_event(
+                room_id,
+                event_type,
+                content.to_string(),
+                delay_ms,
+                sticky_duration_ms,
+            )
+            .await?)
+    }
+
+    async fn send_delayed_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content: Value,
+        delay_ms: u64,
+    ) -> Result<String, DriverError> {
+        Ok(self
+            .callback
+            .send_delayed_state_event(
+                room_id,
+                event_type,
+                state_key,
+                content.to_string(),
+                delay_ms,
+            )
+            .await?)
     }
 
     async fn restart_delayed_event(
@@ -576,7 +862,10 @@ impl OwnMembershipDriver for FfiMatrixDriver {
         room_id: String,
         delay_id: String,
     ) -> Result<(), DriverError> {
-        todo!()
+        Ok(self
+            .callback
+            .restart_delayed_event(room_id, delay_id)
+            .await?)
     }
 
     async fn cancel_delayed_event(
@@ -584,14 +873,25 @@ impl OwnMembershipDriver for FfiMatrixDriver {
         room_id: String,
         delay_id: String,
     ) -> Result<(), DriverError> {
-        todo!()
+        Ok(self
+            .callback
+            .cancel_delayed_event(room_id, delay_id)
+            .await?)
     }
 
     async fn delegate_livekit_delayed_leave(
         &self,
         request: DelegatedDelayedLeaveRequest,
     ) -> Result<(), DriverError> {
-        todo!()
+        Ok(self
+            .callback
+            .delegate_livekit_delayed_leave(
+                request.room_id,
+                request.slot_id,
+                request.member.to_string(),
+                request.delay_id,
+            )
+            .await?)
     }
 }
 
@@ -604,7 +904,27 @@ impl ToDeviceSendDriver for FfiMatrixDriver {
         event_type: String,
         content: Value,
     ) -> Result<Vec<ToDeviceDelivery>, DriverError> {
-        todo!()
+        let recipients = recipients
+            .into_iter()
+            .map(|r| FfiToDeviceRecipient {
+                user_id: r.user_id,
+                device_id: r.device_id,
+            })
+            .collect();
+        let deliveries = self
+            .callback
+            .send_to_device(recipients, event_type, content.to_string())
+            .await?;
+        Ok(deliveries
+            .into_iter()
+            .map(|d| ToDeviceDelivery {
+                recipient: ToDeviceRecipient {
+                    user_id: d.recipient.user_id,
+                    device_id: d.recipient.device_id,
+                },
+                error: d.error,
+            })
+            .collect())
     }
 }
 
@@ -638,7 +958,10 @@ impl RoomEventsDriver for FfiMatrixDriver {
         event_type: String,
         state_key: StateKeySelector,
     ) -> Result<Vec<RawMatrixEvent>, DriverError> {
-        let events = self.callback.read_state(event_type, ffi_state_key(state_key)).await?;
+        let events = self
+            .callback
+            .read_state(event_type, ffi_state_key(state_key))
+            .await?;
         Ok(parse_raw_events(&events, EventOrigin::Cleartext))
     }
 
@@ -654,19 +977,38 @@ impl RoomEventsDriver for FfiMatrixDriver {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl TokenDriver for FfiMatrixDriver {
-    async fn get_open_id(&self) -> Result<OpenIdToken, DriverError> {
-        todo!()
-    }
-
     async fn get_rtc_transports(&self) -> Result<Vec<RtcTransport>, DriverError> {
-        todo!()
+        let transports = self.callback.get_rtc_transports().await?;
+        Ok(transports
+            .into_iter()
+            .filter_map(|t| match RtcTransport::try_from(t) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    log::warn!("skipping a transport the host handed over: {e}");
+                    None
+                }
+            })
+            .collect())
     }
 
     async fn get_livekit_token(
         &self,
         request: LivekitTokenRequest,
     ) -> Result<LivekitTokenResponse, DriverError> {
-        todo!()
+        let token = self
+            .callback
+            .get_livekit_token(FfiLivekitTokenRequest {
+                url: request.url,
+                room_id: request.room_id,
+                slot_id: request.slot_id,
+                member_json: request.member.to_string(),
+                legacy_sfu_get: request.legacy_sfu_get,
+            })
+            .await?;
+        Ok(LivekitTokenResponse {
+            jwt: token.jwt,
+            url: token.url,
+        })
     }
 }
 
@@ -685,7 +1027,9 @@ pub trait ConnectionsListener: Send + Sync {
 
 #[uniffi::export(with_foreign)]
 pub trait KeyMapListener: Send + Sync {
-    fn on_key_map_change(&self, key_map: Vec<FfiMediaKey>);
+    /// The full map plus the one key that changed — route `change` to the LK
+    /// room(s) of that member.
+    fn on_key_map_change(&self, key_map: Vec<FfiMediaKey>, change: FfiMediaKey);
 }
 
 #[uniffi::export(with_foreign)]
@@ -696,7 +1040,7 @@ pub trait StatusListener: Send + Sync {
 /// FFI wrapper around [`ParticipationManager`].
 #[derive(uniffi::Object)]
 pub struct FfiParticipationManager {
-    inner: std::sync::Mutex<Option<ParticipationManager>>,
+    inner: ParticipationManager,
 }
 
 // No async runtime on wasm: uniffi-bindgen-react-native drives futures via
@@ -704,14 +1048,31 @@ pub struct FfiParticipationManager {
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export(async_runtime = "tokio"))]
 #[cfg_attr(target_arch = "wasm32", uniffi::export)]
 impl FfiParticipationManager {
+    /// One manager per `(room, slot)`; `user_id`/`device_id` are who we
+    /// publish as. Any number of managers may share one driver.
     #[uniffi::constructor]
     pub fn new(
         room_id: String,
         slot_id: String,
+        user_id: String,
+        device_id: String,
         driver: Arc<FfiMatrixDriver>,
         compat: FfiElementCallCompat,
     ) -> Arc<Self> {
-        todo!()
+        let config = ParticipationConfig {
+            compat: compat.into(),
+            ..ParticipationConfig::default()
+        };
+        let driver: Arc<dyn crate::driver::MatrixDriver> = driver;
+        Arc::new(Self {
+            inner: ParticipationManager::new(
+                room_id,
+                slot_id,
+                OwnIdentity { user_id, device_id },
+                driver,
+                config,
+            ),
+        })
     }
 
     pub async fn join(
@@ -719,50 +1080,103 @@ impl FfiParticipationManager {
         intent: FfiTransportIntent,
         params: FfiJoinParams,
     ) -> Result<(), RtcError> {
-        todo!()
+        Ok(self.inner.join(intent.try_into()?, params.into()).await?)
     }
 
-    pub async fn leave(&self, code: Option<String>, reason: Option<String>) -> Result<(), RtcError> {
-        todo!()
+    /// `code` defaults to MSC4143's plain `leave`.
+    pub async fn leave(
+        &self,
+        code: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), RtcError> {
+        let leave_reason = code.map(|code| LeaveReason::new(code, reason));
+        Ok(self.inner.leave(leave_reason).await?)
+    }
+
+    /// Open this manager's slot (`m.per_member` encryption when `encrypted`).
+    pub async fn open_slot(
+        &self,
+        application_type: String,
+        encrypted: bool,
+    ) -> Result<(), RtcError> {
+        Ok(self.inner.open_slot(&application_type, encrypted).await?)
+    }
+
+    pub async fn close_slot(&self) -> Result<(), RtcError> {
+        Ok(self.inner.close_slot().await?)
+    }
+
+    /// The live session snapshot (slot open?, encrypted?, members, start
+    /// time) — the same record `compute_sessions_from_events` returns.
+    pub fn session(&self) -> FfiSessionSnapshot {
+        (&self.inner.session()).into()
     }
 
     /// The session's joined projection plus left members still holding our
     /// keys (see [`FfiMembershipState`]).
     pub fn memberships(&self) -> Vec<FfiMembership> {
-        todo!()
+        self.inner
+            .memberships()
+            .iter()
+            .map(FfiMembership::from)
+            .collect()
     }
 
     pub fn connections(&self) -> Vec<FfiConnectionWithMembers> {
-        todo!()
+        self.inner
+            .connections()
+            .iter()
+            .map(FfiConnectionWithMembers::from)
+            .collect()
     }
 
     pub fn key_map(&self) -> Vec<FfiMediaKey> {
-        todo!()
+        ffi_key_map(&self.inner.key_map())
     }
 
     pub fn status(&self) -> FfiStatus {
-        todo!()
+        (&self.inner.status()).into()
     }
 
     pub fn set_memberships_listener(&self, listener: Arc<dyn MembershipsListener>) {
-        todo!()
+        self.inner
+            .on_memberships_change(Box::new(move |memberships| {
+                listener
+                    .on_memberships_change(memberships.iter().map(FfiMembership::from).collect())
+            }));
     }
 
     pub fn set_connections_listener(&self, listener: Arc<dyn ConnectionsListener>) {
-        todo!()
+        self.inner
+            .on_connections_change(Box::new(move |connections| {
+                listener.on_connections_change(
+                    connections
+                        .iter()
+                        .map(FfiConnectionWithMembers::from)
+                        .collect(),
+                )
+            }));
     }
 
     pub fn set_key_map_listener(&self, listener: Arc<dyn KeyMapListener>) {
-        todo!()
+        self.inner
+            .on_key_map_change(Box::new(move |map: &KeyMap, change: &MediaKeyChange| {
+                listener.on_key_map_change(
+                    ffi_key_map(map),
+                    FfiMediaKey::new(&change.member_id, &change.key),
+                )
+            }));
     }
 
     pub fn set_status_listener(&self, listener: Arc<dyn StatusListener>) {
-        todo!()
+        self.inner.on_status_change(Box::new(move |status| {
+            listener.on_status_change(status.into())
+        }));
     }
 
-    /// Diagnostics JSON (state + per-candidate join verdicts).
+    /// Diagnostics JSON (every part's state, per-candidate join verdicts).
     pub fn debug_snapshot(&self) -> String {
-        todo!()
+        self.inner.debug_snapshot().to_string()
     }
 }
 
@@ -781,8 +1195,13 @@ pub fn compute_sessions_from_events(
         .iter()
         .map(|json| parse_raw_event(json, EventOrigin::Unknown))
         .collect::<Result<Vec<_>, _>>()?;
-    let config = SessionConfig { compat: compat.into() };
-    Ok(session::compute_sessions_from_events(&events, &config).iter().map(FfiSessionSnapshot::from).collect())
+    let config = SessionConfig {
+        compat: compat.into(),
+    };
+    Ok(session::compute_sessions_from_events(&events, &config)
+        .iter()
+        .map(FfiSessionSnapshot::from)
+        .collect())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -809,25 +1228,40 @@ mod tests {
     #[test]
     fn room_event_sink_parses_and_bad_json_is_not_a_drop_signal() {
         let fan_out = FanOut::new();
-        let sink = RoomEventSink { fan_out: fan_out.clone() };
+        let sink = RoomEventSink {
+            fan_out: fan_out.clone(),
+        };
         let mut rx = fan_out.subscribe();
         assert!(sink.emit("not json".into(), FfiEventOrigin::Unknown));
         assert!(rx.try_recv().is_err());
         assert!(sink.emit(
             r#"{ "type": "m.rtc.member", "sender": "@a:x", "content": {} }"#.into(),
-            FfiEventOrigin::Encrypted { sender_device_id: Some("DEV".into()) },
+            FfiEventOrigin::Encrypted {
+                sender_device_id: Some("DEV".into())
+            },
         ));
         let event = rx.try_recv().unwrap();
         assert_eq!(event.event["type"], "m.rtc.member");
-        assert_eq!(event.origin, EventOrigin::Encrypted { sender_device_id: Some("DEV".into()) });
+        assert_eq!(
+            event.origin,
+            EventOrigin::Encrypted {
+                sender_device_id: Some("DEV".into())
+            }
+        );
     }
 
     #[test]
     fn state_update_sink_skips_malformed_entries_and_keeps_the_batch() {
         let fan_out = FanOut::new();
-        let sink = StateUpdateSink { fan_out: fan_out.clone() };
+        let sink = StateUpdateSink {
+            fan_out: fan_out.clone(),
+        };
         let mut rx = fan_out.subscribe();
-        assert!(sink.emit(vec!["{}".into(), "garbage".into(), r#"{ "type": "m.rtc.slot" }"#.into()]));
+        assert!(sink.emit(vec![
+            "{}".into(),
+            "garbage".into(),
+            r#"{ "type": "m.rtc.slot" }"#.into()
+        ]));
         let batch = rx.try_recv().unwrap();
         assert_eq!(batch.len(), 2);
         assert!(batch.iter().all(|e| e.origin == EventOrigin::Cleartext));
@@ -850,7 +1284,8 @@ mod tests {
                   "room_id": "!room:example.org", "origin_server_ts": {now},
                   "content": {{ "status": "open", "application": {{ "type": "m.call" }} }} }}"#
         );
-        let snapshots = compute_sessions_from_events(vec![join, slot], FfiElementCallCompat::Off).unwrap();
+        let snapshots =
+            compute_sessions_from_events(vec![join, slot], FfiElementCallCompat::Off).unwrap();
         assert_eq!(snapshots.len(), 1);
         let s = &snapshots[0];
         assert_eq!(s.member_count, 1);
@@ -859,7 +1294,13 @@ mod tests {
         assert_eq!(s.encrypted, Some(false));
         assert_eq!(s.application_type.as_deref(), Some("m.call"));
         assert_eq!(s.members[0].member_id, "m-1");
-        assert!(matches!(s.members[0].device_attribution, FfiDeviceAttribution::Unknown), "origins are unknown on this path");
+        assert!(
+            matches!(
+                s.members[0].device_attribution,
+                FfiDeviceAttribution::Unknown
+            ),
+            "origins are unknown on this path"
+        );
 
         assert!(matches!(
             compute_sessions_from_events(vec!["nope".into()], FfiElementCallCompat::Off),

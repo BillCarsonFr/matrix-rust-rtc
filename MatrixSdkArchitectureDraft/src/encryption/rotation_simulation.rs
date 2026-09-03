@@ -23,8 +23,12 @@ const QUIET_INTERVALS: u64 = 3;
 const SETTLE_INTERVALS: u64 = 3;
 
 fn grace_for(n: usize) -> u64 {
-    SendMachine::new(SendMachineConfig::default(), Participation::from_member(&member(0)).unwrap(), true)
-        .grace_period_ms(n)
+    SendMachine::new(
+        SendMachineConfig::default(),
+        Participation::from_member(&member(0)).unwrap(),
+        true,
+    )
+    .grace_period_ms(n)
 }
 
 struct Lcg(u64);
@@ -99,7 +103,9 @@ impl Sim {
         let members = self.members.clone();
         for i in 0..self.clients.len() {
             let jitter = self.rng.next_jitter();
-            let actions = self.clients[i].machine.on_session(&members, self.now, jitter);
+            let actions = self.clients[i]
+                .machine
+                .on_session(&members, self.now, jitter);
             self.handle(i, actions);
         }
     }
@@ -145,7 +151,10 @@ fn simulate(n: usize, seed: &mut Lcg) -> Result_ {
     let quiet_ms = grace * QUIET_INTERVALS;
     let simulated = n.min(SIMULATED_CLIENTS);
     let simulated_indices: HashSet<usize> = (0..simulated).map(|i| i * n / simulated).collect();
-    let flapping = Member { member_id: "flapping".into(), ..member(usize::MAX) };
+    let flapping = Member {
+        member_id: "flapping".into(),
+        ..member(usize::MAX)
+    };
 
     let mut sim = Sim {
         now: 0,
@@ -169,7 +178,11 @@ fn simulate(n: usize, seed: &mut Lcg) -> Result_ {
                     Participation::from_member(&member(i)).unwrap(),
                     true,
                 );
-                sim.clients.push(Client { index: i, machine, last_index: None });
+                sim.clients.push(Client {
+                    index: i,
+                    machine,
+                    last_index: None,
+                });
             }
         }
         joined += per_step;
@@ -206,14 +219,20 @@ fn simulate(n: usize, seed: &mut Lcg) -> Result_ {
 }
 
 fn total_messages(r: &Result_) -> f64 {
-    r.shares.iter().map(|s| s.to_device_messages).sum::<usize>() as f64 * r.n as f64 / r.simulated as f64
+    r.shares.iter().map(|s| s.to_device_messages).sum::<usize>() as f64 * r.n as f64
+        / r.simulated as f64
 }
 
 fn rotation_gaps(r: &Result_) -> Vec<u64> {
     let senders: HashSet<usize> = r.shares.iter().map(|s| s.sender).collect();
     let mut gaps = Vec::new();
     for sender in senders {
-        let times: Vec<u64> = r.shares.iter().filter(|s| s.is_rotation && s.sender == sender).map(|s| s.time).collect();
+        let times: Vec<u64> = r
+            .shares
+            .iter()
+            .filter(|s| s.is_rotation && s.sender == sender)
+            .map(|s| s.time)
+            .collect();
         gaps.extend(times.windows(2).map(|w| w[1] - w[0]));
     }
     gaps
@@ -224,7 +243,11 @@ fn mean(v: &[u64]) -> f64 {
 }
 
 fn human(ms: u64) -> String {
-    if ms >= 60_000 { format!("{:.1}min", ms as f64 / 60_000.0) } else { format!("{:.1}s", ms as f64 / 1000.0) }
+    if ms >= 60_000 {
+        format!("{:.1}min", ms as f64 / 60_000.0)
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
 }
 
 #[test]
@@ -247,19 +270,59 @@ fn a_call_stays_inside_the_contingent_and_goes_quiet_after_the_last_change() {
         let distinct: HashSet<u64> = rotations.iter().map(|s| s.time).collect();
         println!(
             "{} participants ({} simulated), grace {}, {:.1} rotations/client over {}: {total:.0} msgs = {per_minute:.0}/min of {CONTINGENT}/min; {} of {} rotations at their own instant",
-            r.n, r.simulated, human(r.grace), rotations.len() as f64 / r.simulated as f64, human(r.phase_ms), distinct.len(), rotations.len()
+            r.n,
+            r.simulated,
+            human(r.grace),
+            rotations.len() as f64 / r.simulated as f64,
+            human(r.phase_ms),
+            distinct.len(),
+            rotations.len()
         );
 
-        assert!(per_minute <= CONTINGENT as f64, "{}: {per_minute} msgs/min exceeds the contingent", r.n);
-        assert!(gaps.iter().all(|&g| g >= r.grace), "{}: a client rotated faster than its grace period", r.n);
-        assert!(mean(&gaps) <= grace_for(r.n + 1) as f64 * 1.5, "{}: mean gap {} too idle", r.n, mean(&gaps));
-        assert!(distinct.len() as f64 > rotations.len() as f64 * 0.5, "{}: rotations in lockstep", r.n);
+        assert!(
+            per_minute <= CONTINGENT as f64,
+            "{}: {per_minute} msgs/min exceeds the contingent",
+            r.n
+        );
+        assert!(
+            gaps.iter().all(|&g| g >= r.grace),
+            "{}: a client rotated faster than its grace period",
+            r.n
+        );
+        assert!(
+            mean(&gaps) <= grace_for(r.n + 1) as f64 * 1.5,
+            "{}: mean gap {} too idle",
+            r.n,
+            mean(&gaps)
+        );
+        assert!(
+            distinct.len() as f64 > rotations.len() as f64 * 0.5,
+            "{}: rotations in lockstep",
+            r.n
+        );
         assert!(active_window < r.phase_ms);
-        assert!(r.shares.iter().all(|s| s.time <= active_window), "{}: traffic after everything should be quiet", r.n);
+        assert!(
+            r.shares.iter().all(|s| s.time <= active_window),
+            "{}: traffic after everything should be quiet",
+            r.n
+        );
     }
 
     let interval = |n: usize| mean(&rotation_gaps(results.iter().find(|r| r.n == n).unwrap()));
-    assert!(interval(100) > interval(10) * 10.0, "100: {} vs 10: {}", interval(100), interval(10));
-    assert!(interval(300) > interval(100) * 5.0, "300: {} vs 100: {}", interval(300), interval(100));
-    assert!(results[2].shares.iter().any(|s| s.is_rotation), "a 300 participant call must still rotate");
+    assert!(
+        interval(100) > interval(10) * 10.0,
+        "100: {} vs 10: {}",
+        interval(100),
+        interval(10)
+    );
+    assert!(
+        interval(300) > interval(100) * 5.0,
+        "300: {} vs 100: {}",
+        interval(300),
+        interval(100)
+    );
+    assert!(
+        results[2].shares.iter().any(|s| s.is_rotation),
+        "a 300 participant call must still rotate"
+    );
 }

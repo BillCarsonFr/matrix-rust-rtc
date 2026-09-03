@@ -16,9 +16,13 @@ use serde_json::{Map, Value, json};
 
 /// What one `m.rtc.member` event contributes.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Msc4143Conversion {
     /// A membership (join or leave) under `sticky_key`.
-    Candidate { sticky_key: String, candidate: MemberCandidate },
+    Candidate {
+        sticky_key: String,
+        candidate: MemberCandidate,
+    },
     /// MSC4354 removal: the content carries nothing but the sticky key.
     Removal { sticky_key: String },
 }
@@ -46,7 +50,9 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
             // the map key alone says which entry goes.
             Some(sticky_key) => Some(Msc4143Conversion::Removal { sticky_key }),
             None => {
-                log::debug!("m.rtc.member from {sender} has neither slot_id nor sticky key; ignored");
+                log::debug!(
+                    "m.rtc.member from {sender} has neither slot_id nor sticky key; ignored"
+                );
                 None
             }
         };
@@ -64,7 +70,10 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
         return None;
     };
 
-    let member_id = member.get("id").and_then(Value::as_str).filter(|id| !id.is_empty());
+    let member_id = member
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
     let membership = member.get("membership").and_then(Value::as_str);
     let application = object.get("application").and_then(Value::as_object);
     let application_type = application
@@ -99,7 +108,10 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
         .map(str::to_owned);
 
     let transports = if joined {
-        object.get("transports").map(parse_transports).unwrap_or_default()
+        object
+            .get("transports")
+            .map(parse_transports)
+            .unwrap_or_default()
     } else {
         MemberTransports::default()
     };
@@ -107,7 +119,10 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
     let leave_reason = object.get("leave_reason").and_then(|reason| {
         Some(LeaveReason {
             code: reason.get("code")?.as_str()?.to_owned(),
-            reason: reason.get("reason").and_then(Value::as_str).map(str::to_owned),
+            reason: reason
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     });
 
@@ -128,7 +143,11 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
             transports,
         },
         source: CandidateSource::Msc4143,
-        membership: if joined { CandidateMembership::Join } else { CandidateMembership::Leave },
+        membership: if joined {
+            CandidateMembership::Join
+        } else {
+            CandidateMembership::Leave
+        },
         origin: event.origin.clone(),
         // The sticky layer fills this from the event's sticky metadata.
         expires_at: None,
@@ -138,7 +157,10 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
         legacy: None,
     };
 
-    Some(Msc4143Conversion::Candidate { sticky_key, candidate })
+    Some(Msc4143Conversion::Candidate {
+        sticky_key,
+        candidate,
+    })
 }
 
 /// The device a member is bound to, and how much that binding is worth.
@@ -152,9 +174,9 @@ fn attribute_device(
     claimed: Option<String>,
 ) -> (Option<String>, DeviceAttribution) {
     match origin {
-        EventOrigin::Encrypted { sender_device_id: Some(device_id) } => {
-            (Some(device_id.clone()), DeviceAttribution::Verified)
-        }
+        EventOrigin::Encrypted {
+            sender_device_id: Some(device_id),
+        } => (Some(device_id.clone()), DeviceAttribution::Verified),
         _ => match claimed {
             Some(device_id) => (Some(device_id), DeviceAttribution::Claimed),
             None => (None, DeviceAttribution::Unknown),
@@ -188,10 +210,17 @@ fn parse_transports(transports: &Value) -> MemberTransports {
         .get("can_subscribe")
         .and_then(Value::as_array)
         .map(|entries| {
-            entries.iter().filter_map(Value::as_str).map(str::to_owned).collect()
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
         })
         .unwrap_or_default();
-    MemberTransports { published, can_subscribe }
+    MemberTransports {
+        published,
+        can_subscribe,
+    }
 }
 
 /// One `published[..]` entry. Shared with the MSC3401 converter, whose
@@ -204,7 +233,10 @@ pub(crate) fn parse_transport(entry: &Value) -> Option<RtcTransport> {
     };
     let mut properties = object.clone();
     properties.remove("type");
-    Some(RtcTransport { transport_type: transport_type.to_owned(), properties: Value::Object(properties) })
+    Some(RtcTransport {
+        transport_type: transport_type.to_owned(),
+        properties: Value::Object(properties),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +272,11 @@ fn lift_rtc_transports(object: &mut Map<String, Value>) {
     if object.contains_key("transports") {
         return;
     }
-    let Some(published) = object.get("rtc_transports").and_then(Value::as_array).cloned() else {
+    let Some(published) = object
+        .get("rtc_transports")
+        .and_then(Value::as_array)
+        .cloned()
+    else {
         return;
     };
     if published.is_empty() {
@@ -283,7 +319,10 @@ fn infer_membership(object: &mut Map<String, Value>) {
     if member.contains_key("membership") {
         return;
     }
-    let names_member = member.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty());
+    let names_member = member
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
     if !names_member {
         return;
     }
@@ -326,11 +365,16 @@ mod tests {
     }
 
     fn encrypted(device: &str) -> EventOrigin {
-        EventOrigin::Encrypted { sender_device_id: Some(device.to_owned()) }
+        EventOrigin::Encrypted {
+            sender_device_id: Some(device.to_owned()),
+        }
     }
 
     fn convert(json: &str) -> Option<Msc4143Conversion> {
-        member_candidate(&event_with(serde_json::from_str(json).unwrap(), encrypted("DEVICEID")))
+        member_candidate(&event_with(
+            serde_json::from_str(json).unwrap(),
+            encrypted("DEVICEID"),
+        ))
     }
 
     fn candidate(json: &str) -> MemberCandidate {
@@ -352,12 +396,21 @@ mod tests {
         assert_eq!(c.member.intent.as_deref(), Some("video"));
         assert_eq!(c.member.device_id.as_deref(), Some("DEVICEID"));
         assert_eq!(c.member.device_attribution, DeviceAttribution::Verified);
-        assert_eq!(c.member.transports.can_subscribe, vec!["livekit".to_owned()]);
+        assert_eq!(
+            c.member.transports.can_subscribe,
+            vec!["livekit".to_owned()]
+        );
         assert_eq!(c.member.transports.published.len(), 1);
         let lk = &c.member.transports.published[0];
         assert_eq!(lk.transport_type, "livekit");
-        assert_eq!(lk.properties["livekit_service_url"], "https://sfu.example.com/jwt");
-        assert!(lk.properties.get("type").is_none(), "type lives in transport_type");
+        assert_eq!(
+            lk.properties["livekit_service_url"],
+            "https://sfu.example.com/jwt"
+        );
+        assert!(
+            lk.properties.get("type").is_none(),
+            "type lives in transport_type"
+        );
         assert_eq!(c.origin_server_ts, 1_700_000_000_000);
         assert_eq!(c.expires_at, None, "filled by the sticky layer");
         assert_eq!(c.member.membership_ts, None);
@@ -396,7 +449,9 @@ mod tests {
     fn sticky_key_is_accepted_under_both_spellings() {
         let stable = JOIN_JSON.replace("msc4354_sticky_key", "sticky_key");
         match convert(&stable) {
-            Some(Msc4143Conversion::Candidate { sticky_key, .. }) => assert_eq!(sticky_key, "xyzABCDEF0123"),
+            Some(Msc4143Conversion::Candidate { sticky_key, .. }) => {
+                assert_eq!(sticky_key, "xyzABCDEF0123")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -405,9 +460,15 @@ mod tests {
     /// identifies the participation (and is logged).
     #[test]
     fn mismatched_sticky_key_keeps_both_identities() {
-        let json = JOIN_JSON.replace(r#""msc4354_sticky_key": "xyzABCDEF0123""#, r#""msc4354_sticky_key": "other""#);
+        let json = JOIN_JSON.replace(
+            r#""msc4354_sticky_key": "xyzABCDEF0123""#,
+            r#""msc4354_sticky_key": "other""#,
+        );
         match convert(&json) {
-            Some(Msc4143Conversion::Candidate { sticky_key, candidate }) => {
+            Some(Msc4143Conversion::Candidate {
+                sticky_key,
+                candidate,
+            }) => {
                 assert_eq!(sticky_key, "other");
                 assert_eq!(candidate.member.member_id, "xyzABCDEF0123");
             }
@@ -422,10 +483,17 @@ mod tests {
             r#"{ "type": "com.example.sfu", "endpoint": "wss://x", "nested": { "a": 1 } }, { "no_type": true }"#,
         );
         let c = candidate(&json);
-        assert_eq!(c.member.transports.published.len(), 1, "typeless entries are skipped");
+        assert_eq!(
+            c.member.transports.published.len(),
+            1,
+            "typeless entries are skipped"
+        );
         let t = &c.member.transports.published[0];
         assert_eq!(t.transport_type, "com.example.sfu");
-        assert_eq!(t.properties, json!({ "endpoint": "wss://x", "nested": { "a": 1 } }));
+        assert_eq!(
+            t.properties,
+            json!({ "endpoint": "wss://x", "nested": { "a": 1 } })
+        );
     }
 
     #[test]
@@ -439,13 +507,19 @@ mod tests {
         let c = candidate(&json);
         assert!(c.is_join());
         assert!(c.member.transports.published.is_empty());
-        assert_eq!(c.member.transports.can_subscribe, vec!["livekit".to_owned()]);
+        assert_eq!(
+            c.member.transports.can_subscribe,
+            vec!["livekit".to_owned()]
+        );
     }
 
     #[test]
     fn content_not_an_object_or_member_not_an_object_is_none() {
         assert!(convert(r#""just a string""#).is_none());
-        assert!(convert(r#"{ "slot_id": "m.call#ROOM", "msc4354_sticky_key": "k", "member": "nope" }"#).is_none());
+        assert!(
+            convert(r#"{ "slot_id": "m.call#ROOM", "msc4354_sticky_key": "k", "member": "nope" }"#)
+                .is_none()
+        );
         assert!(convert(r#"{ "slot_id": "m.call#ROOM", "msc4354_sticky_key": "k" }"#).is_none());
         // No sticky key at all → not a membership.
         assert!(convert(r#"{ "slot_id": "m.call#ROOM", "member": { "id": "abc" } }"#).is_none());
@@ -462,7 +536,10 @@ mod tests {
         assert_eq!(c.membership, CandidateMembership::Leave);
         assert_eq!(
             c.leave_reason,
-            Some(LeaveReason { code: "slot_closed".into(), reason: Some("bye".into()) })
+            Some(LeaveReason {
+                code: "slot_closed".into(),
+                reason: Some("bye".into())
+            })
         );
         // Transport- and application-defined codes survive as-is.
         let c = candidate(
@@ -475,9 +552,18 @@ mod tests {
     #[test]
     fn origin_passes_through_untouched() {
         let content: Value = serde_json::from_str(JOIN_JSON).unwrap();
-        for origin in [encrypted("D"), EventOrigin::Encrypted { sender_device_id: None }, EventOrigin::Cleartext, EventOrigin::Unknown] {
+        for origin in [
+            encrypted("D"),
+            EventOrigin::Encrypted {
+                sender_device_id: None,
+            },
+            EventOrigin::Cleartext,
+            EventOrigin::Unknown,
+        ] {
             match member_candidate(&event_with(content.clone(), origin.clone())) {
-                Some(Msc4143Conversion::Candidate { candidate, .. }) => assert_eq!(candidate.origin, origin),
+                Some(Msc4143Conversion::Candidate { candidate, .. }) => {
+                    assert_eq!(candidate.origin, origin)
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -512,17 +598,28 @@ mod tests {
         let value = filled(LEGACY_JOIN);
         assert_eq!(value.pointer("/member/membership").unwrap(), "join");
         assert_eq!(
-            value.pointer("/transports/published/0/livekit_service_url").unwrap(),
+            value
+                .pointer("/transports/published/0/livekit_service_url")
+                .unwrap(),
             "https://mrtc.example.io"
         );
-        assert_eq!(value.pointer("/transports/can_subscribe/0").unwrap(), "livekit");
+        assert_eq!(
+            value.pointer("/transports/can_subscribe/0").unwrap(),
+            "livekit"
+        );
         // The legacy fields stay where they were; nothing downstream reads them.
         assert!(value.get("rtc_transports").is_some());
 
         let c = candidate(LEGACY_JOIN);
         assert!(c.is_join());
-        assert_eq!(c.member.transports.can_subscribe, vec!["livekit".to_owned()]);
-        assert_eq!(c.member.transports.published[0].properties["livekit_service_url"], "https://mrtc.example.io");
+        assert_eq!(
+            c.member.transports.can_subscribe,
+            vec!["livekit".to_owned()]
+        );
+        assert_eq!(
+            c.member.transports.published[0].properties["livekit_service_url"],
+            "https://mrtc.example.io"
+        );
     }
 
     /// The whole point of the fill being unconditional: it must be a no-op on
@@ -547,12 +644,16 @@ mod tests {
     fn bare_sticky_key_leave_is_a_removal() {
         assert_eq!(
             convert(r#"{ "msc4354_sticky_key": "41065006-4d3e-49ab-8c7a-3c8471ef6bec" }"#),
-            Some(Msc4143Conversion::Removal { sticky_key: "41065006-4d3e-49ab-8c7a-3c8471ef6bec".into() })
+            Some(Msc4143Conversion::Removal {
+                sticky_key: "41065006-4d3e-49ab-8c7a-3c8471ef6bec".into()
+            })
         );
         // Under the stable spelling too.
         assert_eq!(
             convert(r#"{ "sticky_key": "abc" }"#),
-            Some(Msc4143Conversion::Removal { sticky_key: "abc".into() })
+            Some(Msc4143Conversion::Removal {
+                sticky_key: "abc".into()
+            })
         );
     }
 
@@ -566,7 +667,10 @@ mod tests {
     /// is what MSC4143 requires of a join anyway.
     #[test]
     fn membership_is_not_inferred_without_an_application() {
-        let json = LEGACY_JOIN.replace(r#""application": { "type": "m.call", "m.call.intent": "video" },"#, "");
+        let json = LEGACY_JOIN.replace(
+            r#""application": { "type": "m.call", "m.call.intent": "video" },"#,
+            "",
+        );
         assert!(filled(&json).pointer("/member/membership").is_none());
         assert_eq!(candidate(&json).membership, CandidateMembership::Leave);
     }
@@ -585,7 +689,12 @@ mod tests {
         assert_eq!(c.member.device_attribution, DeviceAttribution::Claimed);
         assert_eq!(c.origin, EventOrigin::Cleartext);
         // Encrypted but unattributed + claim → Claimed.
-        let c = candidate_of(content.clone(), EventOrigin::Encrypted { sender_device_id: None });
+        let c = candidate_of(
+            content.clone(),
+            EventOrigin::Encrypted {
+                sender_device_id: None,
+            },
+        );
         assert_eq!(c.member.device_id.as_deref(), Some("V5cP8FErcB"));
         assert_eq!(c.member.device_attribution, DeviceAttribution::Claimed);
         // Spec content claims nothing.
@@ -617,8 +726,19 @@ mod tests {
             r#"{ "type": "livekit", "livekit_service_url": "https://a" }, { "livekit_service_url": "https://b" }, { "type": "livekit", "livekit_service_url": "https://c" }"#,
         );
         let value = filled(&json);
-        assert_eq!(value.pointer("/transports/can_subscribe").unwrap(), &json!(["livekit"]));
-        assert_eq!(value.pointer("/transports/published").unwrap().as_array().unwrap().len(), 3);
+        assert_eq!(
+            value.pointer("/transports/can_subscribe").unwrap(),
+            &json!(["livekit"])
+        );
+        assert_eq!(
+            value
+                .pointer("/transports/published")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     fn candidate_of(content: Value, origin: EventOrigin) -> MemberCandidate {

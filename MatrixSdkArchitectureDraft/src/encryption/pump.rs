@@ -33,7 +33,9 @@ impl Pump {
         // The initial snapshot counts as a change.
         self.session.mark_changed();
         loop {
-            let Some(inner) = self.inner.upgrade() else { return };
+            let Some(inner) = self.inner.upgrade() else {
+                return;
+            };
             let wake_at = inner.state.lock().unwrap().send.next_wake_ts();
             drop(inner);
 
@@ -76,13 +78,17 @@ impl Pump {
             };
 
             for action in actions {
-                let Some(inner) = self.inner.upgrade() else { return };
+                let Some(inner) = self.inner.upgrade() else {
+                    return;
+                };
                 match action {
                     Action::UseOwnKey(key) => Machine::use_own_key(&inner, key),
                     Action::Send { key, to } => {
                         let (event_type, content) = {
                             let state = inner.state.lock().unwrap();
-                            let Some(own) = state.send.own() else { continue };
+                            let Some(own) = state.send.own() else {
+                                continue;
+                            };
                             (
                                 wire::outbound_event_type(state.compat),
                                 wire::build_content(
@@ -120,7 +126,9 @@ impl Pump {
                                 Vec::new()
                             }
                         };
-                        let Some(inner) = self.inner.upgrade() else { return };
+                        let Some(inner) = self.inner.upgrade() else {
+                            return;
+                        };
                         Machine::on_delivered(&inner, key.index, &served, now_ms());
                     }
                 }
@@ -157,9 +165,15 @@ mod tests {
         ) -> Result<Vec<ToDeviceDelivery>, DriverError> {
             let deliveries = recipients
                 .iter()
-                .map(|r| ToDeviceDelivery { recipient: r.clone(), error: None })
+                .map(|r| ToDeviceDelivery {
+                    recipient: r.clone(),
+                    error: None,
+                })
                 .collect();
-            self.sent.lock().unwrap().push((recipients, event_type, content));
+            self.sent
+                .lock()
+                .unwrap()
+                .push((recipients, event_type, content));
             Ok(deliveries)
         }
     }
@@ -188,7 +202,11 @@ mod tests {
     }
 
     fn snapshot(members: Vec<Member>) -> SessionSnapshot {
-        SessionSnapshot { members, negotiated_encryption: Some(true), ..Default::default() }
+        SessionSnapshot {
+            members,
+            negotiated_encryption: Some(true),
+            ..Default::default()
+        }
     }
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
@@ -201,7 +219,10 @@ mod tests {
 
     #[test]
     fn session_changes_wakes_and_inbound_keys_flow_through_the_pump() {
-        let driver = Arc::new(MockDriver { sent: Mutex::new(Vec::new()), inbound: Mutex::new(None) });
+        let driver = Arc::new(MockDriver {
+            sent: Mutex::new(Vec::new()),
+            inbound: Mutex::new(None),
+        });
         let (session_tx, session_rx) = watch::channel(snapshot(Vec::new()));
         let changes: Arc<Mutex<Vec<MediaKeyChange>>> = Arc::default();
         let changes_cb = changes.clone();
@@ -217,7 +238,7 @@ mod tests {
             true,
             EncryptionConfig::default(),
             SendMachineConfig {
-                shared_per_minute_to_device_contingent: 60,
+                shared_per_minute_to_device_contingent: 600,
                 use_key_delay_ms: 30,
                 ..Default::default()
             },
@@ -226,38 +247,90 @@ mod tests {
         .unwrap();
 
         // 1. A session with bob: our first key goes to bob's device and is in use.
-        session_tx.send(snapshot(vec![own.clone(), bob.clone()])).unwrap();
+        session_tx
+            .send(snapshot(vec![own.clone(), bob.clone()]))
+            .unwrap();
         wait_until("first key sent", || !driver.sent.lock().unwrap().is_empty());
         {
             let sent = driver.sent.lock().unwrap();
             let (recipients, event_type, content) = &sent[0];
-            assert_eq!(recipients, &[ToDeviceRecipient { user_id: "@bob:x".into(), device_id: "BOB".into() }]);
+            assert_eq!(
+                recipients,
+                &[ToDeviceRecipient {
+                    user_id: "@bob:x".into(),
+                    device_id: "BOB".into()
+                }]
+            );
             assert_eq!(event_type, "org.matrix.msc4143.rtc.encryption_key");
             assert_eq!(content["member_id"], "m-@own:x");
             assert_eq!(content["media_key"]["index"], 0);
         }
-        wait_until("own key 0 in map", || changes.lock().unwrap().iter().any(|c| c.member_id == "m-@own:x" && c.key.index == 0));
+        wait_until("own key 0 in map", || {
+            changes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.member_id == "m-@own:x" && c.key.index == 0)
+        });
         assert_eq!(machine.key_map()["m-@own:x"].len(), 1);
-        wait_until("initial keys distributed", || matches!(machine.status(),
-            super::super::Status::Joining { has_distributed_initial_keys: true, .. }));
+        wait_until("initial keys distributed", || {
+            matches!(
+                machine.status(),
+                super::super::Status::Joining {
+                    has_distributed_initial_keys: true,
+                    ..
+                }
+            )
+        });
 
         // 2. Bob's key arrives over to-device and lands in the map.
-        let content = wire::build_content(ElementCallCompat::Off, "!room:x", "", "m-@bob:x", "BOB",
-            &super::super::MediaKey { key: vec![9; 32], index: 0, creation_ts_ms: 0 }, 0);
-        driver.inbound.lock().unwrap().as_ref().unwrap().send(ToDeviceMessage {
-            event_type: "m.rtc.encryption_key".into(),
-            sender: "@bob:x".into(),
-            content,
-            origin: EventOrigin::Encrypted { sender_device_id: Some("BOB".into()) },
-            sender_cross_signed: Some(true),
-        }).unwrap();
-        wait_until("bob's key in map", || machine.key_map().contains_key("m-@bob:x"));
-        assert!(matches!(machine.status(), super::super::Status::Connected { .. }));
+        let content = wire::build_content(
+            ElementCallCompat::Off,
+            "!room:x",
+            "",
+            "m-@bob:x",
+            "BOB",
+            &super::super::MediaKey {
+                key: vec![9; 32],
+                index: 0,
+                creation_ts_ms: 0,
+            },
+            0,
+        );
+        driver
+            .inbound
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(ToDeviceMessage {
+                event_type: "m.rtc.encryption_key".into(),
+                sender: "@bob:x".into(),
+                content,
+                origin: EventOrigin::Encrypted {
+                    sender_device_id: Some("BOB".into()),
+                },
+                sender_cross_signed: Some(true),
+            })
+            .unwrap();
+        wait_until("bob's key in map", || {
+            machine.key_map().contains_key("m-@bob:x")
+        });
+        assert!(matches!(
+            machine.status(),
+            super::super::Status::Connected { .. }
+        ));
 
         // 3. Bob leaves: he is "left with keys" until the timer-driven
         //    rotation; alone, the new key is used at once.
         session_tx.send(snapshot(vec![own.clone()])).unwrap();
-        wait_until("own key 1 after the wake", || changes.lock().unwrap().iter().any(|c| c.member_id == "m-@own:x" && c.key.index == 1));
+        wait_until("own key 1 after the wake", || {
+            changes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.member_id == "m-@own:x" && c.key.index == 1)
+        });
         assert!(matches!(machine.status(),
             super::super::Status::Connected { left_members_with_keys, fully_settled: true, .. } if left_members_with_keys.is_empty()));
         // No batch was sent for the rotation: nobody to send to.
@@ -266,8 +339,14 @@ mod tests {
         // 4. Dropping the machine is leaving: the pump exits and releases the
         //    driver; a later session change reaches nobody.
         drop(machine);
-        wait_until("pump released the driver", || Arc::strong_count(&driver) == 1);
-        assert_eq!(session_tx.receiver_count(), 0, "the session subscription is gone");
+        wait_until("pump released the driver", || {
+            Arc::strong_count(&driver) == 1
+        });
+        assert_eq!(
+            session_tx.receiver_count(),
+            0,
+            "the session subscription is gone"
+        );
         assert!(session_tx.send(snapshot(vec![own, bob])).is_err());
         assert_eq!(driver.sent.lock().unwrap().len(), 1);
     }

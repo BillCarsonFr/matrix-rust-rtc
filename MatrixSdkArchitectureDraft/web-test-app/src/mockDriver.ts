@@ -1,10 +1,14 @@
 // A MatrixDriver implemented in TypeScript — the same seam a
-// matrix-js-sdk-backed driver will implement. This mock records every
-// outbound call for assertions and returns canned homeserver responses.
+// matrix-js-sdk-backed driver implements (see jsSdkDriver.ts). This mock
+// models a homeserver: it records every outbound call for assertions, returns
+// canned responses, **echoes** accepted sticky/state events back through the
+// room-event sink (as sync would, so our own membership reaches the roster
+// like anybody else's), and hosts simulated remote peers that answer our
+// media key with theirs.
 import type {
   FfiEventOrigin,
+  FfiLivekitToken,
   FfiLivekitTokenRequest,
-  FfiOpenIdToken,
   FfiRtcTransport,
   FfiSendEventResponse,
   FfiToDeviceDelivery,
@@ -14,34 +18,78 @@ import type {
   StateUpdateSinkInterface,
   ToDeviceSinkInterface,
 } from "./generated/matrix_rtc";
+import { FfiEventOrigin as Origin, RtcError } from "./generated/matrix_rtc";
 
 export const LK_SERVICE_URL = "https://lk.example.org";
+export const ROOM_ID = "!room:example.org";
+// MSC4143: a slot id is `{application_type}#{id}`; a bare "m.call" resolves closed.
+export const SLOT_ID = "m.call#ROOM";
+export const OWN_USER_ID = "@me:example.org";
+export const OWN_DEVICE_ID = "MYDEV";
 
 export type OutboundCall =
-  | { kind: "stickyEvent"; roomId: string; eventType: string; content: unknown; durationMs: bigint }
-  | { kind: "stateEvent"; roomId: string; eventType: string; stateKey: string; content: unknown }
-  | { kind: "delayedEvent"; roomId: string; eventType: string; content: unknown; delayMs: bigint; delayId: string }
+  | { kind: "stickyEvent"; roomId: string; eventType: string; content: any; durationMs: bigint }
+  | { kind: "stateEvent"; roomId: string; eventType: string; stateKey: string; content: any }
+  | {
+      kind: "delayedEvent";
+      roomId: string;
+      eventType: string;
+      content: any;
+      delayMs: bigint;
+      stickyDurationMs: bigint | undefined;
+      delayId: string;
+    }
+  | {
+      kind: "delayedStateEvent";
+      roomId: string;
+      eventType: string;
+      stateKey: string;
+      content: any;
+      delayMs: bigint;
+      delayId: string;
+    }
   | { kind: "restartDelayed"; roomId: string; delayId: string }
   | { kind: "cancelDelayed"; roomId: string; delayId: string }
   | { kind: "delegateDelayedLeave"; roomId: string; slotId: string; delayId: string }
-  | { kind: "toDevice"; recipients: FfiToDeviceRecipient[]; eventType: string; content: unknown }
-  | { kind: "getOpenId" }
+  | { kind: "toDevice"; recipients: FfiToDeviceRecipient[]; eventType: string; content: any }
   | { kind: "getRtcTransports" }
-  | { kind: "getLivekitToken"; url: string; roomId: string; slotId: string };
+  | { kind: "getLivekitToken"; url: string; roomId: string; slotId: string; member: any; legacySfuGet: boolean };
+
+/** A simulated remote participant. */
+export interface RemotePeer {
+  userId: string;
+  deviceId: string;
+  memberId: string;
+  /** 32 key bytes; defaults to a constant pattern. */
+  key?: Uint8Array;
+}
 
 export class MockMatrixDriver implements MatrixDriverCallback {
   readonly outbound: OutboundCall[] = [];
-  private nextDelayId = 0;
   /** Optional observer so the demo app can render the outbound log live. */
   onOutbound?: (call: OutboundCall) => void;
+  /** Refuse delayed events like a homeserver without MSC4140 (404). */
+  refuseDelayedEvents = false;
+  /** Room state answered by `readState` (the session seed). */
+  roomState: any[] = [];
+  /** Simulated peers answer our media key with theirs (index 0). */
+  readonly peers: RemotePeer[] = [];
+  private nextDelayId = 0;
+  private nextEventId = 0;
+
+  constructor(private readonly ownUserId = OWN_USER_ID, private readonly ownDeviceId = OWN_DEVICE_ID) {}
 
   private record(call: OutboundCall) {
     this.outbound.push(call);
     this.onOutbound?.(call);
   }
 
-  calls(kind: OutboundCall["kind"]): OutboundCall[] {
-    return this.outbound.filter((c) => c.kind === kind);
+  calls<K extends OutboundCall["kind"]>(kind: K): Extract<OutboundCall, { kind: K }>[] {
+    return this.outbound.filter((c) => c.kind === kind) as Extract<OutboundCall, { kind: K }>[];
+  }
+
+  private eventId(): string {
+    return `$echo-${this.nextEventId++}`;
   }
 
   async sendStickyEvent(
@@ -50,8 +98,23 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     contentJson: string,
     durationMs: bigint,
   ): Promise<FfiSendEventResponse> {
-    this.record({ kind: "stickyEvent", roomId, eventType, content: JSON.parse(contentJson), durationMs });
-    return { eventId: `$sticky-${this.outbound.length}`, delayId: undefined };
+    const content = JSON.parse(contentJson);
+    this.record({ kind: "stickyEvent", roomId, eventType, content, durationMs });
+    const eventId = this.eventId();
+    // The homeserver echoes our event through sync.
+    this.echo(
+      {
+        type: eventType,
+        sender: this.ownUserId,
+        event_id: eventId,
+        room_id: roomId,
+        origin_server_ts: Date.now(),
+        msc4354_sticky: { duration_ms: Number(durationMs) },
+        content,
+      },
+      new Origin.Encrypted({ senderDeviceId: this.ownDeviceId }),
+    );
+    return { eventId, delayId: undefined };
   }
 
   async sendStateEvent(
@@ -60,8 +123,22 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     stateKey: string,
     contentJson: string,
   ): Promise<FfiSendEventResponse> {
-    this.record({ kind: "stateEvent", roomId, eventType, stateKey, content: JSON.parse(contentJson) });
-    return { eventId: `$state-${this.outbound.length}`, delayId: undefined };
+    const content = JSON.parse(contentJson);
+    this.record({ kind: "stateEvent", roomId, eventType, stateKey, content });
+    const eventId = this.eventId();
+    this.echo(
+      {
+        type: eventType,
+        sender: this.ownUserId,
+        event_id: eventId,
+        room_id: roomId,
+        state_key: stateKey,
+        origin_server_ts: Date.now(),
+        content,
+      },
+      new Origin.Cleartext(),
+    );
+    return { eventId, delayId: undefined };
   }
 
   async sendDelayedEvent(
@@ -69,9 +146,42 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     eventType: string,
     contentJson: string,
     delayMs: bigint,
+    stickyDurationMs: bigint | undefined,
   ): Promise<string> {
     const delayId = `delay-${this.nextDelayId++}`;
-    this.record({ kind: "delayedEvent", roomId, eventType, content: JSON.parse(contentJson), delayMs, delayId });
+    this.record({
+      kind: "delayedEvent",
+      roomId,
+      eventType,
+      content: JSON.parse(contentJson),
+      delayMs,
+      stickyDurationMs,
+      delayId,
+    });
+    if (this.refuseDelayedEvents) {
+      // 404 M_UNRECOGNIZED: "this homeserver will never do delayed events".
+      throw new RtcError.Unsupported("M_UNRECOGNIZED: delayed events are not supported");
+    }
+    return delayId;
+  }
+
+  async sendDelayedStateEvent(
+    roomId: string,
+    eventType: string,
+    stateKey: string,
+    contentJson: string,
+    delayMs: bigint,
+  ): Promise<string> {
+    const delayId = `delay-${this.nextDelayId++}`;
+    this.record({
+      kind: "delayedStateEvent",
+      roomId,
+      eventType,
+      stateKey,
+      content: JSON.parse(contentJson),
+      delayMs,
+      delayId,
+    });
     return delayId;
   }
 
@@ -98,18 +208,15 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     contentJson: string,
   ): Promise<FfiToDeviceDelivery[]> {
     this.record({ kind: "toDevice", recipients, eventType, content: JSON.parse(contentJson) });
+    // Simulated peers answer with their own key.
+    for (const recipient of recipients) {
+      const peer = this.peers.find(
+        (p) => p.userId === recipient.userId && p.deviceId === recipient.deviceId,
+      );
+      if (peer) queueMicrotask(() => this.peerSendsKey(peer, 0));
+    }
     // every recipient reachable
     return recipients.map((recipient) => ({ recipient, error: undefined }));
-  }
-
-  async getOpenId(): Promise<FfiOpenIdToken> {
-    this.record({ kind: "getOpenId" });
-    return {
-      accessToken: "openid-token",
-      tokenType: "Bearer",
-      matrixServerName: "example.org",
-      expiresInMs: 3600_000n,
-    };
   }
 
   async getRtcTransports(): Promise<FfiRtcTransport[]> {
@@ -122,22 +229,26 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     ];
   }
 
-  async getLivekitToken(request: FfiLivekitTokenRequest): Promise<string> {
+  async getLivekitToken(request: FfiLivekitTokenRequest): Promise<FfiLivekitToken> {
     this.record({
       kind: "getLivekitToken",
       url: request.url,
       roomId: request.roomId,
       slotId: request.slotId,
+      member: JSON.parse(request.memberJson),
+      legacySfuGet: request.legacySfuGet,
     });
-    return "jwt-for-" + request.url;
+    return { jwt: "jwt-for-" + request.url, url: request.url.replace("https", "wss") };
   }
 
   async readEvents(): Promise<string[]> {
     return [];
   }
 
-  async readState(): Promise<string[]> {
-    return [];
+  async readState(eventType: string, stateKey: string | undefined): Promise<string[]> {
+    return this.roomState
+      .filter((e) => e.type === eventType && (stateKey === undefined || e.state_key === stateKey))
+      .map((e) => JSON.stringify(e));
   }
 
   // --- inbound: the SDK subscribes exactly once, during FfiMatrixDriver
@@ -162,25 +273,62 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     this.stateUpdateSink = sink;
   }
 
+  private echo(event: any, origin: FfiEventOrigin) {
+    this.roomEventSink?.emit(JSON.stringify(event), origin);
+  }
+
   /** Emit any room event — sticky or state; the session dispatches on type. */
   emitRoomEvent(eventJson: string, origin: FfiEventOrigin): boolean {
     if (!this.roomEventSink) throw new Error("SDK has not subscribed to room events");
     return this.roomEventSink.emit(eventJson, origin);
   }
 
+  /** `senderCrossSigned` is the MSC4153 verdict; peers are cross-signed by default. */
   emitToDevice(
     eventType: string,
     sender: string,
     contentJson: string,
     origin: FfiEventOrigin,
+    senderCrossSigned: boolean | undefined = true,
   ): boolean {
     if (!this.toDeviceSink) throw new Error("SDK has not subscribed to to-device events");
-    return this.toDeviceSink.emit(eventType, sender, contentJson, origin);
+    return this.toDeviceSink.emit(eventType, sender, contentJson, origin, senderCrossSigned);
   }
 
   emitStateUpdate(eventsJson: string[]): boolean {
     if (!this.stateUpdateSink) throw new Error("SDK has not subscribed to state updates");
     return this.stateUpdateSink.emit(eventsJson);
+  }
+
+  // --- simulated peers -------------------------------------------------------
+
+  addPeer(peer: RemotePeer): RemotePeer {
+    this.peers.push(peer);
+    return peer;
+  }
+
+  /** The peer publishes a join (on `LK_SERVICE_URL` unless given). */
+  peerJoins(peer: RemotePeer, opts: { lkServiceUrl?: string; durationMs?: number } = {}): boolean {
+    return this.emitRoomEvent(
+      memberJoinEvent({ userId: peer.userId, memberId: peer.memberId, ...opts }),
+      new Origin.Encrypted({ senderDeviceId: peer.deviceId }),
+    );
+  }
+
+  peerLeaves(peer: RemotePeer): boolean {
+    return this.emitRoomEvent(
+      memberLeaveEvent({ userId: peer.userId, memberId: peer.memberId }),
+      new Origin.Encrypted({ senderDeviceId: peer.deviceId }),
+    );
+  }
+
+  peerSendsKey(peer: RemotePeer, index: number): boolean {
+    return this.emitToDevice(
+      "m.rtc.encryption_key",
+      peer.userId,
+      encryptionKeyContent({ memberId: peer.memberId, index, key: peer.key }),
+      new Origin.Encrypted({ senderDeviceId: peer.deviceId }),
+    );
   }
 }
 
@@ -191,25 +339,23 @@ export class MockMatrixDriver implements MatrixDriverCallback {
 // sync by a fixture test). Adjust here (one place), not in every test.
 // ---------------------------------------------------------------------------
 
-export const ROOM_ID = "!room:example.org";
-// MSC4143: a slot id is `{application_type}#{id}`; a bare "m.call" resolves closed.
-export const SLOT_ID = "m.call#ROOM";
-
 let eventCounter = 0;
 
 export function memberJoinEvent(opts: {
   userId: string;
-  deviceId: string;
   memberId: string;
   lkServiceUrl?: string;
+  durationMs?: number;
+  /** `org.matrix.msc4143.rtc.member` instead of the stable type. */
+  unstableType?: boolean;
 }): string {
   return JSON.stringify({
-    type: "m.rtc.member",
+    type: opts.unstableType ? "org.matrix.msc4143.rtc.member" : "m.rtc.member",
     sender: opts.userId,
     event_id: `$ev-${eventCounter++}`,
     room_id: ROOM_ID,
     origin_server_ts: Date.now(),
-    msc4354_sticky: { duration_ms: 240_000 },
+    msc4354_sticky: { duration_ms: opts.durationMs ?? 240_000 },
     content: {
       slot_id: SLOT_ID,
       // MSC4354: the sticky key lives in the content and equals member.id.
@@ -238,12 +384,14 @@ export function memberLeaveEvent(opts: { userId: string; memberId: string }): st
       slot_id: SLOT_ID,
       msc4354_sticky_key: opts.memberId,
       member: { id: opts.memberId, membership: "leave" },
-      leave_reason: { code: "m.user_hangup" },
+      leave_reason: { code: "leave" },
     },
   });
 }
 
-export function slotOpenEvent(): string {
+export function slotEvent(opts: { status: "open" | "closed"; encrypted?: boolean } = { status: "open" }): string {
+  const content: any = { status: opts.status, application: { type: "m.call" } };
+  if (opts.encrypted) content.encryption = { type: "m.per_member" };
   return JSON.stringify({
     type: "m.rtc.slot",
     sender: "@admin:example.org",
@@ -251,15 +399,50 @@ export function slotOpenEvent(): string {
     room_id: ROOM_ID,
     state_key: SLOT_ID,
     origin_server_ts: Date.now(),
-    content: { status: "open", application: { type: "m.call" } },
+    content,
   });
 }
 
-export function encryptionKeyContent(opts: { memberId: string; index: number }): string {
+export const slotOpenEvent = () => slotEvent({ status: "open" });
+export const slotClosedEvent = () => slotEvent({ status: "closed" });
+
+export function roomEncryptionEvent(): string {
+  return JSON.stringify({
+    type: "m.room.encryption",
+    sender: "@admin:example.org",
+    event_id: `$ev-${eventCounter++}`,
+    room_id: ROOM_ID,
+    state_key: "",
+    origin_server_ts: Date.now(),
+    content: { algorithm: "m.megolm.v1.aes-sha2" },
+  });
+}
+
+const DEFAULT_KEY = new Uint8Array(32).fill(7);
+
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/=+$/, "");
+}
+
+/** MSC4143 `m.rtc.encryption_key` content. */
+export function encryptionKeyContent(opts: { memberId: string; index: number; key?: Uint8Array }): string {
   return JSON.stringify({
     room_id: ROOM_ID,
     member_id: opts.memberId,
-    keys: [{ index: opts.index, key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }],
+    media_key: { index: opts.index, key: base64(opts.key ?? DEFAULT_KEY) },
     format: 0,
   });
+}
+
+/** One microtask tick: listener callbacks arrive after the emitting task yields. */
+export const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+export async function waitFor(what: string, cond: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }

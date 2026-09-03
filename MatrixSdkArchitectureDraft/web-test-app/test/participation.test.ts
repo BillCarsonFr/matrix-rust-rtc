@@ -1,32 +1,16 @@
 // Acceptance tests for the ParticipationManager, driven entirely through the
 // TS MatrixDriver mock: inbound events are injected, outbound traffic and
-// the manager's outputs are asserted.
-//
-// NOTE: the Rust crate is a skeleton — every method is todo!(), so today
-// each test fails with a wasm panic ("unreachable"). They define the
-// expected behavior and become the harness for implementing the todo!()s:
-// make them pass one by one.
+// the manager's outputs are asserted. Getters are fresh right after an emit
+// (drain-on-read); listener callbacks arrive a tick later.
 import { beforeAll, describe, expect, it } from "vitest";
 import {
-  FfiElementCallCompat,
   FfiEventOrigin,
-  FfiMatrixDriver,
   FfiMembershipState,
-  FfiParticipationManager,
   FfiStatus,
-  FfiTransportIntent,
   type FfiMembership,
 } from "../src/generated/matrix_rtc";
-import {
-  LK_SERVICE_URL,
-  MockMatrixDriver,
-  ROOM_ID,
-  SLOT_ID,
-  encryptionKeyContent,
-  memberJoinEvent,
-  memberLeaveEvent,
-  slotOpenEvent,
-} from "../src/mockDriver";
+import { LK_SERVICE_URL, OWN_USER_ID, ROOM_ID, memberJoinEvent, tick, waitFor } from "../src/mockDriver";
+import { encryptedRoomState, joinParams, newManager, publishLk, receiveOnly } from "./helpers";
 import { initWasm } from "./wasmInit";
 
 beforeAll(async () => {
@@ -35,28 +19,6 @@ beforeAll(async () => {
 
 const encrypted = (deviceId: string) =>
   new FfiEventOrigin.Encrypted({ senderDeviceId: deviceId });
-
-function newManager() {
-  const driver = new MockMatrixDriver();
-  // the subscribe_* handshake happens here, exactly once per driver
-  const matrixDriver = new FfiMatrixDriver(driver);
-  const manager = new FfiParticipationManager(
-    ROOM_ID,
-    SLOT_ID,
-    matrixDriver,
-    FfiElementCallCompat.Off,
-  );
-  return { driver, matrixDriver, manager };
-}
-
-const joinParams = {
-  applicationType: "m.call",
-  stickyDurationMs: 240_000n,
-  keepAliveTimeoutMs: 15_000n,
-  delegateDelayedLeave: false,
-};
-
-const receiveOnly = () => new FfiTransportIntent.ReceiveOnly({ canSubscribe: ["livekit"] });
 
 describe("ParticipationManager", () => {
   it("starts disconnected with no memberships", () => {
@@ -74,9 +36,8 @@ describe("ParticipationManager", () => {
       onMembershipsChange: (m) => changes.push(m),
     });
 
-    driver.emitRoomEvent(slotOpenEvent(), new FfiEventOrigin.Cleartext());
     driver.emitRoomEvent(
-      memberJoinEvent({ userId: "@remote:example.org", deviceId: "RDEV", memberId: "m-1" }),
+      memberJoinEvent({ userId: "@remote:example.org", memberId: "m-1" }),
       encrypted("RDEV"),
     );
 
@@ -84,16 +45,19 @@ describe("ParticipationManager", () => {
     expect(memberships).toHaveLength(1);
     expect(memberships[0].member.memberId).toBe("m-1");
     expect(memberships[0].member.userId).toBe("@remote:example.org");
+    expect(memberships[0].member.deviceId).toBe("RDEV");
     expect(memberships[0].state).toBe(FfiMembershipState.Joined);
     // the tile knows which LK room carries this member's media
     expect(memberships[0].connections).toContain(LK_SERVICE_URL);
-    // and the listener fired with the same list
+    expect(memberships[0].transportIdentity).toBeTypeOf("string");
+    expect(memberships[0].member.publishedTransports[0].transportType).toBe("livekit");
+    // and the listener fires a tick later with the same list
+    await tick();
     expect(changes.at(-1)).toEqual(memberships);
   });
 
   it("join arms the delayed leave before sending the membership", async () => {
     const { driver, manager } = newManager();
-    driver.emitRoomEvent(slotOpenEvent(), new FfiEventOrigin.Cleartext());
     await manager.join(receiveOnly(), joinParams);
 
     // outbound order: dead man's switch first, then the sticky join
@@ -103,45 +67,73 @@ describe("ParticipationManager", () => {
     expect(delayedAt).toBeGreaterThanOrEqual(0);
     expect(stickyAt).toBeGreaterThan(delayedAt);
 
-    const sticky = driver.calls("stickyEvent")[0] as Extract<
-      import("../src/mockDriver").OutboundCall,
-      { kind: "stickyEvent" }
-    >;
+    const delayed = driver.calls("delayedEvent")[0];
+    expect(delayed.delayMs).toBe(15_000n);
+    expect(delayed.stickyDurationMs).toBe(240_000n);
+    expect(delayed.content.leave_reason.code).toBe("delayed_leave");
+
+    const sticky = driver.calls("stickyEvent")[0];
     expect(sticky.roomId).toBe(ROOM_ID);
     // wire type: unstable spelling goes out, per wire_event_type
-    expect(["m.rtc.member", "org.matrix.msc4143.rtc.member"]).toContain(sticky.eventType);
+    expect(sticky.eventType).toBe("org.matrix.msc4143.rtc.member");
     // sticky duration passes through verbatim
     expect(sticky.durationMs).toBe(240_000n);
+    expect(sticky.content.member.membership).toBe("join");
 
-    expect(manager.status()).not.toBe(FfiStatus.Disconnected);
-    // our own membership is in the list
-    expect(manager.memberships().some((m) => m.state === FfiMembershipState.Joined)).toBe(true);
+    expect(manager.status()).toBe(FfiStatus.Connected);
+    // our own membership is in the list (the mock homeserver echoed it)
+    const me = manager.memberships().find((m) => m.member.userId === OWN_USER_ID);
+    expect(me?.state).toBe(FfiMembershipState.Joined);
+    expect(me?.member.memberId).toBe(sticky.content.member.id);
   });
 
-  it("a member that left while holding our key stays as LeftWithKeys", async () => {
-    const { driver, manager } = newManager();
-    const remote = { userId: "@remote:example.org", deviceId: "RDEV", memberId: "m-1" };
+  it("a member that left while holding our key stays as LeftWithKeys until rotation", async () => {
+    const { driver, manager } = newManager({ roomState: encryptedRoomState() });
+    const remote = driver.addPeer({ userId: "@remote:example.org", deviceId: "RDEV", memberId: "m-1" });
 
-    driver.emitRoomEvent(slotOpenEvent(), new FfiEventOrigin.Cleartext());
     await manager.join(receiveOnly(), joinParams);
-    driver.emitRoomEvent(memberJoinEvent(remote), encrypted("RDEV"));
+    driver.peerJoins(remote);
 
-    // the remote sent us their key…
-    driver.emitToDevice(
-      "m.rtc.encryption_key",
-      remote.userId,
-      encryptionKeyContent({ memberId: remote.memberId, index: 0 }),
-      encrypted("RDEV"),
-    );
-    expect(manager.keyMap().map((k) => k.memberId)).toContain(remote.memberId);
+    // we distribute our key to them and they answer with theirs
+    await waitFor("key exchange", () => manager.keyMap().some((k) => k.memberId === remote.memberId));
+    expect(driver.calls("toDevice")[0].recipients).toEqual([{ userId: remote.userId, deviceId: remote.deviceId }]);
 
-    // …and we distributed ours to them, so when they leave they still hold it
-    driver.emitRoomEvent(memberLeaveEvent(remote), encrypted("RDEV"));
-
+    // …so when they leave they still hold it
+    driver.peerLeaves(remote);
     const gone = manager.memberships().find((m) => m.member.memberId === remote.memberId);
     expect(gone).toBeDefined();
     expect(gone!.state).toBe(FfiMembershipState.LeftWithKeys);
-    // once our key rotates away from them, the membership disappears —
-    // covered by a follow-up test when rotation timing is implementable.
+    expect(gone!.connections).toEqual([]);
+
+    // once our key rotates away from them, the membership disappears and
+    // our key ring carries the new index (default 1 s use delay)
+    await waitFor(
+      "rotation settles",
+      () => !manager.memberships().some((m) => m.member.memberId === remote.memberId),
+      5000,
+    );
+    const ownKeys = manager.keyMap().filter((k) => k.memberId !== remote.memberId);
+    expect(ownKeys.map((k) => k.index)).toEqual([0, 1]);
+  });
+
+  it("the status listener follows join and leave", async () => {
+    const { manager } = newManager();
+    const statuses: FfiStatus[] = [];
+    manager.setStatusListener({ onStatusChange: (s) => statuses.push(s) });
+    await manager.join(receiveOnly(), joinParams);
+    await waitFor("connected seen", () => statuses.at(-1) === FfiStatus.Connected);
+    await manager.leave("m.user_hangup", undefined);
+    await waitFor("disconnected seen", () => statuses.at(-1) === FfiStatus.Disconnected);
+    expect(manager.status()).toBe(FfiStatus.Disconnected);
+  });
+
+  it("debugSnapshot is JSON with every part", async () => {
+    const { manager } = newManager();
+    await manager.join(publishLk(), joinParams);
+    const snapshot = JSON.parse(manager.debugSnapshot());
+    expect(snapshot.room_id).toBe(ROOM_ID);
+    expect(snapshot.own_membership.state).toBe("Connected");
+    expect(snapshot.encryption).toBeTruthy();
+    expect(snapshot.connections).toHaveLength(1);
   });
 });

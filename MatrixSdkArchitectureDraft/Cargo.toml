@@ -43,6 +43,8 @@ tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 # the ubrn shim's v1 resolver would unify it anyway.
 getrandom = { version = "0.2", features = ["js"] }
 base64 = "0.22"
+# MSC4195 pseudonymous participant identities (sha256 over the canonical triple).
+sha2 = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uniffi = { version = "=0.31.2", features = ["tokio"], optional = true }

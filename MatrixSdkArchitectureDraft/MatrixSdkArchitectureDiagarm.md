@@ -18,7 +18,7 @@ MatrixDriverRetryWrapper(MatrixDriver)
 │   send    sticky / state / delayed events (MSC4354 · MSC4140                 │
 │           restart/cancel) · delegate delayed leave to the SFU (MSC4195)      │
 │   send    to-device messages (per-recipient delivery results)                │
-│   read    timeline events · room state                                       │
+│   read    timeline (sticky) events · room state                              │
 │   sfu_endpoints OpenID · GET /rtc/transports · LiveKit get_token             │
 │   emit    live streams: room events · state updates · to-device              │
 └──────────────┬───────────────────────────────────────────▲───────────────────┘

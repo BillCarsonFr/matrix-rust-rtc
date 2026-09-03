@@ -53,8 +53,12 @@ const DEFAULT_EXPIRES_MS: u64 = 4 * 60 * 60 * 1000;
 
 /// What one state event contributes.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Msc3401Conversion {
-    Candidate { state_key: String, candidate: MemberCandidate },
+    Candidate {
+        state_key: String,
+        candidate: MemberCandidate,
+    },
     /// Empty content: this generation's leave.
     Removal { state_key: String },
 }
@@ -92,14 +96,21 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc3401Conversi
         return None;
     }
 
-    let Some(application_type) =
-        object.get("application").and_then(Value::as_str).filter(|a| !a.is_empty())
+    let Some(application_type) = object
+        .get("application")
+        .and_then(Value::as_str)
+        .filter(|a| !a.is_empty())
     else {
-        log::debug!("ignoring a pre-sticky membership from {sender} ({state_key}): it names no application");
+        log::debug!(
+            "ignoring a pre-sticky membership from {sender} ({state_key}): it names no application"
+        );
         return None;
     };
 
-    let Some(device_id) = object.get("device_id").and_then(Value::as_str).filter(|d| !d.is_empty())
+    let Some(device_id) = object
+        .get("device_id")
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty())
     else {
         log::debug!(
             "ignoring a pre-sticky membership from {sender} ({state_key}): it names no device, so \
@@ -117,13 +128,23 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc3401Conversi
         Some(created_ts) => created_ts.min(origin_server_ts),
         None => origin_server_ts,
     };
-    let expires = object.get("expires").and_then(Value::as_u64).unwrap_or(DEFAULT_EXPIRES_MS);
+    let expires = object
+        .get("expires")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_EXPIRES_MS);
     let expires_at = joined_at.saturating_add(expires);
 
-    let call_id = object.get("call_id").and_then(Value::as_str).unwrap_or_default();
+    let call_id = object
+        .get("call_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let legacy_call_id = format!(
         "{application_type}#{}",
-        if call_id.is_empty() { ROOM_CALL_ID } else { call_id }
+        if call_id.is_empty() {
+            ROOM_CALL_ID
+        } else {
+            call_id
+        }
     );
 
     // `membershipID` is what Element Call addresses its media keys to; the
@@ -144,7 +165,10 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc3401Conversi
             membership_ts: Some(joined_at),
             display_name: None,
             avatar_url: None,
-            intent: object.get("m.call.intent").and_then(Value::as_str).map(str::to_owned),
+            intent: object
+                .get("m.call.intent")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             application_type: Some(application_type.to_owned()),
             // Resolved across members at projection time (`assign_transports`).
             transports: MemberTransports::default(),
@@ -173,7 +197,10 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc3401Conversi
         }),
     };
 
-    Some(Msc3401Conversion::Candidate { state_key, candidate })
+    Some(Msc3401Conversion::Candidate {
+        state_key,
+        candidate,
+    })
 }
 
 /// Resolve the focus each surviving legacy candidate publishes on and write
@@ -217,7 +244,11 @@ fn resolve_focus<'a>(member: &'a MemberCandidate, all: &'a [MemberCandidate]) ->
         .iter()
         .filter_map(|candidate| candidate.legacy.as_ref())
         .filter(|candidate| candidate.call_id == details.call_id)
-        .min_by(|a, b| a.joined_at.cmp(&b.joined_at).then_with(|| a.state_key.cmp(&b.state_key)))
+        .min_by(|a, b| {
+            a.joined_at
+                .cmp(&b.joined_at)
+                .then_with(|| a.state_key.cmp(&b.state_key))
+        })
         .and_then(|oldest| oldest.own_focus.as_ref());
     oldest.or(details.own_focus.as_ref())
 }
@@ -272,7 +303,11 @@ mod tests {
     }
 
     fn one(json: &str) -> Option<Msc3401Conversion> {
-        member_candidate(&event_at("_@alice:example.io_V5cP8FErcB_m.call", CREATED, content(json)))
+        member_candidate(&event_at(
+            "_@alice:example.io_V5cP8FErcB_m.call",
+            CREATED,
+            content(json),
+        ))
     }
 
     fn candidate(json: &str) -> MemberCandidate {
@@ -296,7 +331,11 @@ mod tests {
         value
     }
 
-    fn candidate_of(state_key: &str, origin_server_ts: u64, value: Value) -> Option<MemberCandidate> {
+    fn candidate_of(
+        state_key: &str,
+        origin_server_ts: u64,
+        value: Value,
+    ) -> Option<MemberCandidate> {
         match member_candidate(&event_at(state_key, origin_server_ts, value)) {
             Some(Msc3401Conversion::Candidate { candidate, .. }) => Some(candidate),
             _ => None,
@@ -330,7 +369,8 @@ mod tests {
     #[test]
     fn the_empty_call_id_becomes_the_room_sentinel() {
         assert_eq!(candidate(EC_JOIN).legacy.unwrap().call_id, "m.call#ROOM");
-        let named = candidate_of("a", CREATED, join_with(&[("call_id", json!("standup"))])).unwrap();
+        let named =
+            candidate_of("a", CREATED, join_with(&[("call_id", json!("standup"))])).unwrap();
         assert_eq!(named.legacy.unwrap().call_id, "m.call#standup");
     }
 
@@ -338,7 +378,9 @@ mod tests {
     fn an_empty_content_is_a_removal() {
         assert_eq!(
             one("{}"),
-            Some(Msc3401Conversion::Removal { state_key: "_@alice:example.io_V5cP8FErcB_m.call".into() })
+            Some(Msc3401Conversion::Removal {
+                state_key: "_@alice:example.io_V5cP8FErcB_m.call".into()
+            })
         );
     }
 
@@ -364,7 +406,14 @@ mod tests {
     fn a_membership_with_no_application_is_dropped() {
         assert!(candidate_of("a", CREATED, join_with(&[("application", Value::Null)])).is_none());
         // An object is the *modern* shape and not this dialect.
-        assert!(candidate_of("a", CREATED, join_with(&[("application", json!({ "type": "m.call" }))])).is_none());
+        assert!(
+            candidate_of(
+                "a",
+                CREATED,
+                join_with(&[("application", json!({ "type": "m.call" }))])
+            )
+            .is_none()
+        );
     }
 
     /// The deadline itself counts as expired (`expires_at <= now`); the
@@ -413,7 +462,10 @@ mod tests {
     fn the_membership_id_falls_back_to_user_and_device() {
         let c = candidate_of("a", CREATED, join_with(&[("membershipID", Value::Null)])).unwrap();
         assert_eq!(c.member.member_id, "@alice:example.io:V5cP8FErcB");
-        assert_eq!(c.member.member_id, participant_identity("@alice:example.io", "V5cP8FErcB"));
+        assert_eq!(
+            c.member.member_id,
+            participant_identity("@alice:example.io", "V5cP8FErcB")
+        );
     }
 
     // -- focus resolution ----------------------------------------------------
@@ -426,17 +478,31 @@ mod tests {
     }
 
     /// One member, with `created_ts` and `origin_server_ts` agreeing.
-    fn focus_member(state_key: &str, joined_at: u64, selection: &str, url: &str) -> MemberCandidate {
+    fn focus_member(
+        state_key: &str,
+        joined_at: u64,
+        selection: &str,
+        url: &str,
+    ) -> MemberCandidate {
         let content = join_with(&[
             ("created_ts", json!(joined_at)),
-            ("focus_active", json!({ "type": "livekit", "focus_selection": selection })),
+            (
+                "focus_active",
+                json!({ "type": "livekit", "focus_selection": selection }),
+            ),
             ("foci_preferred", json!([focus(url)])),
         ]);
         candidate_of(state_key, joined_at, content).unwrap()
     }
 
     fn published_url(c: &MemberCandidate) -> Option<&str> {
-        c.member.transports.published.first()?.properties.get("livekit_service_url")?.as_str()
+        c.member
+            .transports
+            .published
+            .first()?
+            .properties
+            .get("livekit_service_url")?
+            .as_str()
     }
 
     fn resolved(mut members: Vec<MemberCandidate>) -> Vec<MemberCandidate> {
@@ -453,7 +519,10 @@ mod tests {
         ]);
         for member in &members {
             assert_eq!(published_url(member), Some("https://old"));
-            assert_eq!(member.member.transports.can_subscribe, vec!["livekit".to_owned()]);
+            assert_eq!(
+                member.member.transports.can_subscribe,
+                vec!["livekit".to_owned()]
+            );
         }
     }
 
@@ -485,7 +554,10 @@ mod tests {
     fn a_member_with_no_focus_of_its_own_borrows_one() {
         let mut without = focus_member("b", JOINED_LATER, "multi_sfu", "https://unused");
         without.legacy.as_mut().unwrap().own_focus = None;
-        let members = resolved(vec![focus_member("a", JOINED_EARLIER, "multi_sfu", "https://one"), without]);
+        let members = resolved(vec![
+            focus_member("a", JOINED_EARLIER, "multi_sfu", "https://one"),
+            without,
+        ]);
         assert_eq!(published_url(&members[1]), Some("https://one"));
     }
 
@@ -519,6 +591,9 @@ mod tests {
         let transport = &members[0].member.transports.published[0];
         assert_eq!(transport.transport_type, "livekit");
         assert_eq!(transport.properties["livekit_alias"], "!room:example.io");
-        assert_eq!(transport.properties["livekit_service_url"], "https://mrtc.example.io/livekit/jwt");
+        assert_eq!(
+            transport.properties["livekit_service_url"],
+            "https://mrtc.example.io/livekit/jwt"
+        );
     }
 }

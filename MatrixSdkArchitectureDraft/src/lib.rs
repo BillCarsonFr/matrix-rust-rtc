@@ -9,10 +9,9 @@
 //! uniffi-bindgen-react-native — so the generated (and documented) API is
 //! identical on all of them.
 //!
-//! `session` and `encryption` are implemented; the other modules' method
-//! bodies are still `todo!()` — see `../MatrixSdkArchitecture.md` and
-//! `src/session/SessionImplementationPlan.md`.
-#![allow(dead_code, unused_variables)]
+//! Plans and status per module: `src/session/SessionImplementationPlan.md`,
+//! `src/own_membership/OwnMembershipImplementationPlan.md`,
+//! `src/encryption/README.md`, `src/participation/ParticipationImplementationPlan.md`.
 
 pub mod connections;
 pub mod driver;
@@ -27,8 +26,9 @@ pub mod types;
 pub mod uniffi_api;
 
 pub use driver::MatrixDriver;
-pub use participation::{ParticipationManager, Status};
-pub use session::{Session, SessionSnapshot, compute_sessions_from_events};
+pub use own_membership::{JoinParams, OwnIdentity};
+pub use participation::{ParticipationConfig, ParticipationManager, Status};
+pub use session::{ElementCallCompat, Session, SessionSnapshot, compute_sessions_from_events};
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();

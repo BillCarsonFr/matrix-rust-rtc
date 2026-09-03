@@ -23,6 +23,7 @@
     "url": "https://github.com/element-hq/matrix-rust-rtc.git"
   },
   "dependencies": {
-    "@ubjs/core": "^0.31.0-5"
+    "@ubjs/core": "^0.31.0-5",
+    "matrix-js-sdk": "^42.3.0"
   }
 }
