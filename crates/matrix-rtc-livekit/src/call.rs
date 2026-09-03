@@ -41,8 +41,12 @@
 //! # Preconditions
 //!
 //! - the client is logged in and syncing (e.g. `matrix_sdk_ui::sync_service::SyncService`
-//!   is running — under `unstable-msc4354` it auto-enables the sticky-events
-//!   extension the membership bridge relies on);
+//!   is running — with the `experimental-sticky` feature it auto-enables the
+//!   sticky-events extension the membership bridge relies on);
+//! - the build matches the mode: without `experimental-sticky` only
+//!   [`ElementCallCompat::StateEvents`] can join, and [`Call::join`] returns
+//!   [`CallError::StickyEventsUnsupported`] for the others (see
+//!   [`STICKY_EVENTS_SUPPORTED`]);
 //! - the user has joined `room`;
 //! - the slot is open (an `m.rtc.slot` state event; see [`open_slot`]) —
 //!   MSC4143 counts nobody as joined against a closed slot.
@@ -53,11 +57,12 @@ use std::time::Duration;
 use livekit::RoomEvent;
 use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
 use matrix_sdk::event_handler::EventHandlerDropGuard;
+use matrix_sdk::ruma::api::client::rtc::RtcTransport as RumaRtcTransport;
 use matrix_sdk::ruma::api::client::rtc::transports::v1 as rtc_transports;
 use matrix_sdk::ruma::events::AnyToDeviceEvent;
-use matrix_sdk::ruma::events::rtc::transport::RtcTransport as RumaRtcTransport;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::{Client, Room};
+use serde::Deserialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
@@ -66,13 +71,13 @@ use matrix_rtc_bridge::compat::{
     self, ElementCallCompat, ElementCallDialect, ElementCallStateDialect, OutboundDialect,
 };
 use matrix_rtc_bridge::{
-    SdkCommandSender, TimelineIngest, register_timeline_receiver, run_sticky_bridge,
-    run_timeline_bridge,
+    STICKY_EVENTS_SUPPORTED, SdkCommandSender, TimelineIngest, register_timeline_receiver,
+    run_membership_bridge, run_timeline_bridge,
 };
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, KeyOrigin, LiveKitTransport, NotifyConfig, RaisedHand,
-    ReactionError, ReactionsConfig, ReceivedEncryptionKey, RtcSessionManager, RtcTransport,
-    SlotEncryption, generate_member_id,
+    EncryptionConfig, JoinSessionParams, KEY_MESSAGE_TYPE, KeyOrigin, LiveKitTransport,
+    NotifyConfig, RaisedHand, ReactionError, ReactionsConfig, ReceivedEncryptionKey,
+    RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
@@ -110,6 +115,16 @@ pub enum CallError {
     /// [`matrix_rtc_core::reactions`]).
     #[error(transparent)]
     Reaction(#[from] ReactionError),
+
+    /// The requested [`ElementCallCompat`] mode carries membership as MSC4354
+    /// sticky events, and this build of the crate cannot send or read those:
+    /// it was made without the `experimental-sticky` feature, against the stock
+    /// matrix-rust-sdk. Only [`ElementCallCompat::StateEvents`] joins here.
+    #[error(
+        "{0:?} needs MSC4354 sticky events; this build of matrix-rtc-livekit lacks the \
+         `experimental-sticky` feature, so only ElementCallCompat::StateEvents can join"
+    )]
+    StickyEventsUnsupported(ElementCallCompat),
 }
 
 fn signalling_error(error: impl std::fmt::Display) -> CallError {
@@ -299,6 +314,15 @@ impl Call {
             .to_string();
         let room_id = room.room_id().to_string();
 
+        // Refuse up front rather than join a call nobody can see: without sticky
+        // support our membership would be rejected by the command sender and no
+        // peer's would ever be read.
+        if !STICKY_EVENTS_SUPPORTED && !options.element_call_compat.reads_state_membership() {
+            return Err(CallError::StickyEventsUnsupported(
+                options.element_call_compat,
+            ));
+        }
+
         // The manager plus the bridge feeding it peer memberships.
         let dialect = match options.element_call_compat {
             ElementCallCompat::Off => OutboundDialect::None,
@@ -335,7 +359,7 @@ impl Call {
         let manager: Manager = Arc::new(Mutex::new(RtcSessionManager::with_command_sender(
             Arc::new(SdkCommandSender::with_compat(client.clone(), dialect)),
         )));
-        let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_sticky_bridge(
+        let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_membership_bridge(
             room.clone(),
             manager.clone(),
             options.element_call_compat.reads_state_membership(),
@@ -960,8 +984,33 @@ pub async fn discover_livekit_transport(
         })
 }
 
+/// The content of an `m.rtc.encryption_key` to-device message, as the 2026
+/// MSC4143 rewrite shapes it and as `matrix-rtc-core` puts it on the wire.
+///
+/// Our own type rather than ruma's: upstream ruma has no event for the rewrite
+/// (its `rtc` module stops at notification and decline), and the core does not
+/// depend on ruma. `format` is not read — the key is always base64.
+#[derive(Deserialize)]
+struct KeyMessageContent {
+    room_id: String,
+    member_id: String,
+    media_key: MediaKey,
+}
+
+#[derive(Deserialize)]
+struct MediaKey {
+    index: u8,
+    key: String,
+}
+
 /// Register a to-device handler that forwards decrypted
 /// `m.rtc.encryption_key` events to the key pump.
+///
+/// Raw rather than typed, like [`register_legacy_key_receiver`] and for the same
+/// reasons: ruma has no typed event for this content, and a typed handler
+/// silently never fires when the content does not match ruma's model. The type
+/// is filtered here, under both the stable and the MSC4143 unstable id, and a
+/// content that will not parse is logged instead of vanishing.
 ///
 /// The handler is `Send` (it only moves owned key data into a channel), which
 /// `add_event_handler` requires; the `!Send` work happens in the pump.
@@ -970,18 +1019,36 @@ fn register_key_receiver(
     key_tx: UnboundedSender<ReceivedKey>,
 ) -> matrix_sdk::event_handler::EventHandlerHandle {
     client.add_event_handler(
-        move |event: AnyToDeviceEvent, encryption_info: Option<EncryptionInfo>| {
+        move |event: Raw<AnyToDeviceEvent>, encryption_info: Option<EncryptionInfo>| {
             let key_tx = key_tx.clone();
             async move {
-                if let AnyToDeviceEvent::RtcEncryptionKey(event) = event {
-                    let _ = key_tx.send(ReceivedKey {
-                        origin: key_origin(encryption_info.as_ref()),
-                        room_id: event.content.room_id.to_string(),
-                        member_id: event.content.member_id,
-                        key_index: event.content.media_key.index,
-                        key_b64: event.content.media_key.key,
-                    });
+                let event_type = event.get_field::<String>("type").ok().flatten();
+                if !matches!(
+                    event_type.as_deref(),
+                    Some("m.rtc.encryption_key" | KEY_MESSAGE_TYPE)
+                ) {
+                    return;
                 }
+                let content = match event.get_field::<KeyMessageContent>("content") {
+                    Ok(Some(content)) => content,
+                    Ok(None) => {
+                        log::warn!("ignoring an m.rtc.encryption_key to-device with no content");
+                        return;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "ignoring an unparseable m.rtc.encryption_key to-device: {error}"
+                        );
+                        return;
+                    }
+                };
+                let _ = key_tx.send(ReceivedKey {
+                    origin: key_origin(encryption_info.as_ref()),
+                    room_id: content.room_id,
+                    member_id: content.member_id,
+                    key_index: content.media_key.index,
+                    key_b64: content.media_key.key,
+                });
             }
         },
     )

@@ -37,7 +37,12 @@ help:
 	@echo "  make backend-up         Start the MatrixRTC backend stack (docker compose)"
 	@echo "  make backend-down       Tear the backend stack down"
 	@echo "  make backend-logs       Follow the backend stack logs"
-	@echo "  make test-e2e           Run the e2e call test against the backend stack"
+	@echo "  make test-e2e           Run the e2e call test against the backend stack (upstream SDK: pre-sticky mode only)"
+	@echo ""
+	@echo "MSC4354 sticky events (fork SDK, see .cargo/experimental-sticky.toml):"
+	@echo "  make check-sticky       cargo check with the fork SDK and experimental-sticky"
+	@echo "  make clippy-sticky      Clippy with the fork SDK and experimental-sticky"
+	@echo "  make test-e2e-sticky    Run the full e2e suite (sticky + pre-sticky) with the fork SDK"
 	@echo ""
 	@echo "Element Call interop (demo/backend/INTEROP.md):"
 	@echo "  make interop-up         Start the backend stack + TLS, Element Web/Call"
@@ -71,8 +76,35 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
+# Explicit features rather than `--all-features`: that would also turn on
+# `experimental-sticky`, whose code needs the fork SDK and does not compile
+# against the upstream one the workspace depends on. This set covers every
+# target the upstream build can have, including the SDK-backed half of the
+# livekit crate (`call`, the bridge's `sdk`) and the FFI's media surface.
+UPSTREAM_FEATURES = matrix-rtc-livekit/matrix-sdk,matrix-rtc-livekit/testing,matrix-rtc-ffi/media
+
 clippy:
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --all-targets --features $(UPSTREAM_FEATURES) -- -D warnings
+
+# ---- MSC4354 sticky events (fork SDK) -------------------------------------
+# Everything below runs through scripts/cargo-sticky.sh, which applies the
+# `.cargo/experimental-sticky.toml` overlay (redirecting matrix-rust-sdk to the
+# fork that has sticky events), builds in target/sticky, and keeps the sticky
+# lockfile in Cargo.sticky.lock so the committed Cargo.lock stays the upstream
+# one. The SDK's own `unstable-msc4354` is passed here because our
+# `experimental-sticky` feature cannot forward to a feature upstream lacks.
+STICKY_FEATURES = matrix-sdk,testing,experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354
+
+.PHONY: check-sticky clippy-sticky test-e2e-sticky
+check-sticky:
+	./scripts/cargo-sticky.sh check -p matrix-rtc-livekit --all-targets --features $(STICKY_FEATURES)
+
+clippy-sticky:
+	./scripts/cargo-sticky.sh clippy -p matrix-rtc-livekit --all-targets --features $(STICKY_FEATURES) -- -D warnings
+
+# The full e2e suite: the three sticky scenarios plus the pre-sticky one.
+test-e2e-sticky: backend-up
+	./scripts/cargo-sticky.sh test -p matrix-rtc-livekit --features $(STICKY_FEATURES) --test e2e_call -- --ignored --nocapture --test-threads=1
 
 test:
 	cargo test --all
@@ -131,8 +163,10 @@ backend-reset: backend-down
 backend-logs:
 	docker compose -f demo/backend/docker-compose.yml logs -f
 
-# --test-threads=1: the single-focus and two-foci scenarios share the compose
-# stack; running them in parallel would double the load and interleave logs.
+# Against the upstream SDK only the pre-sticky scenario exists; the sticky
+# scenarios are compiled out without `experimental-sticky` (see
+# test-e2e-sticky). --test-threads=1: the scenarios share the compose stack;
+# running them in parallel would double the load and interleave logs.
 test-e2e: backend-up
 	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
 

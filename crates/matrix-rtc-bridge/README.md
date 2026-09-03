@@ -24,7 +24,7 @@ on the bridge.
 | Module | What it does |
 | --- | --- |
 | **`compat`** | Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite (today: Element Call on the JS SDK), in two generations. `StickyEvents` is the 2025 format — MSC4354 stickies with pre-2026 field names; reading it is always on, writing it is opt-in. `StateEvents` is the format before MSC4354, with membership as `org.matrix.msc3401.call.member` **room state**; opt-in in both directions, and visible to nobody but that generation. Pure JSON in, pure JSON out — no Matrix SDK, no async runtime. Scaffolding, to be deleted once Element Call catches up. |
-| **`sdk`** *(feature `matrix-sdk`)* | `SdkCommandSender` implements the core's `RtcCommandSender`, turning outbound commands (join/leave stickies, dead man's switch delayed events, Olm-encrypted `m.rtc.encryption_key` to-device messages) into Client-Server requests. `run_sticky_bridge` feeds the SDK's live sticky events — and, in the pre-sticky compat mode, room state — back into an `RtcSessionManager`. Owns the ruma pin the whole signalling path depends on. |
+| **`sdk`** *(feature `matrix-sdk`)* | `SdkCommandSender` implements the core's `RtcCommandSender`, turning outbound commands (join/leave stickies, dead man's switch delayed events, Olm-encrypted `m.rtc.encryption_key` to-device messages) into Client-Server requests. `run_membership_bridge` feeds the room's live membership — sticky events with `experimental-sticky`, and in the pre-sticky compat mode room state — back into an `RtcSessionManager`. |
 | **`OpenIdTokenSource`** *(crate root)* | The host's route to a Matrix OpenID token, which a transport exchanges for its own credentials. The trait is always available so a transport can name it; the `matrix_sdk::Client` impl is behind the feature. |
 
 ## Features
@@ -32,7 +32,8 @@ on the bridge.
 | Feature | Effect |
 | --- | --- |
 | *(default)* | `compat` and the `OpenIdTokenSource` trait. Depends only on `matrix-rtc-core`, serde/serde_json, thiserror, async-trait and log — no Matrix SDK, no async runtime, no git dependencies. |
-| `matrix-sdk` *(off by default)* | `sdk`, plus the `OpenIdTokenSource` impl for `matrix_sdk::Client`. Pulls in the experimental sticky-events fork of matrix-sdk (see the pin comment in `Cargo.toml`). |
+| `matrix-sdk` *(off by default)* | `sdk`, plus the `OpenIdTokenSource` impl for `matrix_sdk::Client`. Depends on upstream matrix-rust-sdk (rev in the workspace manifest), which has no MSC4354, so on its own this speaks only the pre-sticky `StateEvents` dialect. |
+| `experimental-sticky` *(off by default)* | The MSC4354 sticky carrier — what `ElementCallCompat::Off` and `StickyEvents` need. Requires the SDK fork that implements it, selected with `.cargo/experimental-sticky.toml`, plus `matrix-sdk/unstable-msc4354` on the command line (see the feature's comment in `Cargo.toml` for why it cannot forward that itself). `STICKY_EVENTS_SUPPORTED` tells a caller which build it has. |
 
 ## Testing
 
@@ -69,7 +70,7 @@ the edge — read the module docs before touching it.
 ## Known follow-up
 
 `matrix_rtc_livekit::call::Call::join` still interleaves the Matrix and media
-halves. Its transport-agnostic part (manager + command sender + sticky bridge +
+halves. Its transport-agnostic part (manager + command sender + membership bridge +
 to-device key handlers + key pump + heartbeat + join/leave) is what a second
 transport would actually want to reuse, and `matrix-rtc-ffi`'s `media/session.rs`
 plus `RtcSessionManagerHandle` is a parallel implementation of the same wiring.

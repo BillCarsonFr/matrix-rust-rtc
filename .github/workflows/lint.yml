@@ -69,8 +69,50 @@ jobs:
       # does NOT cover matrix-rtc-wasm, whose body is cfg-gated to wasm32 (its
       # JS-backed futures are !Send, so it cannot compile on a host target) —
       # the `wasm` job below is what checks it.
+      #
+      # `matrix-sdk` + `testing` so the SDK-backed half (`call`, the bridge's
+      # `sdk`) is type-checked against the upstream SDK on every PR; without them
+      # those modules are not compiled at all. Not `--all-features`: that would
+      # add `experimental-sticky`, which needs the fork (see `clippy-sticky`).
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: >
+          cargo clippy --workspace --all-targets
+          --features matrix-rtc-livekit/matrix-sdk,matrix-rtc-livekit/testing
+          -- -D warnings
+
+  clippy-sticky:
+    name: Clippy (experimental-sticky, fork SDK)
+    runs-on: ubuntu-latest
+    # An uncached build of the fork SDK is ~25-45 minutes.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install webrtc-sys system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      # Its own key: this tree resolves a different matrix-sdk than every other
+      # job, and it builds in target/sticky.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sticky
+          workspaces: ". -> target/sticky"
+
+      # The sticky code paths, against the fork SDK that has them. Same feature
+      # list as the Makefile's STICKY_FEATURES.
+      - name: Run clippy
+        run: >
+          ./scripts/cargo-sticky.sh clippy -p matrix-rtc-livekit --all-targets
+          --features matrix-sdk,testing,experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354
+          -- -D warnings
 
   wasm:
     name: Clippy (wasm32)

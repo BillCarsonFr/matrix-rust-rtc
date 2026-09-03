@@ -101,6 +101,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     //
     // `state`: the generation before MSC4354, where membership is room state.
     // Nothing about such a call is visible to a spec-current peer.
+    //
+    // The other two modes need a build with `experimental-sticky` (and the fork
+    // SDK behind it); against the upstream SDK `Call::join` refuses them, so
+    // that build only runs with `LEGACY_ELEMENT_CALL=state`.
     let element_call_compat = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
         None => ElementCallCompat::Off,
         Some("state") => ElementCallCompat::StateEvents,
@@ -111,7 +115,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
 
-    // 1. Log in and start syncing. Under `unstable-msc4354`, sliding sync
+    // 1. Log in and start syncing. With `experimental-sticky`, sliding sync
     //    auto-enables the sticky-events extension that carries `m.rtc.member`.
     //    Cross-signing is bootstrapped automatically on a first-ever login.
     let mut builder = matrix_sdk::Client::builder()

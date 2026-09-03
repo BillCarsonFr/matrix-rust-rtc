@@ -36,11 +36,12 @@ join/leave facade, so the test exercises exactly what a consumer would use.
 Inside `Call::join`:
 
 ```
-matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext auto-on under unstable-msc4354)
+matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext auto-on with experimental-sticky)
         │                              │
         │                              ▼
-        │                     room.subscribe_to_sticky_events()
-        │                              │  run_sticky_bridge (bridge: src/sdk.rs)
+        │            room.subscribe_to_sticky_events()   [experimental-sticky only]
+        │            room.subscribe_to_updates() + 30s poll  [pre-sticky state mode]
+        │                              │  run_membership_bridge (bridge: src/sdk.rs)
         ▼                              ▼
  SdkCommandSender ──▶ RtcSessionManager (join → own membership sticky + delayed leave; heartbeat)
  (bridge: src/sdk.rs)     │  └─ EncryptionManager: generates + distributes per-participant keys
@@ -70,24 +71,39 @@ make backend-up
 
 ## Dependency caveat (important)
 
-The test needs the experimental sticky-events SDK. `matrix-rtc-livekit/Cargo.toml`
-pins it to **`BillCarsonFr/matrix-rust-sdk` rev `3773300`** — see the long
-comment there for why the rev cannot move freely (it pairs a ruma fork whose
-MSC4143 event types match the 2026 rewrite with the "keep encryption info for
-sticky events" commit this crate's bridge relies on). `m.rtc.encryption_key`
-to-device messages deserialize through ruma's typed `AnyToDeviceEvent`; member
-events still go through `matrix_rtc_core::RawStickyEventContent`, since the
-core cannot depend on ruma.
+The workspace depends on **upstream `matrix-org/matrix-rust-sdk`** (rev in the
+root `Cargo.toml`), which has no MSC4354 sticky events. Against it only the
+pre-sticky scenario (`e2e_call_two_clients_pre_sticky_element_call`, membership
+as room state) exists; the three sticky scenarios are compiled out.
 
-The root `Cargo.toml` also carries a `[patch.crates-io]` block copied from the fork
-(cargo doesn't propagate a git dep's own patches to the consumer).
+The sticky scenarios need the `experimental-sticky` feature and the SDK fork
+that implements MSC4354 (`BillCarsonFr/matrix-rust-sdk`), selected by the
+`.cargo/experimental-sticky.toml` overlay — `scripts/cargo-sticky.sh` applies
+it, builds in `target/sticky`, and keeps the fork's lockfile in
+`Cargo.sticky.lock` so the committed `Cargo.lock` stays the upstream one. The
+SDK's own `unstable-msc4354` feature is passed on the command line, because a
+cargo feature cannot forward to a feature the upstream dependency lacks.
+
+Member events go through `matrix_rtc_core::RawStickyEventContent` and
+`m.rtc.encryption_key` to-device messages through a raw handler in `call.rs`,
+never ruma's typed RTC events: upstream ruma does not model the 2026 MSC4143
+rewrite, and the core cannot depend on ruma.
+
+The root `Cargo.toml` also carries the SDK's own `[patch]` blocks (cargo doesn't
+propagate a git dep's patches to the consumer).
 
 ## Build & run
 
 First build is long (it compiles `matrix-sdk` + native `libwebrtc`).
 
 ```sh
+# upstream SDK: the pre-sticky scenario
 cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
+
+# fork SDK: the whole suite (or `make test-e2e-sticky`)
+./scripts/cargo-sticky.sh test -p matrix-rtc-livekit \
+  --features matrix-sdk,testing,experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354 \
+  --test e2e_call -- --ignored --nocapture --test-threads=1
 ```
 
 That's the whole invocation against a local `make backend-up` stack — every

@@ -46,17 +46,29 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 log = "0.4"
 async-trait = "0.1"
 
-# The experimental matrix-sdk fork (used by matrix-rtc-livekit behind the
-# `matrix-sdk` feature) carries these git pins in its own `[patch.crates-io]`.
-# Cargo does NOT propagate a dependency's `[patch]` to the consuming workspace,
-# so we must replicate them here verbatim, or the SDK fails to build. ruma is a
-# plain git dependency in the fork and resolves transitively, so it needs no patch.
-# Source: BillCarsonFr/matrix-rust-sdk@valere/experimental_sticky Cargo.toml.
+# The Matrix SDK, used by matrix-rtc-bridge and matrix-rtc-livekit behind their
+# `matrix-sdk` feature. Upstream `main`, pinned to a rev so builds are
+# reproducible; the three crates MUST share one rev or cargo resolves two copies
+# of matrix-sdk and the `Client` one crate takes is not the one the other accepts.
+#
+# This is the stock SDK: it has no MSC4354 sticky events, so the default build
+# only speaks the pre-sticky `ElementCallCompat::StateEvents` dialect. The
+# `experimental-sticky` feature of those two crates needs the fork that carries
+# MSC4354, selected by redirecting this git source — see
+# `.cargo/experimental-sticky.toml`.
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "cd943e235f482ccf598a226e04f802061aaa9504" }
+matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "cd943e235f482ccf598a226e04f802061aaa9504" }
+matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "cd943e235f482ccf598a226e04f802061aaa9504" }
+
+# matrix-rust-sdk carries these git pins in its own `[patch]` tables. Cargo does
+# NOT propagate a dependency's `[patch]` to the consuming workspace, so they are
+# replicated here verbatim, or the SDK fails to build; a downstream workspace
+# that depends on matrix-rtc-bridge/-livekit with `matrix-sdk` on must do the
+# same. Source: matrix-org/matrix-rust-sdk@cd943e2 Cargo.toml — keep in step when
+# bumping the rev above.
 [patch.crates-io]
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 const_panic = { git = "https://github.com/jplatte/const_panic", rev = "e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f" }
-# Needed to fix rotation log issue on Android (https://github.com/tokio-rs/tracing/issues/2937)
-tracing = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
-tracing-core = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
-tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
-tracing-appender = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
+
+[patch."https://github.com/ruma/ruma"]
+ruma = { git = "https://github.com/matrix-org/ruma", rev = "bf21677a8fcba04fd01e341809eb5991908441a2" }

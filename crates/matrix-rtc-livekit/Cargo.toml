@@ -83,20 +83,16 @@ livekit = { version = "0.7", features = [
 futures-util = "0.3"
 # `call` needs the SDK directly — `Client`, `Room`, the to-device event handlers
 # and ruma's `GET /rtc/transports` request type. Everything else Matrix-side is
-# `matrix-rtc-bridge`'s, and the long rationale for this exact pin (MSC4354 sticky
-# support, why room-key forwarding stays on, what rev 3773300's ruma models, and
-# the `encryption_info().sender_device` the pin also carries) lives there, next to
-# the code that depends on it.
-#
-# The rev MUST stay in lockstep with the bridge's, or cargo resolves two copies of
-# matrix-sdk and the `Client` this crate takes is not the one the bridge's command
-# sender accepts.
-matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
-# Drives sliding sync (which auto-enables the sticky extension under
-# `unstable-msc4354`) plus the encryption sync, so sticky events actually flow.
-# Encryption support rides along via matrix-sdk's default features; ui only needs
-# the sticky feature for unification with matrix-sdk-base.
-matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354"] }
+# `matrix-rtc-bridge`'s, and the rationale for the feature set (why room-key
+# forwarding stays on, what `experimental-send-custom-to-device` is for) lives
+# there, next to the code that depends on it. The rev is the workspace's, so the
+# two crates cannot drift onto two copies of matrix-sdk.
+matrix-sdk = { workspace = true, optional = true, features = ["experimental-send-custom-to-device"] }
+# Drives sliding sync plus the encryption sync in the examples and the e2e test.
+# Under `experimental-sticky` it also enables the sticky-events extension, so
+# sticky events actually flow; encryption support rides along via matrix-sdk's
+# default features.
+matrix-sdk-ui = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # For the `android::initialize_android` re-export's signature; unifies with
@@ -104,11 +100,23 @@ matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev =
 jni = "0.21"
 
 [features]
-# Turns on the SDK-backed half: the bridge's command sender / sticky bridge and
-# its default `OpenIdTokenSource` for `matrix_sdk::Client`, the `call::Call`
+# Turns on the SDK-backed half: the bridge's command sender / membership bridge
+# and its default `OpenIdTokenSource` for `matrix_sdk::Client`, the `call::Call`
 # facade that composes them with this transport, and the examples / `e2e_call`.
 # Off by default to keep the base crate light and buildable without the git SDK.
+#
+# Against the stock SDK this only joins in `ElementCallCompat::StateEvents`;
+# `Call::join` rejects the other modes with `CallError::StickyEventsUnsupported`.
 matrix-sdk = ["matrix-rtc-bridge/matrix-sdk", "dep:matrix-sdk", "dep:matrix-sdk-ui"]
+# MSC4354 sticky events, for `ElementCallCompat::Off` and `StickyEvents`. Needs
+# the fork SDK, selected with `.cargo/experimental-sticky.toml`, AND its
+# `unstable-msc4354` feature on both `matrix-sdk` and `matrix-sdk-ui` (the latter
+# is what makes `SyncService` enable the sliding-sync sticky extension). This
+# feature cannot forward those itself — see the bridge's feature of the same name
+# for why — so pass them on the command line, as the Makefile's `*-sticky`
+# targets do:
+#   --features experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354
+experimental-sticky = ["matrix-sdk", "matrix-rtc-bridge/experimental-sticky"]
 # Exposes the test-only parts of the `media` module (tone generator, Goertzel
 # frequency detector) for examples and integration tests; recording/WAV
 # helpers in that module are shipped API and need no feature. Otherwise the

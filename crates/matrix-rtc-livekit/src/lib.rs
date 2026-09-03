@@ -92,9 +92,11 @@ pub mod android {
 #[cfg(feature = "matrix-sdk")]
 pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_slot};
 // The SDK-backed bridge itself lives in `matrix-rtc-bridge`; re-exported so a
-// host driving a call keeps one dependency.
+// host driving a call keeps one dependency. `STICKY_EVENTS_SUPPORTED` is how a
+// host learns, before joining, whether this build was made with
+// `experimental-sticky` or can only speak `ElementCallCompat::StateEvents`.
 #[cfg(feature = "matrix-sdk")]
-pub use matrix_rtc_bridge::{SdkCommandSender, run_sticky_bridge};
+pub use matrix_rtc_bridge::{STICKY_EVENTS_SUPPORTED, SdkCommandSender, run_membership_bridge};
 
 /// Obtain a fresh OpenID token and exchange it for an SFU JWT.
 ///

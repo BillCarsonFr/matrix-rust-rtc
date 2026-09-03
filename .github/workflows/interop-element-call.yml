@@ -39,7 +39,7 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'interop')
     runs-on: ubuntu-latest
     # Generous for the same reason as the E2E Call workflow: an uncached build
-    # of the matrix-sdk fork alone is ~25-45 minutes.
+    # of matrix-sdk alone is ~25-45 minutes.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -78,8 +78,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev
 
-      # Same key as the E2E Call workflow: identical tree, and the matrix-sdk
-      # fork build dominates the job either way.
+      # Same key as the E2E Call workflow's upstream leg: identical tree, and
+      # the matrix-sdk build dominates the job either way. The interop peer runs
+      # in the pre-sticky mode, which the upstream SDK serves.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
