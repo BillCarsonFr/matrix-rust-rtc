@@ -35,6 +35,13 @@
 #   committed, so sticky builds resolve the same way every time.
 set -euo pipefail
 
+if [ $# -eq 0 ]; then
+    echo "usage: $0 <cargo subcommand> [args...]" >&2
+    exit 2
+fi
+subcommand=$1
+shift
+
 cd "$(dirname "$0")/.."
 
 mkdir -p target
@@ -50,5 +57,11 @@ restore() {
 }
 trap restore EXIT
 
+# `--config` goes AFTER the subcommand, not before it. `cargo clippy` is an
+# external subcommand: cargo hands off to `cargo-clippy`, which runs its own
+# `cargo check`, and a global `--config` given before the subcommand is not
+# forwarded across that hop — so the overlay silently vanished and clippy
+# resolved the upstream SDK. Placed after, it is one of the arguments
+# `cargo-clippy` passes through; built-in subcommands accept it there too.
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/sticky}" \
-    cargo --config .cargo/experimental-sticky.toml "$@"
+    cargo "$subcommand" --config .cargo/experimental-sticky.toml "$@"

@@ -7,11 +7,14 @@
 # enabled on the command line, not by our feature (see the bridge manifest for
 # why it cannot be), so a sticky build is three things together:
 #
-#   cargo --config .cargo/experimental-sticky.toml <cmd> -p matrix-rtc-livekit \
+#   cargo <cmd> --config .cargo/experimental-sticky.toml -p matrix-rtc-livekit \
 #     --features experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354
 #
-# or the `*-sticky` Makefile targets. Only the three direct dependencies need
-# redirecting; the fork's internal `path` dependencies follow the patched source.
+# or the `*-sticky` Makefile targets. `--config` must come AFTER the subcommand:
+# `cargo clippy` is an external subcommand that re-runs `cargo check` itself,
+# and a global `--config` placed before it is not forwarded across that hop.
+# Only the three direct dependencies need redirecting; the fork's internal
+# `path` dependencies follow the patched source.
 #
 # Switching between the two configurations re-resolves the SDK subgraph and
 # rewrites Cargo.lock; the committed lockfile is the upstream one, so do not
