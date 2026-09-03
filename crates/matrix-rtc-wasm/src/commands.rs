@@ -87,6 +87,10 @@ impl JsCommandSender {
     /// - restartDelayedEvent(roomId, delayId, callback)
     /// - cancelDelayedEvent(roomId, delayId, callback)
     /// - sendToDeviceMessage(userId, deviceId, messageType, content, callback)
+    /// - sendRoomEvent(roomId, eventType, content) -> Promise, resolving to
+    ///   `{event_id}` on the same terms as sendStickyEvent (reactions, raised
+    ///   hand)
+    /// - redactEvent(roomId, eventId, reason?) -> Promise (lowering a hand)
     #[wasm_bindgen(constructor)]
     pub fn new(#[wasm_bindgen(unchecked_param_type = "MatrixClientHost")] client: JsValue) -> Self {
         Self {
@@ -528,6 +532,69 @@ impl RtcCommandSender for JsCommandSender {
                 }
             })
             .collect())
+    }
+
+    async fn send_room_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+    ) -> Result<String, CommandError> {
+        // Verbatim, not through `wire_event_type`: a reaction is not a
+        // MatrixRTC type and has no unstable alias in that table.
+        self.log_command(&format!(
+            "send_room_event: room={room_id}, type={event_type}"
+        ));
+
+        let js_content = to_plain_js(&content)?;
+        let promise = self
+            .call_js_promise_method(
+                "sendRoomEvent",
+                vec![
+                    JsValue::from_str(&room_id),
+                    JsValue::from_str(&event_type),
+                    js_content,
+                ],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        let resolved = wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        js_event_id(&resolved, "sendRoomEvent")
+    }
+
+    async fn redact_event(
+        &self,
+        room_id: String,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), CommandError> {
+        self.log_command(&format!(
+            "redact_event: room={room_id}, event_id={event_id}"
+        ));
+
+        let js_reason = match reason {
+            Some(reason) => JsValue::from_str(&reason),
+            None => JsValue::UNDEFINED,
+        };
+        let promise = self
+            .call_js_promise_method(
+                "redactEvent",
+                vec![
+                    JsValue::from_str(&room_id),
+                    JsValue::from_str(&event_id),
+                    js_reason,
+                ],
+            )
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(JsCommandSender::convert_js_error)?;
+
+        Ok(())
     }
 }
 

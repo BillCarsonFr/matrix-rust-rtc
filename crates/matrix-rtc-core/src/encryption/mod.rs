@@ -147,7 +147,7 @@
 //! impl RtcCommandSender for MyCommandSender {
 //!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _duration_ms: u64) -> Result<String, CommandError> {
 //!         Ok("$event".to_owned())
-//!     }
+//!     }   
 //!     async fn send_delayed_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
 //!         Ok(String::new())
 //!     }
@@ -162,6 +162,12 @@
 //!     }
 //!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<String, CommandError> {
 //!         Ok("$event".to_owned())
+//!     }
+//!     async fn send_room_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value) -> Result<String, CommandError> {
+//!         Ok("$event".to_owned())
+//!     }
+//!     async fn redact_event(&self, _room_id: String, _event_id: String, _reason: Option<String>) -> Result<(), CommandError> {
+//!         Ok(())
 //!     }
 //! }
 //!
@@ -2032,6 +2038,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some("device456".to_string())),
             sticky_key: "bob-device456-uuid".to_string(),
             member_id: "bob-device456-uuid".to_string(),
+            membership_event_id: None,
             membership_ts: None,
             application: Some("m.call".to_string()),
             transports: Vec::new(),
@@ -3619,6 +3626,22 @@ mod tests {
                 _delay_ms: u64,
             ) -> Result<String, CommandError> {
                 Ok("$delay".to_string())
+            }
+            async fn send_room_event(
+                &self,
+                _room_id: String,
+                _event_type: String,
+                _content: serde_json::Value,
+            ) -> Result<String, CommandError> {
+                Ok("$room".to_string())
+            }
+            async fn redact_event(
+                &self,
+                _room_id: String,
+                _event_id: String,
+                _reason: Option<String>,
+            ) -> Result<(), CommandError> {
+                Ok(())
             }
             async fn restart_delayed_event(
                 &self,

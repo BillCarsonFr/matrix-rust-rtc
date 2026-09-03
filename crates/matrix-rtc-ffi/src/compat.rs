@@ -150,6 +150,10 @@ pub(crate) fn member_id(compat: ElementCallCompat, user_id: &str, device_id: &st
 /// semantics of every field.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RawMemberEvent {
+    /// The event's id. Element Call relates reactions and the raised hand to
+    /// it; a member fed without one cannot be reacted for. Supply it.
+    #[uniffi(default = None)]
+    pub event_id: Option<String>,
     /// Sender user ID of the event.
     pub sender: String,
     /// Device that sent the event, from its decryption metadata.
@@ -182,6 +186,7 @@ impl RawMemberEvent {
             })
             .ok()?;
         Some(ingest::RawMemberEventIn {
+            event_id: self.event_id,
             sender: self.sender,
             sender_device_id: self.sender_device_id,
             was_encrypted: self.was_encrypted,
@@ -199,6 +204,10 @@ impl RawMemberEvent {
 /// [`FfiElementCallCompat::StateEvents`] mode.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct LegacyStateMemberEvent {
+    /// The event's id, carried through to the translated membership so
+    /// reactions can relate to it. Supply it.
+    #[uniffi(default = None)]
+    pub event_id: Option<String>,
     /// The event's `sender`. Homeserver-authenticated, and the only trustworthy
     /// identity in the whole event.
     pub sender: String,
@@ -227,6 +236,7 @@ impl LegacyStateMemberEvent {
             })
             .ok()?;
         Some(ingest::LegacyStateMemberEventIn {
+            event_id: self.event_id,
             sender: self.sender,
             state_key: self.state_key,
             origin_server_ts: self.origin_server_ts,
@@ -275,6 +285,7 @@ mod tests {
     #[test]
     fn a_non_json_content_drops_the_event_not_the_batch() {
         let good = RawMemberEvent {
+            event_id: None,
             sender: "@alice:example.org".to_owned(),
             sender_device_id: Some("ALICEDEVICE".to_owned()),
             was_encrypted: Some(true),

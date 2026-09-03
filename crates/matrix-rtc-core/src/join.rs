@@ -23,6 +23,7 @@
 
 use crate::encryption::types::EncryptionConfig;
 use crate::notification::NotifyConfig;
+use crate::reactions::ReactionsConfig;
 use crate::session::{LeaveCode, LeaveReason};
 use crate::transport::RtcTransport;
 
@@ -176,6 +177,12 @@ pub struct JoinSessionParams {
     /// session, but the intent to summon anyone at all is the application's to
     /// state.
     pub notify: Option<NotifyConfig>,
+
+    /// How this session handles Element Call reactions and the raised hand.
+    ///
+    /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
+    /// Element Call's three-second window. See [`crate::reactions`].
+    pub reactions: Option<ReactionsConfig>,
 }
 
 impl JoinSessionParams {
@@ -203,6 +210,7 @@ impl JoinSessionParams {
             degraded_lifetime_ms: None,
             encryption_config: None,
             notify: None,
+            reactions: None,
         }
     }
 
@@ -228,6 +236,7 @@ impl JoinSessionParams {
             degraded_lifetime_ms: None,
             encryption_config: None,
             notify: None,
+            reactions: None,
         }
     }
 
@@ -278,6 +287,11 @@ impl JoinSessionParams {
         self.degraded_lifetime_ms
             .unwrap_or(DEFAULT_DEGRADED_LIFETIME_MS)
             .min(MAX_STICKY_DURATION_MS)
+    }
+
+    /// The reactions configuration to use: the configured one or the default.
+    pub fn reactions(&self) -> ReactionsConfig {
+        self.reactions.clone().unwrap_or_default()
     }
 
     /// Gets the encryption configuration to use.

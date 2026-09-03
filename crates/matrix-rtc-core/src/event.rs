@@ -127,6 +127,14 @@ impl EventOrigin {
 pub struct RawStickyEvent {
     /// Room where the event belongs.
     pub room_id: String,
+    /// The event's id, when the host reports it.
+    ///
+    /// Element Call's reactions and raised hand relate to the *membership
+    /// event* of the reacting member, so a member whose event id is unknown can
+    /// neither be reacted for nor have their reactions validated. Optional only
+    /// because a host may feed memberships it did not receive as events (a
+    /// translated pre-sticky state map, say); every real Matrix event has one.
+    pub event_id: Option<String>,
     /// Sender user ID of the event.
     pub sender: String,
     /// How the event reached us, including the sending device.
@@ -280,6 +288,7 @@ impl RawStickyEvent {
             origin: self.origin,
             sticky_key: self.content.sticky_key,
             member_id,
+            membership_event_id: self.event_id,
             membership_ts: self.content.created_ts,
             application: application_type,
             transports: transports
@@ -397,6 +406,7 @@ mod tests {
     fn event(content: RawStickyEventContent) -> RawStickyEvent {
         RawStickyEvent {
             room_id: "!room:example.org".to_owned(),
+            event_id: Some("$member".to_owned()),
             sender: "@alice:example.org".to_owned(),
             origin: EventOrigin::encrypted(Some("DEVICEID".to_owned())),
             event_type: "m.rtc.member".to_owned(),

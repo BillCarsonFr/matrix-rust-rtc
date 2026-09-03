@@ -183,6 +183,27 @@ pub enum CallEvent {
         /// line.
         reason: KeyRejection,
     },
+    /// A participant raised their hand (Element Call's `m.reaction` annotation
+    /// of their membership). Also set on the roster as
+    /// [`Participant::hand_raised_at_ms`](crate::participant::Participant::hand_raised_at_ms).
+    HandRaised {
+        member_id: String,
+        raised_at_ms: u64,
+    },
+    /// A participant lowered their hand, or left with it up.
+    HandLowered { member_id: String },
+    /// A participant sent an emoji reaction. Transient: show `emoji` for a few
+    /// seconds (Element Call uses three) and play `sound` if reaction sounds
+    /// are on. The SDK does no audio; `sound` is the base name of the asset
+    /// to play (`clap`, `party`, …, or `generic` for an unknown `name`), or
+    /// `None` for a silent reaction.
+    Reaction {
+        member_id: String,
+        emoji: String,
+        /// The reaction's `name` as sent, e.g. `clapping`. Empty if none.
+        name: String,
+        sound: Option<String>,
+    },
     /// A transport-level participant appeared that maps to no signalled
     /// membership. It gets no subscription (and could not be decrypted
     /// anyway); surfaced for diagnostics.

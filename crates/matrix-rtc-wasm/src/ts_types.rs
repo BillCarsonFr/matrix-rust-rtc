@@ -47,6 +47,10 @@ export interface MatrixClientHost {
     cancelDelayedEvent(roomId: string, delayId: string): Promise<unknown>;
     /** Olm-encrypted, per specific device. Resolving with nothing reports every recipient served. */
     sendToDeviceMessage(recipients: { userId: string; deviceId: string }[], messageType: string, content: Record<string, unknown>): Promise<{ userId: string; deviceId: string; error?: string }[] | void>;
+    /** Plain message-like send (reactions, raised hand); encrypted in an encrypted room. */
+    sendRoomEvent(roomId: string, eventType: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
+    /** Redact one of our own events (lowering a raised hand). */
+    redactEvent(roomId: string, eventId: string, reason?: string): Promise<unknown>;
     /** Pre-sticky compat only: the delayed leave as a delayed STATE event. */
     sendDelayedStateEvent?(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>, delayMs: number): Promise<string>;
 }
@@ -64,6 +68,8 @@ export interface RtcParticipant {
     /** The livekit-js participant identity — the join key for `room.getParticipantByIdentity()`. */
     rtc_identity: string | null;
     streams: { kind: RtcStreamKind; muted: boolean }[];
+    /** When the participant raised their hand (ms since the epoch); `null` while it is down. */
+    hand_raised_at_ms: number | null;
 }
 
 /** An event on the unified call stream (`onEvent`). */
@@ -83,6 +89,10 @@ export type RtcCallEvent =
         sender_user_id: string | null; sender_device_id: string | null;
         reason_code: "cleartext" | "not_cross_signed" | "room_mismatch" | "sender_mismatch" | "unverifiable_device" | "device_mismatch";
         reason: string }
+    | { type: "hand_raised"; member_id: string; raised_at_ms: number }
+    | { type: "hand_lowered"; member_id: string }
+    /** Transient: show `emoji` for ~3 s; `sound` is the asset base name to play (`null` = silent). */
+    | { type: "reaction"; member_id: string; emoji: string; name: string; sound: string | null }
     | { type: "unknown_participant"; identity: string }
     | { type: "media_connection_state"; degraded: boolean }
     | { type: "ended"; reason: string };
@@ -142,6 +152,8 @@ export interface JoinParamsIn {
     };
     notify?: { notification_type?: string; mentions?: Record<string, unknown>; lifetime_ms?: number };
     element_call_compat?: ElementCallCompatMode;
+    /** Element Call reactions and raised hand; omitted is enabled with the 3 s window. */
+    reactions?: { enabled?: boolean; active_window_ms?: number; send_cooldown_ms?: number };
 }
 
 /** `leave`'s parameters (`{}` is a plain hang-up). */
@@ -152,6 +164,8 @@ export interface LeaveParamsIn {
 /** One sticky event for the TYPED ingestion (`set_current_sticky_state`). */
 export interface StickyEventIn {
     room_id: string;
+    /** The event's id; reactions and the raised hand relate to it. Supply it. */
+    event_id?: string;
     sender: string;
     /** From decryption metadata, not the payload. */
     sender_device_id?: string;
@@ -171,6 +185,8 @@ export interface StickyEventIn {
 
 /** One raw member event for the compat funnel (`setCurrentMembership`) — content verbatim. */
 export interface RawMemberEventIn {
+    /** The event's id; reactions and the raised hand relate to it. Supply it. */
+    event_id?: string;
     sender: string;
     sender_device_id?: string;
     was_encrypted?: boolean;
@@ -180,11 +196,50 @@ export interface RawMemberEventIn {
 
 /** One pre-MSC4354 `org.matrix.msc3401.call.member` room-state event. */
 export interface LegacyStateMemberEventIn {
+    /** The event's id; reactions and the raised hand relate to it. Supply it. */
+    event_id?: string;
     sender: string;
     state_key: string;
     /** Load-bearing: the expiry base for a content with no `created_ts`. */
     origin_server_ts: number;
     content: Record<string, unknown>;
+}
+
+/** One message-like room event for the reactions intake (`onRoomTimelineEvents`, `onRelationsReceived`). */
+export interface TimelineEventIn {
+    room_id?: string;
+    event_id: string;
+    sender: string;
+    /** From decryption metadata, not the payload. */
+    sender_device_id?: string;
+    was_encrypted?: boolean;
+    /** `io.element.call.reaction` or `m.reaction`; anything else is ignored. */
+    type: string;
+    origin_server_ts: number;
+    content: Record<string, unknown>;
+}
+
+/** A membership event whose annotations the host should fetch (`pendingRelationLookups`). */
+export interface RelationLookup {
+    member_id: string;
+    membership_event_id: string;
+}
+
+/** A member whose hand is up (`raisedHands`). */
+export interface RaisedHand {
+    member_id: string;
+    sender: string;
+    reaction_event_id: string;
+    /** ms since the epoch, by the server's clock; sort ascending to order speakers. */
+    raised_at_ms: number;
+}
+
+/** One entry of Element Call's reaction catalogue (`reactionCatalog()`). */
+export interface ReactionKind {
+    name: string;
+    emoji: string;
+    /** Base name of the sound asset Element Call plays for it, or `null` for a silent reaction. */
+    sound: string | null;
 }
 
 /** One `m.rtc.slot` state event (`on_room_slots_received`). */
@@ -239,6 +294,9 @@ export interface MembershipSnapshot {
         | { claimed: { device_id: string } };
     sticky_key: string;
     member_id: string;
+    /** Id of the member's latest membership event; moves on every sticky refresh. */
+    membership_event_id: string | null;
+    membership_ts: number | null;
     application: string | null;
     /** Externally tagged: the core's typed transports, not the wire shape. */
     transports: (

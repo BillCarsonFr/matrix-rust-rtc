@@ -14,6 +14,25 @@ log only.
 Hosts implementing the FFI/WASM command sender must update. All of these are
 compile errors, not silent behaviour changes.
 
+- **The command sender gains `sendRoomEvent(roomId, eventType, content)` and
+  `redactEvent(roomId, eventId, reason?)`.** Kotlin/Swift: two new methods on
+  `CommandSenderCallback`; JS: two new methods on the client object handed to
+  `setupCommandSender`, resolving like `sendStickyEvent` does (`{event_id}`)
+  and to anything at all, respectively. They carry Element Call's reactions
+  (`io.element.call.reaction`) and the raised hand (an `m.reaction`
+  annotation, lowered by redacting it) — plain message-like sends, encrypted
+  in an encrypted room by the client SDK's ordinary send. The `matrix-js-sdk`
+  host module implements both.
+
+- **Sticky events fed in should now carry their `event_id`.** `StickyEvent`
+  (FFI), `StickyEventIn` / `RawMemberEventIn` / `LegacyStateMemberEventIn`
+  (JS) and the FFI `RawMemberEvent` / `LegacyStateMemberEvent` records gain an
+  optional `event_id`. Optional so existing hosts compile, but a member fed
+  without one cannot be reacted for and none of their reactions validate:
+  Element Call relates every reaction to the reacting member's membership
+  event. `JoinedMembership` / `MembershipSnapshot` grow the matching
+  `membership_event_id`, which moves on every sticky refresh.
+
 **v0.2.0 sweep** — deliberately batched into one release while there is still a
 single integrator, rather than dripped out over several:
 
@@ -157,6 +176,28 @@ single integrator, rather than dripped out over several:
   loads fine through JNA); harmless to call either way.
 
 ### Added
+
+- **Element Call reactions and the raised hand**, interoperable with Element
+  Call and shared by every host through the core's new `reactions` module.
+  An emoji reaction is an `io.element.call.reaction` relating to the sender's
+  membership event, shown for three seconds and de-duplicated per member
+  inside that window (Element Call's rules, unspecced); a raised hand is an
+  `m.reaction` annotation of the membership event with key `🖐️`, lowered by
+  redaction. Sending: `Call::send_reaction` / `raise_hand` / `lower_hand`
+  (Rust), the same on `RtcSessionManagerHandle` (FFI) and
+  `WasmRtcSessionManager` / `MatrixRtcCall` (JS), with a send cooldown that
+  refuses what peers would drop anyway. Receiving: `CallEvent::Reaction`
+  (with a sound *hint* — the SDK plays no audio; hosts bundle the assets the
+  `reactionCatalog()` names), `CallEvent::HandRaised` / `HandLowered`, and
+  `Participant.hand_raised_at_ms` on the roster so tiles can be ordered by
+  who asked first. Our own hand is re-annotated onto the new membership
+  event after every sticky refresh, because Element Call drops a hand whose
+  membership event moved on; as a receiver we are lenient and keep a peer's
+  hand for as long as they are in the call. Hands raised before we joined are
+  recovered from the membership events' `/relations`: the Rust and JS hosts
+  do this themselves, FFI hosts answer `pendingRelationLookups` (see the
+  host obligations on `RtcSessionManagerHandle`). Configured per join with
+  `JoinSessionParams::reactions` / `CallOptions::reactions`; on by default.
 
 - **`MediaSession.unpublish(kind)`, so a stopped screen share can be retracted
   rather than left muted.** Muting keeps the publication up on purpose — that

@@ -52,7 +52,7 @@ mod ts_types;
 pub use commands::JsCommandSender;
 pub use logging::{init_logging, log_event};
 pub use media::{WasmConnectionEventSink, WasmMediaSession};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
 use wasm_bindgen::prelude::*;
@@ -341,6 +341,117 @@ impl WasmRtcSessionManager {
     #[wasm_bindgen(js_name = ownMemberId)]
     pub fn own_member_id(&self, room_id: String, slot_id: String) -> Option<String> {
         self.inner.own_member_id(&room_id, &slot_id)
+    }
+
+    /// The event id of our current membership event in one session, or
+    /// `undefined` if there is no such session or it has not joined. Moves on
+    /// every sticky refresh, so read it at the moment of use.
+    #[wasm_bindgen(js_name = ownMembershipEventId)]
+    pub fn own_membership_event_id(&self, room_id: String, slot_id: String) -> Option<String> {
+        self.inner.own_membership_event_id(&room_id, &slot_id)
+    }
+
+    // ---- Reactions and raised hands ----
+    //
+    // Three host obligations, for every room with a joined session (the
+    // `matrix-js-sdk-host` module does all three): forward every decrypted
+    // `io.element.call.reaction` and `m.reaction` event through
+    // `onRoomTimelineEvents` and every redaction through `onEventRedacted`;
+    // after each membership feed, answer `pendingRelationLookups` with each
+    // event's `/relations` through `onRelationsReceived`; and supply
+    // `event_id` on every sticky event fed in.
+
+    /// Feeds message-like room events to every session of `room_id`:
+    /// `[{ room_id, event_id, sender, sender_device_id?, was_encrypted?, type,
+    /// origin_server_ts, content }]`. Only `io.element.call.reaction` and
+    /// `m.reaction` are read; forward without filtering.
+    #[wasm_bindgen(js_name = onRoomTimelineEvents)]
+    pub fn on_room_timeline_events(
+        &mut self,
+        room_id: String,
+        #[wasm_bindgen(unchecked_param_type = "TimelineEventIn[]")] events: JsValue,
+    ) -> Result<(), JsError> {
+        let events = parse_timeline_events(&room_id, events)?;
+        self.inner.on_room_timeline_events(&room_id, &events);
+        Ok(())
+    }
+
+    /// Lowers whichever hand the redacted `event_id` raised, in every session
+    /// of `room_id`. Feed every redaction of the room.
+    #[wasm_bindgen(js_name = onEventRedacted)]
+    pub fn on_event_redacted(&mut self, room_id: String, event_id: String) {
+        self.inner.on_event_redacted(&room_id, &event_id);
+    }
+
+    /// Membership events in `room_id` whose annotations have not been fetched
+    /// yet, as `RelationLookup[]`. Answer each with
+    /// `client.relations(roomId, membership_event_id, "m.annotation", "m.reaction")`
+    /// through `onRelationsReceived`.
+    #[wasm_bindgen(js_name = pendingRelationLookups, unchecked_return_type = "RelationLookup[]")]
+    pub fn pending_relation_lookups(&self, room_id: String) -> Result<JsValue, JsError> {
+        let lookups = self.inner.pending_relation_lookups(&room_id);
+        serde_wasm_bindgen::to_value(&lookups).map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Feeds the annotations of one membership event back (same shape as
+    /// `onRoomTimelineEvents`; `[]` when there were none).
+    #[wasm_bindgen(js_name = onRelationsReceived)]
+    pub fn on_relations_received(
+        &mut self,
+        room_id: String,
+        target_event_id: String,
+        #[wasm_bindgen(unchecked_param_type = "TimelineEventIn[]")] events: JsValue,
+    ) -> Result<(), JsError> {
+        let events = parse_timeline_events(&room_id, events)?;
+        self.inner
+            .on_relations_received(&room_id, &target_event_id, &events);
+        Ok(())
+    }
+
+    /// Sends an Element Call emoji reaction from one session; `name` is what
+    /// peers pick a sound by (see `reactionCatalog()`). Resolves with the
+    /// event id; rejects inside the send cooldown.
+    #[wasm_bindgen(js_name = sendReaction)]
+    pub async fn send_reaction(
+        &mut self,
+        room_id: String,
+        slot_id: String,
+        emoji: String,
+        name: String,
+    ) -> Result<String, JsError> {
+        self.inner
+            .send_reaction(&room_id, &slot_id, &emoji, &name)
+            .await
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Raises our hand in one session. Idempotent while it is up.
+    #[wasm_bindgen(js_name = raiseHand)]
+    pub async fn raise_hand(&mut self, room_id: String, slot_id: String) -> Result<(), JsError> {
+        self.inner
+            .raise_hand(&room_id, &slot_id)
+            .await
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Lowers our hand in one session. A no-op when it is down.
+    #[wasm_bindgen(js_name = lowerHand)]
+    pub async fn lower_hand(&mut self, room_id: String, slot_id: String) -> Result<(), JsError> {
+        self.inner
+            .lower_hand(&room_id, &slot_id)
+            .await
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// The raised hands of one session, oldest first, as `RaisedHand[]`;
+    /// empty if there is no such session.
+    #[wasm_bindgen(js_name = raisedHands, unchecked_return_type = "RaisedHand[]")]
+    pub fn raised_hands(&self, room_id: String, slot_id: String) -> Result<JsValue, JsError> {
+        let hands = self
+            .inner
+            .raised_hands(&room_id, &slot_id)
+            .unwrap_or_default();
+        serde_wasm_bindgen::to_value(&hands).map_err(|err| JsError::new(&err.to_string()))
     }
 
     /// Leaves an RTC session.
@@ -657,6 +768,83 @@ impl WasmRtcSessionManager {
 
 /// How often a page should call [`WasmRtcSessionManager::heartbeat`] while
 /// joined. Matches the FFI's keep-alive driver interval.
+/// One message-like room event for the reactions intake, as JS hands it in.
+#[derive(Debug, Deserialize)]
+struct WasmTimelineEvent {
+    #[serde(default)]
+    room_id: Option<String>,
+    event_id: String,
+    sender: String,
+    #[serde(default)]
+    sender_device_id: Option<String>,
+    #[serde(default)]
+    was_encrypted: Option<bool>,
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    origin_server_ts: u64,
+    #[serde(default)]
+    content: serde_json::Value,
+}
+
+fn parse_timeline_events(
+    room_id: &str,
+    events: JsValue,
+) -> Result<Vec<matrix_rtc_core::RawTimelineEvent>, JsError> {
+    let events: Vec<WasmTimelineEvent> = serde_wasm_bindgen::from_value(events).map_err(|err| {
+        log::warn!("manager: [{room_id}] invalid timeline event payload: {err}");
+        JsError::new(&format!("invalid timeline event payload: {err}"))
+    })?;
+    Ok(events
+        .into_iter()
+        .map(|event| matrix_rtc_core::RawTimelineEvent {
+            room_id: event.room_id.unwrap_or_else(|| room_id.to_owned()),
+            event_id: event.event_id,
+            sender: event.sender,
+            origin: match event.was_encrypted {
+                Some(true) => matrix_rtc_core::EventOrigin::encrypted(event.sender_device_id),
+                Some(false) => matrix_rtc_core::EventOrigin::Cleartext,
+                None => matrix_rtc_core::EventOrigin::Unknown,
+            },
+            event_type: event.event_type,
+            origin_server_ts: event.origin_server_ts,
+            content: event.content,
+        })
+        .collect())
+}
+
+/// Element Call's reaction catalogue, as `ReactionKind[]` in the order its
+/// picker shows them. The `sound` of each entry is the base name of the asset
+/// to bundle and play; `reactionSoundFor` resolves a received `name`.
+#[wasm_bindgen(js_name = reactionCatalog, unchecked_return_type = "ReactionKind[]")]
+pub fn reaction_catalog() -> Result<JsValue, JsError> {
+    #[derive(Serialize)]
+    struct Kind {
+        name: &'static str,
+        emoji: &'static str,
+        sound: Option<&'static str>,
+    }
+    let catalogue: Vec<Kind> = matrix_rtc_core::KNOWN_REACTIONS
+        .iter()
+        .map(|kind| Kind {
+            name: kind.name,
+            emoji: kind.emoji,
+            sound: kind.sound,
+        })
+        .collect();
+    serde_wasm_bindgen::to_value(&catalogue).map_err(|err| JsError::new(&err.to_string()))
+}
+
+/// The sound asset to play for a reaction `name`: a catalogue entry's sound,
+/// `"generic"` for a name outside the catalogue, or `undefined` for a silent
+/// one.
+#[wasm_bindgen(js_name = reactionSoundFor)]
+pub fn reaction_sound_for(name: String) -> Option<String> {
+    matrix_rtc_core::sound_for(&name)
+        .asset_name()
+        .map(str::to_owned)
+}
+
 #[wasm_bindgen(js_name = HEARTBEAT_INTERVAL_MS)]
 pub fn heartbeat_interval_ms() -> u32 {
     10_000
@@ -772,6 +960,40 @@ pub struct WasmJoinSessionParams {
     /// object's `sendDelayedStateEvent`.
     #[serde(default)]
     pub element_call_compat: Option<String>,
+    /// How this session handles Element Call reactions and the raised hand.
+    /// Omitted is enabled with Element Call's three-second window.
+    #[serde(default)]
+    pub reactions: Option<WasmReactionsConfig>,
+}
+
+/// WASM-friendly reactions configuration (mirrors the core's
+/// `ReactionsConfig`; every field defaults).
+#[derive(Debug, Deserialize)]
+pub struct WasmReactionsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_reaction_window_ms")]
+    pub active_window_ms: u64,
+    #[serde(default = "default_reaction_window_ms")]
+    pub send_cooldown_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reaction_window_ms() -> u64 {
+    matrix_rtc_core::DEFAULT_REACTION_ACTIVE_MS
+}
+
+impl From<WasmReactionsConfig> for matrix_rtc_core::ReactionsConfig {
+    fn from(value: WasmReactionsConfig) -> Self {
+        matrix_rtc_core::ReactionsConfig {
+            enabled: value.enabled,
+            active_window_ms: value.active_window_ms,
+            send_cooldown_ms: value.send_cooldown_ms,
+        }
+    }
 }
 
 /// WASM-friendly MSC4075 notification request.
@@ -893,6 +1115,7 @@ impl WasmJoinSessionParams {
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
             degraded_lifetime_ms: self.degraded_lifetime_ms,
+            reactions: self.reactions.map(Into::into),
             encryption_config,
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
         })
@@ -1140,6 +1363,9 @@ impl WasmMembershipSnapshotSubscription {
 #[derive(Debug, Deserialize)]
 struct WasmStickyEvent {
     room_id: String,
+    /// The event's id; reactions and the raised hand relate to it.
+    #[serde(default)]
+    event_id: Option<String>,
     sender: String,
     /// Device that sent the event, from its decryption metadata. MSC4143 has no
     /// self-asserted device field, so the host must supply this.
@@ -1238,6 +1464,7 @@ impl From<WasmStickyEvent> for RawStickyEvent {
 
         RawStickyEvent {
             room_id: value.room_id,
+            event_id: value.event_id,
             sender: value.sender,
             origin: match value.was_encrypted {
                 Some(true) => matrix_rtc_core::EventOrigin::encrypted(value.sender_device_id),

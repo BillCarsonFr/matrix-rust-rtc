@@ -52,7 +52,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_core::{DiscardedKey, JoinedMembership};
+use matrix_rtc_core::{DiscardedKey, JoinedMembership, RaisedHand, ReceivedReaction};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::constraints::MediaConstraints;
@@ -123,6 +123,16 @@ pub struct EngineConfig {
     /// one itself — the caller establishes it (so join can fail fast) and
     /// hands it over via [`CallEngine::adopt_own_connection`].
     pub own_connection_key: Option<String>,
+    /// The core's raised-hand snapshots
+    /// (`RtcSession::subscribe_raised_hands`), merged onto the roster as
+    /// [`Participant::hand_raised_at_ms`] and reported as
+    /// [`CallEvent::HandRaised`] / [`CallEvent::HandLowered`]. `None` leaves
+    /// every hand down.
+    pub raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
+    /// The core's emoji reactions (`RtcSession::subscribe_reactions`),
+    /// forwarded as [`CallEvent::Reaction`] for members on the roster. `None`
+    /// reports no reactions.
+    pub reactions: Option<broadcast::Receiver<ReceivedReaction>>,
 }
 
 /// Everything the engine can be told from outside its actor task.
@@ -293,12 +303,18 @@ impl CallEngine {
             encryption_states: HashMap::new(),
             installed_keys: HashMap::new(),
             pending_keys: HashMap::new(),
+            raised_hands: HashMap::new(),
             pool: HashMap::new(),
             connection_generation: 0,
             degraded_keys: HashSet::new(),
             ended: false,
         };
-        let task = rt::spawn(actor.run(memberships, messages_rx));
+        let task = rt::spawn(actor.run(
+            memberships,
+            messages_rx,
+            config.raised_hands,
+            config.reactions,
+        ));
 
         CallEngine {
             messages: messages_tx,
@@ -575,6 +591,11 @@ struct Actor {
     /// so the host saw one `KeyImported` where the core had imported several, and
     /// could not tell which index the transport actually held.
     pending_keys: HashMap<String, Vec<u8>>,
+    /// `member_id` → when they raised their hand, as the core last reported.
+    /// Kept for members not yet on the roster too: the core learns of a hand
+    /// and of the membership it belongs to through different channels, and a
+    /// hand that arrives first must not be lost.
+    raised_hands: HashMap<String, u64>,
     pool: HashMap<String, ManagedConnection>,
     connection_generation: u64,
     /// Connections currently impaired (reconnecting or failing to connect);
@@ -583,15 +604,53 @@ struct Actor {
     ended: bool,
 }
 
+/// Waits for the raised-hands watch to change; never resolves when there is
+/// no such channel, so the `select!` branch simply never fires.
+async fn hands_changed(
+    hands: &mut Option<watch::Receiver<Vec<RaisedHand>>>,
+) -> Result<(), watch::error::RecvError> {
+    match hands {
+        Some(hands) => hands.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next reaction, skipping over any the receiver lagged past; `None`
+/// once the channel is closed. Never resolves when there is no channel.
+async fn next_reaction(
+    reactions: &mut Option<broadcast::Receiver<ReceivedReaction>>,
+) -> Option<ReceivedReaction> {
+    let Some(reactions) = reactions else {
+        return std::future::pending().await;
+    };
+    loop {
+        match reactions.recv().await {
+            Ok(reaction) => return Some(reaction),
+            // A reaction is a three-second visual; the ones we fell behind on
+            // are not worth showing late.
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                log::debug!("skipped {skipped} reaction(s) the engine fell behind on");
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
 impl Actor {
     async fn run(
         mut self,
         mut memberships: watch::Receiver<Vec<JoinedMembership>>,
         mut messages: mpsc::UnboundedReceiver<ActorMessage>,
+        mut raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
+        mut reactions: Option<broadcast::Receiver<ReceivedReaction>>,
     ) {
-        // The watch channel always has a value; start from it.
+        // The watch channels always have a value; start from it.
         let initial = memberships.borrow_and_update().clone();
         self.apply_snapshot(initial);
+        if let Some(hands) = raised_hands.as_mut() {
+            let initial = hands.borrow_and_update().clone();
+            self.apply_raised_hands(initial);
+        }
 
         let mut memberships_open = true;
         loop {
@@ -604,6 +663,20 @@ impl Actor {
                     // The core session is gone; media may outlive it briefly,
                     // so keep serving connection events.
                     Err(_) => memberships_open = false,
+                },
+                changed = hands_changed(&mut raised_hands) => match changed {
+                    Ok(()) => {
+                        let snapshot = raised_hands
+                            .as_mut()
+                            .map(|hands| hands.borrow_and_update().clone())
+                            .unwrap_or_default();
+                        self.apply_raised_hands(snapshot);
+                    }
+                    Err(_) => raised_hands = None,
+                },
+                reaction = next_reaction(&mut reactions) => match reaction {
+                    Some(reaction) => self.apply_reaction(reaction),
+                    None => reactions = None,
                 },
                 message = messages.recv() => match message {
                     Some(ActorMessage::Shutdown { ack }) => {
@@ -1359,6 +1432,7 @@ impl Actor {
             ),
         }
 
+        let hand_raised_at_ms = self.raised_hands.get(&member.member_id).copied();
         self.roster.push(Participant {
             member_id: member.member_id.clone(),
             user_id: member.sender.clone(),
@@ -1366,11 +1440,18 @@ impl Actor {
             is_local: member.member_id == self.own_member_id,
             reachable,
             streams: Vec::new(),
+            hand_raised_at_ms,
         });
         self.emit(CallEvent::ParticipantJoined {
             member_id: member.member_id.clone(),
             user_id: member.sender.clone(),
         });
+        if let Some(raised_at_ms) = hand_raised_at_ms {
+            self.emit(CallEvent::HandRaised {
+                member_id: member.member_id.clone(),
+                raised_at_ms,
+            });
+        }
 
         if let Some(identity) = identity {
             self.identity_map
@@ -1397,6 +1478,64 @@ impl Actor {
                 });
             }
         }
+    }
+
+    // ---- reactions --------------------------------------------------------
+
+    /// Applies the core's raised-hand set: the roster entries change, and each
+    /// hand that went up or down is reported. Hands of members not on the
+    /// roster yet are kept for `add_member`.
+    fn apply_raised_hands(&mut self, hands: Vec<RaisedHand>) {
+        self.raised_hands = hands
+            .into_iter()
+            .map(|hand| (hand.member_id, hand.raised_at_ms))
+            .collect();
+
+        let mut changed = false;
+        for index in 0..self.roster.len() {
+            let member_id = self.roster[index].member_id.clone();
+            let now = self.raised_hands.get(&member_id).copied();
+            let before = self.roster[index].hand_raised_at_ms;
+            if before == now {
+                continue;
+            }
+            self.roster[index].hand_raised_at_ms = now;
+            changed = true;
+            match now {
+                Some(raised_at_ms) => self.emit(CallEvent::HandRaised {
+                    member_id,
+                    raised_at_ms,
+                }),
+                None => self.emit(CallEvent::HandLowered { member_id }),
+            }
+        }
+        if changed {
+            self.publish_roster();
+        }
+    }
+
+    /// Reports a reaction from a member on the roster. One from a member the
+    /// roster does not hold is dropped: the core validated it against a
+    /// membership, so this is a hand-off race, not a stranger.
+    fn apply_reaction(&mut self, reaction: ReceivedReaction) {
+        if !self
+            .roster
+            .iter()
+            .any(|participant| participant.member_id == reaction.member_id)
+        {
+            log::debug!(
+                "dropping reaction from {} ({}): not on the roster yet",
+                reaction.member_id,
+                reaction.sender,
+            );
+            return;
+        }
+        self.emit(CallEvent::Reaction {
+            member_id: reaction.member_id,
+            emoji: reaction.emoji,
+            name: reaction.name,
+            sound: reaction.sound.asset_name().map(str::to_owned),
+        });
     }
 
     fn record_installed_key(&mut self, member_id: &str, key_index: u8) {
@@ -1860,6 +1999,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some("DEVICE".to_owned())),
             sticky_key: member_id.to_owned(),
             member_id: member_id.to_owned(),
+            membership_event_id: None,
             membership_ts: None,
             application: Some("m.call".to_owned()),
             transports: vec![RtcTransport::LiveKit(LiveKitTransport {
@@ -1877,12 +2017,16 @@ mod tests {
         engine: CallEngine,
         events: broadcast::Receiver<CallEvent>,
         memberships: watch::Sender<Vec<JoinedMembership>>,
+        raised_hands: watch::Sender<Vec<RaisedHand>>,
+        reactions: broadcast::Sender<ReceivedReaction>,
         state: Arc<TransportState>,
     }
 
     fn fixture() -> Fixture {
         let state = Arc::new(TransportState::default());
         let (memberships, memberships_rx) = watch::channel(Vec::new());
+        let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
+        let (reactions, reactions_rx) = broadcast::channel(8);
         let engine = CallEngine::new(
             EngineConfig {
                 transports: vec![Arc::new(FakeTransport {
@@ -1899,6 +2043,8 @@ mod tests {
                     },
                 },
                 own_connection_key: Some(OWN_FOCUS.to_owned()),
+                raised_hands: Some(raised_hands_rx),
+                reactions: Some(reactions_rx),
             },
             memberships_rx,
         );
@@ -1907,8 +2053,84 @@ mod tests {
             engine,
             events,
             memberships,
+            raised_hands,
+            reactions,
             state,
         }
+    }
+
+    /// A hand and a reaction are keyed by `member_id` like everything else;
+    /// the hand lands on the roster entry (even when it was reported before
+    /// the membership) and both surface as events.
+    #[tokio::test]
+    async fn raised_hands_and_reactions_ride_on_the_roster() {
+        let mut fx = fixture();
+
+        // The hand is known before the membership: parked, then applied.
+        fx.raised_hands
+            .send(vec![RaisedHand {
+                member_id: "bob".to_owned(),
+                sender: "@bob:example.org".to_owned(),
+                reaction_event_id: "$hand".to_owned(),
+                raised_at_ms: 42,
+            }])
+            .unwrap();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(next_event(&mut fx.events).await);
+        }
+        assert!(seen.contains(&CallEvent::HandRaised {
+            member_id: "bob".to_owned(),
+            raised_at_ms: 42,
+        }));
+        let bob = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.member_id == "bob")
+            .unwrap();
+        assert_eq!(bob.hand_raised_at_ms, Some(42));
+
+        fx.reactions
+            .send(ReceivedReaction {
+                member_id: "bob".to_owned(),
+                sender: "@bob:example.org".to_owned(),
+                emoji: "👏".to_owned(),
+                name: "clapping".to_owned(),
+                sound: matrix_rtc_core::ReactionSound::Named("clap".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::Reaction {
+                member_id: "bob".to_owned(),
+                emoji: "👏".to_owned(),
+                name: "clapping".to_owned(),
+                sound: Some("clap".to_owned()),
+            }
+        );
+
+        fx.raised_hands.send(Vec::new()).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::HandLowered {
+                member_id: "bob".to_owned(),
+            }
+        );
+        let bob = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.member_id == "bob")
+            .unwrap();
+        assert_eq!(bob.hand_raised_at_ms, None);
     }
 
     async fn next_event(events: &mut broadcast::Receiver<CallEvent>) -> CallEvent {

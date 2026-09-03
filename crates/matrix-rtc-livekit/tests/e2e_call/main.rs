@@ -75,8 +75,8 @@ use matrix_rtc_core::SlotEncryption;
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
 use matrix_rtc_media::{
-    I420Buffer, MediaConstraints, MediaStreamKind, Participant as MediaParticipant, PublishOptions,
-    VideoFrame, VideoRotation, VideoSourceConfig,
+    CallEvent, I420Buffer, MediaConstraints, MediaStreamKind, Participant as MediaParticipant,
+    PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
 };
 
 use provision::Credentials;
@@ -588,6 +588,11 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     let alice_key_seen_by_bob = bob.call.imported_key_for(alice.call.local_identity());
     println!("[bob] imported alice's per-participant media key: {alice_key_seen_by_bob}");
 
+    // Reactions proof: alice's raised hand and emoji reaction — plain room
+    // events relating to her membership event — reach bob's roster and event
+    // stream through the timeline bridge, in every dialect.
+    let reactions_ok = verify_reactions(&alice.call, &bob.call).await?;
+
     // Hang up and call again, with alice staying put and still publishing. Her
     // core is the long-lived one across this transition: it retires the key bob's
     // first participation held and must hand his new one a key it can decrypt the
@@ -654,6 +659,7 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     println!("sticky membership discovered by bob:   {bob_sees}");
     println!("alice's media key received by bob:      {alice_key_seen_by_bob}");
     println!("tone alice->bob received + verified:    {tone_ok}");
+    println!("raised hand + reaction alice->bob:      {reactions_ok}");
     if mode == RunMode::TwoFoci {
         println!("tone bob->alice received + verified:    {reverse_tone_ok}");
         println!("video pattern alice->bob verified:      {video_ok}");
@@ -669,6 +675,7 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
         && bob_sees
         && alice_key_seen_by_bob
         && tone_ok
+        && reactions_ok
         && reverse_tone_ok
         && video_ok
         && constraints_ok
@@ -681,6 +688,90 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     } else {
         Err("end-to-end test failed (see WARNING lines above)".into())
     }
+}
+
+/// Alice raises her hand, lowers it, and reacts; bob must see each step on his
+/// call event stream and roster, and alice's second reaction inside the cooldown
+/// must be refused locally.
+async fn verify_reactions(alice: &Call, bob: &Call) -> Result<bool, Box<dyn Error>> {
+    use matrix_rtc_core::ReactionError;
+    use matrix_rtc_livekit::CallError;
+
+    const DEADLINE: Duration = Duration::from_secs(60);
+    let alice_member = alice.membership_id().to_owned();
+    let mut events = bob.subscribe_call_events();
+
+    /// The next event of bob's matching `predicate`, or `None` on timeout.
+    async fn next_matching(
+        events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+        mut predicate: impl FnMut(&CallEvent) -> bool,
+    ) -> Option<CallEvent> {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                match events.recv().await {
+                    Ok(event) if predicate(&event) => return Some(event),
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    println!("[alice] raising hand");
+    alice.raise_hand().await?;
+    let raised = next_matching(&mut events, |event| {
+        matches!(event, CallEvent::HandRaised { member_id, .. } if *member_id == alice_member)
+    })
+    .await
+    .is_some();
+    println!("[bob] saw alice's hand go up: {raised}");
+    let on_roster = bob
+        .participants()
+        .iter()
+        .any(|p| p.member_id == alice_member && p.hand_raised_at_ms.is_some());
+    let listed = bob
+        .raised_hands()
+        .await
+        .iter()
+        .any(|hand| hand.member_id == alice_member);
+    println!("[bob] alice's hand on the roster: {on_roster}, in raised_hands(): {listed}");
+
+    println!("[alice] lowering hand");
+    alice.lower_hand().await?;
+    let lowered = next_matching(
+        &mut events,
+        |event| matches!(event, CallEvent::HandLowered { member_id } if *member_id == alice_member),
+    )
+    .await
+    .is_some();
+    println!("[bob] saw alice's hand go down: {lowered}");
+
+    println!("[alice] reacting 👏 (clapping)");
+    alice.send_reaction("👏", "clapping").await?;
+    let reaction = next_matching(&mut events, |event| {
+        matches!(event, CallEvent::Reaction { member_id, .. } if *member_id == alice_member)
+    })
+    .await;
+    let reaction_ok = matches!(
+        &reaction,
+        Some(CallEvent::Reaction { emoji, name, sound, .. })
+            if emoji == "👏" && name == "clapping" && sound.as_deref() == Some("clap")
+    );
+    println!("[bob] saw alice's reaction: {reaction:?}");
+
+    // Inside Element Call's window a second reaction would be dropped by every
+    // peer, so the SDK refuses it before it reaches the homeserver.
+    let cooldown_ok = matches!(
+        alice.send_reaction("🎉", "party").await,
+        Err(CallError::Reaction(ReactionError::Cooldown { .. }))
+    );
+    println!("[alice] second reaction refused by the cooldown: {cooldown_ok}");
+
+    Ok(raised && on_roster && listed && lowered && reaction_ok && cooldown_ok)
 }
 
 /// Poll until the roster shows a remote participant, or `deadline`.

@@ -58,4 +58,8 @@ pub struct Participant {
     pub reachable: bool,
     /// Streams currently published by this participant, in arrival order.
     pub streams: Vec<StreamState>,
+    /// When this participant raised their hand (ms since the epoch, by the
+    /// server's clock), or `None` while it is down. Sort ascending to queue
+    /// speakers in the order they asked; see `matrix_rtc_core::reactions`.
+    pub hand_raised_at_ms: Option<u64>,
 }

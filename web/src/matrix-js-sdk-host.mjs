@@ -46,6 +46,8 @@ const LEGACY_STATE_MEMBER_EVENT_TYPE = 'org.matrix.msc3401.call.member';
 const KEY_MESSAGE_TYPES = ['m.rtc.encryption_key', 'org.matrix.msc4143.rtc.encryption_key'];
 /// The pre-2026 Element Call key type; bound per the room's compat mode.
 const LEGACY_KEY_MESSAGE_TYPE = 'io.element.call.encryption_keys';
+/** Element Call reactions and the raised-hand annotation; the core reads only these. */
+const REACTION_EVENT_TYPES = ['io.element.call.reaction', 'm.reaction'];
 
 /**
  * Log in (registering a throwaway user first when `user` is blank — dev
@@ -190,6 +192,11 @@ export class MatrixHost {
         // batch unattempted, and the core re-sends on the next rollout.
         await client.encryptAndSendToDevice(messageType, recipients, content);
       },
+      // Reactions and the raised hand: ordinary message-like sends, which
+      // js-sdk encrypts in an encrypted room on its own.
+      sendRoomEvent: (roomId, eventType, content) => client.sendEvent(roomId, eventType, content),
+      redactEvent: (roomId, eventId, reason) =>
+        client.redactEvent(roomId, eventId, undefined, reason === undefined ? undefined : { reason }),
     };
   }
 
@@ -233,7 +240,104 @@ export class MatrixHost {
     this.client.on(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice);
     this.detachers.push(() => this.client.off(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice));
 
+    // Reactions and raised hands are ordinary timeline events (the sticky
+    // listeners above never see them), and in an encrypted room they arrive
+    // encrypted: the Timeline event fires before decryption, so the Decrypted
+    // one is what carries the readable content. Redactions lower hands.
+    const { RoomEvent, MatrixEventEvent } = this.sdk;
+    if (RoomEvent && MatrixEventEvent) {
+      const onTimeline = (event, _room, toStartOfTimeline, removed) => {
+        if (toStartOfTimeline || removed) return;
+        this.onTimelineEvent(event).catch((error) => this.log(`timeline event failed: ${error}`));
+      };
+      const onDecrypted = (event) => {
+        if (event.getRoomId() !== roomId) return;
+        this.onTimelineEvent(event).catch((error) => this.log(`decrypted event failed: ${error}`));
+      };
+      const onRedaction = (event) => {
+        const target = event.event?.redacts ?? event.getContent()?.redacts;
+        if (!target) return;
+        this.managerOps
+          .enqueue(() => manager.onEventRedacted(roomId, target))
+          .catch((error) => this.log(`redaction failed: ${error}`));
+      };
+      room.on(RoomEvent.Timeline, onTimeline);
+      this.client.on(MatrixEventEvent.Decrypted, onDecrypted);
+      room.on(RoomEvent.Redaction, onRedaction);
+      this.detachers.push(() => {
+        room.off(RoomEvent.Timeline, onTimeline);
+        this.client.off(MatrixEventEvent.Decrypted, onDecrypted);
+        room.off(RoomEvent.Redaction, onRedaction);
+      });
+    } else {
+      this.log('sdk exposes no RoomEvent/MatrixEventEvent; reactions will not be read');
+    }
+
     await this.feed();
+  }
+
+  /**
+   * Forward one timeline event if it is a reaction or a raised hand. Skips
+   * events still being sent (their id is not final) and encrypted events
+   * that have not been decrypted yet (the Decrypted listener gets those).
+   */
+  async onTimelineEvent(event) {
+    if (event.getRoomId() !== this.room?.roomId) return;
+    if (event.isSending?.() || event.isBeingDecrypted?.() || event.isDecryptionFailure?.()) return;
+    if (event.isEncrypted?.() && event.getClearContent?.() === undefined && event.getType() === 'm.room.encrypted') return;
+    if (!REACTION_EVENT_TYPES.includes(event.getType())) return;
+    const payload = await this.timelinePayload(event);
+    await this.managerOps.enqueue(() => this.manager.onRoomTimelineEvents(this.room.roomId, [payload]));
+  }
+
+  /** A decrypted timeline event in the shape `onRoomTimelineEvents` takes. */
+  async timelinePayload(event) {
+    const wasEncrypted = event.isEncrypted();
+    return {
+      room_id: this.room.roomId,
+      event_id: event.getId(),
+      sender: event.getSender(),
+      sender_device_id: wasEncrypted ? await this.senderDeviceOf(event) : undefined,
+      was_encrypted: wasEncrypted,
+      type: event.getType(),
+      origin_server_ts: event.getTs(),
+      content: event.getContent(),
+    };
+  }
+
+  /**
+   * Hands raised before we joined live in the relations of each member's
+   * membership event, not in the timeline we see live. The manager lists the
+   * membership events it has not looked up yet; answer each with the
+   * `/relations` of that event. Asking marks an id as fetched, so a failed
+   * fetch is retried on the next feed.
+   */
+  async backfillRaisedHands() {
+    const { room, manager } = this;
+    if (typeof manager.pendingRelationLookups !== 'function') return;
+    const roomId = room.roomId;
+    const lookups = await this.managerOps.enqueue(() => manager.pendingRelationLookups(roomId));
+    for (const lookup of lookups) {
+      try {
+        const { events } = await this.client.relations(
+          roomId,
+          lookup.membership_event_id,
+          'm.annotation',
+          'm.reaction',
+        );
+        const payloads = [];
+        for (const event of events) {
+          await this.client.decryptEventIfNeeded(event);
+          if (event.isDecryptionFailure()) continue;
+          payloads.push(await this.timelinePayload(event));
+        }
+        await this.managerOps.enqueue(() =>
+          manager.onRelationsReceived(roomId, lookup.membership_event_id, payloads),
+        );
+      } catch (error) {
+        this.log(`relations of ${lookup.membership_event_id} failed: ${error}`);
+      }
+    }
   }
 
   detach() {
@@ -275,6 +379,7 @@ export class MatrixHost {
     // set (sticky wins on a shared key).
     const legacyState = this.readsStateMembership
       ? room.currentState.getStateEvents(LEGACY_STATE_MEMBER_EVENT_TYPE).map((ev) => ({
+          event_id: ev.getId(),
           sender: ev.getSender(),
           state_key: ev.getStateKey(),
           origin_server_ts: ev.getTs(),
@@ -291,6 +396,9 @@ export class MatrixHost {
       // no-op on spec-current content.
       await manager.setCurrentMembership(roomId, sticky, legacyState);
     });
+
+    // After the membership, so the lookups are for the roster the core holds.
+    await this.backfillRaisedHands();
   }
 
   /**
@@ -313,6 +421,7 @@ export class MatrixHost {
       const wasEncrypted = event.isEncrypted();
       events.push({
         room_id: this.room.roomId,
+        event_id: event.getId(),
         sender: event.getSender(),
         sender_device_id: wasEncrypted ? await this.senderDeviceOf(event) : undefined,
         was_encrypted: wasEncrypted,
