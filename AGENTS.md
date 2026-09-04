@@ -69,7 +69,7 @@ Always read the karpathy-guidelines skill before coding (`skills/karpathy-guidel
 
 - `cargo check`
 - `cargo fmt`
-- `cargo clippy --all-targets --all-features -- -D warnings`
+- `make clippy` (explicit features; `--all-features` turns on `experimental-sticky`, which needs the fork SDK — see `make clippy-sticky`)
 - `cargo test`
 - Web bindings: `cd web && npm run build && npm test`
 - Android bindings: `./scripts/build-android-aar.sh`
@@ -83,7 +83,7 @@ Before committing **any** code change (new feature, bug fix, PR comment fix, ref
 
 `cargo check`
 `cargo fmt`
-`cargo clippy --all-targets --all-features -- -D warnings`
+`make clippy` (explicit features; `--all-features` turns on `experimental-sticky`, which needs the fork SDK — see `make clippy-sticky`)
 `cargo test`
 
 Then run binding tasks for any touched binding surface:

@@ -18,16 +18,27 @@
 //! Glue between `matrix-rtc-core` and a `matrix_sdk::Client`.
 //!
 //! This is what makes the Rust stack a first-class MatrixRTC participant against
-//! a real homeserver, using the experimental MSC4354 sticky-event support:
+//! a real homeserver:
 //!
 //! - [`SdkCommandSender`] implements [`RtcCommandSender`], turning the core's
-//!   outbound commands (join/leave sticky events, dead man's switch delayed
+//!   outbound commands (join/leave member events, dead man's switch delayed
 //!   events) into Matrix Client-Server requests.
-//! - [`run_sticky_bridge`] feeds the SDK's live sticky events into an
+//! - [`run_membership_bridge`] feeds the room's live membership into an
 //!   [`RtcSessionManager`], so the core discovers every peer's `m.rtc.member`
 //!   membership.
 //!
-//! Requires the `matrix-sdk` feature.
+//! Requires the `matrix-sdk` feature. Membership has two carriers, and which
+//! this build can read and write is a compile-time fact:
+//!
+//! - MSC4354 **sticky events**, the spec-current carrier, need the
+//!   `experimental-sticky` feature and the fork SDK behind it. Without it the
+//!   sticky send arm returns an error and the bridge reads no sticky map.
+//! - `org.matrix.msc3401.call.member` **room state**, the pre-sticky Element
+//!   Call carrier ([`crate::compat::ElementCallCompat::StateEvents`]), works
+//!   against the stock SDK and is the only carrier a default build has.
+//!
+//! [`STICKY_EVENTS_SUPPORTED`] says which build this is, so a caller can refuse
+//! a mode it cannot serve instead of joining a call nobody can see.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -57,7 +68,7 @@ use matrix_sdk::{Client, Room, RoomMemberships};
 use matrix_sdk_base::crypto::CollectStrategy;
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 use matrix_rtc_core::{
     ANNOTATION_EVENT_TYPE, CommandError, EventOrigin, REACTION_EVENT_TYPE, RawSlotEvent,
@@ -65,9 +76,20 @@ use matrix_rtc_core::{
     RtcSessionManager, SLOT_EVENT_TYPE, ToDeviceDelivery, ToDeviceRecipient,
 };
 
-use crate::compat::{
-    MemberContent, MemberEventRoute, OutboundDialect, element_call, element_call_state,
-};
+use crate::compat::{MemberEventRoute, OutboundDialect, element_call_state};
+// Only the sticky snapshot normalises the 2025 sticky dialect; the state
+// snapshot has its own translation in `element_call_state`.
+#[cfg(feature = "experimental-sticky")]
+use crate::compat::{MemberContent, element_call};
+
+/// Whether this build can send and read MSC4354 sticky events.
+///
+/// `false` is the default build against upstream matrix-rust-sdk, which only
+/// carries membership as room state. A caller about to join in a mode that needs
+/// sticky events ([`crate::compat::ElementCallCompat::Off`] or `StickyEvents`)
+/// should check this first: the alternative is a join whose membership nobody
+/// ever sees, which looks exactly like an empty call.
+pub const STICKY_EVENTS_SUPPORTED: bool = cfg!(feature = "experimental-sticky");
 
 // The sticky duration for `m.rtc.member` now comes from the core
 // (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
@@ -180,6 +202,68 @@ impl SdkCommandSender {
             .get_room(&room_id)
             .ok_or_else(|| CommandError::from_message(format!("room {room_id} not found")))
     }
+
+    /// Send a message-like event as an MSC4354 sticky event with the given TTL.
+    ///
+    /// `duration_ms` is the core's value, not a constant of ours: it schedules
+    /// the refresh against exactly this lifetime, so substituting one here would
+    /// break the refresh. The core clamps to `MAX_STICKY_DURATION_MS` for the
+    /// same reason the SDK does — anything longer comes back as an hour, and a
+    /// refresh scheduled against the longer figure would fire after the entry had
+    /// already lapsed.
+    #[cfg(feature = "experimental-sticky")]
+    async fn send_sticky(
+        &self,
+        room: &Room,
+        event_type: String,
+        content: &Value,
+        duration_ms: u64,
+    ) -> Result<String, CommandError> {
+        let event_type = wire_event_type(event_type).to_string();
+        let duration_ms = u32::try_from(duration_ms).unwrap_or(u32::MAX);
+        let response = room
+            .send_raw(&event_type, content)
+            .with_sticky_duration_ms(duration_ms)
+            .with_request_config(rtc_request_config())
+            .await
+            .map_err(command_error)?;
+        Ok(response.response.event_id.to_string())
+    }
+
+    /// The sticky send in a build whose SDK has no MSC4354: refused, never
+    /// degraded. A membership sent as a plain room event lands in nobody's sticky
+    /// map, so degrading would produce a call that looks empty to every peer and
+    /// gives the caller no clue why. `Call::join` refuses the sticky modes up
+    /// front; this is the backstop for a direct `SdkCommandSender` user.
+    #[cfg(not(feature = "experimental-sticky"))]
+    async fn send_sticky(
+        &self,
+        _room: &Room,
+        event_type: String,
+        _content: &Value,
+        _duration_ms: u64,
+    ) -> Result<String, CommandError> {
+        Err(CommandError::ClientRejected(format!(
+            "{event_type}: MSC4354 sticky events need matrix-rtc-bridge's `experimental-sticky` \
+             feature; this build only speaks ElementCallCompat::StateEvents"
+        )))
+    }
+
+    /// Send a plain message-like room event, bounded like every other RTC send.
+    /// `send_raw` encrypts in an encrypted room like any other message send.
+    async fn send_room_message(
+        &self,
+        room: &Room,
+        event_type: &str,
+        content: &Value,
+    ) -> Result<String, CommandError> {
+        let response = room
+            .send_raw(event_type, content)
+            .with_request_config(rtc_request_config())
+            .await
+            .map_err(command_error)?;
+        Ok(response.response.event_id.to_string())
+    }
 }
 
 /// Bounded request behaviour for RTC signalling sends.
@@ -231,22 +315,18 @@ impl RtcCommandSender for SdkCommandSender {
                 event_type,
                 content,
             } => {
-                let event_type = wire_event_type(event_type).to_string();
-                // The core's value, not a constant of ours: it schedules the
-                // refresh against exactly this lifetime, so substituting one here
-                // would break the refresh. The core clamps to
-                // `MAX_STICKY_DURATION_MS` for the same reason the SDK does —
-                // anything longer comes back as an hour, and a refresh scheduled
-                // against the longer figure would fire after the entry had
-                // already lapsed.
-                let duration_ms = u32::try_from(duration_ms).unwrap_or(u32::MAX);
-                let response = room
-                    .send_raw(&event_type, &content)
-                    .with_sticky_duration_ms(duration_ms)
-                    .with_request_config(rtc_request_config())
+                self.send_sticky(&room, event_type, &content, duration_ms)
                     .await
-                    .map_err(command_error)?;
-                Ok(response.response.event_id.to_string())
+            }
+            // The pre-sticky generation's notification: an ordinary room event,
+            // because that wire has no sticky map. `duration_ms` has no meaning
+            // for it.
+            MemberEventRoute::Room {
+                event_type,
+                content,
+            } => {
+                let event_type = wire_event_type(event_type).to_string();
+                self.send_room_message(&room, &event_type, &content).await
             }
             // `duration_ms` is dropped on purpose: room state has no TTL, and in
             // this dialect the lifetime is stated inside the content instead
@@ -300,7 +380,13 @@ impl RtcCommandSender for SdkCommandSender {
         // No lifetime: the delayed leave's legacy content is `{}`, which has
         // nowhere to carry a deadline and needs none.
         let delay_id = match self.compat.route_member_event(event_type, content, None) {
+            // One arm for both: a delayed event is a plain (non-sticky) send in
+            // every generation, so the two carriers meet here anyway.
             MemberEventRoute::Sticky {
+                event_type,
+                content,
+            }
+            | MemberEventRoute::Room {
                 event_type,
                 content,
             } => {
@@ -417,14 +503,8 @@ impl RtcCommandSender for SdkCommandSender {
     ) -> Result<String, CommandError> {
         let room = self.room(&room_id)?;
         // Verbatim, not through `wire_event_type`: a reaction is not a MatrixRTC
-        // type and has no unstable alias for ruma to resolve. `send_raw`
-        // encrypts in an encrypted room like any other message send.
-        let response = room
-            .send_raw(&event_type, &content)
-            .with_request_config(rtc_request_config())
-            .await
-            .map_err(command_error)?;
-        Ok(response.response.event_id.to_string())
+        // type and has no unstable alias for ruma to resolve.
+        self.send_room_message(&room, &event_type, &content).await
     }
 
     async fn redact_event(
@@ -568,6 +648,7 @@ impl RtcCommandSender for SdkCommandSender {
 
 /// An origin built from a device the member event only claims, or `None` when
 /// it claimed none. Never used where decryption named a device.
+#[cfg(feature = "experimental-sticky")]
 fn claimed_origin(claimed_device: &Option<String>) -> Option<EventOrigin> {
     claimed_device.as_ref().map(EventOrigin::claimed)
 }
@@ -581,6 +662,10 @@ fn claimed_origin(claimed_device: &Option<String>) -> Option<EventOrigin> {
 /// falls back to the device it claims, if any (see [`crate::compat`]), and
 /// otherwise names none — in which case that member can neither be sent a key
 /// nor have one accepted from them.
+///
+/// `live_sticky_events` and `encryption_info` exist only in the fork SDK, hence
+/// the feature gate; a build without it has no sticky map to snapshot.
+#[cfg(feature = "experimental-sticky")]
 fn snapshot(room: &Room) -> Vec<RawStickyEvent> {
     let room_id = room.room_id().to_string();
     room.live_sticky_events()
@@ -949,7 +1034,13 @@ async fn tick(
     // `set_current_sticky_state` does that now, and correctly for a slot whose
     // last member expired — such a slot contributes no events at all, so a diff
     // over events could never have noticed it.
+    //
+    // Without sticky support there is no sticky map to read, so the room-state
+    // half below is the whole membership.
+    #[cfg(feature = "experimental-sticky")]
     let mut current = snapshot(room);
+    #[cfg(not(feature = "experimental-sticky"))]
+    let mut current: Vec<RawStickyEvent> = Vec::new();
     let from_sticky = current.len();
 
     // Which is also why the two membership sources are concatenated into **one**
@@ -1186,7 +1277,7 @@ pub fn register_timeline_receiver(
 /// Drives the core's reactions intake from what
 /// [`register_timeline_receiver`] forwards, until the channel closes.
 ///
-/// Intended to be `spawn_local`ed next to [`run_sticky_bridge`].
+/// Intended to be `spawn_local`ed next to [`run_membership_bridge`].
 pub async fn run_timeline_bridge(
     room_id: String,
     manager: Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
@@ -1219,6 +1310,18 @@ fn keep_bridging<T>(result: Result<T, RecvError>) -> bool {
 /// mode that runs against a test deployment.
 const STATE_MEMBERSHIP_POLL: Duration = Duration::from_secs(30);
 
+/// Wait for the next reason to re-read room-state membership: a sync that
+/// touched the room, or the poll interval elapsing.
+///
+/// Both branches are cancel-safe, so losing the race inside a larger
+/// `select!` drops nothing.
+async fn state_wake(room_updates: &mut broadcast::Receiver<matrix_sdk::sync::RoomUpdate>) -> bool {
+    tokio::select! {
+        result = room_updates.recv() => keep_bridging(result),
+        _ = tokio::time::sleep(STATE_MEMBERSHIP_POLL) => true,
+    }
+}
+
 /// Feed a room's live membership into `manager` until the room is dropped.
 ///
 /// Seeds the manager with the current snapshot, then re-derives the whole
@@ -1226,20 +1329,35 @@ const STATE_MEMBERSHIP_POLL: Duration = Duration::from_secs(30);
 /// re-feeding the full set each tick is safe; connected members surface as joins,
 /// disconnects and TTL expiries as leaves.
 ///
-/// `state_membership` additionally reads pre-sticky Element Call membership out of
-/// `org.matrix.msc3401.call.member` room state, for interoperating with Element
-/// Call builds older than MSC4354. Opt-in; see [`crate::compat`] and delete the
+/// Membership is read from the MSC4354 sticky map when this build has one
+/// (`experimental-sticky`), and — when `state_membership` is set — from
+/// `org.matrix.msc3401.call.member` room state as well, for interoperating with
+/// Element Call builds older than MSC4354. In a build without sticky support the
+/// state carrier is the only one, so `state_membership == false` there means the
+/// bridge has nothing to read: it logs an error and returns without feeding
+/// anything. Callers should refuse that combination earlier (see
+/// [`STICKY_EVENTS_SUPPORTED`]). Opt-in; see [`crate::compat`] and delete the
 /// parameter with it.
 ///
 /// Intended to be `tokio::spawn`ed. Returns when a wake source closes.
-pub async fn run_sticky_bridge(
+pub async fn run_membership_bridge(
     room: Room,
     manager: Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
     state_membership: bool,
 ) {
     let room_id = room.room_id().to_string();
-    log::info!("[{room_id}] sticky bridge started");
 
+    if !STICKY_EVENTS_SUPPORTED && !state_membership {
+        log::error!(
+            "[{room_id}] membership bridge not started: this build has no MSC4354 sticky \
+             support and the room is not in state-membership mode, so there is no membership \
+             carrier to read"
+        );
+        return;
+    }
+    log::info!("[{room_id}] membership bridge started");
+
+    #[cfg(feature = "experimental-sticky")]
     let mut sticky = room.subscribe_to_sticky_events();
 
     // Second wake source, and only in state mode: that dialect keeps membership
@@ -1265,13 +1383,23 @@ pub async fn run_sticky_bridge(
         // late. Fixing that for the spec path means subscribing to room updates
         // there too — and paying the state fetch per sync, or throttling it
         // first. Still a follow-up.
+        //
+        // `#[cfg]` on match arms rather than inside `select!`: the macro does not
+        // accept attributes on its branches.
         let woken = match &mut room_updates {
+            #[cfg(feature = "experimental-sticky")]
             Some(room_updates) => tokio::select! {
                 result = sticky.recv() => keep_bridging(result),
-                result = room_updates.recv() => keep_bridging(result),
-                _ = tokio::time::sleep(STATE_MEMBERSHIP_POLL) => true,
+                woken = state_wake(room_updates) => woken,
             },
+            #[cfg(feature = "experimental-sticky")]
             None => keep_bridging(sticky.recv().await),
+            #[cfg(not(feature = "experimental-sticky"))]
+            Some(room_updates) => state_wake(room_updates).await,
+            // Ruled out by the guard above; stopping is the only sane answer if
+            // it were ever reached.
+            #[cfg(not(feature = "experimental-sticky"))]
+            None => false,
         };
         if !woken {
             break;
@@ -1280,7 +1408,7 @@ pub async fn run_sticky_bridge(
         tick(&room, &manager, state_membership).await;
     }
 
-    log::info!("[{room_id}] sticky bridge stopped");
+    log::info!("[{room_id}] membership bridge stopped");
 }
 
 #[cfg(test)]

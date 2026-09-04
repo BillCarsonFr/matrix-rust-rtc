@@ -115,7 +115,7 @@ for a runnable two-client example against the local backend.
 - `crates/matrix-rtc-core`: single-session machine plus room-scoped session
   manager and MSC4143/MSC4354 event conversion boundary.
 - `crates/matrix-rtc-bridge`: the Matrix side — SDK-backed command sender and
-  sticky/room-state bridge into the core (behind the `matrix-sdk` feature), the
+  membership bridge into the core (behind the `matrix-sdk` feature; MSC4354 sticky events need `experimental-sticky` and the fork SDK, the default build speaks the pre-sticky room-state dialect only), the
   `OpenIdTokenSource` trait, and `compat` for pre-2026 Element Call wire formats.
   **No LiveKit**; `compat` needs no Matrix SDK either, so its tests run in
   seconds against no git dependencies.

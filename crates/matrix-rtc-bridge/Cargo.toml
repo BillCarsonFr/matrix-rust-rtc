@@ -38,11 +38,9 @@ log.workspace = true
 # it, which is what keeps `cargo test -p matrix-rtc-bridge` a seconds-long build.
 tokio = { workspace = true, optional = true }
 
-# The experimental branch carries MSC4354 sticky-event support that the crates.io
-# release lacks; the whole MatrixRTC signalling path (own membership, keep-alive,
-# peer discovery) rides on it. See `sdk`. Keeps matrix-sdk's default features
-# (e2e-encryption, sqlite, rustls-aws-lc-rs, automatic-room-key-forwarding) and
-# adds sticky events.
+# Upstream matrix-rust-sdk (rev in the workspace manifest). Keeps its default
+# features (e2e-encryption, sqlite, rustls-aws-lc-rs,
+# automatic-room-key-forwarding). See `sdk`.
 #
 # Key forwarding stays ON deliberately. Without it a freshly logged-in device
 # cannot obtain the Megolm sessions for member events sent before it existed,
@@ -51,29 +49,19 @@ tokio = { workspace = true, optional = true }
 # request/forward chatter out of their measurements switch it off per client at
 # runtime instead; see `matrix-rtc-livekit/examples/load_test.rs`.
 #
-# Pinned to rev 3773300 ("Update ruma to the rewritten MSC4143"), which
-# repoints ruma to `BillCarsonFr/ruma@3fc675d`. That ruma models the 2026
-# MSC4143 rewrite — `member.membership`, `leave_reason`, `transports
-# {published, can_subscribe}`, and an `m.rtc.encryption_key` content of
-# `{room_id, member_id, media_key, format}` — matching what `matrix-rtc-core`
-# puts on the wire, so ruma's typed events (e.g. `AnyToDeviceEvent`) can be
-# used on RTC wire content again. Member events are still parsed with
-# `matrix_rtc_core::RawStickyEventContent` (the core must not depend on ruma).
-#
-# The pin also carries 7603577 ("keep encryption info for sticky events"),
-# which makes `StickyLiveEvent` expose `encryption_info().sender_device` — the
-# only source for a member event's sending device now that MSC4143 has dropped
-# `member.claimed_device_id`. See `sdk::snapshot`.
 # `experimental-send-custom-to-device` exposes
 # `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
 # keys as Olm-encrypted to-device messages (see `sdk`). It pulls in
 # `e2e-encryption`, already on via defaults.
-matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["unstable-msc4354", "experimental-send-custom-to-device"] }
+#
+# Member events are parsed with `matrix_rtc_core::RawStickyEventContent`, never
+# ruma's typed RTC events: upstream ruma does not model the 2026 MSC4143 rewrite,
+# and the core must not depend on ruma anyway.
+matrix-sdk = { workspace = true, optional = true, features = ["experimental-send-custom-to-device"] }
 # Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
-# to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it. Same
-# rev as matrix-sdk so cargo unifies the source; `e2e-encryption` gates the
-# `crypto` re-export.
-matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "377330059c3a335ab36d190fc10b87de3427c6b3", optional = true, features = ["e2e-encryption"] }
+# to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it.
+# `e2e-encryption` gates the `crypto` re-export.
+matrix-sdk-base = { workspace = true, optional = true, features = ["e2e-encryption"] }
 
 # `std::time::SystemTime::now()` PANICS on wasm32-unknown-unknown; web-time is
 # the drop-in that reads `Date.now()` instead. The compat dialects stamp
@@ -87,11 +75,33 @@ matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev
 web-time = "1"
 
 [features]
-# The SDK-backed half: `sdk` (command sender + sticky/room-state bridge into
+# The SDK-backed half: `sdk` (command sender + membership bridge into
 # matrix-rtc-core) and the default `OpenIdTokenSource` impl for
 # `matrix_sdk::Client`. Off by default so `compat` — pure JSON translation with
 # no git dependencies — stays cheap to build and test on its own.
+#
+# On its own this speaks only the pre-sticky `ElementCallCompat::StateEvents`
+# dialect: membership as `org.matrix.msc3401.call.member` room state, which the
+# stock SDK reads and writes fine.
 matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "dep:tokio"]
+# MSC4354 sticky events — the spec-current membership carrier, and what
+# `ElementCallCompat::Off` and `StickyEvents` need. Requires an SDK built with
+# `unstable-msc4354`, which upstream matrix-rust-sdk does not have; the fork that
+# carries it is selected with `cargo --config .cargo/experimental-sticky.toml`
+# (workspace root).
+#
+# This feature gates only our code. It deliberately does NOT forward to
+# `matrix-sdk/unstable-msc4354`: cargo resolves the lockfile with every feature
+# enabled, so a feature table that names an SDK feature upstream lacks fails to
+# resolve *always*, not just when this feature is on. The caller enables
+# `matrix-sdk/unstable-msc4354` alongside (the Makefile's `*-sticky` targets do);
+# forgetting it is a compile error on `with_sticky_duration_ms`, which is loud
+# enough.
+#
+# The fork also gives `StickyLiveEvent::encryption_info().sender_device`, the
+# only source for a member event's sending device now that MSC4143 has dropped
+# `member.claimed_device_id`. See `sdk::snapshot`.
+experimental-sticky = ["matrix-sdk"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

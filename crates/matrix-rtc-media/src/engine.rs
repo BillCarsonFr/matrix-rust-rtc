@@ -1491,26 +1491,32 @@ impl Actor {
             .map(|hand| (hand.member_id, hand.raised_at_ms))
             .collect();
 
-        let mut changed = false;
-        for index in 0..self.roster.len() {
-            let member_id = self.roster[index].member_id.clone();
-            let now = self.raised_hands.get(&member_id).copied();
-            let before = self.roster[index].hand_raised_at_ms;
-            if before == now {
+        let mut events = Vec::new();
+        for participant in &mut self.roster {
+            let now = self.raised_hands.get(&participant.member_id).copied();
+            if participant.hand_raised_at_ms == now {
                 continue;
             }
-            self.roster[index].hand_raised_at_ms = now;
-            changed = true;
-            match now {
-                Some(raised_at_ms) => self.emit(CallEvent::HandRaised {
-                    member_id,
+            participant.hand_raised_at_ms = now;
+            events.push(match now {
+                Some(raised_at_ms) => CallEvent::HandRaised {
+                    member_id: participant.member_id.clone(),
                     raised_at_ms,
-                }),
-                None => self.emit(CallEvent::HandLowered { member_id }),
-            }
+                },
+                None => CallEvent::HandLowered {
+                    member_id: participant.member_id.clone(),
+                },
+            });
         }
-        if changed {
-            self.publish_roster();
+        if events.is_empty() {
+            return;
+        }
+        // Roster first, events second. This actor runs on a worker thread while
+        // a consumer may sit on another, and a consumer woken by `HandRaised`
+        // reads `participants()` straight away — it must see the hand there.
+        self.publish_roster();
+        for event in events {
+            self.emit(event);
         }
     }
 

@@ -34,8 +34,9 @@
 //!   behind the `matrix-sdk` feature.
 //! - [`sdk`] — the SDK-backed bridge proper: [`SdkCommandSender`] carries the
 //!   core's outbound commands (memberships, delayed leaves, to-device keys) to a
-//!   `matrix_sdk::Client`, and [`run_sticky_bridge`] feeds inbound sticky events
-//!   and room state back into the core. Behind the `matrix-sdk` feature.
+//!   `matrix_sdk::Client`, and [`run_membership_bridge`] feeds inbound
+//!   membership — sticky events and/or room state — back into the core. Behind
+//!   the `matrix-sdk` feature.
 //!
 //! # Why `matrix-sdk` is off by default
 //!
@@ -44,6 +45,14 @@
 //! seconds against no git dependencies — which is the whole reason this crate
 //! was split out of the LiveKit transport, where every one of them was trapped
 //! behind a `libwebrtc` build.
+//!
+//! # Why sticky events are a second feature
+//!
+//! `matrix-sdk` alone builds against upstream matrix-rust-sdk, which has no
+//! MSC4354 support, so that build carries membership as room state only
+//! ([`ElementCallCompat::StateEvents`]). `experimental-sticky` adds the
+//! spec-current sticky carrier and needs the fork SDK that implements it; see
+//! [`STICKY_EVENTS_SUPPORTED`] and the crate manifest.
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
@@ -58,8 +67,8 @@ pub mod sdk;
 
 #[cfg(feature = "matrix-sdk")]
 pub use sdk::{
-    SdkCommandSender, TimelineIngest, register_timeline_receiver, run_sticky_bridge,
-    run_timeline_bridge, timeline_ingest_from_raw,
+    STICKY_EVENTS_SUPPORTED, SdkCommandSender, TimelineIngest, register_timeline_receiver,
+    run_membership_bridge, run_timeline_bridge, timeline_ingest_from_raw,
 };
 
 pub use compat::{

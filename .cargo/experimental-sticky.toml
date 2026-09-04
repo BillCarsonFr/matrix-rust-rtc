@@ -1,0 +1,25 @@
+# Cargo config overlay that selects the MSC4354-capable matrix-rust-sdk fork.
+#
+# The workspace depends on upstream matrix-org/matrix-rust-sdk, which has no
+# sticky-event support. The `experimental-sticky` feature of matrix-rtc-bridge
+# and matrix-rtc-livekit compiles the sticky code paths, which need the SDK's
+# `unstable-msc4354` feature — and only the fork has it. That SDK feature is
+# enabled on the command line, not by our feature (see the bridge manifest for
+# why it cannot be), so a sticky build is three things together:
+#
+#   cargo <cmd> --config .cargo/experimental-sticky.toml -p matrix-rtc-livekit \
+#     --features experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354
+#
+# or the `*-sticky` Makefile targets. `--config` must come AFTER the subcommand:
+# `cargo clippy` is an external subcommand that re-runs `cargo check` itself,
+# and a global `--config` placed before it is not forwarded across that hop.
+# Only the three direct dependencies need redirecting; the fork's internal
+# `path` dependencies follow the patched source.
+#
+# Switching between the two configurations re-resolves the SDK subgraph and
+# rewrites Cargo.lock; the committed lockfile is the upstream one, so do not
+# commit a lockfile produced under this overlay (the Makefile targets restore it).
+[patch."https://github.com/matrix-org/matrix-rust-sdk"]
+matrix-sdk = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "f606bdd01b0891ebf01c00eaea20e4e32c4a12fe" }
+matrix-sdk-base = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "f606bdd01b0891ebf01c00eaea20e4e32c4a12fe" }
+matrix-sdk-ui = { git = "https://github.com/BillCarsonFr/matrix-rust-sdk", rev = "f606bdd01b0891ebf01c00eaea20e4e32c4a12fe" }

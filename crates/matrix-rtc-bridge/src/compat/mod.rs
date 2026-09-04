@@ -84,8 +84,9 @@
 //! 1. `sdk::snapshot` — normalises inbound `m.rtc.member` content.
 //! 2. `sdk::SdkCommandSender` — routes and rewrites outbound events.
 //! 3. `sdk::element_call_state_snapshot` — reads inbound state membership.
-//! 4. `sdk::run_sticky_bridge` — the room-state wake source a state-carried
-//!    membership needs.
+//! 4. `sdk::run_membership_bridge` — the room-state wake source a state-carried
+//!    membership needs, and the only membership source in a build without
+//!    `experimental-sticky`.
 //!
 //! In `matrix-rtc-livekit`:
 //!
@@ -175,6 +176,11 @@ pub enum MemberEventRoute {
         state_key: String,
         content: Value,
     },
+    /// An ordinary message-like room event, with no TTL. What a non-membership
+    /// event (the MSC4075 notification) becomes for a generation whose wire
+    /// has no sticky map at all — [`ElementCallCompat::StateEvents`] — so that
+    /// a host with no MSC4354 support is never asked for a sticky send.
+    Room { event_type: String, content: Value },
 }
 
 /// The outbound dialect a command sender speaks: exactly one generation at a
@@ -192,9 +198,13 @@ pub enum OutboundDialect {
 impl OutboundDialect {
     /// Decide where an outbound event goes and what it says.
     ///
-    /// Anything that is not a membership passes through as a sticky event
-    /// untouched, in every mode — the legacy generations differ about
-    /// memberships, not about everything.
+    /// Anything that is not a membership passes through untouched — the legacy
+    /// generations differ about memberships, not about everything — but its
+    /// *carrier* still follows the generation: a sticky event for the two that
+    /// have a sticky map, an ordinary room event for the pre-sticky one, which
+    /// has none. That keeps a host that cannot send sticky events at all (no
+    /// MSC4354 in its SDK) able to run a [`ElementCallCompat::StateEvents`]
+    /// call end to end, notification included.
     ///
     /// `lifetime_ms` is how long the membership should stay valid from now. The
     /// sticky routes ignore it — the homeserver is told separately, as the
@@ -209,9 +219,15 @@ impl OutboundDialect {
         lifetime_ms: Option<u64>,
     ) -> MemberEventRoute {
         if !ElementCallDialect::is_member_event(&event_type) {
-            return MemberEventRoute::Sticky {
-                event_type,
-                content,
+            return match self {
+                Self::State(_) => MemberEventRoute::Room {
+                    event_type,
+                    content,
+                },
+                Self::None | Self::Sticky(_) => MemberEventRoute::Sticky {
+                    event_type,
+                    content,
+                },
             };
         }
 
@@ -278,6 +294,62 @@ impl OutboundDialect {
                 message_type,
                 content,
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn notification() -> Value {
+        json!({
+            "application": { "type": "m.call", "notification_type": "ring" },
+            "m.mentions": { "user_ids": [], "room": true },
+        })
+    }
+
+    fn state_dialect() -> OutboundDialect {
+        OutboundDialect::State(ElementCallStateDialect::new(
+            "@us:example.io",
+            "DEVICE",
+            "!room:example.io",
+            "m.call#ROOM",
+        ))
+    }
+
+    /// The pre-sticky wire has no sticky map, so a host in that mode must never
+    /// be asked for a sticky send — including for the notification.
+    #[test]
+    fn a_notification_is_a_plain_room_event_in_the_state_dialect() {
+        let route =
+            state_dialect().route_member_event("m.rtc.notification".into(), notification(), None);
+        assert!(
+            matches!(route, MemberEventRoute::Room { ref event_type, .. } if event_type == "m.rtc.notification"),
+            "got {route:?}"
+        );
+    }
+
+    /// Both generations with a sticky map keep the notification sticky, and the
+    /// non-member short-circuit leaves the content alone.
+    #[test]
+    fn a_notification_stays_sticky_in_the_other_dialects() {
+        for dialect in [
+            OutboundDialect::None,
+            OutboundDialect::Sticky(ElementCallDialect::new(
+                "@us:example.io",
+                "DEVICE",
+                "m.call#ROOM",
+            )),
+        ] {
+            let route =
+                dialect.route_member_event("m.rtc.notification".into(), notification(), None);
+            assert!(
+                matches!(route, MemberEventRoute::Sticky { ref content, .. } if *content == notification()),
+                "got {route:?}"
+            );
         }
     }
 }

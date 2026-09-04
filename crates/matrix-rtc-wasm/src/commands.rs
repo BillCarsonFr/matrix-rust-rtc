@@ -51,13 +51,14 @@ fn to_plain_js<T: Serialize>(value: &T) -> Result<JsValue, CommandError> {
 /// This sender delegates to a JavaScript object that provides the actual Matrix SDK integration.
 /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
 /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
+// No `#[wasm_bindgen(skip)]` on the fields: wasm-bindgen only exports `pub`
+// fields, so on private ones the attribute is redundant — and since 0.2.12x its
+// macro trips `unused_variables` on it.
 #[wasm_bindgen]
 pub struct JsCommandSender {
     /// The JavaScript Matrix client that handles the actual event sending
-    #[wasm_bindgen(skip)]
     client: JsValue,
     /// Optional callback for logging/debugging
-    #[wasm_bindgen(skip)]
     on_command: Option<Function>,
     /// The outbound dialect each room's session speaks, registered by
     /// `WasmRtcSessionManager::join` and empty for every spec-current room —
@@ -66,7 +67,6 @@ pub struct JsCommandSender {
     /// Keyed by room rather than `(room, slot)` because a to-device media key
     /// names only its room. A `RefCell` because the trait methods take `&self`
     /// and wasm is one thread; never borrowed across an await.
-    #[wasm_bindgen(skip)]
     dialects: RefCell<HashMap<String, OutboundDialect>>,
 }
 
@@ -255,6 +255,38 @@ impl RtcCommandSender for JsCommandSender {
 
                 js_event_id(&resolved, "sendStickyEvent")
             }
+            // The notification for a `state_events` room: a plain room event,
+            // so a host with no MSC4354 support is never asked for a sticky
+            // send. `duration_ms` has no meaning for it. Through
+            // `wire_event_type`, unlike the state arm below: this type *is* the
+            // core's.
+            MemberEventRoute::Room {
+                event_type,
+                content,
+            } => {
+                let event_type = wire_event_type(&event_type);
+                self.log_command(&format!(
+                    "send_sticky_event as room event: room={room_id}, type={event_type}",
+                ));
+
+                let js_content = to_plain_js(&content)?;
+                let promise = self
+                    .call_js_promise_method(
+                        "sendRoomEvent",
+                        vec![
+                            JsValue::from_str(&room_id),
+                            JsValue::from_str(event_type),
+                            js_content,
+                        ],
+                    )
+                    .map_err(JsCommandSender::convert_js_error)?;
+
+                let resolved = wasm_bindgen_futures::JsFuture::from(promise)
+                    .await
+                    .map_err(JsCommandSender::convert_js_error)?;
+
+                js_event_id(&resolved, "sendRoomEvent")
+            }
             // `duration_ms` is dropped on purpose: room state has no TTL, and
             // in this dialect the lifetime is stated inside the content
             // instead. The type is already the legacy wire id, so it does NOT
@@ -341,7 +373,13 @@ impl RtcCommandSender for JsCommandSender {
             .dialect(&room_id)
             .route_member_event(event_type, content, None)
         {
+            // One arm for both carriers: a delayed event is a plain send in
+            // every generation.
             MemberEventRoute::Sticky {
+                event_type,
+                content,
+            }
+            | MemberEventRoute::Room {
                 event_type,
                 content,
             } => {

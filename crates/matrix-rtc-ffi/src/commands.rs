@@ -794,9 +794,10 @@ impl RtcCommandSender for FfiCommandSender {
         content: Value,
         duration_ms: u64,
     ) -> Result<String, CommandError> {
-        // Anything that is not a membership routes straight through in every
-        // mode; the legacy generations differ about memberships, not about
-        // everything. See `matrix_rtc_bridge::compat`.
+        // Anything that is not a membership routes through untouched; only its
+        // carrier follows the mode — the pre-sticky generation has no sticky
+        // map, so there it becomes an ordinary room event. See
+        // `matrix_rtc_bridge::compat`.
         let dialect = self.dialect(&room_id);
         let content = dialect.rewrite_notification(&event_type, content);
         match dialect.route_member_event(event_type, content, Some(duration_ms)) {
@@ -815,6 +816,29 @@ impl RtcCommandSender for FfiCommandSender {
                     &what,
                     self.callback
                         .send_sticky_event(room_id, wire_event_type, content_json, duration_ms)
+                        .await
+                        .map_err(CommandError::from),
+                )
+            }
+            // The notification for a `StateEvents` room: a plain room event, so
+            // a host whose SDK has no MSC4354 is never asked for a sticky send.
+            // `duration_ms` has no meaning for it. Through `wire_type`, unlike
+            // the state arm below: this type *is* the core's.
+            MemberEventRoute::Room {
+                event_type,
+                content,
+            } => {
+                let content_json = serde_json::to_string(&content)
+                    .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+                let wire_event_type = wire_type(event_type);
+                let what = format!("room event [{room_id}] type={wire_event_type} (pre-sticky)");
+                trace_command_content(&what, &content_json);
+
+                log_command(
+                    &what,
+                    self.callback
+                        .send_room_event(room_id, wire_event_type, content_json)
                         .await
                         .map_err(CommandError::from),
                 )
@@ -865,7 +889,13 @@ impl RtcCommandSender for FfiCommandSender {
             .dialect(&room_id)
             .route_member_event(event_type, content, None)
         {
+            // One arm for both carriers: a delayed event is a plain send in
+            // every generation.
             MemberEventRoute::Sticky {
+                event_type,
+                content,
+            }
+            | MemberEventRoute::Room {
                 event_type,
                 content,
             } => {
@@ -1102,6 +1132,7 @@ mod tests {
         State,
         DelayedSticky,
         DelayedState,
+        Room,
     }
 
     #[derive(Clone, Debug)]
@@ -1250,9 +1281,10 @@ mod tests {
             &self,
             _room_id: String,
             event_type: String,
-            _content_json: String,
+            content_json: String,
         ) -> Result<String, CommandSenderError> {
             self.record(&event_type);
+            self.record_send(Carrier::Room, &event_type, None, &content_json);
             Ok("$room-event".to_owned())
         }
 
@@ -2074,6 +2106,51 @@ mod tests {
                 .any(|send| send.carrier == Carrier::Sticky
                     && send.event_type == "org.matrix.msc4143.rtc.member"),
             "a spec-current rejoin must go back to a sticky membership",
+        );
+    }
+
+    /// The pre-sticky wire has no sticky map, so in that mode the notification
+    /// is an ordinary room event — a host whose SDK has no MSC4354 is never
+    /// asked for a sticky send. In every other mode it stays sticky.
+    #[tokio::test]
+    async fn a_notification_goes_out_as_a_room_event_in_the_state_dialect() {
+        let (mock, sender) = mock_sender();
+        sender.set_dialect(
+            "!legacy:example.org",
+            crate::compat::outbound_dialect(
+                matrix_rtc_bridge::compat::ElementCallCompat::StateEvents,
+                "@alice:example.org",
+                "DEVICE",
+                "!legacy:example.org",
+                "m.call#ROOM",
+            ),
+        );
+        let notification = serde_json::json!({
+            "application": { "type": "m.call", "notification_type": "ring" },
+            "m.mentions": { "user_ids": [], "room": true },
+        });
+
+        for room_id in ["!legacy:example.org", "!modern:example.org"] {
+            sender
+                .send_sticky_event(
+                    room_id.to_owned(),
+                    "m.rtc.notification".to_owned(),
+                    notification.clone(),
+                    30_000,
+                )
+                .await
+                .unwrap();
+        }
+
+        let carriers: Vec<Carrier> = mock.sends().into_iter().map(|send| send.carrier).collect();
+        assert_eq!(carriers, [Carrier::Room, Carrier::Sticky]);
+        // Both under the wire id the core's alias map resolves to.
+        assert_eq!(
+            mock.sent_types(),
+            [
+                "org.matrix.msc4075.rtc.notification",
+                "org.matrix.msc4075.rtc.notification"
+            ]
         );
     }
 

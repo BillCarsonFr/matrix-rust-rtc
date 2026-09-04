@@ -171,10 +171,14 @@ At this stage there is no persistence, network transport, or encryption key dist
 - `sdk` (behind the **`matrix-sdk` feature**): `SdkCommandSender` implements the
   core's `RtcCommandSender`, turning outbound commands (join/leave sticky events,
   the dead man's switch delayed events, Olm-encrypted `m.rtc.encryption_key`
-  to-device messages) into Client-Server requests; `run_sticky_bridge` feeds the
-  SDK's live sticky events — and, in the pre-sticky compat mode, room state —
-  back into an `RtcSessionManager`. Owns the ruma pin the whole signalling path
-  depends on.
+  to-device messages) into Client-Server requests; `run_membership_bridge` feeds
+  the room's live membership back into an `RtcSessionManager`. Which carrier it
+  reads is a build-time fact: MSC4354 sticky events need the
+  **`experimental-sticky` feature** and the SDK fork that implements them (see
+  `.cargo/experimental-sticky.toml`); the default build, against upstream
+  matrix-rust-sdk, reads only `org.matrix.msc3401.call.member` room state, so
+  it serves the pre-sticky `ElementCallCompat::StateEvents` mode and nothing
+  else. `STICKY_EVENTS_SUPPORTED` exposes which build this is.
 - `OpenIdTokenSource` (always available): the host's route to a Matrix OpenID
   token, which a transport exchanges for its own credentials. The trait is
   unconditional so a transport can name it; the `matrix_sdk::Client` impl sits
@@ -379,8 +383,9 @@ proposal. The `m.rtc.member` wire format now matches it:
 - `member.claimed_user_id`, `member.claimed_device_id`, `versions`,
   `m.relates_to` and `created_ts` are gone. The sending device now comes from the
   event's decryption metadata and rides on `RawStickyEvent::origin`, which the
-  Matrix bridge fills from `EncryptionInfo` — available since the SDK's "keep
-  encryption info for sticky events" commit, which is why the pin moved.
+  Matrix bridge fills from `EncryptionInfo` — for sticky events that is the fork
+  SDK's "keep encryption info for sticky events" change, one of the reasons the
+  sticky carrier needs `experimental-sticky`.
 - `member.id` is generated fresh per join (`generate_member_id`), as the spec
   requires; it is no longer derived from the user and device IDs.
 

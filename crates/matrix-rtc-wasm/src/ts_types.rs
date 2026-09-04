@@ -37,7 +37,7 @@ use wasm_bindgen::prelude::*;
 const TS_TYPES: &'static str = r#"
 /** The `matrix-js-sdk`-shaped client object `setup_command_sender` dispatches on. */
 export interface MatrixClientHost {
-    /** MSC4354 sticky send; pass `durationMs` through verbatim. */
+    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room joined in `state_events` mode, so a host without sticky support may reject it there. */
     sendStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, durationMs: number): Promise<{ event_id: string } | { eventId: string } | string>;
     sendStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
     /** MSC4140 delayed send; resolves with the bare delay id. */

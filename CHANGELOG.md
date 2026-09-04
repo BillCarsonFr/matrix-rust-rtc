@@ -14,6 +14,33 @@ log only.
 Hosts implementing the FFI/WASM command sender must update. All of these are
 compile errors, not silent behaviour changes.
 
+- **The Rust-driven path now depends on upstream `matrix-org/matrix-rust-sdk`
+  by default; MSC4354 sticky events are behind a new `experimental-sticky`
+  feature.** `matrix-rtc-bridge` and `matrix-rtc-livekit` (feature `matrix-sdk`)
+  no longer pin the `BillCarsonFr/matrix-rust-sdk` fork. Against the stock SDK
+  they carry membership as `org.matrix.msc3401.call.member` room state only, so
+  `Call::join` accepts `ElementCallCompat::StateEvents` and returns the new
+  `CallError::StickyEventsUnsupported` for `Off` and `StickyEvents`; a sticky
+  send reaching `SdkCommandSender` directly fails with
+  `CommandError::ClientRejected`. `experimental-sticky` compiles the sticky
+  paths and needs the fork, selected with the `.cargo/experimental-sticky.toml`
+  overlay (`scripts/cargo-sticky.sh`, `make check-sticky` / `clippy-sticky` /
+  `test-e2e-sticky`), plus `matrix-sdk/unstable-msc4354` and
+  `matrix-sdk-ui/unstable-msc4354` on the command line — a cargo feature cannot
+  forward to an SDK feature upstream lacks without breaking resolution for
+  everyone. `matrix_rtc_bridge::STICKY_EVENTS_SUPPORTED` says which build a
+  caller has. `run_sticky_bridge` is renamed `run_membership_bridge`. Consumers
+  must replicate the SDK's `[patch]` blocks as before; the set is now
+  upstream's (the `tracing` pins are gone, a `ruma` patch is added). The FFI and
+  WASM bindings are unaffected: they never had matrix-sdk in their graph.
+
+- **In `StateEvents` mode the MSC4075 notification goes out through
+  `send_room_event` / `sendRoomEvent`, not the sticky send.** The pre-sticky
+  wire has no sticky map, so that generation's ring is an ordinary room event.
+  `MemberEventRoute` gains a `Room` variant for it (exhaustive matches break).
+  A host whose SDK has no MSC4354 support can now run a `StateEvents` call end
+  to end, notification included, without ever implementing `sendStickyEvent`.
+
 - **The command sender gains `sendRoomEvent(roomId, eventType, content)` and
   `redactEvent(roomId, eventId, reason?)`.** Kotlin/Swift: two new methods on
   `CommandSenderCallback`; JS: two new methods on the client object handed to

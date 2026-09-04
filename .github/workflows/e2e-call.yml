@@ -29,11 +29,28 @@ concurrency:
 
 jobs:
   e2e-call:
-    name: Two-client audio call
+    name: Two-client audio call (${{ matrix.sdk }} SDK)
     runs-on: ubuntu-latest
-    # Generous: an uncached build of the matrix-sdk fork alone takes ~25-45
-    # minutes. With a warm rust-cache the whole job is ~10 minutes.
+    # Generous: an uncached build of matrix-sdk alone takes ~25-45 minutes.
+    # With a warm rust-cache the whole job is ~10 minutes.
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Two SDKs, two feature sets. `upstream` is the workspace's default
+      # (matrix-org/matrix-rust-sdk) and can only run the pre-sticky scenario —
+      # the sticky ones are compiled out without `experimental-sticky`. `sticky`
+      # runs the whole suite through scripts/cargo-sticky.sh, which redirects
+      # the SDK to the MSC4354 fork and passes its `unstable-msc4354` feature.
+      matrix:
+        include:
+          - sdk: upstream
+            cargo: cargo
+            features: matrix-sdk,testing
+            target_dir: target
+          - sdk: sticky
+            cargo: ./scripts/cargo-sticky.sh
+            features: matrix-sdk,testing,experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354
+            target_dir: target/sticky
     steps:
       - uses: actions/checkout@v4
 
@@ -53,23 +70,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev
 
+      # Per-SDK key: the two legs resolve different matrix-sdk trees and build
+      # into different target directories. The `sticky` key is shared with the
+      # Lint workflow's clippy-sticky job.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: e2e-call
+          shared-key: ${{ matrix.sdk == 'upstream' && 'e2e-call' || 'sticky' }}
+          workspaces: ". -> ${{ matrix.target_dir }}"
 
       # Build without running so a compile failure is distinguishable from a
       # call failure, and the stack gets extra minutes to settle.
       - name: Build e2e test
-        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call --no-run
+        run: ${{ matrix.cargo }} test -p matrix-rtc-livekit --features ${{ matrix.features }} --test e2e_call --no-run
 
       - name: Wait for backend readiness
         run: ./demo/backend/wait-ready.sh
 
       - name: Run e2e call test
-        # --test-threads=1: the single-focus and two-foci scenarios share the
-        # compose stack; run them sequentially.
-        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
+        # --test-threads=1: the scenarios share the compose stack; run them
+        # sequentially.
+        run: ${{ matrix.cargo }} test -p matrix-rtc-livekit --features ${{ matrix.features }} --test e2e_call -- --ignored --nocapture --test-threads=1
         env:
           # `debug` on our own crates: this is the only CI job that exercises a
           # real join end to end, so its log is the reference for what a healthy
@@ -89,7 +110,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-received-wav
+          name: e2e-received-wav-${{ matrix.sdk }}
+          # The test writes next to the manifest, not into CARGO_TARGET_DIR, so
+          # the path is the same for both legs.
           path: target/e2e/*.wav
           if-no-files-found: ignore
 
