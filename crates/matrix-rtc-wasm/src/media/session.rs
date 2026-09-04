@@ -208,7 +208,10 @@ impl WasmRtcSessionManager {
             ));
         }
 
-        #[expect(clippy::arc_with_non_send_sync)]
+        // `allow`, not `expect`: whether clippy fires this depends on the
+        // toolchain (1.98 no longer does), and an unfulfilled expectation is
+        // itself an error under `-D warnings`.
+        #[allow(clippy::arc_with_non_send_sync)]
         let transport = Arc::new(JsMediaTransport::new(
             delegate.clone(),
             mapper.clone(),

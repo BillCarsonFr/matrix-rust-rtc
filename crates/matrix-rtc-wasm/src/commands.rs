@@ -51,13 +51,14 @@ fn to_plain_js<T: Serialize>(value: &T) -> Result<JsValue, CommandError> {
 /// This sender delegates to a JavaScript object that provides the actual Matrix SDK integration.
 /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
 /// sendDelayedEvent, restartDelayedEvent, cancelDelayedEvent.
+// No `#[wasm_bindgen(skip)]` on the fields: wasm-bindgen only exports `pub`
+// fields, so on private ones the attribute is redundant — and since 0.2.12x its
+// macro trips `unused_variables` on it.
 #[wasm_bindgen]
 pub struct JsCommandSender {
     /// The JavaScript Matrix client that handles the actual event sending
-    #[wasm_bindgen(skip)]
     client: JsValue,
     /// Optional callback for logging/debugging
-    #[wasm_bindgen(skip)]
     on_command: Option<Function>,
     /// The outbound dialect each room's session speaks, registered by
     /// `WasmRtcSessionManager::join` and empty for every spec-current room —
@@ -66,7 +67,6 @@ pub struct JsCommandSender {
     /// Keyed by room rather than `(room, slot)` because a to-device media key
     /// names only its room. A `RefCell` because the trait methods take `&self`
     /// and wasm is one thread; never borrowed across an await.
-    #[wasm_bindgen(skip)]
     dialects: RefCell<HashMap<String, OutboundDialect>>,
 }
 
