@@ -1,0 +1,6 @@
+# Merged into the generated rust_modules/wasm/Cargo.toml by ubrn
+# (`web.manifestPatchFile`). ubrn's bundled wasm-bindgen CLI is 0.2.100 and
+# the wasm-bindgen schema must match exactly, so the crate side is pinned to
+# the same version. Bump together with uniffi-bindgen-react-native.
+[dependencies]
+wasm-bindgen = "=0.2.100"

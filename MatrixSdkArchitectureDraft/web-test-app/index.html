@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>matrix-rtc demo</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; padding: 1rem; max-width: 1300px; margin-inline: auto; }
+    h1 { font-size: 1.2rem; }
+    .toolbar { display: flex; gap: .5rem; margin: .6rem 0; flex-wrap: wrap; align-items: center; }
+    button { padding: .4rem .7rem; border-radius: 6px; border: 1px solid #8884; background: #6366f1; color: white; cursor: pointer; }
+    button.secondary { background: transparent; color: inherit; }
+    input[type=text], input[type=password], input[type=number], select { padding: .35rem .5rem; border-radius: 6px; border: 1px solid #8886; background: transparent; color: inherit; }
+    label { font-size: .85rem; display: inline-flex; gap: .3rem; align-items: center; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; }
+    section { border: 1px solid #8884; border-radius: 8px; padding: .8rem; min-height: 6rem; }
+    section h2 { margin: 0 0 .5rem; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
+    #tiles { display: flex; gap: .6rem; flex-wrap: wrap; }
+    .tile { width: 260px; border-radius: 8px; border: 1px solid #8886; padding: .6rem; font-size: .78rem; }
+    .tile.leaving { opacity: .55; border-style: dashed; }
+    .tile.me { border-color: #6366f1; }
+    .tile .avatar { width: 40px; height: 40px; border-radius: 50%; background: #6366f1; color: white; display: flex; align-items: center; justify-content: center; margin: 0 auto .3rem; font-size: 1.1rem; }
+    .tile .name { text-align: center; font-weight: 600; margin-bottom: .4rem; word-break: break-all; }
+    .tile .you { opacity: .6; font-weight: 400; }
+    .tile dl { display: grid; grid-template-columns: max-content 1fr; gap: .1rem .5rem; margin: 0; }
+    .tile dt { opacity: .6; }
+    .tile dd { margin: 0; word-break: break-all; }
+    pre { margin: 0; font-size: .72rem; white-space: pre-wrap; word-break: break-all; max-height: 16rem; overflow-y: auto; }
+    #status { font-weight: 600; }
+    #backend-info { font-size: .8rem; opacity: .7; }
+    .err { color: #dc2626; }
+    fieldset { border: 1px solid #8884; border-radius: 8px; padding: .5rem .8rem; }
+    legend { font-size: .8rem; opacity: .7; }
+  </style>
+</head>
+<body>
+  <h1>matrix-rtc — ParticipationManager demo</h1>
+
+  <div class="toolbar">
+    <fieldset>
+      <legend>Mock homeserver (TS MatrixDriver)</legend>
+      <label><input type="checkbox" id="mock-encrypted" checked /> encrypted room</label>
+      <label><input type="checkbox" id="mock-refuse-delayed" /> refuse delayed events</label>
+      <button id="mock-start">Start with mock</button>
+    </fieldset>
+    <fieldset>
+      <legend>Real homeserver (matrix-js-sdk MatrixDriver, demo/backend)</legend>
+      <input type="text" id="hs-url" value="http://localhost:8008" size="22" title="homeserver URL" />
+      <input type="text" id="hs-user" placeholder="user (blank = register)" size="18" />
+      <input type="password" id="hs-password" placeholder="password" size="12" />
+      <input type="text" id="hs-room" placeholder="room id (blank = create)" size="24" />
+      <button id="backend-start">Log in &amp; start</button>
+    </fieldset>
+  </div>
+
+  <div class="toolbar">
+    <span id="status">initializing wasm…</span>
+    <span id="backend-info"></span>
+    <span style="flex:1"></span>
+    <select id="intent">
+      <option value="publish">publish on LiveKit</option>
+      <option value="receive">receive-only</option>
+    </select>
+    <label>keep-alive ms <input type="number" id="keep-alive" value="15000" style="width:6rem" /></label>
+    <label><input type="checkbox" id="delegate" /> delegate delayed leave</label>
+    <button id="join">Join</button>
+    <button id="leave" class="secondary">Leave</button>
+    <button id="open-slot" class="secondary">Open slot</button>
+    <button id="close-slot" class="secondary">Close slot</button>
+  </div>
+
+  <div class="toolbar" id="mock-controls" hidden>
+    <fieldset>
+      <legend>Simulated peers (mock only)</legend>
+      <label><input type="checkbox" id="simulate-keys" checked /> peers answer our key with theirs</label>
+      <button id="peer-join" class="secondary">Peer joins</button>
+      <button id="peer-leave" class="secondary">Last peer leaves</button>
+      <button id="peer-key" class="secondary">Last peer sends key</button>
+      <label>index <input type="number" id="peer-key-index" value="0" min="0" max="255" style="width:4rem" /></label>
+      <button id="mock-slot-close" class="secondary">Slot closed (state update)</button>
+      <button id="mock-slot-open" class="secondary">Slot open (state update)</button>
+    </fieldset>
+  </div>
+
+  <div class="grid">
+    <section style="grid-column: 1 / -1;">
+      <h2>Tiles (one per membership — everything the SDK exposes per member)</h2>
+      <div id="tiles"></div>
+    </section>
+    <section><h2>Connections (LK rooms to hold)</h2><pre id="connections"></pre></section>
+    <section><h2>Key map (member → key indexes)</h2><pre id="keymap"></pre></section>
+    <section><h2>Outbound driver calls / driver log</h2><pre id="outbound"></pre></section>
+    <section><h2>Debug snapshot</h2><pre id="debug"></pre></section>
+    <section style="grid-column: 1 / -1;"><h2>Errors</h2><pre id="errors" class="err"></pre></section>
+  </div>
+  <script type="module" src="/src/app.ts"></script>
+</body>
+</html>
