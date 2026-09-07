@@ -18,7 +18,38 @@
 plugins {
     id 'com.android.library'
     id 'kotlin-android'
+    id 'maven-publish'
+    id 'signing'
 }
+
+// The version is the Rust workspace's ([workspace.package] in the root
+// Cargo.toml) so a locally built AAR carries the version of the code it was
+// built from. -PmatrixRtcVersion overrides it; the release workflow passes it
+// explicitly and asserts the two agree.
+def cargoWorkspaceVersion() {
+    def cargoToml = rootProject.file('../../Cargo.toml').text
+    def matcher = cargoToml =~ /(?s)\[workspace\.package\][^\[]*?\bversion\s*=\s*"([^"]+)"/
+    if (!matcher.find()) {
+        throw new GradleException('No [workspace.package] version in Cargo.toml')
+    }
+    return matcher.group(1)
+}
+
+// The Maven group is a property so the artifact can move to another namespace
+// (e.g. org.matrix.rustcomponents) without touching the build.
+def publishGroup = project.findProperty('matrixRtcGroup') ?: 'io.github.billcarsonfr.matrixrtc'
+def publishVersion = project.findProperty('matrixRtcVersion') ?: cargoWorkspaceVersion()
+def publishArtifactId = 'matrix-rtc-android'
+
+// The media bindings generate callback interfaces the slim ones do not
+// (`OpenIdTokenProvider`), so the callback-thread pinning that names them
+// lives in a per-variant source dir rather than in the shared file. Set by
+// scripts/build-android-aar.sh from MEDIA; a plain `./gradlew` build gets
+// the slim source, matching the default cargo feature set.
+def mediaVariant = project.findProperty('matrixRtcMedia') == 'true'
+
+group = publishGroup
+version = publishVersion
 
 android {
     namespace 'org.matrix.rtc'
@@ -27,16 +58,8 @@ android {
     defaultConfig {
         minSdk 24
         targetSdk 34
-        version "0.1.0"
 
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles "consumer-rules.pro"
-
-        externalNativeBuild {
-            cmake {
-                cppFlags ""
-            }
-        }
     }
 
     buildTypes {
@@ -55,13 +78,6 @@ android {
         jvmTarget = '1.8'
     }
 
-    // The media bindings generate callback interfaces the slim ones do not
-    // (`OpenIdTokenProvider`), so the callback-thread pinning that names them
-    // lives in a per-variant source dir rather than in the shared file. Set by
-    // scripts/build-android-aar.sh from MEDIA; a plain `./gradlew` build gets
-    // the slim source, matching the default cargo feature set.
-    def mediaVariant = project.findProperty('matrixRtcMedia') == 'true'
-
     // Pre-built native libraries are placed in src/main/jniLibs by the build script
     sourceSets {
         main {
@@ -71,22 +87,97 @@ android {
             java.srcDirs += mediaVariant ? 'src/media/kotlin' : 'src/slim/kotlin'
         }
     }
+
+    packaging {
+        jniLibs {
+            // The build script strips the .so itself (--split-debug) and leaves
+            // a .gnu_debuglink to the split symbols; AGP's strip would drop
+            // that link, and cannot process the prebuilt libwebrtc objects
+            // anyway (it only logs that it failed).
+            keepDebugSymbols += '**/*.so'
+        }
+    }
+
+    publishing {
+        singleVariant('release') {
+            withSourcesJar()
+        }
+    }
 }
 
 dependencies {
-    implementation "androidx.appcompat:appcompat:1.6.1"
-    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.0"
-    // Keep in step with what hosts actually resolve. This is an `implementation`
-    // dependency, so an app that brings its own newer JNA wins the conflict and
-    // our bindings run against a version we never built against; declaring the
-    // version hosts are on removes that gap. 5.19.1 is API- and
-    // behaviour-identical to 5.13.0 for the callback-thread handling
-    // `MatrixRtc.pinCallbackThreads` relies on.
-    implementation 'net.java.dev.jna:jna:5.19.1'
-    implementation 'net.java.dev.jna:jna-platform:5.19.1'
+    // `api`, not `implementation`: the generated bindings load the native
+    // library through JNA, so a consumer that does not bring its own copy
+    // needs ours to reach it through the POM. `@aar` is the Android build of
+    // JNA, which bundles libjnidispatch.so; the plain jar only carries desktop
+    // natives.
+    api 'net.java.dev.jna:jna:5.19.1@aar'
+    // The generated bindings' async functions are suspend functions built on
+    // kotlinx.coroutines, and the cleaner code is annotated @RequiresApi.
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3'
+    implementation 'androidx.annotation:annotation:1.9.1'
     // Media variant only: the build script drops libwebrtc.jar in libs/
     // (libwebrtc's native code up-calls into its Java classes). Empty for
-    // the slim signalling-only build.
+    // the slim signalling-only build. AGP packages local jars into the AAR's
+    // libs/ directory, so consumers get it; the build script checks that.
     implementation fileTree(dir: 'libs', include: ['*.jar'])
 }
 
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId publishGroup
+                artifactId publishArtifactId
+                version publishVersion
+
+                pom {
+                    name = publishArtifactId
+                    description = 'Android bindings to matrix-rust-rtc: MatrixRTC signalling and media (MSC4143, MSC4195, MSC4354)'
+                    url = 'https://github.com/BillCarsonFr/matrix-rust-rtc'
+                    licenses {
+                        license {
+                            name = 'GNU Affero General Public License v3.0'
+                            url = 'https://www.gnu.org/licenses/agpl-3.0.txt'
+                        }
+                    }
+                    developers {
+                        developer {
+                            id = 'BillCarsonFr'
+                            name = 'Valere Fedronic'
+                        }
+                    }
+                    scm {
+                        connection = 'scm:git:git://github.com/BillCarsonFr/matrix-rust-rtc.git'
+                        developerConnection = 'scm:git:ssh://git@github.com/BillCarsonFr/matrix-rust-rtc.git'
+                        url = 'https://github.com/BillCarsonFr/matrix-rust-rtc'
+                    }
+                }
+            }
+        }
+
+        repositories {
+            maven {
+                name = 'GitHubPackages'
+                def repository = System.getenv('GITHUB_REPOSITORY') ?: 'BillCarsonFr/matrix-rust-rtc'
+                url = uri("https://maven.pkg.github.com/${repository}")
+                credentials {
+                    username = System.getenv('GITHUB_ACTOR') ?: project.findProperty('gpr.user')
+                    password = System.getenv('GITHUB_TOKEN') ?: project.findProperty('gpr.key')
+                }
+            }
+        }
+    }
+
+    // Maven Central requires signed artifacts; GitHub Packages does not. Sign
+    // whenever a key is provided (the release workflow exports these from
+    // secrets) and skip silently otherwise so local publishToMavenLocal works.
+    def signingKey = System.getenv('SIGNING_KEY')
+    if (signingKey) {
+        signing {
+            useInMemoryPgpKeys(System.getenv('SIGNING_KEY_ID'), signingKey, System.getenv('SIGNING_PASSWORD'))
+            sign publishing.publications.release
+        }
+    }
+}

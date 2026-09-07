@@ -48,7 +48,15 @@ mobile/android/matrixrtc/build/
 
 mobile/ios/generated/
 
-mobile/android/matrixrtc/src/main/java/uniffi/
+# xcframework, headers, zip and checksum from scripts/build-ios-xcframework.sh.
+mobile/ios/build/
+
+# Generated Kotlin bindings (org/matrix/rtc/matrix_rtc_ffi.kt); the hand-written
+# sources live in src/main/kotlin.
+mobile/android/matrixrtc/src/main/java/
+
+# Split debug symbols from scripts/build-android-aar.sh --split-debug.
+mobile/android/debuginfo/
 
 # Working copy of scripts/load-test-sample.sh — carries the account password
 # and recovery key, so it must never be committed.

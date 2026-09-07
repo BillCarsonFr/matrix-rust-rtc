@@ -29,9 +29,23 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0-rc.1"
 edition = "2024"
 license = "AGPL-3.0-only"
+
+# Profile of the distributed mobile artifacts (`scripts/build-*.sh --profile
+# mobile-release`, used by .github/workflows/release.yml). `opt-level = "s"`
+# plus LTO is what matrix-rust-sdk ships to Element X. Debug info is kept as
+# line tables and not stripped here: the Android script splits it into a
+# `.debug` file for symbolication and strips the shipped `.so` itself, and on
+# Apple the static archive carries it into the app's dSYM.
+[profile.mobile-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = "line-tables-only"
+strip = "none"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

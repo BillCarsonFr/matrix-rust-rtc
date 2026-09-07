@@ -7,8 +7,9 @@ This directory contains build scripts and configuration for packaging the Matrix
 ### Install Build Tools
 
 ```bash
-# Install Rust toolchain additions and build tools
-cargo install uniffi_bindgen cargo-ndk
+# Install Rust toolchain additions and build tools (the bindings generator is
+# the in-repo `uniffi-bindgen` crate; nothing else to install)
+cargo install cargo-ndk
 
 # Add iOS targets
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
@@ -31,7 +32,12 @@ Output: `mobile/android/matrixrtc/build/outputs/aar/matrixrtc-release.aar`
 ./scripts/build-ios-xcframework.sh
 ```
 
-Output: `mobile/ios/build/MatrixRtcFFI.xcframework`
+Output: `mobile/ios/build/MatrixRtcFFI.xcframework` (headers included) and the
+generated Swift in `mobile/ios/generated/MatrixRtc.swift`.
+
+Published releases (Maven artifact and Swift Package) are described in
+[PACKAGING.md](./PACKAGING.md#consuming-a-release); cutting one is
+[../RELEASING.md](../RELEASING.md).
 
 ## Load the native library first (Android)
 
@@ -59,7 +65,7 @@ The SDK is silent until the host installs a logger. Do this before creating an
 
 ```kotlin
 import org.matrix.rtc.RtcLogging
-import uniffi.matrix_rtc_ffi.RtcLogLevel
+import org.matrix.rtc.RtcLogLevel
 
 RtcLogging.initLogcat(RtcLogLevel.DEBUG)
 // noisier, for one subsystem:

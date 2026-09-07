@@ -7,12 +7,29 @@ had a tagged release yet, so everything so far lives under Unreleased.
 Entries begin with the Android integration work — earlier history is in the git
 log only.
 
+## v0.2.0-rc.1
+
+Release candidate of 0.2.0, cut to exercise the release pipeline and the
+Swift package end to end. Everything it contains is described under
+[Unreleased](#unreleased); the final 0.2.0 notes will replace this section.
+
 ## Unreleased
 
 ### Breaking
 
 Hosts implementing the FFI/WASM command sender must update. All of these are
 compile errors, not silent behaviour changes.
+
+- **The generated bindings have their release names.** Kotlin moves from
+  package `uniffi.matrix_rtc_ffi` to `org.matrix.rtc` (the package of the
+  hand-written `MatrixRtc` / `RtcLogging` helpers, so one import prefix covers
+  the whole API); the Swift module is `MatrixRtc` and the C module inside the
+  xcframework `MatrixRtcFFI` (was `matrix_rtc_ffiFFI`). The Android module now
+  declares JNA as an `api` dependency (`net.java.dev.jna:jna:5.19.1@aar`), so a
+  consumer gets it from the POM, and drops the `appcompat` and `jna-platform`
+  dependencies nothing used. The Swift package moves to the repository root
+  (`Package.swift` + `Sources/MatrixRtc`) and is consumed as a remote package
+  at a `v*` tag; `mobile/ios/Package.swift` is gone.
 
 - **The command sender gains `sendRoomEvent(roomId, eventType, content)` and
   `redactEvent(roomId, eventId, reason?)`.** Kotlin/Swift: two new methods on
@@ -176,6 +193,22 @@ single integrator, rather than dripped out over several:
   loads fine through JNA); harmless to call either way.
 
 ### Added
+
+- **Releases.** `.github/workflows/release.yml` (dispatched by hand, see
+  [RELEASING.md](RELEASING.md)) builds the media variant for both platforms
+  with the new `mobile-release` cargo profile, publishes the AAR to GitHub
+  Packages (and Maven Central once its secrets are configured) as
+  `io.github.billcarsonfr.matrixrtc:matrix-rtc-android`, rewrites the root
+  `Package.swift` with the xcframework zip's checksum, and tags `v<version>`
+  with the AAR, the zip, split Android debug symbols and `SHA256SUMS` attached
+  to the GitHub Release. The xcframework now ships its header and module map,
+  so `import MatrixRtcFFI` resolves for SwiftPM consumers. The build scripts
+  grew `--target`, `--profile`, `--split-debug`, `--skip-build`,
+  `--skip-codegen`, `--version` (Android) and `--profile`, `--swift-out`,
+  `--zip` (iOS) for the workflow; `make release-android` / `make release-ios`
+  run the same locally. The Android consumer ProGuard rules are now valid
+  (`consumer-rules.pro` carried a C-style comment) and keep JNA, the bindings
+  and libwebrtc's Java classes.
 
 - **Element Call reactions and the raised hand**, interoperable with Element
   Call and shared by every host through the core's new `reactions` module.

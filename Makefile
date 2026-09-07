@@ -55,6 +55,10 @@ help:
 	@echo "  make build-ffi          Build FFI crate only"
 	@echo "  make test-ffi-media     Run the media FFI smoke tests (needs libwebrtc build)"
 	@echo ""
+	@echo "Release artifacts (media, mobile-release profile; see RELEASING.md):"
+	@echo "  make release-android    Android AAR as the release workflow builds it"
+	@echo "  make release-ios        iOS xcframework + zip + Sources/MatrixRtc as the release workflow builds it"
+	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean              Clean build artifacts"
 	@echo ""
@@ -107,12 +111,22 @@ build-ios-media:
 test-ffi-media:
 	cargo test -p matrix-rtc-ffi --features media
 
+# The artifacts as .github/workflows/release.yml builds them, locally.
+.PHONY: release-android release-ios
+release-android:
+	MEDIA=1 ./scripts/build-android-aar.sh --profile mobile-release --split-debug
+
+release-ios:
+	MEDIA=1 ./scripts/build-ios-xcframework.sh --profile mobile-release --swift-out Sources/MatrixRtc --zip
+
 clean:
 	cargo clean
 	rm -rf mobile/ios/build
 	rm -rf mobile/ios/generated
 	rm -rf mobile/android/matrixrtc/src/main/jniLibs
+	rm -rf mobile/android/matrixrtc/src/main/java
 	rm -rf mobile/android/matrixrtc/build
+	rm -rf mobile/android/debuginfo
 
 backend-up:
 	docker compose -f demo/backend/docker-compose.yml up -d --wait

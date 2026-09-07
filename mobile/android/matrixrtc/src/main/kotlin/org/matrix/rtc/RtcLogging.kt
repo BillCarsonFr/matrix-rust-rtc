@@ -17,14 +17,6 @@
 
 package org.matrix.rtc
 
-import uniffi.matrix_rtc_ffi.MatrixRtcFfiException
-import uniffi.matrix_rtc_ffi.RtcLogConfig
-import uniffi.matrix_rtc_ffi.RtcLogLevel
-import uniffi.matrix_rtc_ffi.RtcLogRecord
-import uniffi.matrix_rtc_ffi.RtcLogSink
-import uniffi.matrix_rtc_ffi.logEvent
-import uniffi.matrix_rtc_ffi.setupLogging
-
 /**
  * Turns on logging in the Rust SDK.
  *
@@ -33,7 +25,7 @@ import uniffi.matrix_rtc_ffi.setupLogging
  * installed. Call this once, before creating an `RtcSessionManagerHandle`.
  *
  * This is a thin convenience wrapper over the generated
- * `uniffi.matrix_rtc_ffi.setupLogging`; use that directly if you need the full
+ * `org.matrix.rtc.setupLogging`; use that directly if you need the full
  * [RtcLogConfig].
  *
  * Every entry point here calls [MatrixRtc.initialize] first, so setting logging

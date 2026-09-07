@@ -18,7 +18,6 @@
 package org.matrix.rtc
 
 import com.sun.jna.CallbackThreadInitializer
-import uniffi.matrix_rtc_ffi.uniffiCallbackInterfaceOpenIdTokenProvider
 
 /**
  * Media build: pin the callback interfaces that only the `media` feature's
