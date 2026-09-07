@@ -125,19 +125,36 @@ for a runnable two-client example against the local backend.
 - `crates/matrix-rtc-wasm`: wasm bindings for the web (signalling only —
   browsers keep using livekit-js for media).
 - `web`: browser-first JavaScript package and wasm-pack build/test scaffold.
-- `mobile/android`, `mobile/ios`: Gradle library module / Swift Package and
-  packaging scripts (AAR, XCFramework).
+- `mobile/android`: Gradle library module for the AAR; `Package.swift` +
+  `Sources/MatrixRtc` (repo root): the Swift package over the released
+  xcframework; `mobile/ios`: its local-development manifest and build output.
 - `demo/backend`: self-contained MatrixRTC backend (Synapse +
   lk-jwt-service + **two** LiveKit SFUs for multi-focus testing, docker
   compose) used by the e2e call test on CI and for local development.
+
+## Releases
+
+Tagged releases (`v*`) ship the media variant for both platforms; see
+[RELEASING.md](RELEASING.md) for how they are cut and
+[mobile/PACKAGING.md](mobile/PACKAGING.md#consuming-a-release) for the full
+integration notes.
+
+```kotlin
+// Android — Gradle (GitHub Packages Maven repository, or Maven Central once enabled)
+implementation("io.github.billcarsonfr.matrixrtc:matrix-rtc-android:<version>")
+```
+
+```
+// iOS — Xcode: File > Add Package Dependencies…, this repository's URL, a v* tag.
+// Then add -ObjC to the app target's "Other Linker Flags".
+```
 
 ## Quick Mobile Builds
 
 To build the Android AAR and iOS XCFramework with one command each:
 
 ```bash
-# Prerequisites
-cargo install uniffi_bindgen
+# Prerequisites (the bindings generator is the in-repo uniffi-bindgen crate)
 cargo install cargo-ndk
 
 # Add required Rust targets

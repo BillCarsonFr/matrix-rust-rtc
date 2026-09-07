@@ -15,9 +15,23 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
 
-// Top-level build file where you can add configuration options common to all sub-projects/modules.
-
 plugins {
     id 'com.android.library' version '8.13.2' apply false
     id 'org.jetbrains.kotlin.android' version '1.9.25' apply false
+    // Maven Central: stages and releases through the Portal's OSSRH-compatible
+    // API (the Portal itself has no Gradle task). Only used by the release
+    // workflow when MAVEN_CENTRAL_USERNAME / MAVEN_CENTRAL_PASSWORD are set;
+    // GitHub Packages publishing is plain maven-publish in the module.
+    id 'io.github.gradle-nexus.publish-plugin' version '2.0.0'
+}
+
+nexusPublishing {
+    repositories {
+        sonatype {
+            nexusUrl.set(uri('https://ossrh-staging-api.central.sonatype.com/service/local/'))
+            snapshotRepositoryUrl.set(uri('https://central.sonatype.com/repository/maven-snapshots/'))
+            username = System.getenv('MAVEN_CENTRAL_USERNAME')
+            password = System.getenv('MAVEN_CENTRAL_PASSWORD')
+        }
+    }
 }

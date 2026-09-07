@@ -1,0 +1,20 @@
+# Binding names are part of the published API: a host imports these packages
+# and modules by name, so they are pinned here rather than left to uniffi's
+# defaults (`uniffi.matrix_rtc_ffi` / `matrix_rtc_ffiFFI`).
+
+[bindings.kotlin]
+# Same package as the hand-written helpers in mobile/android/matrixrtc/src/main/kotlin.
+package_name = "org.matrix.rtc"
+cdylib_name = "matrix_rtc_ffi"
+android = true
+kotlin_target_version = "1.9"
+# uniffi's API checksums fail spuriously on 32-bit devices and the AAR ships
+# armeabi-v7a. Drop once https://github.com/mozilla/uniffi-rs/issues/2740 is
+# fixed. matrix-rust-components-kotlin carries the same workaround.
+omit_checksums = true
+
+[bindings.swift]
+# `MatrixRtc` is the Swift module (the SPM target in Sources/MatrixRtc);
+# `MatrixRtcFFI` is the C module inside MatrixRtcFFI.xcframework.
+module_name = "MatrixRtc"
+ffi_module_name = "MatrixRtcFFI"

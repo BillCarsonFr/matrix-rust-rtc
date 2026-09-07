@@ -1,3 +1,4 @@
+// swift-tools-version:5.9
 // Copyright 2026 Valere Fedronic
 //
 // This file is part of matrix-rust-rtc.
@@ -17,27 +18,20 @@
 
 import PackageDescription
 
+// Local-development twin of the root Package.swift: points at the xcframework
+// built by `scripts/build-ios-xcframework.sh --swift-out Sources/MatrixRtc`
+// instead of a released zip. Copy it over the root manifest (and do not commit
+// the result) to add the repository as a local package in Xcode.
 let package = Package(
-    name: "MatrixRtcFFI",
+    name: "MatrixRtc",
     platforms: [
-        .iOS(.v12)
+        .iOS(.v16),
     ],
     products: [
-        .library(
-            name: "MatrixRtcFFI",
-            targets: ["MatrixRtcFFI", "MatrixRtcFFIRust"]
-        ),
+        .library(name: "MatrixRtc", targets: ["MatrixRtc"]),
     ],
     targets: [
-        .target(
-            name: "MatrixRtcFFI",
-            dependencies: ["MatrixRtcFFIRust"],
-            path: "Sources/Swift"
-        ),
-        .binaryTarget(
-            name: "MatrixRtcFFIRust",
-            path: "build/MatrixRtcFFI.xcframework"
-        ),
+        .binaryTarget(name: "MatrixRtcFFI", path: "mobile/ios/build/MatrixRtcFFI.xcframework"),
+        .target(name: "MatrixRtc", dependencies: ["MatrixRtcFFI"]),
     ]
 )
-

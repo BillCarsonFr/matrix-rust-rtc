@@ -21,14 +21,10 @@ import com.sun.jna.Callback
 import com.sun.jna.CallbackThreadInitializer
 import com.sun.jna.Native
 import com.sun.jna.Structure
-import uniffi.matrix_rtc_ffi.uniffiCallbackInterfaceCommandSenderCallback
-import uniffi.matrix_rtc_ffi.uniffiCallbackInterfaceRtcLogSink
-import uniffi.matrix_rtc_ffi.uniffiForeignFutureFreeImpl
-import uniffi.matrix_rtc_ffi.uniffiRustFutureContinuationCallbackImpl
 
 /**
  * Loads the SDK's native library. **Call [initialize] once before any other
- * SDK call** — including the generated `uniffi.matrix_rtc_ffi.*` API.
+ * SDK call** — including the generated `org.matrix.rtc.*` API.
  *
  * ```kotlin
  * MatrixRtc.initialize()

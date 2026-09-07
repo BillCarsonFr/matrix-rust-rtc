@@ -1,0 +1,382 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+# Cuts a release of the mobile artifacts (media variant): the Android AAR to
+# GitHub Packages (and Maven Central when its secrets are set) and the iOS
+# xcframework as a Swift package, both attached to a GitHub Release tagged
+# v<version>. See RELEASING.md for the procedure around it.
+#
+# Dispatched by hand, not on tag push: the tag is created here, after every
+# artifact has been built, so a tag never exists without its assets and the
+# Package.swift committed at the tag points at the zip attached to it.
+#
+# A dry run builds and uploads everything as workflow artifacts and stops
+# before anything is published, committed or tagged.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.2.0. Must equal [workspace.package].version in Cargo.toml.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build only: no publish, commit, tag or GitHub release'
+        required: true
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  MEDIA: "1"
+  CARGO_PROFILE: mobile-release
+
+jobs:
+  validate:
+    name: Validate ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Version matches Cargo.toml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "matrix-rtc-ffi") | .version')"
+          if [ "$cargo_version" != "$VERSION" ]; then
+            echo "::error::Requested $VERSION but Cargo.toml says $cargo_version. Bump [workspace.package].version first."
+            exit 1
+          fi
+
+      - name: Tag does not exist yet
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p dist
+          ./scripts/changelog-section.sh "$VERSION" > dist/release-notes.md
+          echo "Release notes:"
+          cat dist/release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: dist/release-notes.md
+          if-no-files-found: error
+
+  android:
+    name: Android ${{ matrix.target }}
+    needs: validate
+    runs-on: ubuntu-latest
+    # Uncached, each target compiles the libwebrtc-carrying stack with LTO.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-android-${{ matrix.target }}
+
+      # The runner image ships the NDK under $ANDROID_HOME/ndk/<version>; the
+      # build script's resolve_ndk() finds it there.
+      - name: Build native library
+        run: |
+          ./scripts/build-android-aar.sh \
+            --target "${{ matrix.target }}" \
+            --profile "$CARGO_PROFILE" \
+            --split-debug
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lib-${{ matrix.target }}
+          # The path below the first wildcard (the ABI directory) is preserved.
+          path: mobile/android/matrixrtc/src/main/jniLibs/*/libmatrix_rtc_ffi.so
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debuginfo-${{ matrix.target }}
+          path: mobile/android/debuginfo/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Identical for every ABI, so taken from one job only.
+      - name: Upload Kotlin bindings
+        if: matrix.target == 'aarch64-linux-android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-kotlin
+          path: mobile/android/matrixrtc/src/main/java/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload libwebrtc.jar
+        if: matrix.target == 'aarch64-linux-android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-webrtc-jar
+          path: mobile/android/matrixrtc/libs/libwebrtc.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  ios:
+    name: iOS xcframework
+    needs: validate
+    # macos-latest is Apple Silicon, matching the media variant's arm64-only
+    # simulator support.
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-ios
+
+      - name: Build xcframework
+        run: |
+          ./scripts/build-ios-xcframework.sh \
+            --profile "$CARGO_PROFILE" \
+            --swift-out Sources/MatrixRtc \
+            --zip
+
+      - name: Upload xcframework zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcframework
+          path: |
+            mobile/ios/build/MatrixRtcFFI.xcframework.zip
+            mobile/ios/build/MatrixRtcFFI.xcframework.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Swift sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-swift
+          path: Sources/MatrixRtc/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: ${{ inputs.dry_run && 'Assemble (dry run)' || 'Publish' }} v${{ inputs.version }}
+    needs: [validate, android, ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # tag, release commit, GitHub Release
+      packages: write   # GitHub Packages (Maven)
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release commit (Package.swift + Sources/MatrixRtc) is pushed
+          # back to the branch this run was dispatched on.
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Download native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: android-lib-*
+          merge-multiple: true
+          path: mobile/android/matrixrtc/src/main/jniLibs/
+
+      - name: Download Kotlin bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: android-kotlin
+          path: mobile/android/matrixrtc/src/main/java/
+
+      - name: Download libwebrtc.jar
+        uses: actions/download-artifact@v4
+        with:
+          name: android-webrtc-jar
+          path: mobile/android/matrixrtc/libs/
+
+      - name: Download debug symbols
+        uses: actions/download-artifact@v4
+        with:
+          pattern: android-debuginfo-*
+          merge-multiple: true
+          path: debuginfo/
+
+      - name: Download xcframework zip
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-xcframework
+          path: dist/
+
+      - name: Download Swift sources
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-swift
+          path: Sources/MatrixRtc/
+
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: dist/
+
+      - name: Assemble AAR
+        run: |
+          ls -R mobile/android/matrixrtc/src/main/jniLibs
+          ./scripts/build-android-aar.sh --skip-build --skip-codegen --version "$VERSION"
+          cp mobile/android/matrixrtc/build/outputs/aar/matrixrtc-release.aar \
+             "dist/matrix-rtc-android-$VERSION.aar"
+
+      - name: Package debug symbols
+        run: |
+          (cd debuginfo && zip -r "../dist/matrix-rtc-android-$VERSION-debuginfo.zip" .)
+
+      - name: Point Package.swift at the release
+        run: |
+          ./scripts/update-package-swift.sh "$VERSION" "$(cat dist/MatrixRtcFFI.xcframework.zip.sha256)"
+          rm dist/MatrixRtcFFI.xcframework.zip.sha256
+          git diff --stat
+
+      - name: Checksums
+        run: |
+          (cd dist && sha256sum *.aar *.zip > SHA256SUMS && cat SHA256SUMS)
+
+      # Always exercised, even on a dry run: it fails on a POM or signing
+      # misconfiguration before anything reaches a remote repository.
+      - name: Publish to the local Maven repository (POM check)
+        working-directory: mobile/android
+        run: |
+          ./gradlew :matrixrtc:publishReleasePublicationToMavenLocal \
+            -PmatrixRtcMedia=true -PmatrixRtcVersion="$VERSION"
+          find ~/.m2/repository -path '*matrix-rtc-android*' -name '*.pom' -exec cat {} \;
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-v${{ inputs.version }}
+          path: |
+            dist/
+            Package.swift
+            Sources/MatrixRtc/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to GitHub Packages
+        if: ${{ !inputs.dry_run }}
+        working-directory: mobile/android
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :matrixrtc:publishReleasePublicationToGitHubPackagesRepository \
+            -PmatrixRtcMedia=true -PmatrixRtcVersion="$VERSION"
+
+      - name: Publish to Maven Central
+        if: ${{ !inputs.dry_run && secrets.MAVEN_CENTRAL_USERNAME != '' }}
+        working-directory: mobile/android
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          SIGNING_KEY_ID: ${{ secrets.SIGNING_KEY_ID }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository \
+            -PmatrixRtcMedia=true -PmatrixRtcVersion="$VERSION"
+
+      - name: Commit and tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add Package.swift Sources/MatrixRtc
+          git commit -m "Release v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/v$VERSION"
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          # A semver pre-release (0.2.0-rc.1) must not become "latest".
+          prerelease: ${{ contains(inputs.version, '-') }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/matrix-rtc-android-${{ inputs.version }}.aar
+            dist/matrix-rtc-android-${{ inputs.version }}-debuginfo.zip
+            dist/MatrixRtcFFI.xcframework.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
