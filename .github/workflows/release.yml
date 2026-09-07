@@ -233,6 +233,9 @@ jobs:
       packages: write   # GitHub Packages (Maven)
     env:
       VERSION: ${{ inputs.version }}
+      # `secrets` is not allowed in a step's `if`, so the presence check is
+      # evaluated here and the step tests the resulting env value.
+      MAVEN_CENTRAL_CONFIGURED: ${{ secrets.MAVEN_CENTRAL_USERNAME != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -343,7 +346,7 @@ jobs:
             -PmatrixRtcMedia=true -PmatrixRtcVersion="$VERSION"
 
       - name: Publish to Maven Central
-        if: ${{ !inputs.dry_run && secrets.MAVEN_CENTRAL_USERNAME != '' }}
+        if: ${{ !inputs.dry_run && env.MAVEN_CENTRAL_CONFIGURED == 'true' }}
         working-directory: mobile/android
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
