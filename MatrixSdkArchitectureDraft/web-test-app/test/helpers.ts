@@ -17,19 +17,25 @@ import {
   slotOpenEvent,
 } from "../src/mockDriver";
 
-export function newManager(opts: { roomState?: any[]; compat?: FfiElementCallCompat; slotId?: string } = {}) {
+export function newManager(
+  opts: {
+    roomState?: any[];
+    compat?: FfiElementCallCompat;
+    slotId?: string;
+    manageMediaKeys?: boolean;
+    requireCrossSignedSender?: boolean;
+  } = {},
+) {
   const driver = new MockMatrixDriver();
   driver.roomState = opts.roomState ?? [JSON.parse(slotOpenEvent())];
   // the subscribe_* handshake happens here, exactly once per driver
   const matrixDriver = new FfiMatrixDriver(driver);
-  const manager = new FfiParticipationManager(
-    ROOM_ID,
-    opts.slotId ?? SLOT_ID,
-    OWN_USER_ID,
-    OWN_DEVICE_ID,
-    matrixDriver,
-    opts.compat ?? FfiElementCallCompat.Off,
-  );
+  const manager = new FfiParticipationManager(ROOM_ID, opts.slotId ?? SLOT_ID, OWN_USER_ID, OWN_DEVICE_ID, matrixDriver, {
+    compat: opts.compat ?? FfiElementCallCompat.Off,
+    manageMediaKeys: opts.manageMediaKeys ?? true,
+    requireCrossSignedSender: opts.requireCrossSignedSender ?? true,
+    useKeyDelayMs: 1000n,
+  });
   return { driver, matrixDriver, manager };
 }
 

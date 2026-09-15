@@ -103,6 +103,9 @@ struct Mock {
     fail_token: AtomicBool,
     /// Fail every `read_state` for `m.rtc.slot` while set.
     fail_slot_read: AtomicBool,
+    /// The homeserver is unreachable while set (`ConnectivityDriver`).
+    disconnected: AtomicBool,
+    connectivity: Mutex<Vec<UnboundedSender<bool>>>,
 }
 
 impl Mock {
@@ -115,6 +118,15 @@ impl Mock {
 
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// The homeserver comes or goes, as a syncing client would report it.
+    fn set_connected(&self, connected: bool) {
+        self.disconnected.store(!connected, Ordering::Relaxed);
+        self.connectivity
+            .lock()
+            .unwrap()
+            .retain(|tx| tx.send(connected).is_ok());
     }
 
     fn record(&self, call: Call) {
@@ -430,6 +442,16 @@ impl RoomEventsDriver for Mock {
 
     fn subscribe_state_updates(&self) -> UnboundedReceiver<Vec<RawMatrixEvent>> {
         subscribe(&self.state_updates)
+    }
+}
+
+impl ConnectivityDriver for Mock {
+    fn is_homeserver_connected(&self) -> bool {
+        !self.disconnected.load(Ordering::Relaxed)
+    }
+
+    fn subscribe_connectivity(&self) -> UnboundedReceiver<bool> {
+        subscribe(&self.connectivity)
     }
 }
 
@@ -1460,4 +1482,45 @@ async fn a_failed_join_is_disconnected_with_the_cause_and_the_progress() {
         !progress.has_created_transport_token,
         "we know which step failed"
     );
+}
+
+#[tokio::test]
+async fn losing_the_homeserver_is_a_critical_impairment_until_it_is_back() {
+    let mock = Mock::new(vec![slot_event("open", false)]);
+    let m = manager(&mock);
+    assert!(m.is_homeserver_connected());
+    m.join(receive_only(), params()).await.unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<Vec<Impairment>>::new()));
+    let sink = seen.clone();
+    m.on_status_change(Box::new(move |status| {
+        sink.lock().unwrap().push(status.impairments().to_vec());
+    }));
+
+    mock.set_connected(false);
+    wait_for("the outage is reported", || {
+        matches!(
+            m.status().impairments().first(),
+            Some(Impairment::HomeserverUnreachable { .. })
+        )
+    })
+    .await;
+    assert!(!m.is_homeserver_connected());
+    assert_eq!(
+        m.status().impairments()[0].severity(),
+        Severity::Critical,
+        "nothing else can succeed while the homeserver is gone"
+    );
+    // ...and it reached the callback, not only the getter.
+    wait_for("callback saw it", || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|i| matches!(i.first(), Some(Impairment::HomeserverUnreachable { .. })))
+    })
+    .await;
+
+    mock.set_connected(true);
+    wait_for("the outage clears", || m.status().impairments().is_empty()).await;
+    assert!(m.is_homeserver_connected());
+    m.leave(None).await.unwrap();
 }

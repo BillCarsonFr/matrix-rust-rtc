@@ -41,7 +41,12 @@ const publish = () =>
 
 function managerFor(b: JsSdkBackend) {
   const driver = new FfiMatrixDriver(b.driver);
-  return new FfiParticipationManager(b.roomId, b.slotId, b.userId, b.deviceId, driver, FfiElementCallCompat.Off);
+  return new FfiParticipationManager(b.roomId, b.slotId, b.userId, b.deviceId, driver, {
+    compat: FfiElementCallCompat.Off,
+    manageMediaKeys: true,
+    requireCrossSignedSender: true,
+    useKeyDelayMs: 1000n,
+  });
 }
 
 describe.skipIf(!enabled)("demo backend (matrix-js-sdk driver)", () => {

@@ -19,6 +19,7 @@ import type {
   FfiToDeviceDelivery,
   FfiToDeviceRecipient,
   MatrixDriverCallback,
+  ConnectivitySinkInterface,
   RoomEventSinkInterface,
   StateUpdateSinkInterface,
   ToDeviceSinkInterface,
@@ -112,10 +113,19 @@ export class JsSdkMatrixDriver implements MatrixDriverCallback {
     await guard(() => this.client._unstable_updateDelayedEvent(delayId, sdk.UpdateDelayedEventAction.Cancel));
   }
 
-  async delegateLivekitDelayedLeave(roomId: string, slotId: string, memberJson: string, delayId: string): Promise<void> {
+  async delegateLivekitDelayedLeave(
+    roomId: string,
+    slotId: string,
+    memberJson: string,
+    delayId: string,
+    _livekitServiceUrl: string | undefined,
+    _delayMs: bigint,
+  ): Promise<void> {
     // MSC4195: the homeserver hands the delayed leave to the SFU once the
     // participant is connected. Best effort: the SDK restarts it itself when
-    // this fails.
+    // this fails. (Element Call's driver delegates through the authorisation
+    // service's `get_token` instead, which is what the service url and delay
+    // are for; this demo driver keeps the homeserver endpoint.)
     await guard(() =>
       this.client.http.authedRequest(
         sdk.Method.Post,
@@ -283,6 +293,21 @@ export class JsSdkMatrixDriver implements MatrixDriverCallback {
     };
     const detach = () => this.client.off(sdk.RoomStateEvent.Events, onState);
     this.client.on(sdk.RoomStateEvent.Events, onState);
+    this.detachers.push(detach);
+  }
+
+  // --- connectivity ---------------------------------------------------------
+
+  isHomeserverConnected(): boolean {
+    return this.client.getSyncState() === sdk.SyncState.Syncing;
+  }
+
+  subscribeConnectivity(sink: ConnectivitySinkInterface): void {
+    const onSync = () => {
+      if (!sink.emit(this.isHomeserverConnected())) detach();
+    };
+    const detach = () => this.client.off(sdk.ClientEvent.Sync, onSync);
+    this.client.on(sdk.ClientEvent.Sync, onSync);
     this.detachers.push(detach);
   }
 

@@ -17,3 +17,5 @@ npm-debug.log*
 
 # OS noise
 .DS_Store
+# built by element-call's scripts/sync-matrix-rtc-sdk.sh (feature set differs)
+src/generated-element-call/

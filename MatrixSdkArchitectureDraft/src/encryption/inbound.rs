@@ -379,6 +379,7 @@ mod tests {
             membership_ts: None,
             display_name: None,
             avatar_url: None,
+            event_id: None,
             intent: None,
             application_type: None,
             transports: Default::default(),

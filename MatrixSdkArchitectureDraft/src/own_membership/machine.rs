@@ -9,7 +9,7 @@ use super::wire::{self, Route, WireContext};
 use super::{
     ConnectedStatus, DEFAULT_DEGRADED_LIFETIME_MS, DelayedLeaveOutcome, JoinError, JoinParams,
     JoinStatus, KeepAlive, LeaveError, LeaveStatus, MAX_STICKY_DURATION_MS, MembershipPublication,
-    OwnIdentity, RosterPresence, Status,
+    OwnIdentity, RosterPresence, Status, UpdateApplicationError,
 };
 use crate::driver::{DriverError, SendEventResponse};
 use crate::session::{
@@ -41,6 +41,11 @@ pub(crate) enum Input {
     Leave {
         reason: Option<LeaveReason>,
         reply: oneshot::Sender<Result<(), LeaveError>>,
+    },
+    /// Change `application["m.call.intent"]` of the current participation.
+    UpdateApplication {
+        intent: Option<String>,
+        reply: oneshot::Sender<Result<(), UpdateApplicationError>>,
     },
     Session(SessionSnapshot),
     Wake,
@@ -78,6 +83,8 @@ pub(crate) enum Action {
     Delegate {
         delay_id: String,
         member: Value,
+        livekit_service_url: Option<String>,
+        delay_ms: u64,
     },
 }
 
@@ -118,6 +125,9 @@ fn classify_refusal(error: &DriverError, now: u64) -> DelayedLeaveSupport {
 struct JoinPlan {
     member: Member,
     params: JoinParams,
+    /// The resolved transport intent the content was rendered from, kept so
+    /// the content can be re-rendered when the application changes.
+    transport_intent: TransportIntent,
     join_content: Value,
     /// Chosen before the first publish, never moved (MSC4354 "last to expire
     /// wins" ignores a shorter refresh).
@@ -286,6 +296,9 @@ impl Machine {
                 reply,
             } => self.on_join(member_id, intent, params, reply, now),
             Input::Leave { reason, reply } => self.on_leave(reason, reply, now),
+            Input::UpdateApplication { intent, reply } => {
+                self.on_update_application(intent, reply, now)
+            }
             Input::Session(snapshot) => self.on_session(snapshot, now),
             Input::Wake => self.on_wake(now),
             Input::Outcome(outcome) => self.on_outcome(outcome, now),
@@ -558,6 +571,7 @@ impl Machine {
             membership_ts: Some(now),
             display_name: None,
             avatar_url: None,
+            event_id: None,
             intent: params.intent.clone(),
             application_type: Some(params.application_type.clone()),
             transports,
@@ -577,6 +591,7 @@ impl Machine {
         let plan = JoinPlan {
             member,
             params: params.clone(),
+            transport_intent: joining.intent.clone(),
             join_content,
             published_lifetime_ms: params.sticky_duration_ms,
             keep_alive_timeout_ms,
@@ -700,6 +715,52 @@ impl Machine {
             return Vec::new();
         }
         self.begin_leave(reason.unwrap_or_else(LeaveReason::leave), Some(reply), now)
+    }
+
+    /// Re-render the membership with a new `m.call.intent`. Connected: publish
+    /// it now as a refresh (so a failure follows the refresh retry path).
+    /// Joining with a plan: the join event, or the first refresh, carries it.
+    fn on_update_application(
+        &mut self,
+        intent: Option<String>,
+        reply: oneshot::Sender<Result<(), UpdateApplicationError>>,
+        now: u64,
+    ) -> Vec<Action> {
+        let plan = match &mut self.state {
+            State::Connected(c) => &mut c.plan,
+            State::Joining(j) if j.plan.is_some() => j.plan.as_mut().expect("checked"),
+            _ => {
+                let _ = reply.send(Err(UpdateApplicationError::NotJoined));
+                return Vec::new();
+            }
+        };
+        if plan.params.intent == intent {
+            let _ = reply.send(Ok(()));
+            return Vec::new();
+        }
+        log::info!(
+            "[{}/{}] application intent {:?} -> {intent:?}",
+            self.room_id,
+            self.slot_id,
+            plan.params.intent
+        );
+        plan.params.intent = intent.clone();
+        plan.member.intent = intent;
+        plan.join_content = wire::join_content(
+            &self.slot_id,
+            &plan.member.member_id,
+            &plan.params.application_type,
+            plan.params.intent.as_deref(),
+            &plan.transport_intent,
+        );
+        let _ = reply.send(Ok(()));
+        match &self.state {
+            State::Connected(c) => vec![Action::SendMembership {
+                route: self.membership_route(&c.plan, &c.plan.join_content, now),
+                kind: SendKind::Refresh,
+            }],
+            _ => Vec::new(),
+        }
     }
 
     fn begin_leave(
@@ -965,6 +1026,14 @@ impl Machine {
                         let action = Action::Delegate {
                             delay_id: joining.delayed.as_ref().expect("checked").delay_id.clone(),
                             member: plan.join_content["member"].clone(),
+                            livekit_service_url: plan
+                                .member
+                                .transports
+                                .published
+                                .iter()
+                                .find_map(crate::connections::service_url)
+                                .map(str::to_owned),
+                            delay_ms: plan.keep_alive_timeout_ms,
                         };
                         self.state = State::Joining(joining);
                         vec![action]
@@ -1220,6 +1289,7 @@ mod tests {
                     membership_ts: None,
                     display_name: None,
                     avatar_url: None,
+                    event_id: None,
                     intent: None,
                     application_type: None,
                     transports: Default::default(),
@@ -1770,6 +1840,77 @@ mod tests {
     }
 
     #[test]
+    fn update_application_republishes_with_the_new_intent_while_connected() {
+        let mut h = H::new(ElementCallCompat::Off);
+        // Not joined: refused.
+        let (tx, mut rx) = oneshot::channel();
+        assert!(
+            h.m.step(
+                Input::UpdateApplication {
+                    intent: Some("video".into()),
+                    reply: tx,
+                },
+                T0,
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(UpdateApplicationError::NotJoined))
+        ));
+
+        h.connected(T0);
+        let (tx, mut rx) = oneshot::channel();
+        let a = h.m.step(
+            Input::UpdateApplication {
+                intent: Some("video".into()),
+                reply: tx,
+            },
+            T0 + 1,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+        // Published at once, on the refresh path, with the new intent.
+        assert_eq!(a.len(), 1);
+        match &a[0] {
+            Action::SendMembership {
+                route: Route::Sticky { content, .. },
+                kind: SendKind::Refresh,
+            } => {
+                assert_eq!(content["application"]["m.call.intent"], "video");
+                assert_eq!(content["application"]["type"], "m.call");
+                assert_eq!(content["member"]["membership"], "join");
+            }
+            other => panic!("expected a sticky refresh, got {other:?}"),
+        }
+        // The same intent again is a no-op.
+        let (tx, mut rx) = oneshot::channel();
+        assert!(
+            h.m.step(
+                Input::UpdateApplication {
+                    intent: Some("video".into()),
+                    reply: tx,
+                },
+                T0 + 2,
+            )
+            .is_empty()
+        );
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+        // ...and the next scheduled refresh carries it too.
+        let a = h.m.step(Input::Wake, T0 + 10 * 60 * 60 * 1000);
+        let refreshed = a.iter().find_map(|a| match a {
+            Action::SendMembership {
+                route: Route::Sticky { content, .. },
+                kind: SendKind::Refresh,
+            } => Some(content.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            refreshed.expect("a refresh")["application"]["m.call.intent"],
+            "video"
+        );
+    }
+
+    #[test]
     fn sticky_duration_is_clamped_to_one_hour() {
         let mut h = H::new(ElementCallCompat::Off);
         let (a, _) = h.join(
@@ -1817,7 +1958,10 @@ mod tests {
             a,
             vec![Action::Delegate {
                 delay_id: "d".into(),
-                member: json!({ "id": "m-1", "membership": "join" })
+                member: json!({ "id": "m-1", "membership": "join" }),
+                // receive-only: nothing to name
+                livekit_service_url: None,
+                delay_ms: DELEGATION_MIN_DELAY_MS,
             }]
         );
         assert!(

@@ -20,13 +20,18 @@ use crate::connections::{
     ConnectionData, ConnectionProblem, ConnectionProblemKind, ConnectionWithMembers,
 };
 use crate::driver::{
-    DelegatedDelayedLeaveRequest, DriverError, LivekitTokenRequest, LivekitTokenResponse,
-    OwnMembershipDriver, RoomEventsDriver, SendEventResponse, StateKeySelector, ToDeviceDelivery,
-    ToDeviceDriver, ToDeviceMessage, ToDeviceRecipient, ToDeviceSendDriver, TokenDriver,
+    ConnectivityDriver, DelegatedDelayedLeaveRequest, DriverError, LivekitTokenRequest,
+    LivekitTokenResponse, OwnMembershipDriver, RoomEventsDriver, SendEventResponse,
+    StateKeySelector, ToDeviceDelivery, ToDeviceDriver, ToDeviceMessage, ToDeviceRecipient,
+    ToDeviceSendDriver, TokenDriver,
 };
-use crate::encryption::{KeyMap, KeyRejection, MediaKey, MediaKeyChange, MediaKeyState};
+use crate::encryption::{
+    EncryptionConfig, KeyMap, KeyRejection, MediaKey, MediaKeyChange, MediaKeyState,
+    SendMachineConfig,
+};
 use crate::own_membership::{
     self, DelayedLeaveOutcome, JoinError, JoinParams, LeaveError, OwnIdentity,
+    UpdateApplicationError,
 };
 use crate::participation::{
     Component, DisconnectCause, Impairment, MembershipState, ParticipationConfig,
@@ -146,6 +151,15 @@ impl From<LeaveError> for RtcError {
     }
 }
 
+impl From<UpdateApplicationError> for RtcError {
+    fn from(error: UpdateApplicationError) -> Self {
+        match error {
+            UpdateApplicationError::NotJoined => RtcError::NotJoined,
+            UpdateApplicationError::Driver(e) => e.into(),
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Debug, uniffi::Enum)]
 pub enum FfiDeviceAttribution {
     Verified,
@@ -172,8 +186,15 @@ pub struct FfiMember {
     /// `origin_server_ts` of the event that started this participation, where
     /// the dialect needs it to tell joins apart (MSC3401 compat).
     pub membership_ts: Option<u64>,
+    /// From the room's `m.room.member` state for this user, kept current by
+    /// the session: a rename shows up as a memberships change.
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+    /// The membership event this entry was projected from — the *current*
+    /// one, so it changes on every re-send. Relate application events
+    /// (reactions, hand raises) to it. `None` for a member without an event
+    /// yet (our own entry before the echo).
+    pub event_id: Option<String>,
     pub intent: Option<String>,
     pub application_type: Option<String>,
     /// The transports this member publishes on.
@@ -191,6 +212,7 @@ impl From<&Member> for FfiMember {
             membership_ts: member.membership_ts,
             display_name: member.display_name.clone(),
             avatar_url: member.avatar_url.clone(),
+            event_id: member.event_id.clone(),
             intent: member.intent.clone(),
             application_type: member.application_type.clone(),
             published_transports: member
@@ -295,9 +317,10 @@ pub enum FfiMembershipState {
 pub struct FfiMembership {
     pub member: FfiMember,
     pub state: FfiMembershipState,
-    /// `ws_url`s of the connections this member publishes on — the LK
-    /// room(s) carrying their media. Empty for receive-only members and
-    /// `LeftWithKeys` entries.
+    /// `service_url`s (the connection key, `FfiConnectionData::service_url`)
+    /// of the connections this member publishes on — the LK room(s) carrying
+    /// their media. Empty for receive-only members and `LeftWithKeys`
+    /// entries.
     pub connections: Vec<String>,
     /// Participant identity inside those LK rooms (MSC4195 pseudonymous
     /// hash; `{user}:{device}` in legacy compat mode).
@@ -493,6 +516,40 @@ impl From<FfiElementCallCompat> for ElementCallCompat {
             FfiElementCallCompat::Off => ElementCallCompat::Off,
             FfiElementCallCompat::StickyEvents => ElementCallCompat::StickyEvents,
             FfiElementCallCompat::StateEvents => ElementCallCompat::StateEvents,
+        }
+    }
+}
+
+/// Per-manager configuration: the compat dialect plus the encryption knobs a
+/// host must be able to set (a room without a slot negotiates nothing, so
+/// the local defaults decide).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiParticipationConfig {
+    pub compat: FfiElementCallCompat,
+    /// Whether to exchange media keys when the slot prescribes nothing (no
+    /// slot in the room). A slot's negotiated encryption overrides it.
+    pub manage_media_keys: bool,
+    /// MSC4153: discard media keys from a sending device the host did not
+    /// report as cross-signed by its owner. Hosts that cannot evaluate that
+    /// (or whose peers may be unverified guests) turn it off.
+    pub require_cross_signed_sender: bool,
+    /// Wait this long after sending a rotated key before encrypting with it,
+    /// so slow peers have it before the first frame arrives.
+    pub use_key_delay_ms: u64,
+}
+
+impl From<FfiParticipationConfig> for ParticipationConfig {
+    fn from(config: FfiParticipationConfig) -> Self {
+        ParticipationConfig {
+            compat: config.compat.into(),
+            encryption: EncryptionConfig {
+                require_cross_signed_sender: config.require_cross_signed_sender,
+                manage_media_keys: config.manage_media_keys,
+            },
+            rotation: SendMachineConfig {
+                use_key_delay_ms: config.use_key_delay_ms,
+                ..SendMachineConfig::default()
+            },
         }
     }
 }
@@ -840,6 +897,10 @@ impl From<Severity> for FfiSeverity {
 /// else; the structured status above is for anything that needs the details.
 #[derive(Clone, Debug, PartialEq, uniffi::Enum)]
 pub enum FfiImpairment {
+    /// The driver reports the homeserver unreachable; clears when it is back.
+    HomeserverUnreachable {
+        since_ts: u64,
+    },
     KeepAliveRestartFailing {
         since_ts: u64,
         fires_at_ts: u64,
@@ -898,6 +959,9 @@ pub enum FfiImpairment {
 impl From<&Impairment> for FfiImpairment {
     fn from(i: &Impairment) -> Self {
         match i {
+            Impairment::HomeserverUnreachable { since_ts } => Self::HomeserverUnreachable {
+                since_ts: *since_ts,
+            },
             Impairment::KeepAliveRestartFailing {
                 since_ts,
                 fires_at_ts,
@@ -988,7 +1052,8 @@ impl From<&Impairment> for FfiImpairment {
 pub fn impairment_severity(impairment: FfiImpairment) -> FfiSeverity {
     // Mirrors `participation::Impairment::severity`.
     match impairment {
-        FfiImpairment::KeepAliveExpired { .. }
+        FfiImpairment::HomeserverUnreachable { .. }
+        | FfiImpairment::KeepAliveExpired { .. }
         | FfiImpairment::OwnMembershipMissing { .. }
         | FfiImpairment::OwnMembershipExcluded { .. }
         | FfiImpairment::KeepAliveRestartFailing { .. }
@@ -1408,6 +1473,22 @@ impl StateUpdateSink {
     }
 }
 
+/// One end of the driver's connectivity stream: the host emits the new
+/// verdict whenever its homeserver connection comes or goes (a syncing
+/// client: sync running or not). `false` from `emit` means no consumer is
+/// left — unhook the handler.
+#[derive(uniffi::Object)]
+pub struct ConnectivitySink {
+    fan_out: Arc<FanOut<bool>>,
+}
+
+#[uniffi::export]
+impl ConnectivitySink {
+    pub fn emit(&self, connected: bool) -> bool {
+        self.fan_out.emit(connected)
+    }
+}
+
 /// The host-implemented Matrix driver: the same seam as
 /// [`crate::driver::MatrixDriver`], flattened for FFI. matrix-rust-sdk hosts
 /// adapt their `MatrixDriver`; a matrix-js-sdk host implements this directly.
@@ -1471,12 +1552,18 @@ pub trait MatrixDriverCallback: Send + Sync {
     async fn cancel_delayed_event(&self, room_id: String, delay_id: String)
     -> Result<(), RtcError>;
 
+    /// MSC4195: hand the delayed leave to the SFU. `livekit_service_url` is
+    /// the transport we publish on (`None` for a receive-only member) and
+    /// `delay_ms` the armed delay — what an adapter that delegates through
+    /// the authorisation service's token endpoint needs.
     async fn delegate_livekit_delayed_leave(
         &self,
         room_id: String,
         slot_id: String,
         member_json: String,
         delay_id: String,
+        livekit_service_url: Option<String>,
+        delay_ms: u64,
     ) -> Result<(), RtcError>;
 
     async fn send_to_device(
@@ -1520,6 +1607,14 @@ pub trait MatrixDriverCallback: Send + Sync {
 
     /// Room-state update batches (what notices a slot closing promptly).
     fn subscribe_state_updates(&self, sink: Arc<StateUpdateSink>);
+
+    /// Whether the homeserver is reachable right now (a syncing client: its
+    /// sync loop is running).
+    fn is_homeserver_connected(&self) -> bool;
+
+    /// Live connectivity verdicts. Store the sink; `emit` the new value from
+    /// the host SDK's sync-state handler.
+    fn subscribe_connectivity(&self, sink: Arc<ConnectivitySink>);
 }
 
 /// The FFI driver object — the one place a foreign [`MatrixDriverCallback`]
@@ -1540,6 +1635,7 @@ pub struct FfiMatrixDriver {
     room_events: Arc<FanOut<RawMatrixEvent>>,
     to_device: Arc<FanOut<ToDeviceMessage>>,
     state_updates: Arc<FanOut<Vec<RawMatrixEvent>>>,
+    connectivity: Arc<FanOut<bool>>,
 }
 
 #[uniffi::export]
@@ -1551,6 +1647,10 @@ impl FfiMatrixDriver {
         let room_events = FanOut::new();
         let to_device = FanOut::new();
         let state_updates = FanOut::new();
+        let connectivity = FanOut::new();
+        callback.subscribe_connectivity(Arc::new(ConnectivitySink {
+            fan_out: connectivity.clone(),
+        }));
         callback.subscribe_room_events(Arc::new(RoomEventSink {
             fan_out: room_events.clone(),
         }));
@@ -1565,7 +1665,18 @@ impl FfiMatrixDriver {
             room_events,
             to_device,
             state_updates,
+            connectivity,
         })
+    }
+}
+
+impl ConnectivityDriver for FfiMatrixDriver {
+    fn is_homeserver_connected(&self) -> bool {
+        self.callback.is_homeserver_connected()
+    }
+
+    fn subscribe_connectivity(&self) -> UnboundedReceiver<bool> {
+        self.connectivity.subscribe()
     }
 }
 
@@ -1687,6 +1798,8 @@ impl OwnMembershipDriver for FfiMatrixDriver {
                 request.slot_id,
                 request.member.to_string(),
                 request.delay_id,
+                request.livekit_service_url,
+                request.delay_ms,
             )
             .await?)
     }
@@ -1865,12 +1978,9 @@ impl FfiParticipationManager {
         user_id: String,
         device_id: String,
         driver: Arc<FfiMatrixDriver>,
-        compat: FfiElementCallCompat,
+        config: FfiParticipationConfig,
     ) -> Arc<Self> {
-        let config = ParticipationConfig {
-            compat: compat.into(),
-            ..ParticipationConfig::default()
-        };
+        let config: ParticipationConfig = config.into();
         let driver: Arc<dyn crate::driver::MatrixDriver> = driver;
         Arc::new(Self {
             inner: ParticipationManager::new(
@@ -1889,6 +1999,13 @@ impl FfiParticipationManager {
         params: FfiJoinParams,
     ) -> Result<(), RtcError> {
         Ok(self.inner.join(intent.try_into()?, params.into()).await?)
+    }
+
+    /// Change `application["m.call.intent"]` (e.g. `"audio"` / `"video"`)
+    /// while joined: the membership is re-published with it. `None` removes
+    /// the intent. Rejects with `NotJoined` outside a participation.
+    pub async fn update_application(&self, intent: Option<String>) -> Result<(), RtcError> {
+        Ok(self.inner.update_application(intent).await?)
     }
 
     /// `code` defaults to MSC4143's plain `leave`.
@@ -1911,6 +2028,19 @@ impl FfiParticipationManager {
     /// several RTC members, and a rejoin mints a fresh id.
     pub fn own_member_id(&self) -> Option<String> {
         self.inner.own_member_id()
+    }
+
+    /// Our LiveKit participant identity, known from the moment `join()`
+    /// starts (before our membership echo). `None` while not joined.
+    pub fn own_transport_identity(&self) -> Option<String> {
+        self.inner.own_transport_identity()
+    }
+
+    /// Whether the driver currently reports the homeserver reachable. Inside a
+    /// participation the same fact is `FfiImpairment::HomeserverUnreachable`
+    /// in the status; this covers the lobby and the post-call screen.
+    pub fn is_homeserver_connected(&self) -> bool {
+        self.inner.is_homeserver_connected()
     }
 
     /// Our own entry in `memberships()`, when the session projects it.

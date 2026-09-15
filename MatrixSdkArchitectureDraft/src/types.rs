@@ -25,6 +25,12 @@ pub struct Member {
     pub membership_ts: Option<u64>,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+    /// `event_id` of the event this membership was projected from — the
+    /// *current* sticky/state event, so it changes on every re-send. Hosts
+    /// relate application events (reactions, hand raises) to it. `None`
+    /// where no event exists yet (our own member before the echo) or the
+    /// host omitted the id.
+    pub event_id: Option<String>,
     /// Application-level intent (e.g. what EX shows in the room header).
     pub intent: Option<String>,
     /// `application.type` of the membership (MSC4143 requires it on a join;

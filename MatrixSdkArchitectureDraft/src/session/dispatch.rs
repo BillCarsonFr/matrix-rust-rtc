@@ -113,13 +113,32 @@ pub(crate) enum Ingest {
     LegacyMemberRemoval { state_key: String },
     /// `m.rtc.slot` (either type).
     Slot { slot_id: String, slot: RawSlot },
-    /// `m.room.member`; `joined` is `membership == "join"`.
-    RoomMember { user_id: String, joined: bool },
+    /// `m.room.member`; `joined` is `membership == "join"`. The profile is
+    /// what the event carries, joined or not — a member's name is a fact
+    /// about them even while the roster condition is unenforced.
+    RoomMember {
+        user_id: String,
+        joined: bool,
+        profile: RoomMemberProfile,
+    },
     /// `m.room.encryption` naming an algorithm. Empty content is `Ignored`:
     /// a room cannot be un-encrypted, so nothing is inferred from it.
     RoomEncryption,
     /// Logged at trace, never an error that aborts a batch.
     Ignored(&'static str),
+}
+
+/// The `displayname` / `avatar_url` an `m.room.member` event carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoomMemberProfile {
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+impl RoomMemberProfile {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.display_name.is_none() && self.avatar_url.is_none()
+    }
 }
 
 /// Classify one raw event. `now` is the receive time (the MSC4354
@@ -153,13 +172,25 @@ pub(crate) fn classify(event: &RawMatrixEvent, config: &SessionConfig, now: u64)
             let Some(user_id) = state_key(event).filter(|k| !k.is_empty()) else {
                 return Ingest::Ignored("m.room.member without a state_key");
             };
-            let joined = content(event)
+            let content = content(event);
+            let joined = content
                 .and_then(|c| c.get("membership"))
                 .and_then(Value::as_str)
                 == Some("join");
+            let field = |name: &str| {
+                content
+                    .and_then(|c| c.get(name))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
             Ingest::RoomMember {
                 user_id: user_id.to_owned(),
                 joined,
+                profile: RoomMemberProfile {
+                    display_name: field("displayname"),
+                    avatar_url: field("avatar_url"),
+                },
             }
         }
         ROOM_ENCRYPTION_EVENT_TYPE => {
@@ -285,7 +316,8 @@ mod tests {
             ),
             Ingest::RoomMember {
                 user_id: "@a:x".into(),
-                joined: true
+                joined: true,
+                profile: RoomMemberProfile::default(),
             }
         );
         for membership in ["leave", "ban", "invite"] {
@@ -296,7 +328,8 @@ mod tests {
                 ),
                 Ingest::RoomMember {
                     user_id: "@a:x".into(),
-                    joined: false
+                    joined: false,
+                    profile: RoomMemberProfile::default(),
                 }
             );
         }
@@ -306,7 +339,22 @@ mod tests {
             classify_now(missing, ElementCallCompat::Off),
             Ingest::RoomMember {
                 user_id: "@a:x".into(),
-                joined: false
+                joined: false,
+                profile: RoomMemberProfile::default(),
+            }
+        );
+        let mut named = room_member_event("@a:x", "join", NOW);
+        named["content"]["displayname"] = json!("Alice");
+        named["content"]["avatar_url"] = json!("mxc://x/a");
+        assert_eq!(
+            classify_now(named, ElementCallCompat::Off),
+            Ingest::RoomMember {
+                user_id: "@a:x".into(),
+                joined: true,
+                profile: RoomMemberProfile {
+                    display_name: Some("Alice".into()),
+                    avatar_url: Some("mxc://x/a".into()),
+                },
             }
         );
         assert_eq!(

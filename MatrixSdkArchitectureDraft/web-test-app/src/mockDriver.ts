@@ -14,6 +14,7 @@ import type {
   FfiToDeviceDelivery,
   FfiToDeviceRecipient,
   MatrixDriverCallback,
+  ConnectivitySinkInterface,
   RoomEventSinkInterface,
   StateUpdateSinkInterface,
   ToDeviceSinkInterface,
@@ -50,7 +51,14 @@ export type OutboundCall =
     }
   | { kind: "restartDelayed"; roomId: string; delayId: string }
   | { kind: "cancelDelayed"; roomId: string; delayId: string }
-  | { kind: "delegateDelayedLeave"; roomId: string; slotId: string; delayId: string }
+  | {
+      kind: "delegateDelayedLeave";
+      roomId: string;
+      slotId: string;
+      delayId: string;
+      livekitServiceUrl: string | undefined;
+      delayMs: bigint;
+    }
   | { kind: "toDevice"; recipients: FfiToDeviceRecipient[]; eventType: string; content: any }
   | { kind: "getRtcTransports" }
   | { kind: "getLivekitToken"; url: string; roomId: string; slotId: string; member: any; legacySfuGet: boolean };
@@ -70,6 +78,8 @@ export class MockMatrixDriver implements MatrixDriverCallback {
   onOutbound?: (call: OutboundCall) => void;
   /** Refuse delayed events like a homeserver without MSC4140 (404). */
   refuseDelayedEvents = false;
+  /** Fail the slot state reads, so the slot stays *unknown* rather than closed. */
+  failSlotReads = false;
   /** Room state answered by `readState` (the session seed). */
   roomState: any[] = [];
   /** Simulated peers answer our media key with theirs (index 0). */
@@ -198,8 +208,10 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     slotId: string,
     _memberJson: string,
     delayId: string,
+    livekitServiceUrl: string | undefined,
+    delayMs: bigint,
   ): Promise<void> {
-    this.record({ kind: "delegateDelayedLeave", roomId, slotId, delayId });
+    this.record({ kind: "delegateDelayedLeave", roomId, slotId, delayId, livekitServiceUrl, delayMs });
   }
 
   async sendToDevice(
@@ -246,6 +258,9 @@ export class MockMatrixDriver implements MatrixDriverCallback {
   }
 
   async readState(eventType: string, stateKey: string | undefined): Promise<string[]> {
+    if (this.failSlotReads && eventType.endsWith("rtc.slot")) {
+      throw new RtcError.Http("500: slot state unavailable");
+    }
     return this.roomState
       .filter((e) => e.type === eventType && (stateKey === undefined || e.state_key === stateKey))
       .map((e) => JSON.stringify(e));
@@ -260,6 +275,8 @@ export class MockMatrixDriver implements MatrixDriverCallback {
   private roomEventSink?: RoomEventSinkInterface;
   private toDeviceSink?: ToDeviceSinkInterface;
   private stateUpdateSink?: StateUpdateSinkInterface;
+  private connectivitySink?: ConnectivitySinkInterface;
+  private homeserverConnected = true;
 
   subscribeRoomEvents(sink: RoomEventSinkInterface): void {
     this.roomEventSink = sink;
@@ -271,6 +288,20 @@ export class MockMatrixDriver implements MatrixDriverCallback {
 
   subscribeStateUpdates(sink: StateUpdateSinkInterface): void {
     this.stateUpdateSink = sink;
+  }
+
+  isHomeserverConnected(): boolean {
+    return this.homeserverConnected;
+  }
+
+  subscribeConnectivity(sink: ConnectivitySinkInterface): void {
+    this.connectivitySink = sink;
+  }
+
+  /** The homeserver comes or goes, as a syncing client would report it. */
+  setHomeserverConnected(connected: boolean): boolean {
+    this.homeserverConnected = connected;
+    return this.connectivitySink?.emit(connected) ?? true;
   }
 
   private echo(event: any, origin: FfiEventOrigin) {
@@ -405,6 +436,27 @@ export function slotEvent(opts: { status: "open" | "closed"; encrypted?: boolean
 
 export const slotOpenEvent = () => slotEvent({ status: "open" });
 export const slotClosedEvent = () => slotEvent({ status: "closed" });
+
+/** `m.room.member` state with the profile fields a call renders. */
+export function roomMemberEvent(opts: {
+  userId: string;
+  membership?: "join" | "invite" | "leave";
+  displayName?: string;
+  avatarUrl?: string;
+}): string {
+  const content: Record<string, unknown> = { membership: opts.membership ?? "join" };
+  if (opts.displayName !== undefined) content.displayname = opts.displayName;
+  if (opts.avatarUrl !== undefined) content.avatar_url = opts.avatarUrl;
+  return JSON.stringify({
+    type: "m.room.member",
+    sender: opts.userId,
+    event_id: `$ev-${eventCounter++}`,
+    room_id: ROOM_ID,
+    state_key: opts.userId,
+    origin_server_ts: Date.now(),
+    content,
+  });
+}
 
 export function roomEncryptionEvent(): string {
   return JSON.stringify({

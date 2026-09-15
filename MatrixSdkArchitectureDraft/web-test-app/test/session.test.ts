@@ -5,17 +5,20 @@ import { beforeAll, describe, expect, it } from "vitest";
 import {
   FfiElementCallCompat,
   FfiEventOrigin,
+  FfiStatus,
+  FfiTransportIntent,
   computeSessionsFromEvents,
   type FfiMembership,
 } from "../src/generated/matrix_rtc";
 import {
   memberJoinEvent,
+  roomMemberEvent,
   slotClosedEvent,
   slotOpenEvent,
   tick,
   waitFor,
 } from "../src/mockDriver";
-import { newManager } from "./helpers";
+import { joinParams, newManager } from "./helpers";
 import { initWasm } from "./wasmInit";
 
 beforeAll(async () => {
@@ -45,6 +48,58 @@ describe("session", () => {
     driver.emitRoomEvent(memberJoinEvent({ ...remote, durationMs: 200 }), encrypted("RDEV"));
     expect(manager.memberships()).toHaveLength(1);
     await waitFor("expiry", () => manager.memberships().length === 0, 1500);
+  });
+
+  it("a room without a slot has no call until a client opens one, in every dialect", async () => {
+    // No slot = no call: members are excluded and join is refused. The
+    // client that starts the call opens the slot (a state event the
+    // homeserver echoes), after which both work.
+    for (const compat of [FfiElementCallCompat.Off, FfiElementCallCompat.StickyEvents]) {
+      const { driver, manager } = newManager({ compat, roomState: [] });
+      await waitFor("seeded", () => manager.session().seeded);
+      expect(manager.session().slotOpen).toBe(false);
+      driver.emitRoomEvent(memberJoinEvent(remote), encrypted("RDEV"));
+      expect(manager.memberships()).toHaveLength(0);
+      expect(manager.session().excludedCandidates[0]?.member.eventId).toMatch(/^\$ev-/);
+      await expect(
+        manager.join(new FfiTransportIntent.ReceiveOnly({ canSubscribe: ["livekit"] }), joinParams),
+      ).rejects.toThrow();
+
+      await manager.openSlot("m.call", false);
+      const slot = driver.calls("stateEvent")[0];
+      expect(slot.eventType).toBe("org.matrix.msc4143.rtc.slot");
+      expect(slot.stateKey).toBe("m.call#ROOM");
+      expect(slot.content).toEqual({ status: "open", application: { type: "m.call" } });
+      expect(manager.session().slotOpen).toBe(true);
+      expect(manager.memberships()).toHaveLength(1);
+      await manager.join(new FfiTransportIntent.ReceiveOnly({ canSubscribe: ["livekit"] }), joinParams);
+      expect(FfiStatus.Connected.instanceOf(manager.status())).toBe(true);
+      await manager.leave(undefined, undefined);
+    }
+  });
+
+  it("members carry the display name and avatar from m.room.member, kept current", async () => {
+    const { driver, manager } = newManager({
+      roomState: [
+        JSON.parse(slotOpenEvent()),
+        JSON.parse(roomMemberEvent({ userId: remote.userId, displayName: "Alice", avatarUrl: "mxc://example.org/a" })),
+      ],
+    });
+    await waitFor("seeded", () => manager.session().seeded);
+    driver.emitRoomEvent(memberJoinEvent(remote), encrypted("RDEV"));
+    const [member] = manager.memberships();
+    expect(member.member.displayName).toBe("Alice");
+    expect(member.member.avatarUrl).toBe("mxc://example.org/a");
+    // a rename lands as a state update and the getter is fresh
+    driver.emitStateUpdate([roomMemberEvent({ userId: remote.userId, displayName: "Alicia" })]);
+    expect(manager.memberships()[0].member.displayName).toBe("Alicia");
+    expect(manager.memberships()[0].member.avatarUrl).toBeUndefined();
+    // ...and the listener sees it a tick later
+    const changes: FfiMembership[][] = [];
+    manager.setMembershipsListener({ onMembershipsChange: (m) => changes.push(m) });
+    driver.emitStateUpdate([roomMemberEvent({ userId: remote.userId, displayName: "Alice again" })]);
+    await tick();
+    expect(changes.at(-1)?.[0].member.displayName).toBe("Alice again");
   });
 
   it("the unstable type org.matrix.msc4143.rtc.member is accepted", () => {

@@ -165,6 +165,7 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc3401Conversi
             membership_ts: Some(joined_at),
             display_name: None,
             avatar_url: None,
+            event_id: dispatch::event_id(event).map(str::to_owned),
             intent: object
                 .get("m.call.intent")
                 .and_then(Value::as_str)

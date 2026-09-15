@@ -148,6 +148,24 @@ pub(crate) fn room_member_event(user_id: &str, membership: &str, ts: u64) -> Val
     event
 }
 
+/// `m.room.member` with the profile fields Element Call renders.
+pub(crate) fn room_member_profile_event(
+    user_id: &str,
+    membership: &str,
+    ts: u64,
+    display_name: Option<&str>,
+    avatar_url: Option<&str>,
+) -> Value {
+    let mut event = room_member_event(user_id, membership, ts);
+    if let Some(name) = display_name {
+        event["content"]["displayname"] = json!(name);
+    }
+    if let Some(url) = avatar_url {
+        event["content"]["avatar_url"] = json!(url);
+    }
+    event
+}
+
 pub(crate) fn room_encryption_event(ts: u64) -> Value {
     let mut event = base(
         "m.room.encryption",

@@ -155,13 +155,20 @@ impl Pump {
             Action::CancelDelayedLeave { delay_id } => {
                 Outcome::Cancelled(self.driver.cancel_delayed_event(room_id, delay_id).await)
             }
-            Action::Delegate { delay_id, member } => Outcome::Delegated(
+            Action::Delegate {
+                delay_id,
+                member,
+                livekit_service_url,
+                delay_ms,
+            } => Outcome::Delegated(
                 self.driver
                     .delegate_livekit_delayed_leave(DelegatedDelayedLeaveRequest {
                         room_id,
                         slot_id: self.slot_id.clone(),
                         member,
                         delay_id,
+                        livekit_service_url,
+                        delay_ms,
                     })
                     .await,
             ),

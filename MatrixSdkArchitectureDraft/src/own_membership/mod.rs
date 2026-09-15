@@ -291,6 +291,15 @@ pub enum LeaveError {
     Driver(#[from] DriverError),
 }
 
+/// Why [`OwnMembershipManager::update_application`] was refused.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum UpdateApplicationError {
+    #[error("not joined")]
+    NotJoined,
+    #[error(transparent)]
+    Driver(#[from] DriverError),
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub type ResolveTransportFuture =
     Pin<Box<dyn Future<Output = Result<RtcTransport, ResolveTransportError>> + Send>>;
@@ -427,6 +436,22 @@ impl OwnMembershipManager {
                 params,
                 reply,
             })
+            .map_err(|_| stopped())?;
+        rx.await.map_err(|_| stopped())?
+    }
+
+    /// Change the application-level intent (`application["m.call.intent"]`,
+    /// e.g. a call turning from audio to video) of the current participation.
+    /// While connected the membership is re-published at once (a failure
+    /// retries like a refresh); during a join the join event carries it.
+    /// Resolves once the change is accepted, not once it is on the server.
+    pub async fn update_application(
+        &self,
+        intent: Option<String>,
+    ) -> Result<(), UpdateApplicationError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Input::UpdateApplication { intent, reply })
             .map_err(|_| stopped())?;
         rx.await.map_err(|_| stopped())?
     }

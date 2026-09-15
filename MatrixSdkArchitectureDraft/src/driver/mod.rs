@@ -82,6 +82,13 @@ pub struct DelegatedDelayedLeaveRequest {
     pub slot_id: String,
     pub member: Value,
     pub delay_id: String,
+    /// The `livekit_service_url` we publish on, when we publish: the MatrixRTC
+    /// authorisation service is what performs the delegation, and an adapter
+    /// that delegates *through* it (Element Call's `get_token` with
+    /// `delay_id`) needs to know which one.
+    pub livekit_service_url: Option<String>,
+    /// The armed delay, for adapters whose delegation call takes it.
+    pub delay_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -264,14 +271,27 @@ pub trait TokenDriver: Send + Sync {
     ) -> Result<LivekitTokenResponse, DriverError>;
 }
 
+/// Whether the homeserver is reachable — for a syncing client, whether its
+/// sync loop is running. Every other slice fails call by call; this one says
+/// *why* they are about to, and lets a participation report
+/// `Impairment::HomeserverUnreachable` while the connection is gone.
+pub trait ConnectivityDriver: Send + Sync {
+    /// The current verdict.
+    fn is_homeserver_connected(&self) -> bool;
+
+    /// Live verdicts, each the new value. Dropping the receiver stops
+    /// forwarding.
+    fn subscribe_connectivity(&self) -> UnboundedReceiver<bool>;
+}
+
 /// The full driver — what matrix-rust-sdk's widget `MatrixDriver` (behind a
 /// thin adapter) implements, and what `participation::Manager` takes.
 pub trait MatrixDriver:
-    OwnMembershipDriver + ToDeviceDriver + RoomEventsDriver + TokenDriver
+    OwnMembershipDriver + ToDeviceDriver + RoomEventsDriver + TokenDriver + ConnectivityDriver
 {
 }
 
 impl<T> MatrixDriver for T where
-    T: OwnMembershipDriver + ToDeviceDriver + RoomEventsDriver + TokenDriver
+    T: OwnMembershipDriver + ToDeviceDriver + RoomEventsDriver + TokenDriver + ConnectivityDriver
 {
 }

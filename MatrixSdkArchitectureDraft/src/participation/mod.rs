@@ -26,7 +26,8 @@ use crate::encryption::{
 use crate::executor;
 pub use crate::own_membership::OwnIdentity;
 use crate::own_membership::{
-    self, JoinError, JoinParams, LeaveError, OwnMembershipManager, new_member_id,
+    self, JoinError, JoinParams, LeaveError, OwnMembershipManager, UpdateApplicationError,
+    new_member_id,
 };
 use crate::session::{ElementCallCompat, Session, SessionConfig};
 use crate::types::{
@@ -136,6 +137,12 @@ pub enum Severity {
 /// Timestamps are unix-ms (`_ts` = a point in time, `_ms` = a duration).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Impairment {
+    // ---- the homeserver ------------------------------------------------
+    /// The driver reports the homeserver unreachable (its sync stopped):
+    /// nothing below can succeed until it is back, and our keep-alive is
+    /// running down meanwhile. Clears when the driver reports it back.
+    HomeserverUnreachable { since_ts: u64 },
+
     // ---- our own membership ------------------------------------------
     /// The dead man's switch could not be restarted. It is still armed:
     /// unless a restart succeeds, the homeserver publishes our leave at
@@ -247,7 +254,8 @@ pub enum Impairment {
 impl Impairment {
     pub fn severity(&self) -> Severity {
         match self {
-            Self::KeepAliveExpired { .. }
+            Self::HomeserverUnreachable { .. }
+            | Self::KeepAliveExpired { .. }
             | Self::OwnMembershipMissing { .. }
             | Self::OwnMembershipExcluded { .. }
             | Self::KeepAliveRestartFailing { .. }
@@ -268,19 +276,20 @@ impl Impairment {
     /// inputs, so publish-on-change never flaps on ordering alone.
     fn sort_key(&self) -> (Severity, u8, String) {
         let (rank, discriminator) = match self {
-            Self::KeepAliveExpired { .. } => (0, String::new()),
-            Self::OwnMembershipMissing { .. } => (1, String::new()),
-            Self::OwnMembershipExcluded { .. } => (2, String::new()),
-            Self::KeepAliveRestartFailing { .. } => (3, String::new()),
-            Self::MembershipRefreshFailing { .. } => (4, String::new()),
-            Self::ConnectionTokenExpired { service_url, .. } => (5, service_url.clone()),
-            Self::ConnectionUnavailable { service_url, .. } => (6, service_url.clone()),
-            Self::MediaKeyNotDelivered { .. } => (7, String::new()),
-            Self::MediaKeyNotReceived { .. } => (8, String::new()),
-            Self::MediaKeyRejected { member_id, .. } => (9, member_id.clone()),
-            Self::KeepAliveUnavailable { .. } => (10, String::new()),
-            Self::SessionStateUnread { .. } => (11, String::new()),
-            Self::JoinedBeforeSeed { .. } => (12, String::new()),
+            Self::HomeserverUnreachable { .. } => (0, String::new()),
+            Self::KeepAliveExpired { .. } => (1, String::new()),
+            Self::OwnMembershipMissing { .. } => (2, String::new()),
+            Self::OwnMembershipExcluded { .. } => (3, String::new()),
+            Self::KeepAliveRestartFailing { .. } => (4, String::new()),
+            Self::MembershipRefreshFailing { .. } => (5, String::new()),
+            Self::ConnectionTokenExpired { service_url, .. } => (6, service_url.clone()),
+            Self::ConnectionUnavailable { service_url, .. } => (7, service_url.clone()),
+            Self::MediaKeyNotDelivered { .. } => (8, String::new()),
+            Self::MediaKeyNotReceived { .. } => (9, String::new()),
+            Self::MediaKeyRejected { member_id, .. } => (10, member_id.clone()),
+            Self::KeepAliveUnavailable { .. } => (11, String::new()),
+            Self::SessionStateUnread { .. } => (12, String::new()),
+            Self::JoinedBeforeSeed { .. } => (13, String::new()),
         };
         (self.severity(), rank, discriminator)
     }
@@ -423,6 +432,9 @@ struct Inner {
     joined_before_seed: Mutex<Option<u64>>,
     /// Serialises `join`/`leave`.
     lifecycle: tokio::sync::Mutex<()>,
+    /// When the driver last reported the homeserver unreachable, while it
+    /// still is. Fed by the pump from the driver's connectivity stream.
+    homeserver_disconnected_since: Mutex<Option<u64>>,
 }
 
 pub struct ParticipationManager {
@@ -471,6 +483,11 @@ impl ParticipationManager {
             }),
         );
         let key_map_changed = Arc::new(Notify::new());
+        let homeserver_disconnected_since = if driver.is_homeserver_connected() {
+            None
+        } else {
+            Some(executor::now_ms())
+        };
         let inner = Arc::new(Inner {
             room_id,
             slot_id,
@@ -487,6 +504,7 @@ impl ParticipationManager {
             disconnect: Mutex::new(DisconnectCause::NeverJoined),
             joined_before_seed: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
+            homeserver_disconnected_since: Mutex::new(homeserver_disconnected_since),
         });
         let notify = Arc::new(Notify::new());
         executor::spawn(run(Arc::downgrade(&inner), notify.clone(), key_map_changed));
@@ -541,6 +559,7 @@ impl ParticipationManager {
             membership_ts: Some(executor::now_ms()),
             display_name: None,
             avatar_url: None,
+            event_id: None,
             intent: params.intent.clone(),
             application_type: Some(params.application_type.clone()),
             transports: MemberTransports::default(),
@@ -618,6 +637,23 @@ impl ParticipationManager {
             .and_then(|m| m.own_member_id())
     }
 
+    /// Our LiveKit participant identity for this participation, `None` while
+    /// not joined. Known from the moment `join()` starts — before our
+    /// membership echo — so a host can key its own media into the transport
+    /// (and its own key into a key provider) without waiting for the roster.
+    pub fn own_transport_identity(&self) -> Option<String> {
+        let member_id = self.own_member_id()?;
+        let own = &self.inner.own;
+        Some(match self.inner.config.compat {
+            ElementCallCompat::StateEvents => {
+                connections::legacy_participant_identity(&own.user_id, &own.device_id)
+            }
+            ElementCallCompat::Off | ElementCallCompat::StickyEvents => {
+                connections::participant_identity(&own.user_id, &own.device_id, &member_id)
+            }
+        })
+    }
+
     /// Our own entry in [`Self::memberships`], when the session projects it.
     /// `None` while not joined *or* while our echo has not come back — which
     /// is itself reported as
@@ -658,6 +694,16 @@ impl ParticipationManager {
             Err(LeaveError::Driver(_)) => {}
         }
         result
+    }
+
+    /// Change the application-level intent (`m.call.intent`) of the current
+    /// participation — the membership is re-published with it.
+    pub async fn update_application(
+        &self,
+        intent: Option<String>,
+    ) -> Result<(), UpdateApplicationError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.inner.own_membership.update_application(intent).await
     }
 
     /// Slot administration (usually needs elevated power levels): open this
@@ -780,6 +826,17 @@ impl ParticipationManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .key_rejected = Some(callback);
+    }
+
+    /// Whether the driver currently reports the homeserver reachable. While
+    /// in a participation the same fact is `Impairment::HomeserverUnreachable`
+    /// in the status; this is for the moments before and after one.
+    pub fn is_homeserver_connected(&self) -> bool {
+        self.inner
+            .homeserver_disconnected_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
     }
 
     /// Diagnostics: every part's state as JSON (no key material).
@@ -959,6 +1016,13 @@ impl Inner {
     /// apply.
     fn impairments(&self, own: Option<&own_membership::ConnectedStatus>) -> Vec<Impairment> {
         let mut out = Vec::new();
+        if let Some(since_ts) = *self
+            .homeserver_disconnected_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            out.push(Impairment::HomeserverUnreachable { since_ts });
+        }
         if let Some(own) = own {
             own_membership_impairments(own, &mut out);
         }
@@ -997,6 +1061,26 @@ impl Inner {
         // inputs yields the same vec and `PartialEq` does not flap.
         out.sort_by_key(Impairment::sort_key);
         out
+    }
+
+    /// The driver's connectivity verdict changed. Only the first "gone"
+    /// stamps the time: a repeated report is the same outage.
+    fn set_homeserver_connected(&self, connected: bool) {
+        let mut since = self
+            .homeserver_disconnected_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match (connected, *since) {
+            (true, Some(_)) => {
+                log::info!("[{}] the homeserver is reachable again", self.room_id);
+                *since = None;
+            }
+            (false, None) => {
+                log::warn!("[{}] the homeserver is unreachable", self.room_id);
+                *since = Some(executor::now_ms());
+            }
+            _ => {}
+        }
     }
 
     /// Publish the status through the callback if it changed, without
@@ -1276,6 +1360,10 @@ async fn run(inner: Weak<Inner>, notify: Arc<Notify>, key_map_changed: Arc<Notif
     // impairment that reports it.
     let mut problems = strong.connections.subscribe_problems();
     let mut own_status = strong.own_membership.subscribe_status();
+    let mut connectivity = strong.driver.subscribe_connectivity();
+    // Once the driver closes its stream the last verdict stands; the arm is
+    // disabled rather than polled.
+    let mut connectivity_open = true;
     drop(strong);
     let _guard = LivenessGuard {
         inner: inner.clone(),
@@ -1291,6 +1379,14 @@ async fn run(inner: Weak<Inner>, notify: Arc<Notify>, key_map_changed: Arc<Notif
             r = connections.changed() => if r.is_err() { return },
             r = problems.changed() => if r.is_err() { return },
             r = own_status.changed() => if r.is_err() { return },
+            verdict = connectivity.recv(), if connectivity_open => match verdict {
+                Some(connected) => {
+                    if let Some(strong) = inner.upgrade() {
+                        strong.set_homeserver_connected(connected);
+                    }
+                }
+                None => connectivity_open = false,
+            },
             // Also poked by the key-rejection callback: a rejection changes
             // no key, so nothing else would wake for it.
             _ = key_map_changed.notified() => {}
@@ -1351,6 +1447,7 @@ mod tests {
                 membership_ts: None,
                 display_name: None,
                 avatar_url: None,
+                event_id: None,
                 intent: None,
                 application_type: None,
                 transports: MemberTransports::default(),

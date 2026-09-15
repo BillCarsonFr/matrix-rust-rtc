@@ -138,6 +138,7 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
             membership_ts: None,
             display_name: None,
             avatar_url: None,
+            event_id: dispatch::event_id(event).map(str::to_owned),
             intent,
             application_type: application_type.map(str::to_owned),
             transports,

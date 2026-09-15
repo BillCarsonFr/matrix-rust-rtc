@@ -149,7 +149,12 @@ function createManager(b: Backend) {
   // one driver per room (subscribe handshake happens here, exactly once);
   // managers — one per slot — share it
   const matrixDriver = new FfiMatrixDriver(b.driver);
-  manager = new FfiParticipationManager(b.roomId, b.slotId, b.userId, b.deviceId, matrixDriver, FfiElementCallCompat.Off);
+  manager = new FfiParticipationManager(b.roomId, b.slotId, b.userId, b.deviceId, matrixDriver, {
+    compat: FfiElementCallCompat.Off,
+    manageMediaKeys: true,
+    requireCrossSignedSender: true,
+    useKeyDelayMs: 1000n,
+  });
   manager.setMembershipsListener({
     onMembershipsChange: (m) => {
       memberships = m;

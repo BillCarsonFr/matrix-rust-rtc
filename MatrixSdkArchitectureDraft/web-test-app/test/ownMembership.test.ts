@@ -77,6 +77,37 @@ describe("own membership", () => {
     expect(kinds.indexOf("delegateDelayedLeave")).toBeGreaterThan(kinds.indexOf("stickyEvent"));
     expect(driver.calls("delayedEvent")[0].delayMs).toBe(3_600_000n);
     expect(driver.calls("delegateDelayedLeave")[0].delayId).toBe(driver.calls("delayedEvent")[0].delayId);
+    // receive-only: no transport to name; the armed delay is passed along
+    expect(driver.calls("delegateDelayedLeave")[0].livekitServiceUrl).toBeUndefined();
+    expect(driver.calls("delegateDelayedLeave")[0].delayMs).toBe(driver.calls("delayedEvent")[0].delayMs);
+    await manager.leave(undefined, undefined);
+  });
+
+  it("updateApplication re-publishes the membership with the new intent", async () => {
+    const { driver, manager } = newManager();
+    await expect(manager.updateApplication("video")).rejects.toThrow();
+    await manager.join(receiveOnly(), { ...joinParams, intent: "audio" });
+    expect(driver.calls("stickyEvent")[0].content.application["m.call.intent"]).toBe("audio");
+    await manager.updateApplication("video");
+    await waitFor("re-publish", () => driver.calls("stickyEvent").length >= 2);
+    const republished = driver.calls("stickyEvent")[1].content;
+    expect(republished.application["m.call.intent"]).toBe("video");
+    expect(republished.member.id).toBe(manager.ownMemberId());
+    // the echo puts the new intent on our own tile
+    expect(manager.ownMembership()?.member.intent).toBe("video");
+    await manager.leave(undefined, undefined);
+  });
+
+  it("delegateDelayedLeave names the transport we publish on", async () => {
+    const { driver, manager } = newManager();
+    await manager.join(publishLk(), { ...joinParams, delegateDelayedLeave: true });
+    expect(driver.calls("delegateDelayedLeave")[0].livekitServiceUrl).toBe(LK_SERVICE_URL);
+    // the identity is known before the echo and matches what the roster says
+    const identity = manager.ownTransportIdentity();
+    expect(identity).toBeTypeOf("string");
+    await waitFor("own echo", () => manager.ownMembership() !== undefined);
+    expect(manager.ownMembership()!.transportIdentity).toBe(identity);
+    await manager.leave(undefined, undefined);
   });
 
   it("a slot close state update makes the manager leave with code slot_closed", async () => {

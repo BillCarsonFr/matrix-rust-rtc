@@ -8,10 +8,12 @@
 //! Room-state conditions are *opt-in*: "no slot state has been supplied" and
 //! "slot state supplied but this slot has none" are different things (the
 //! first leaves the condition unenforced, the second closes the slot), and
-//! the same goes for the room's joined members.
+//! the same goes for the room's joined members. A room without a slot is a
+//! room without a call, in every dialect: the client that starts the call
+//! opens the slot first.
 
 use super::convert::{CandidateSource, LEGACY_SLOT_ID, MemberCandidate, msc3401};
-use super::dispatch::Ingest;
+use super::dispatch::{Ingest, RoomMemberProfile};
 use super::slot::RawSlot;
 use super::sticky::{self, Outcome};
 use super::{JoinExclusionReason, SessionSnapshot, SlotState};
@@ -44,6 +46,10 @@ pub(crate) struct RoomState {
     room_encryption: Option<bool>,
     /// `None` = unenforced.
     room_members: Option<HashSet<String>>,
+    /// Display names and avatars from `m.room.member`, kept whether or not
+    /// the roster condition is enforced, and stamped onto members at
+    /// projection time so a rename republishes the snapshot.
+    profiles: HashMap<String, RoomMemberProfile>,
     /// Static path: the first `m.room.member` event supplies the set. Live:
     /// only the seed does — a single live event is not the room's roster.
     infer_room_members: bool,
@@ -73,6 +79,7 @@ impl RoomState {
             slot_state_supplied: false,
             room_encryption: None,
             room_members: None,
+            profiles: HashMap::new(),
             infer_room_members,
             expired: Vec::new(),
         }
@@ -104,6 +111,31 @@ impl RoomState {
             );
             self.room_members = Some(HashSet::new());
         }
+    }
+
+    /// Remember what an `m.room.member` event says the user is called; an
+    /// event carrying neither field forgets a previous profile. Returns
+    /// whether anything a projection would show has changed.
+    fn record_profile(&mut self, user_id: &str, profile: RoomMemberProfile) -> bool {
+        if profile.is_empty() {
+            return self.profiles.remove(user_id).is_some();
+        }
+        match self.profiles.get(user_id) {
+            Some(existing) if *existing == profile => false,
+            _ => {
+                self.profiles.insert(user_id.to_owned(), profile);
+                true
+            }
+        }
+    }
+
+    /// The member with its room profile stamped on (`None`s stay `None`).
+    fn with_profile(&self, mut member: crate::types::Member) -> crate::types::Member {
+        if let Some(profile) = self.profiles.get(&member.user_id) {
+            member.display_name = profile.display_name.clone();
+            member.avatar_url = profile.avatar_url.clone();
+        }
+        member
     }
 
     /// Forget the previous transition's `Expired` report. Call once at the
@@ -191,29 +223,41 @@ impl RoomState {
                 }
                 Changed::from_bool(changed)
             }
-            Ingest::RoomMember { user_id, joined } => match &mut self.room_members {
-                Some(members) => {
-                    let changed = if joined {
-                        members.insert(user_id.clone())
-                    } else {
-                        members.remove(&user_id)
-                    };
-                    if changed {
-                        log::debug!("[{room}] room member {user_id}: joined={joined}");
+            Ingest::RoomMember {
+                user_id,
+                joined,
+                profile,
+            } => {
+                let profile_changed = self.record_profile(&user_id, profile);
+                let roster_changed = match &mut self.room_members {
+                    Some(members) => {
+                        let changed = if joined {
+                            members.insert(user_id.clone())
+                        } else {
+                            members.remove(&user_id)
+                        };
+                        if changed {
+                            log::debug!("[{room}] room member {user_id}: joined={joined}");
+                        }
+                        changed
                     }
-                    Changed::from_bool(changed)
-                }
-                None if self.infer_room_members => {
-                    self.supply_room_members();
-                    self.ingest(Ingest::RoomMember { user_id, joined }, now)
-                }
-                None => {
-                    log::trace!(
-                        "[{room}] room member {user_id} ignored: room members not supplied"
-                    );
-                    Changed::No
-                }
-            },
+                    None if self.infer_room_members => {
+                        self.supply_room_members();
+                        self.room_members
+                            .as_mut()
+                            .expect("just supplied")
+                            .insert(user_id.clone());
+                        joined
+                    }
+                    None => {
+                        log::trace!(
+                            "[{room}] room member {user_id}: roster ignored, room members not supplied"
+                        );
+                        false
+                    }
+                };
+                Changed::from_bool(profile_changed || roster_changed)
+            }
             Ingest::RoomEncryption => {
                 let changed = self.room_encryption != Some(true);
                 if changed {
@@ -399,11 +443,14 @@ impl RoomState {
         SessionSnapshot {
             room_id: self.room_id.clone(),
             slot_id: slot_id.to_owned(),
-            members: joined.into_iter().map(|c| c.member).collect(),
+            members: joined
+                .into_iter()
+                .map(|c| self.with_profile(c.member))
+                .collect(),
             transports,
             excluded_candidates: excluded
                 .into_iter()
-                .map(|(c, reason)| (c.member, reason))
+                .map(|(c, reason)| (self.with_profile(c.member), reason))
                 .collect(),
             slot_state,
             negotiated_encryption,
@@ -464,6 +511,7 @@ impl RoomState {
             "known_slots": self.slots.keys().collect::<BTreeSet<_>>(),
             "room_encryption": self.room_encryption,
             "room_members_known": self.room_members.as_ref().map(HashSet::len),
+            "room_member_profiles_known": self.profiles.len(),
             "negotiated_encryption": self.negotiated_encryption(slot_id),
             "joined_count": snapshot.members.len(),
             "joined": snapshot.members.iter().map(|m| m.member_id.clone()).collect::<Vec<_>>(),
@@ -838,6 +886,53 @@ mod tests {
             Changed::No
         );
         assert_eq!(joined(&s), vec!["m-a"]);
+    }
+
+    #[test]
+    fn room_member_profiles_reach_projected_members_and_follow_renames() {
+        let mut s = live();
+        apply(
+            &mut s,
+            member_join_event("@a:x", "m-a", NOW),
+            encrypted("A"),
+        );
+        assert_eq!(s.project(SLOT_ID).members[0].display_name, None);
+        // A profile counts even while the roster condition is unenforced.
+        assert_eq!(
+            apply(
+                &mut s,
+                room_member_profile_event("@a:x", "join", NOW, Some("Alice"), Some("mxc://x/a")),
+                EventOrigin::Cleartext,
+            ),
+            Changed::Yes
+        );
+        let member = &s.project(SLOT_ID).members[0];
+        assert_eq!(member.display_name.as_deref(), Some("Alice"));
+        assert_eq!(member.avatar_url.as_deref(), Some("mxc://x/a"));
+        // The same profile again changes nothing; a rename does.
+        assert_eq!(
+            apply(
+                &mut s,
+                room_member_profile_event("@a:x", "join", NOW, Some("Alice"), Some("mxc://x/a")),
+                EventOrigin::Cleartext,
+            ),
+            Changed::No
+        );
+        apply(
+            &mut s,
+            room_member_profile_event("@a:x", "join", NOW, Some("Alicia"), None),
+            EventOrigin::Cleartext,
+        );
+        let member = &s.project(SLOT_ID).members[0];
+        assert_eq!(member.display_name.as_deref(), Some("Alicia"));
+        assert_eq!(member.avatar_url, None);
+        // Enforcing the roster afterwards keeps the profile on the excluded entry too.
+        s.supply_room_members();
+        let snapshot = s.project(SLOT_ID);
+        assert_eq!(
+            snapshot.excluded_candidates[0].0.display_name.as_deref(),
+            Some("Alicia")
+        );
     }
 
     #[test]

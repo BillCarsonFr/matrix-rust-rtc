@@ -8,7 +8,9 @@ import {
   FfiDisconnectCause,
   FfiKeepAlive,
   FfiMembershipState,
+  FfiSeverity,
   FfiStatus,
+  impairmentSeverity,
   type FfiMembership,
 } from "../src/generated/matrix_rtc";
 import { LK_SERVICE_URL, OWN_USER_ID, ROOM_ID, memberJoinEvent, tick, waitFor } from "../src/mockDriver";
@@ -162,6 +164,35 @@ describe("ParticipationManager", () => {
     expect(manager.session().seeded).toBe(true);
     expect(manager.session().failedReads).toEqual([]);
     expect(manager.session().excludedCandidates).toEqual([]);
+  });
+
+  it("losing the homeserver is a critical impairment until it is back", async () => {
+    const { driver, manager } = newManager();
+    expect(manager.isHomeserverConnected()).toBe(true);
+    await manager.join(receiveOnly(), joinParams);
+    const statuses: FfiStatus[] = [];
+    manager.setStatusListener({ onStatusChange: (s) => statuses.push(s) });
+
+    driver.setHomeserverConnected(false);
+    await waitFor("outage reported", () => {
+      const status = manager.status();
+      return FfiStatus.Connected.instanceOf(status) && status.inner.impairments[0]?.tag === "HomeserverUnreachable";
+    });
+    expect(manager.isHomeserverConnected()).toBe(false);
+    const status = manager.status();
+    if (!FfiStatus.Connected.instanceOf(status)) throw new Error("expected Connected");
+    expect(impairmentSeverity(status.inner.impairments[0])).toBe(FfiSeverity.Critical);
+    await waitFor("listener saw it", () =>
+      statuses.some((s) => !FfiStatus.Disconnected.instanceOf(s) && s.inner.impairments.some((i) => i.tag === "HomeserverUnreachable")),
+    );
+
+    driver.setHomeserverConnected(true);
+    await waitFor("outage clears", () => {
+      const s = manager.status();
+      return FfiStatus.Connected.instanceOf(s) && s.inner.impairments.length === 0;
+    });
+    expect(manager.isHomeserverConnected()).toBe(true);
+    await manager.leave(undefined, undefined);
   });
 
   it("debugSnapshot is JSON with every part", async () => {
