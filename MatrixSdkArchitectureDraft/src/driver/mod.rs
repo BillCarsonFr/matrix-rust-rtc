@@ -74,21 +74,36 @@ pub struct LivekitTokenResponse {
     pub url: Option<String>,
 }
 
-/// MSC4195 `POST /rtc/livekit/delegate_delayed_leave` — hands the dead man's
-/// switch to the SFU.
-#[derive(Clone, Debug)]
-pub struct DelegatedDelayedLeaveRequest {
+/// MSC4195 through the homeserver's CS API: one authenticated
+/// `POST .../rtc/livekit/delegate_delayed_leave`. The crate tries this route
+/// first; an adapter that cannot make authenticated homeserver calls (a
+/// widget client) answers [`DriverError::Unsupported`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct HomeserverDelegationRequest {
+    pub room_id: String,
+    pub slot_id: String,
+    /// MSC4195 member claims `{ id, claimed_user_id, claimed_device_id }`.
+    pub member: Value,
+    pub delay_id: String,
+}
+
+/// MSC4195 through the MatrixRTC authorisation service's token endpoint —
+/// the route Element Call has always used: the `get_token` (or, with
+/// `legacy_sfu_get`, `sfu/get`) call the adapter already makes, with
+/// `delay_id`, `delay_timeout` and the adapter's own CS API URL added so the
+/// service restarts the delayed leave while we are connected. The token in
+/// the answer is discarded. The crate tries this when the homeserver route
+/// failed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransportDelegationRequest {
+    /// The transport we publish on.
+    pub livekit_service_url: String,
     pub room_id: String,
     pub slot_id: String,
     pub member: Value,
     pub delay_id: String,
-    /// The `livekit_service_url` we publish on, when we publish: the MatrixRTC
-    /// authorisation service is what performs the delegation, and an adapter
-    /// that delegates *through* it (Element Call's `get_token` with
-    /// `delay_id`) needs to know which one.
-    pub livekit_service_url: Option<String>,
-    /// The armed delay, for adapters whose delegation call takes it.
-    pub delay_ms: u64,
+    pub delay_timeout_ms: u64,
+    pub legacy_sfu_get: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -200,10 +215,17 @@ pub trait OwnMembershipDriver: Send + Sync {
         delay_id: String,
     ) -> Result<(), DriverError>;
 
-    /// MSC4195: delegate the delayed leave to the SFU.
-    async fn delegate_livekit_delayed_leave(
+    /// MSC4195 via the homeserver (see [`HomeserverDelegationRequest`]).
+    async fn delegate_delayed_leave_via_homeserver(
         &self,
-        request: DelegatedDelayedLeaveRequest,
+        request: HomeserverDelegationRequest,
+    ) -> Result<(), DriverError>;
+
+    /// MSC4195 via the authorisation service (see
+    /// [`TransportDelegationRequest`]).
+    async fn delegate_delayed_leave_via_transport(
+        &self,
+        request: TransportDelegationRequest,
     ) -> Result<(), DriverError>;
 }
 

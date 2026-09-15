@@ -50,12 +50,12 @@ describe("session", () => {
     await waitFor("expiry", () => manager.memberships().length === 0, 1500);
   });
 
-  it("a room without a slot has no call until a client opens one, in every dialect", async () => {
+  it("a room without a slot has no call until a client opens one", async () => {
     // No slot = no call: members are excluded and join is refused. The
     // client that starts the call opens the slot (a state event the
     // homeserver echoes), after which both work.
-    for (const compat of [FfiElementCallCompat.Off, FfiElementCallCompat.StickyEvents]) {
-      const { driver, manager } = newManager({ compat, roomState: [] });
+    {
+      const { driver, manager } = newManager({ roomState: [] });
       await waitFor("seeded", () => manager.session().seeded);
       expect(manager.session().slotOpen).toBe(false);
       driver.emitRoomEvent(memberJoinEvent(remote), encrypted("RDEV"));

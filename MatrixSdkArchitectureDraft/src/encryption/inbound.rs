@@ -102,6 +102,11 @@ pub struct InboundKeys {
     /// (`ErrorSurfaceAnalysis.md` §4.1); latching it is what puts it in
     /// `Status`, where a UI attaching late still finds it.
     rejections: HashMap<String, (KeyRejection, u64)>,
+    /// The MSC4153 verdict (`sender_cross_signed`) the host reported for the
+    /// last key we *accepted* from each member. With
+    /// `require_cross_signed_sender` off an unsigned sender's key is
+    /// accepted, and this is how a tile can still say so.
+    verdicts: HashMap<String, Option<bool>>,
 }
 
 impl InboundKeys {
@@ -122,6 +127,7 @@ impl InboundKeys {
             filter: OutdatedKeyFilter::default(),
             early: Vec::new(),
             rejections: HashMap::new(),
+            verdicts: HashMap::new(),
         }
     }
 
@@ -142,6 +148,13 @@ impl InboundKeys {
         self.key_map
             .get(member_id)
             .is_some_and(|ring| !ring.is_empty())
+    }
+
+    /// Whether the device that sent the key we hold from this member was
+    /// cross-signed by its owner (MSC4153): `Some(verdict)` once a key was
+    /// accepted and the host could tell, `None` otherwise.
+    pub fn sender_cross_signed(&self, member_id: &str) -> Option<bool> {
+        self.verdicts.get(member_id).copied().flatten()
     }
 
     /// The latched reason this member's last key was discarded.
@@ -336,6 +349,14 @@ impl InboundKeys {
         Self::verify_against_member(&key, member)?;
         if self.filter.check_and_add(&member.member_id, key.index, now) {
             return Err(KeyRejection::Outdated);
+        }
+        if let KeyOrigin::Encrypted {
+            sender_cross_signed,
+            ..
+        } = &key.origin
+        {
+            self.verdicts
+                .insert(member.member_id.clone(), *sender_cross_signed);
         }
         let media_key = MediaKey {
             key: key.key,

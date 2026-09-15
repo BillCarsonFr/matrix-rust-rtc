@@ -1,10 +1,5 @@
-//! `m.rtc.member` sticky events (stable and unstable types) -> candidates.
-//!
-//! Spec-shaped content is what this file is written for. The permissive
-//! read of the 2025 Element Call dialect is folded in at the top
-//! ([`fill_from_2025_dialect`], one delete-by-date block): it only ever
-//! *adds* a modern field that is absent, so spec-shaped content passes
-//! through byte-identical and the rest of the file never sees a dialect.
+//! `m.rtc.member` sticky events (stable and unstable types) -> candidates,
+//! spec-shaped (MSC4143) content only.
 
 use super::{CandidateMembership, CandidateSource, MemberCandidate};
 use crate::session::dispatch;
@@ -12,7 +7,7 @@ use crate::types::{
     DeviceAttribution, EventOrigin, LeaveReason, Member, MemberTransports, RawMatrixEvent,
     RtcTransport,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 /// What one `m.rtc.member` event contributes.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,8 +32,7 @@ pub(crate) enum Msc4143Conversion {
 /// encrypted in an encrypted room, still sticky) are applied by the session.
 pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversion> {
     let sender = dispatch::sender(event)?;
-    let mut content = dispatch::content(event)?.clone();
-    fill_from_2025_dialect(&mut content);
+    let content = dispatch::content(event)?.clone();
     let object = content.as_object()?;
 
     let sticky_key = sticky_key_of(object);
@@ -95,12 +89,7 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
         log::warn!("m.rtc.member from {sender} has sticky_key '{sticky_key}' != member.id '{id}'");
     }
 
-    let claimed_device = member
-        .get("device_id")
-        .and_then(Value::as_str)
-        .filter(|d| !d.is_empty())
-        .map(str::to_owned);
-    let (device_id, device_attribution) = attribute_device(&event.origin, claimed_device);
+    let (device_id, device_attribution) = attribute_device(&event.origin);
 
     let intent = application
         .and_then(|a| a.get("m.call.intent"))
@@ -164,24 +153,15 @@ pub(crate) fn member_candidate(event: &RawMatrixEvent) -> Option<Msc4143Conversi
     })
 }
 
-/// The device a member is bound to, and how much that binding is worth.
-///
-/// A device from decryption metadata always wins. A device the content
-/// merely *claims* (`member.device_id`, 2025 dialect) is used only where the
-/// origin names none — it is unauthenticated, so it narrows what inbound keys
-/// are accepted from but never satisfies an encryption rule.
-fn attribute_device(
-    origin: &EventOrigin,
-    claimed: Option<String>,
-) -> (Option<String>, DeviceAttribution) {
+/// The device a member is bound to, and how much that binding is worth: only
+/// decryption metadata can name one for a sticky member event (MSC4143
+/// content carries no device), so it is `Verified` or nothing.
+fn attribute_device(origin: &EventOrigin) -> (Option<String>, DeviceAttribution) {
     match origin {
         EventOrigin::Encrypted {
             sender_device_id: Some(device_id),
         } => (Some(device_id.clone()), DeviceAttribution::Verified),
-        _ => match claimed {
-            Some(device_id) => (Some(device_id), DeviceAttribution::Claimed),
-            None => (None, DeviceAttribution::Unknown),
-        },
+        _ => (None, DeviceAttribution::Unknown),
     }
 }
 
@@ -240,101 +220,10 @@ pub(crate) fn parse_transport(entry: &Value) -> Option<RtcTransport> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// 2025 Element Call sticky dialect — delete this block with that generation.
-//
-// Same event type, same `slot_id`, same `application` object. Differences:
-// `member: {user_id, device_id, id}` with no `membership`; a flat
-// `rtc_transports` array instead of `transports`; `versions` / `m.relation`
-// extras (ignored). A leave is content holding nothing but the sticky key,
-// which is the MSC4354 removal and needs no dialect code. The claimed
-// `member.device_id` is read by `member_candidate` above.
-// ---------------------------------------------------------------------------
-
-/// Fill absent modern fields from their 2025-dialect counterparts, in place.
-/// Every rule fires only when the modern field is absent *and* the legacy one
-/// is present, so spec-shaped content comes out untouched.
-fn fill_from_2025_dialect(content: &mut Value) {
-    let Some(object) = content.as_object_mut() else {
-        return;
-    };
-    // Without a slot id this is a removal or garbage; neither is dressed up.
-    if !object.contains_key("slot_id") {
-        return;
-    }
-    lift_rtc_transports(object);
-    infer_membership(object);
-}
-
-/// `rtc_transports: [...]` → `transports: {published: [...], can_subscribe: [...]}`,
-/// with `can_subscribe` the deduplicated `type`s of the array (an Element Call
-/// client publishing on LiveKit can receive LiveKit).
-fn lift_rtc_transports(object: &mut Map<String, Value>) {
-    if object.contains_key("transports") {
-        return;
-    }
-    let Some(published) = object
-        .get("rtc_transports")
-        .and_then(Value::as_array)
-        .cloned()
-    else {
-        return;
-    };
-    if published.is_empty() {
-        return;
-    }
-    let mut can_subscribe: Vec<Value> = Vec::new();
-    for transport in &published {
-        let Some(transport_type) = transport.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        let entry = Value::String(transport_type.to_owned());
-        if !can_subscribe.contains(&entry) {
-            can_subscribe.push(entry);
-        }
-    }
-    object.insert(
-        "transports".to_owned(),
-        json!({ "published": published, "can_subscribe": can_subscribe }),
-    );
-}
-
-/// Give a legacy member object the `membership` MSC4143 now requires.
-///
-/// Only `join` is ever inferred, and only when the content names an
-/// application and a member id. A legacy content that does not look like a
-/// join is left without a membership, which reads as left — writing `"leave"`
-/// in would be inventing a statement the sender never made.
-fn infer_membership(object: &mut Map<String, Value>) {
-    let names_application = object
-        .get("application")
-        .and_then(|application| application.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|t| !t.is_empty());
-    if !names_application {
-        return;
-    }
-    let Some(member) = object.get_mut("member").and_then(Value::as_object_mut) else {
-        return;
-    };
-    if member.contains_key("membership") {
-        return;
-    }
-    let names_member = member
-        .get("id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty());
-    if !names_member {
-        return;
-    }
-    member.insert("membership".to_owned(), Value::String("join".to_owned()));
-}
-
-// --------------------------------------------------------------------------- end of dialect block
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// A spec-shaped join event as another client would send it on the wire.
     const JOIN_JSON: &str = r#"{
@@ -570,76 +459,7 @@ mod tests {
         }
     }
 
-    // -- 2025 dialect --------------------------------------------------------
-
-    /// A join exactly as observed from Element Call on the JS SDK.
-    const LEGACY_JOIN: &str = r#"{
-        "application": { "type": "m.call", "m.call.intent": "video" },
-        "slot_id": "m.call#ROOM",
-        "rtc_transports": [
-            { "type": "livekit", "livekit_service_url": "https://mrtc.example.io" }
-        ],
-        "member": {
-            "device_id": "V5cP8FErcB",
-            "user_id": "@alice:example.io",
-            "id": "41065006-4d3e-49ab-8c7a-3c8471ef6bec"
-        },
-        "versions": [],
-        "msc4354_sticky_key": "41065006-4d3e-49ab-8c7a-3c8471ef6bec"
-    }"#;
-
-    fn filled(json: &str) -> Value {
-        let mut value: Value = serde_json::from_str(json).unwrap();
-        fill_from_2025_dialect(&mut value);
-        value
-    }
-
-    #[test]
-    fn legacy_join_gains_a_membership_and_typed_transports() {
-        let value = filled(LEGACY_JOIN);
-        assert_eq!(value.pointer("/member/membership").unwrap(), "join");
-        assert_eq!(
-            value
-                .pointer("/transports/published/0/livekit_service_url")
-                .unwrap(),
-            "https://mrtc.example.io"
-        );
-        assert_eq!(
-            value.pointer("/transports/can_subscribe/0").unwrap(),
-            "livekit"
-        );
-        // The legacy fields stay where they were; nothing downstream reads them.
-        assert!(value.get("rtc_transports").is_some());
-
-        let c = candidate(LEGACY_JOIN);
-        assert!(c.is_join());
-        assert_eq!(
-            c.member.transports.can_subscribe,
-            vec!["livekit".to_owned()]
-        );
-        assert_eq!(
-            c.member.transports.published[0].properties["livekit_service_url"],
-            "https://mrtc.example.io"
-        );
-    }
-
-    /// The whole point of the fill being unconditional: it must be a no-op on
-    /// spec-shaped content.
-    #[test]
-    fn spec_shaped_join_is_untouched() {
-        let before: Value = serde_json::from_str(JOIN_JSON).unwrap();
-        assert_eq!(filled(JOIN_JSON), before);
-    }
-
-    /// A spec leave states `membership: "leave"`, and no amount of legacy
-    /// inference may promote it to a join.
-    #[test]
-    fn spec_leave_is_untouched() {
-        let json = JOIN_JSON.replace(r#""membership": "join""#, r#""membership": "leave""#);
-        let before: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(filled(&json), before);
-        assert_eq!(candidate(&json).membership, CandidateMembership::Leave);
-    }
+    // -- removals ------------------------------------------------------------
 
     #[test]
     fn bare_sticky_key_leave_is_a_removal() {
@@ -662,90 +482,5 @@ mod tests {
     #[test]
     fn content_missing_everything_is_left_to_fail_normally() {
         assert!(convert(r#"{ "member": { "id": "abc" } }"#).is_none());
-    }
-
-    /// A join is only inferred when the content names an application, which
-    /// is what MSC4143 requires of a join anyway.
-    #[test]
-    fn membership_is_not_inferred_without_an_application() {
-        let json = LEGACY_JOIN.replace(
-            r#""application": { "type": "m.call", "m.call.intent": "video" },"#,
-            "",
-        );
-        assert!(filled(&json).pointer("/member/membership").is_none());
-        assert_eq!(candidate(&json).membership, CandidateMembership::Leave);
-    }
-
-    #[test]
-    fn claimed_device_is_read_only_when_stated() {
-        let content: Value = serde_json::from_str(LEGACY_JOIN).unwrap();
-        let spec: Value = serde_json::from_str(JOIN_JSON).unwrap();
-
-        // Nothing decrypted: the claim is all there is.
-        let c = candidate_of(content.clone(), EventOrigin::Unknown);
-        assert_eq!(c.member.device_id.as_deref(), Some("V5cP8FErcB"));
-        assert_eq!(c.member.device_attribution, DeviceAttribution::Claimed);
-        // Cleartext + claim → still Claimed (and the origin still says cleartext).
-        let c = candidate_of(content.clone(), EventOrigin::Cleartext);
-        assert_eq!(c.member.device_attribution, DeviceAttribution::Claimed);
-        assert_eq!(c.origin, EventOrigin::Cleartext);
-        // Encrypted but unattributed + claim → Claimed.
-        let c = candidate_of(
-            content.clone(),
-            EventOrigin::Encrypted {
-                sender_device_id: None,
-            },
-        );
-        assert_eq!(c.member.device_id.as_deref(), Some("V5cP8FErcB"));
-        assert_eq!(c.member.device_attribution, DeviceAttribution::Claimed);
-        // Spec content claims nothing.
-        let c = candidate_of(spec.clone(), EventOrigin::Unknown);
-        assert_eq!(c.member.device_id, None);
-        assert_eq!(c.member.device_attribution, DeviceAttribution::Unknown);
-    }
-
-    #[test]
-    fn prefers_the_decrypted_device_over_the_claimed_one() {
-        let content: Value = serde_json::from_str(LEGACY_JOIN).unwrap();
-        let c = candidate_of(content, encrypted("ALICEDEVICE"));
-        assert_eq!(c.member.device_id.as_deref(), Some("ALICEDEVICE"));
-        assert_eq!(c.member.device_attribution, DeviceAttribution::Verified);
-    }
-
-    #[test]
-    fn empty_rtc_transports_inserts_nothing_and_typeless_entries_are_skipped() {
-        let json = LEGACY_JOIN.replace(
-            r#"[
-            { "type": "livekit", "livekit_service_url": "https://mrtc.example.io" }
-        ]"#,
-            "[]",
-        );
-        assert!(filled(&json).get("transports").is_none());
-
-        let json = LEGACY_JOIN.replace(
-            r#"{ "type": "livekit", "livekit_service_url": "https://mrtc.example.io" }"#,
-            r#"{ "type": "livekit", "livekit_service_url": "https://a" }, { "livekit_service_url": "https://b" }, { "type": "livekit", "livekit_service_url": "https://c" }"#,
-        );
-        let value = filled(&json);
-        assert_eq!(
-            value.pointer("/transports/can_subscribe").unwrap(),
-            &json!(["livekit"])
-        );
-        assert_eq!(
-            value
-                .pointer("/transports/published")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .len(),
-            3
-        );
-    }
-
-    fn candidate_of(content: Value, origin: EventOrigin) -> MemberCandidate {
-        match member_candidate(&event_with(content, origin)) {
-            Some(Msc4143Conversion::Candidate { candidate, .. }) => candidate,
-            other => panic!("{other:?}"),
-        }
     }
 }

@@ -12,22 +12,6 @@ beforeAll(async () => {
 });
 
 describe("own membership", () => {
-  it("join in StickyEvents compat adds rtc_transports, versions and member.user_id/device_id", async () => {
-    const { driver, manager } = newManager({ compat: FfiElementCallCompat.StickyEvents });
-    await manager.join(publishLk(), joinParams);
-    const content = driver.calls("stickyEvent")[0].content;
-    expect(content.rtc_transports).toEqual([{ type: "livekit", livekit_service_url: LK_SERVICE_URL }]);
-    expect(content.versions).toEqual([]);
-    expect(content.member.user_id).toBe(OWN_USER_ID);
-    expect(content.member.device_id).toBe(OWN_DEVICE_ID);
-    // the spec fields stay
-    expect(content.member.membership).toBe("join");
-    expect(content.transports.published).toHaveLength(1);
-    await manager.leave(undefined, undefined);
-    // a legacy leave is a bare sticky key
-    expect(driver.calls("stickyEvent")[1].content).toEqual({ msc4354_sticky_key: content.member.id });
-  });
-
   it("join in StateEvents compat sends a state event with an underscore state key and a user:device member id", async () => {
     // The legacy generation has no slot: the manager is created for "".
     const { driver, manager } = newManager({ compat: FfiElementCallCompat.StateEvents, slotId: "", roomState: [] });
@@ -70,19 +54,6 @@ describe("own membership", () => {
     expect(manager.memberships().some((m) => m.member.userId === OWN_USER_ID)).toBe(false);
   });
 
-  it("delegateDelayedLeave is called after the membership when requested, with a ≥ 1 h delay", async () => {
-    const { driver, manager } = newManager();
-    await manager.join(receiveOnly(), { ...joinParams, delegateDelayedLeave: true });
-    const kinds = driver.outbound.map((c) => c.kind);
-    expect(kinds.indexOf("delegateDelayedLeave")).toBeGreaterThan(kinds.indexOf("stickyEvent"));
-    expect(driver.calls("delayedEvent")[0].delayMs).toBe(3_600_000n);
-    expect(driver.calls("delegateDelayedLeave")[0].delayId).toBe(driver.calls("delayedEvent")[0].delayId);
-    // receive-only: no transport to name; the armed delay is passed along
-    expect(driver.calls("delegateDelayedLeave")[0].livekitServiceUrl).toBeUndefined();
-    expect(driver.calls("delegateDelayedLeave")[0].delayMs).toBe(driver.calls("delayedEvent")[0].delayMs);
-    await manager.leave(undefined, undefined);
-  });
-
   it("updateApplication re-publishes the membership with the new intent", async () => {
     const { driver, manager } = newManager();
     await expect(manager.updateApplication("video")).rejects.toThrow();
@@ -98,15 +69,51 @@ describe("own membership", () => {
     await manager.leave(undefined, undefined);
   });
 
-  it("delegateDelayedLeave names the transport we publish on", async () => {
+  it("delegation arms a long leave after the join, tries the homeserver, then swaps out the short leave", async () => {
     const { driver, manager } = newManager();
+    await manager.join(receiveOnly(), { ...joinParams, delegateDelayedLeave: true });
+    const kinds = driver.outbound.map((c) => c.kind);
+    // short leave · join · long leave · homeserver delegation · cancel of the short one
+    expect(kinds).toEqual(["delayedEvent", "stickyEvent", "delayedEvent", "delegateViaHomeserver", "cancelDelayed"]);
+    const [short, long] = driver.calls("delayedEvent");
+    expect(short.delayMs).toBe(15_000n);
+    expect(long.delayMs).toBe(3_600_000n);
+    expect(driver.calls("delegateViaHomeserver")[0].delayId).toBe(long.delayId);
+    expect(driver.calls("cancelDelayed")[0].delayId).toBe(short.delayId);
+    const status = manager.status();
+    if (!FfiStatus.Connected.instanceOf(status)) throw new Error("expected Connected");
+    expect(status.inner.keepAlive.tag).toBe("Delegated");
+    await manager.leave(undefined, undefined);
+  });
+
+  it("delegation falls back to the authorisation service of the transport we publish on", async () => {
+    const { driver, manager } = newManager();
+    driver.refuseHomeserverDelegation = true;
     await manager.join(publishLk(), { ...joinParams, delegateDelayedLeave: true });
-    expect(driver.calls("delegateDelayedLeave")[0].livekitServiceUrl).toBe(LK_SERVICE_URL);
-    // the identity is known before the echo and matches what the roster says
-    const identity = manager.ownTransportIdentity();
-    expect(identity).toBeTypeOf("string");
-    await waitFor("own echo", () => manager.ownMembership() !== undefined);
-    expect(manager.ownMembership()!.transportIdentity).toBe(identity);
+    const viaTransport = driver.calls("delegateViaTransport")[0];
+    expect(viaTransport.livekitServiceUrl).toBe(LK_SERVICE_URL);
+    expect(viaTransport.delayTimeoutMs).toBe(3_600_000n);
+    expect(viaTransport.legacySfuGet).toBe(false);
+    expect(viaTransport.delayId).toBe(driver.calls("delayedEvent")[1].delayId);
+    // the short leave is the one cancelled
+    expect(driver.calls("cancelDelayed")[0].delayId).toBe(driver.calls("delayedEvent")[0].delayId);
+    const status = manager.status();
+    if (!FfiStatus.Connected.instanceOf(status)) throw new Error("expected Connected");
+    expect(status.inner.keepAlive.tag).toBe("Delegated");
+    await manager.leave(undefined, undefined);
+  });
+
+  it("when no route takes the delegation the short leave stays and the long one is cancelled", async () => {
+    const { driver, manager } = newManager();
+    driver.refuseHomeserverDelegation = true;
+    driver.refuseTransportDelegation = true;
+    await manager.join(publishLk(), { ...joinParams, delegateDelayedLeave: true, keepAliveTimeoutMs: 60n });
+    expect(driver.calls("cancelDelayed")[0].delayId).toBe(driver.calls("delayedEvent")[1].delayId);
+    const status = manager.status();
+    if (!FfiStatus.Connected.instanceOf(status)) throw new Error("expected Connected");
+    expect(status.inner.keepAlive.tag).toBe("Armed");
+    // ...and we keep restarting the short one ourselves
+    await waitFor("restart", () => driver.calls("restartDelayed").some((c) => c.delayId === driver.calls("delayedEvent")[0].delayId), 500);
     await manager.leave(undefined, undefined);
   });
 

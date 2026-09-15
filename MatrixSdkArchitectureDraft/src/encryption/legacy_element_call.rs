@@ -1,7 +1,6 @@
 //! The pre-2026 Element Call key message, `io.element.call.encryption_keys`
-//! (`ElementCallCompat::StateEvents` *and* `StickyEvents`: the deployed
-//! sticky-event generation kept this key message). Delete-by date: this file
-//! plus the two dispatch arms in [`super::matrix_encryption_event`].
+//! (`ElementCallCompat::StateEvents`). Delete-by date: this file plus the
+//! two dispatch arms in [`super::matrix_encryption_event`].
 //!
 //! Differences to MSC4143: the type; `keys` (an object today, historically an
 //! array — highest index wins); `member.id` plus a `claimed_device_id` and

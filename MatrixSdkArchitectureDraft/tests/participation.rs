@@ -66,7 +66,8 @@ enum Call {
     },
     Restart(String),
     Cancel(String),
-    Delegate(String),
+    DelegateViaHomeserver(String),
+    DelegateViaTransport(TransportDelegationRequest),
     ToDevice {
         recipients: Vec<ToDeviceRecipient>,
         event_type: String,
@@ -105,6 +106,8 @@ struct Mock {
     fail_slot_read: AtomicBool,
     /// The homeserver is unreachable while set (`ConnectivityDriver`).
     disconnected: AtomicBool,
+    /// The homeserver has no MSC4195 endpoint while set.
+    refuse_homeserver_delegation: AtomicBool,
     connectivity: Mutex<Vec<UnboundedSender<bool>>>,
 }
 
@@ -352,11 +355,22 @@ impl OwnMembershipDriver for Mock {
         Ok(())
     }
 
-    async fn delegate_livekit_delayed_leave(
+    async fn delegate_delayed_leave_via_homeserver(
         &self,
-        request: DelegatedDelayedLeaveRequest,
+        request: HomeserverDelegationRequest,
     ) -> Result<(), DriverError> {
-        self.record(Call::Delegate(request.delay_id));
+        self.record(Call::DelegateViaHomeserver(request.delay_id));
+        if self.refuse_homeserver_delegation.load(Ordering::Relaxed) {
+            return Err(DriverError::Unsupported("no such endpoint".into()));
+        }
+        Ok(())
+    }
+
+    async fn delegate_delayed_leave_via_transport(
+        &self,
+        request: TransportDelegationRequest,
+    ) -> Result<(), DriverError> {
+        self.record(Call::DelegateViaTransport(request));
         Ok(())
     }
 }

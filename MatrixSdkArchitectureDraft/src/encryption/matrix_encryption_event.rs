@@ -25,15 +25,10 @@ pub fn is_key_event_type(event_type: &str) -> bool {
         || event_type == super::legacy_element_call::LEGACY_KEY_EVENT_TYPE
 }
 
-/// The event type our key messages go out as, per compat mode. Both
-/// pre-2026 dialects share one key message (the js-sdk transport never
-/// changed when memberships moved from state to sticky events), so both
-/// compat modes send it; only spec `Off` sends the MSC4143 message.
+/// The event type our key messages go out as, per compat mode.
 pub fn outbound_event_type(compat: ElementCallCompat) -> &'static str {
     match compat {
-        ElementCallCompat::StateEvents | ElementCallCompat::StickyEvents => {
-            super::legacy_element_call::LEGACY_KEY_EVENT_TYPE
-        }
+        ElementCallCompat::StateEvents => super::legacy_element_call::LEGACY_KEY_EVENT_TYPE,
         // Deployed clients read the unstable spelling.
         ElementCallCompat::Off => crate::types::wire_event_type(KEY_EVENT_TYPE),
     }
@@ -88,16 +83,14 @@ pub fn build_content(
     now_ms: u64,
 ) -> Value {
     match compat {
-        ElementCallCompat::StateEvents | ElementCallCompat::StickyEvents => {
-            super::legacy_element_call::build_content(
-                room_id,
-                slot_id,
-                own_member_id,
-                own_device_id,
-                key,
-                now_ms,
-            )
-        }
+        ElementCallCompat::StateEvents => super::legacy_element_call::build_content(
+            room_id,
+            slot_id,
+            own_member_id,
+            own_device_id,
+            key,
+            now_ms,
+        ),
         ElementCallCompat::Off => json!({
             "room_id": room_id,
             "member_id": own_member_id,
@@ -206,15 +199,10 @@ mod tests {
             outbound_event_type(ElementCallCompat::Off),
             KEY_EVENT_TYPE_UNSTABLE
         );
-        for compat in [
-            ElementCallCompat::StateEvents,
-            ElementCallCompat::StickyEvents,
-        ] {
-            assert_eq!(
-                outbound_event_type(compat),
-                super::super::legacy_element_call::LEGACY_KEY_EVENT_TYPE
-            );
-        }
+        assert_eq!(
+            outbound_event_type(ElementCallCompat::StateEvents),
+            super::super::legacy_element_call::LEGACY_KEY_EVENT_TYPE
+        );
     }
 
     #[test]

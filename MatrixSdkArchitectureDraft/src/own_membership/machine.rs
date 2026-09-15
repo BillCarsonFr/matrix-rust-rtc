@@ -7,9 +7,9 @@
 use super::ResolveTransportError;
 use super::wire::{self, Route, WireContext};
 use super::{
-    ConnectedStatus, DEFAULT_DEGRADED_LIFETIME_MS, DelayedLeaveOutcome, JoinError, JoinParams,
-    JoinStatus, KeepAlive, LeaveError, LeaveStatus, MAX_STICKY_DURATION_MS, MembershipPublication,
-    OwnIdentity, RosterPresence, Status, UpdateApplicationError,
+    ConnectedStatus, DEFAULT_DEGRADED_LIFETIME_MS, DelayedLeaveOutcome, DelegationRoute, JoinError,
+    JoinParams, JoinStatus, KeepAlive, LeaveError, LeaveStatus, MAX_STICKY_DURATION_MS,
+    MembershipPublication, OwnIdentity, RosterPresence, Status, UpdateApplicationError,
 };
 use crate::driver::{DriverError, SendEventResponse};
 use crate::session::{
@@ -80,10 +80,16 @@ pub(crate) enum Action {
     CancelDelayedLeave {
         delay_id: String,
     },
-    Delegate {
+    /// MSC4195 through the homeserver's CS API.
+    DelegateViaHomeserver {
         delay_id: String,
         member: Value,
-        livekit_service_url: Option<String>,
+    },
+    /// MSC4195 through the authorisation service of the transport we publish on.
+    DelegateViaTransport {
+        delay_id: String,
+        member: Value,
+        livekit_service_url: String,
         delay_ms: u64,
     },
 }
@@ -185,7 +191,10 @@ enum JoinStage {
     Resolving,
     Arming,
     Sending,
-    Delegating,
+    /// Arming the long leave the delegation will take over.
+    ArmingDelegated,
+    DelegatingViaHomeserver,
+    DelegatingViaTransport,
 }
 
 struct Joining {
@@ -194,7 +203,12 @@ struct Joining {
     intent: TransportIntent,
     params: JoinParams,
     plan: Option<JoinPlan>,
+    /// The short leave, armed before the join event and kept until a
+    /// delegation is confirmed.
     delayed: Option<DelayedLeave>,
+    /// The long leave being delegated, while that is in progress.
+    delegated: Option<DelayedLeave>,
+    delegation_route: Option<DelegationRoute>,
     stage: JoinStage,
     reply: Option<oneshot::Sender<Result<(), JoinError>>>,
 }
@@ -211,6 +225,7 @@ struct Connected {
     sticky_sent_at: u64,
     refresh_retry_at: Option<u64>,
     delegated_at: Option<u64>,
+    delegation_route: Option<DelegationRoute>,
     /// Our id was in the roster at least once — before that, an absence is
     /// the echo still in flight, not a vanished membership.
     seen_in_roster: bool,
@@ -398,6 +413,7 @@ impl Machine {
             (Some(d), Some(delegated_at_ts)) => KeepAlive::Delegated {
                 delegated_at_ts,
                 earliest_fire_ts: delegated_at_ts + d.timeout_ms,
+                via: c.delegation_route.unwrap_or(DelegationRoute::Homeserver),
             },
             (Some(d), None) => match (&c.keep_alive_failing_since, &c.last_restart_error) {
                 (Some(since_ts), last_error) => KeepAlive::RestartFailing {
@@ -466,6 +482,57 @@ impl Machine {
         }
     }
 
+    /// The long leave a delegation takes over (MSC4195 asks for ≥ 1 h).
+    fn arm_delegated_action(&self, plan: &JoinPlan, now: u64) -> Action {
+        let spec = wire::leave_content(
+            &self.slot_id,
+            &plan.member.member_id,
+            &LeaveReason::delayed_leave(),
+        );
+        Action::ArmDelayedLeave {
+            route: self.membership_route(plan, &spec, now),
+            delay_ms: plan.params.delegated_delay_ms,
+        }
+    }
+
+    /// A route accepted the delegation: the long leave is now ours to keep
+    /// and the short one is cancelled. No moment without an armed leave.
+    fn complete_delegation(
+        &mut self,
+        mut joining: Joining,
+        via: DelegationRoute,
+        now: u64,
+    ) -> Vec<Action> {
+        log::info!("[{}] delayed leave delegated via {via:?}", self.room_id);
+        joining.flags.has_delegated_delayed_event = true;
+        joining.delegation_route = Some(via);
+        let short = joining.delayed.take();
+        joining.delayed = joining.delegated.take();
+        let mut actions: Vec<Action> = short
+            .map(|d| Action::CancelDelayedLeave {
+                delay_id: d.delay_id,
+            })
+            .into_iter()
+            .collect();
+        actions.extend(self.finish_join(joining, now));
+        actions
+    }
+
+    /// No route took the delegation: the long leave is cancelled and the
+    /// short one keeps being restarted by us.
+    fn abandon_delegation(&mut self, mut joining: Joining, now: u64) -> Vec<Action> {
+        let mut actions: Vec<Action> = joining
+            .delegated
+            .take()
+            .map(|d| Action::CancelDelayedLeave {
+                delay_id: d.delay_id,
+            })
+            .into_iter()
+            .collect();
+        actions.extend(self.finish_join(joining, now));
+        actions
+    }
+
     fn refresh_due_at(&self, c: &Connected) -> u64 {
         c.refresh_retry_at
             .unwrap_or(c.sticky_sent_at + c.plan.published_lifetime_ms / 2)
@@ -528,6 +595,8 @@ impl Machine {
             params,
             plan: None,
             delayed: None,
+            delegated: None,
+            delegation_route: None,
             stage: JoinStage::Resolving,
             reply: Some(reply),
         };
@@ -583,11 +652,9 @@ impl Machine {
             params.intent.as_deref(),
             &joining.intent,
         );
-        let keep_alive_timeout_ms = if params.delegate_delayed_leave {
-            params.keep_alive_timeout_ms.max(DELEGATION_MIN_DELAY_MS)
-        } else {
-            params.keep_alive_timeout_ms
-        };
+        // The short leave is armed whether or not we will delegate: the
+        // long, delegated one replaces it only once a route accepted it.
+        let keep_alive_timeout_ms = params.keep_alive_timeout_ms;
         let plan = JoinPlan {
             member,
             params: params.clone(),
@@ -668,6 +735,7 @@ impl Machine {
             } else {
                 None
             },
+            delegation_route: joining.delegation_route,
             seen_in_roster: false,
             healed_at: None,
             keep_alive_failing_since: None,
@@ -1022,19 +1090,11 @@ impl Machine {
                         && joining.delayed.is_some()
                         && self.compat != ElementCallCompat::StateEvents;
                     if delegate {
-                        joining.stage = JoinStage::Delegating;
-                        let action = Action::Delegate {
-                            delay_id: joining.delayed.as_ref().expect("checked").delay_id.clone(),
-                            member: plan.join_content["member"].clone(),
-                            livekit_service_url: plan
-                                .member
-                                .transports
-                                .published
-                                .iter()
-                                .find_map(crate::connections::service_url)
-                                .map(str::to_owned),
-                            delay_ms: plan.keep_alive_timeout_ms,
-                        };
+                        // Arm-after-confirm: a second, long leave is armed
+                        // and delegated while the short one keeps guarding
+                        // us; whichever ends up redundant is cancelled.
+                        joining.stage = JoinStage::ArmingDelegated;
+                        let action = self.arm_delegated_action(plan, now);
                         self.state = State::Joining(joining);
                         vec![action]
                     } else {
@@ -1051,19 +1111,81 @@ impl Machine {
                     self.abort_join(joining, JoinError::Driver(e))
                 }
             },
-            (JoinStage::Delegating, Outcome::Delegated(result)) => {
-                match result {
-                    Ok(()) => {
-                        joining.flags.has_delegated_delayed_event = true;
-                        log::info!("[{}] delayed leave delegated to the SFU", self.room_id);
-                    }
-                    Err(e) => log::warn!(
-                        "[{}] delegation failed ({e}); restarting the {}ms delayed leave ourselves",
-                        self.room_id,
-                        joining.plan.as_ref().map_or(0, |p| p.keep_alive_timeout_ms)
-                    ),
+            (JoinStage::ArmingDelegated, Outcome::DelayedArmed(result)) => match result {
+                Ok(delay_id) => {
+                    let plan = joining.plan.as_ref().expect("plan exists while delegating");
+                    joining.delegated = Some(DelayedLeave::armed(
+                        delay_id.clone(),
+                        plan.params.delegated_delay_ms,
+                        now,
+                    ));
+                    joining.stage = JoinStage::DelegatingViaHomeserver;
+                    let action = Action::DelegateViaHomeserver {
+                        delay_id,
+                        member: plan.join_content["member"].clone(),
+                    };
+                    self.state = State::Joining(joining);
+                    vec![action]
                 }
-                self.finish_join(joining, now)
+                Err(e) => {
+                    log::warn!(
+                        "[{}] the delegated leave could not be armed ({e}); keeping our own restarts",
+                        self.room_id
+                    );
+                    self.finish_join(joining, now)
+                }
+            },
+            (JoinStage::DelegatingViaHomeserver, Outcome::Delegated(Ok(()))) => {
+                self.complete_delegation(joining, DelegationRoute::Homeserver, now)
+            }
+            (JoinStage::DelegatingViaHomeserver, Outcome::Delegated(Err(e))) => {
+                let plan = joining.plan.as_ref().expect("plan exists while delegating");
+                let service_url = plan
+                    .member
+                    .transports
+                    .published
+                    .iter()
+                    .find_map(crate::connections::service_url)
+                    .map(str::to_owned);
+                match service_url {
+                    Some(livekit_service_url) => {
+                        log::info!(
+                            "[{}] the homeserver did not take the delayed leave ({e}); asking the authorisation service",
+                            self.room_id
+                        );
+                        joining.stage = JoinStage::DelegatingViaTransport;
+                        let action = Action::DelegateViaTransport {
+                            delay_id: joining
+                                .delegated
+                                .as_ref()
+                                .expect("armed before delegating")
+                                .delay_id
+                                .clone(),
+                            member: plan.join_content["member"].clone(),
+                            livekit_service_url,
+                            delay_ms: plan.params.delegated_delay_ms,
+                        };
+                        self.state = State::Joining(joining);
+                        vec![action]
+                    }
+                    None => {
+                        log::warn!(
+                            "[{}] the homeserver did not take the delayed leave ({e}) and we publish on no transport; keeping our own restarts",
+                            self.room_id
+                        );
+                        self.abandon_delegation(joining, now)
+                    }
+                }
+            }
+            (JoinStage::DelegatingViaTransport, Outcome::Delegated(Ok(()))) => {
+                self.complete_delegation(joining, DelegationRoute::AuthorisationService, now)
+            }
+            (JoinStage::DelegatingViaTransport, Outcome::Delegated(Err(e))) => {
+                log::warn!(
+                    "[{}] the authorisation service did not take the delayed leave either ({e}); keeping our own restarts",
+                    self.room_id
+                );
+                self.abandon_delegation(joining, now)
             }
             (stage, outcome) => {
                 log::error!(
@@ -1170,6 +1292,14 @@ impl Machine {
                 // how long it has been and against what expiry.
                 c.refresh_failing_since.get_or_insert(now);
                 c.last_refresh_error = Some(e.to_string());
+                Vec::new()
+            }
+            // The redundant leave of a finished delegation.
+            Outcome::Cancelled(Ok(())) => Vec::new(),
+            Outcome::Cancelled(Err(e)) => {
+                log::warn!(
+                    "[{room_id}] a redundant delayed leave could not be cancelled ({e}); it may still fire"
+                );
                 Vec::new()
             }
             other => {
@@ -1926,16 +2056,40 @@ mod tests {
         assert_eq!(sticky_duration(&a[0]), MAX_STICKY_DURATION_MS);
     }
 
+    fn delegating() -> JoinParams {
+        JoinParams {
+            delegate_delayed_leave: true,
+            ..params()
+        }
+    }
+
+    fn receive_only() -> TransportIntent {
+        TransportIntent::ReceiveOnly {
+            can_subscribe: vec![],
+        }
+    }
+
+    fn member_claims() -> Value {
+        json!({ "id": "m-1", "membership": "join" })
+    }
+
     #[test]
-    fn delegation_raises_the_delay_to_one_hour_and_a_success_stops_client_restarts() {
+    fn delegation_arms_a_long_leave_after_the_join_and_swaps_the_short_one_on_success() {
         let mut h = H::new(ElementCallCompat::Off);
-        let (a, mut rx) = h.join(
-            TransportIntent::ReceiveOnly {
-                can_subscribe: vec![],
-            },
-            JoinParams {
-                delegate_delayed_leave: true,
-                ..params()
+        let (a, mut rx) = h.join(receive_only(), delegating(), T0);
+        // The short leave is armed as always: nothing is raised in advance.
+        assert!(matches!(
+            a[0],
+            Action::ArmDelayedLeave {
+                delay_ms: 15_000,
+                ..
+            }
+        ));
+        h.outcome(Outcome::DelayedArmed(Ok("short".into())), T0);
+        let a = h.outcome(
+            Outcome::MembershipSent {
+                kind: SendKind::Join,
+                result: ok_sent(),
             },
             T0,
         );
@@ -1946,40 +2100,32 @@ mod tests {
                 ..
             }
         ));
-        h.outcome(Outcome::DelayedArmed(Ok("d".into())), T0);
-        let a = h.outcome(
-            Outcome::MembershipSent {
-                kind: SendKind::Join,
-                result: ok_sent(),
-            },
-            T0,
-        );
+        assert!(rx.try_recv().is_err(), "the reply waits for the delegation");
+        let a = h.outcome(Outcome::DelayedArmed(Ok("long".into())), T0);
         assert_eq!(
             a,
-            vec![Action::Delegate {
-                delay_id: "d".into(),
-                member: json!({ "id": "m-1", "membership": "join" }),
-                // receive-only: nothing to name
-                livekit_service_url: None,
-                delay_ms: DELEGATION_MIN_DELAY_MS,
+            vec![Action::DelegateViaHomeserver {
+                delay_id: "long".into(),
+                member: member_claims(),
             }]
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "the reply waits for the delegation request"
+        let a = h.outcome(Outcome::Delegated(Ok(())), T0 + 1);
+        assert_eq!(
+            a,
+            vec![Action::CancelDelayedLeave {
+                delay_id: "short".into()
+            }]
         );
-        h.outcome(Outcome::Delegated(Ok(())), T0 + 1);
         assert!(matches!(rx.try_recv(), Ok(Ok(()))));
         match h.m.status() {
-            Status::Connected(c) => {
-                assert_eq!(
-                    c.keep_alive,
-                    KeepAlive::Delegated {
-                        delegated_at_ts: T0 + 1,
-                        earliest_fire_ts: T0 + 1 + DELEGATION_MIN_DELAY_MS,
-                    }
-                );
-            }
+            Status::Connected(c) => assert_eq!(
+                c.keep_alive,
+                KeepAlive::Delegated {
+                    delegated_at_ts: T0 + 1,
+                    earliest_fire_ts: T0 + 1 + DELEGATION_MIN_DELAY_MS,
+                    via: DelegationRoute::Homeserver,
+                }
+            ),
             other => panic!("{other:?}"),
         }
         // Only the sticky refresh remains on the clock.
@@ -1991,20 +2137,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failed_delegation_falls_back_to_client_restarts_of_the_same_delay() {
-        let mut h = H::new(ElementCallCompat::Off);
-        let (_, mut rx) = h.join(
-            TransportIntent::ReceiveOnly {
-                can_subscribe: vec![],
-            },
-            JoinParams {
-                delegate_delayed_leave: true,
-                ..params()
-            },
-            T0,
-        );
-        h.outcome(Outcome::DelayedArmed(Ok("d".into())), T0);
+    /// Up to the point where the homeserver has refused: a publishing join
+    /// with the long leave armed.
+    fn refused_by_homeserver(h: &mut H) -> (Vec<Action>, oneshot::Receiver<Result<(), JoinError>>) {
+        let (a, rx) = h.join(TransportIntent::Publish(lk()), delegating(), T0);
+        assert!(matches!(a[0], Action::ResolveTransport { .. }));
+        h.outcome(Outcome::TransportResolved(Ok(lk())), T0);
+        h.outcome(Outcome::DelayedArmed(Ok("short".into())), T0);
         h.outcome(
             Outcome::MembershipSent {
                 kind: SendKind::Join,
@@ -2012,25 +2151,96 @@ mod tests {
             },
             T0,
         );
+        h.outcome(Outcome::DelayedArmed(Ok("long".into())), T0);
         let a = h.outcome(
-            Outcome::Delegated(Err(DriverError::Unsupported("nope".into()))),
+            Outcome::Delegated(Err(DriverError::Unsupported("no endpoint".into()))),
             T0,
         );
-        assert!(a.is_empty(), "no cancel, no replacement");
+        (a, rx)
+    }
+
+    #[test]
+    fn delegation_falls_back_to_the_authorisation_service() {
+        let mut h = H::new(ElementCallCompat::Off);
+        let (a, mut rx) = refused_by_homeserver(&mut h);
+        assert_eq!(
+            a,
+            vec![Action::DelegateViaTransport {
+                delay_id: "long".into(),
+                member: member_claims(),
+                livekit_service_url: "https://lk".into(),
+                delay_ms: DELEGATION_MIN_DELAY_MS,
+            }]
+        );
+        let a = h.outcome(Outcome::Delegated(Ok(())), T0 + 1);
+        assert_eq!(
+            a,
+            vec![Action::CancelDelayedLeave {
+                delay_id: "short".into()
+            }]
+        );
         assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+        assert!(matches!(
+            h.m.status(),
+            Status::Connected(c) if matches!(
+                c.keep_alive,
+                KeepAlive::Delegated { via: DelegationRoute::AuthorisationService, .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn when_no_route_takes_the_delegation_the_short_leave_is_kept() {
+        let mut h = H::new(ElementCallCompat::Off);
+        let (_, mut rx) = refused_by_homeserver(&mut h);
+        let a = h.outcome(Outcome::Delegated(Err(DriverError::Http("503".into()))), T0);
+        // The long leave goes; the short one never stopped guarding us.
+        assert_eq!(
+            a,
+            vec![Action::CancelDelayedLeave {
+                delay_id: "long".into()
+            }]
+        );
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+        assert!(matches!(
+            h.m.status(),
+            Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Armed { delay_ms: 15_000, .. })
+        ));
+        let a = h.m.step(Input::Wake, T0 + 5_000);
         assert!(
-            matches!(h.m.status(), Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Armed { .. })),
-            "delegation fell back: we keep restarting it ourselves"
+            a.iter().any(
+                |a| matches!(a, Action::RestartDelayedLeave { delay_id } if delay_id == "short")
+            )
+        );
+    }
+
+    #[test]
+    fn a_receive_only_member_has_no_service_to_fall_back_to() {
+        let mut h = H::new(ElementCallCompat::Off);
+        h.join(receive_only(), delegating(), T0);
+        h.outcome(Outcome::DelayedArmed(Ok("short".into())), T0);
+        h.outcome(
+            Outcome::MembershipSent {
+                kind: SendKind::Join,
+                result: ok_sent(),
+            },
+            T0,
+        );
+        h.outcome(Outcome::DelayedArmed(Ok("long".into())), T0);
+        let a = h.outcome(
+            Outcome::Delegated(Err(DriverError::Unsupported("no endpoint".into()))),
+            T0,
         );
         assert_eq!(
-            h.m.next_wake_ts(),
-            Some(T0 + 120_000).min(Some(T0 + DELEGATION_MIN_DELAY_MS / 3))
+            a,
+            vec![Action::CancelDelayedLeave {
+                delay_id: "long".into()
+            }]
         );
-        let a = h.m.step(Input::Wake, T0 + DELEGATION_MIN_DELAY_MS / 3);
-        assert!(
-            a.iter()
-                .any(|a| matches!(a, Action::RestartDelayedLeave { delay_id } if delay_id == "d"))
-        );
+        assert!(matches!(
+            h.m.status(),
+            Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Armed { .. })
+        ));
     }
 
     #[test]
@@ -2499,32 +2709,6 @@ mod tests {
             .unwrap();
         assert_eq!(content(refresh)["created_ts"], T0);
         assert_eq!(content(refresh)["expires"], 360_000);
-    }
-
-    #[test]
-    fn sticky_events_join_is_additive_and_the_leave_a_bare_key() {
-        let mut h = H::new(ElementCallCompat::StickyEvents);
-        h.join(
-            TransportIntent::ReceiveOnly {
-                can_subscribe: vec![],
-            },
-            params(),
-            T0,
-        );
-        let a = h.outcome(Outcome::DelayedArmed(Ok("d".into())), T0);
-        let c = content(&a[0]);
-        assert_eq!(c["member"]["user_id"], "@me:x");
-        assert_eq!(c["member"]["device_id"], "DEV");
-        assert_eq!(c["versions"], json!([]));
-        h.outcome(
-            Outcome::MembershipSent {
-                kind: SendKind::Join,
-                result: ok_sent(),
-            },
-            T0,
-        );
-        let (a, _) = h.leave(T0 + 1);
-        assert_eq!(*content(&a[0]), json!({ "msc4354_sticky_key": "m-1" }));
     }
 
     /// A cancel that fails still leaves us out of the call (the delay is

@@ -9,8 +9,9 @@
 use super::machine::{Action, Input, Outcome};
 use super::wire::Route;
 use super::{Inner, TransportResolver};
-use crate::driver::{DelegatedDelayedLeaveRequest, OwnMembershipDriver};
+use crate::driver::{HomeserverDelegationRequest, OwnMembershipDriver, TransportDelegationRequest};
 use crate::executor::{now_ms, sleep_ms};
+use crate::session::ElementCallCompat;
 use crate::session::SessionSnapshot;
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
@@ -26,6 +27,7 @@ pub(super) struct Pump {
     pub commands: UnboundedReceiver<Input>,
     pub room_id: String,
     pub slot_id: String,
+    pub compat: ElementCallCompat,
 }
 
 impl Pump {
@@ -155,20 +157,31 @@ impl Pump {
             Action::CancelDelayedLeave { delay_id } => {
                 Outcome::Cancelled(self.driver.cancel_delayed_event(room_id, delay_id).await)
             }
-            Action::Delegate {
+            Action::DelegateViaHomeserver { delay_id, member } => Outcome::Delegated(
+                self.driver
+                    .delegate_delayed_leave_via_homeserver(HomeserverDelegationRequest {
+                        room_id,
+                        slot_id: self.slot_id.clone(),
+                        member,
+                        delay_id,
+                    })
+                    .await,
+            ),
+            Action::DelegateViaTransport {
                 delay_id,
                 member,
                 livekit_service_url,
                 delay_ms,
             } => Outcome::Delegated(
                 self.driver
-                    .delegate_livekit_delayed_leave(DelegatedDelayedLeaveRequest {
+                    .delegate_delayed_leave_via_transport(TransportDelegationRequest {
+                        livekit_service_url,
                         room_id,
                         slot_id: self.slot_id.clone(),
                         member,
                         delay_id,
-                        livekit_service_url,
-                        delay_ms,
+                        delay_timeout_ms: delay_ms,
+                        legacy_sfu_get: self.compat == ElementCallCompat::StateEvents,
                     })
                     .await,
             ),
@@ -178,7 +191,10 @@ impl Pump {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::super::{JoinParams, KeepAlive, OwnIdentity, OwnMembershipManager, Status};
+    use super::super::machine::DELEGATION_MIN_DELAY_MS;
+    use super::super::{
+        DelegationRoute, JoinParams, KeepAlive, OwnIdentity, OwnMembershipManager, Status,
+    };
     use super::*;
     use crate::driver::{DriverError, SendEventResponse};
     use crate::session::{ElementCallCompat, SlotState};
@@ -211,7 +227,8 @@ mod tests {
         },
         Restart(String),
         Cancel(String),
-        Delegate(String),
+        DelegateViaHomeserver(String),
+        DelegateViaTransport(String),
     }
 
     #[derive(Default)]
@@ -316,14 +333,24 @@ mod tests {
             self.calls.lock().unwrap().push(Call::Cancel(delay_id));
             Ok(())
         }
-        async fn delegate_livekit_delayed_leave(
+        async fn delegate_delayed_leave_via_homeserver(
             &self,
-            request: DelegatedDelayedLeaveRequest,
+            request: HomeserverDelegationRequest,
         ) -> Result<(), DriverError> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(Call::Delegate(request.delay_id));
+                .push(Call::DelegateViaHomeserver(request.delay_id));
+            Ok(())
+        }
+        async fn delegate_delayed_leave_via_transport(
+            &self,
+            request: TransportDelegationRequest,
+        ) -> Result<(), DriverError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::DelegateViaTransport(request.delay_id));
             Ok(())
         }
     }
@@ -437,10 +464,20 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(calls[2], Call::Delegate("delay-1".into()));
-        assert_eq!(calls.len(), 3);
+        // Arm-after-confirm: the long leave is armed, delegated through the
+        // homeserver, then the short one is cancelled.
+        assert!(matches!(
+            &calls[2],
+            Call::Delayed {
+                delay_ms: DELEGATION_MIN_DELAY_MS,
+                ..
+            }
+        ));
+        assert!(matches!(&calls[3], Call::DelegateViaHomeserver(_)));
+        assert_eq!(calls[4], Call::Cancel("delay-1".into()));
+        assert_eq!(calls.len(), 5);
         assert!(
-            matches!(m.status(), Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Delegated { .. }))
+            matches!(m.status(), Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Delegated { via: DelegationRoute::Homeserver, .. }))
         );
         assert!(m.debug_snapshot()["join_event_id"].is_string());
     }

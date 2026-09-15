@@ -18,6 +18,7 @@ import type {
   FfiSendEventResponse,
   FfiToDeviceDelivery,
   FfiToDeviceRecipient,
+  FfiTransportDelegationRequest,
   MatrixDriverCallback,
   ConnectivitySinkInterface,
   RoomEventSinkInterface,
@@ -113,27 +114,27 @@ export class JsSdkMatrixDriver implements MatrixDriverCallback {
     await guard(() => this.client._unstable_updateDelayedEvent(delayId, sdk.UpdateDelayedEventAction.Cancel));
   }
 
-  async delegateLivekitDelayedLeave(
-    roomId: string,
-    slotId: string,
-    memberJson: string,
-    delayId: string,
-    _livekitServiceUrl: string | undefined,
-    _delayMs: bigint,
-  ): Promise<void> {
-    // MSC4195: the homeserver hands the delayed leave to the SFU once the
-    // participant is connected. Best effort: the SDK restarts it itself when
-    // this fails. (Element Call's driver delegates through the authorisation
-    // service's `get_token` instead, which is what the service url and delay
-    // are for; this demo driver keeps the homeserver endpoint.)
+  async delegateDelayedLeaveViaHomeserver(roomId: string, slotId: string, memberJson: string, delayId: string): Promise<void> {
+    // MSC4195 through the CS API. The crate tries this first and falls back
+    // to the authorisation service when it throws.
     await guard(() =>
       this.client.http.authedRequest(
         sdk.Method.Post,
         "/rtc/livekit/delegate_delayed_leave",
         undefined,
-        { room_id: roomId, slot_id: slotId, member_id: JSON.parse(memberJson).id, delay_id: delayId },
-        { prefix: "/_matrix/client/unstable/org.matrix.msc4195" },
+        { room_id: roomId, slot_id: slotId, member: JSON.parse(memberJson), delay_id: delayId },
+        { prefix: "/_matrix/client/unstable/io.element.msc4195" },
       ),
+    );
+  }
+
+  async delegateDelayedLeaveViaTransport(request: FfiTransportDelegationRequest): Promise<void> {
+    // MSC4195 through the authorisation service: the token request with the
+    // delay fields added. The token in the answer is discarded.
+    const { livekitServiceUrl, roomId, slotId, memberJson, delayId, delayTimeoutMs, legacySfuGet } = request;
+    await this.getLivekitToken(
+      { url: livekitServiceUrl, roomId, slotId, memberJson, legacySfuGet },
+      { delay_id: delayId, delay_timeout: Number(delayTimeoutMs), delay_cs_api_url: this.client.baseUrl },
     );
   }
 
@@ -172,14 +173,14 @@ export class JsSdkMatrixDriver implements MatrixDriverCallback {
     });
   }
 
-  async getLivekitToken(request: FfiLivekitTokenRequest): Promise<FfiLivekitToken> {
+  async getLivekitToken(request: FfiLivekitTokenRequest, delegation: Record<string, unknown> = {}): Promise<FfiLivekitToken> {
     return guard(async () => {
       const openid_token = await this.client.getOpenIdToken();
       const base = request.url.replace(/\/$/, "");
       const member = JSON.parse(request.memberJson);
       const [endpoint, body] = request.legacySfuGet
-        ? [`${base}/sfu/get`, { room: request.roomId, openid_token, device_id: member.claimed_device_id }]
-        : [`${base}/get_token`, { room_id: request.roomId, slot_id: request.slotId, openid_token, member }];
+        ? [`${base}/sfu/get`, { room: request.roomId, openid_token, device_id: member.claimed_device_id, ...delegation }]
+        : [`${base}/get_token`, { room_id: request.roomId, slot_id: request.slotId, openid_token, member, ...delegation }];
       const response = await fetch(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       if (!response.ok) {
         const text = await response.text();

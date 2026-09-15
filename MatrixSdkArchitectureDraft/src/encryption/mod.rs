@@ -228,6 +228,12 @@ pub struct MediaKeyState {
     /// Why their most recent key was discarded, while we still lack one.
     /// `None` once a key from them is accepted.
     pub rejection: Option<KeyRejection>,
+    /// MSC4153: whether the device that sent the key we hold from them was
+    /// cross-signed by its owner. `None` while we hold no key from them or
+    /// the host could not tell. Carried whether or not
+    /// `require_cross_signed_sender` is on, so a UI can show an unverified
+    /// sender before the check is turned on.
+    pub sender_cross_signed: Option<bool>,
 }
 
 pub type KeyMapCallback = Box<dyn Fn(&KeyMap, &MediaKeyChange) + Send + Sync>;
@@ -389,6 +395,9 @@ impl Machine {
             // them; once one is accepted the tile is fine.
             rejection: (!have_their_key)
                 .then(|| state.inbound.rejection(member_id).cloned())
+                .flatten(),
+            sender_cross_signed: have_their_key
+                .then(|| state.inbound.sender_cross_signed(member_id))
                 .flatten(),
         }
     }

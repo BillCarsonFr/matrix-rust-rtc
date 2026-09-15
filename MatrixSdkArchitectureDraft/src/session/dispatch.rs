@@ -378,10 +378,6 @@ mod tests {
             Ingest::Ignored(_)
         ));
         assert!(matches!(
-            classify_now(ev.clone(), ElementCallCompat::StickyEvents),
-            Ingest::Ignored(_)
-        ));
-        assert!(matches!(
             classify_now(ev, ElementCallCompat::StateEvents),
             Ingest::LegacyMember { .. }
         ));

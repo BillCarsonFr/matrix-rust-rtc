@@ -2,7 +2,7 @@
 // list): distribution to members, verification of inbound keys, buffering of
 // early keys, and the unencrypted case.
 import { beforeAll, describe, expect, it } from "vitest";
-import { FfiElementCallCompat, FfiEventOrigin, FfiSessionRead, type FfiMediaKey } from "../src/generated/matrix_rtc";
+import { FfiEventOrigin, FfiSessionRead, type FfiMediaKey } from "../src/generated/matrix_rtc";
 import { OWN_DEVICE_ID, encryptionKeyContent, waitFor } from "../src/mockDriver";
 import { encryptedRoomState, joinParams, newManager, receiveOnly } from "./helpers";
 import { initWasm } from "./wasmInit";
@@ -35,27 +35,9 @@ describe("encryption", () => {
     await waitFor("all keys", () => new Set(manager.keyMap().map((k) => k.memberId)).size === 3);
   });
 
-  it("StickyEvents compat sends the deployed io.element.call.encryption_keys message", async () => {
-    // Deployed matrix_2_0 Element Call clients kept the pre-2026 key message
-    // when memberships moved to sticky events; a crate client must too, or
-    // they would not hear it.
-    const { driver, manager } = newManager({ roomState: encryptedRoomState(), compat: FfiElementCallCompat.StickyEvents });
-    driver.peerJoins(driver.addPeer(peerA));
-    await manager.join(receiveOnly(), joinParams);
-    await waitFor("one batch", () => driver.calls("toDevice").length >= 1);
-    const batch = driver.calls("toDevice")[0];
-    expect(batch.eventType).toBe("io.element.call.encryption_keys");
-    expect(batch.content.keys.index).toBe(0);
-    expect(batch.content.member.id).toBe(manager.ownMemberId());
-    expect(batch.content.member.claimed_device_id).toBe(OWN_DEVICE_ID);
-    expect(batch.content.session).toEqual({ application: "m.call", call_id: "", scope: "m.room" });
-    // the peer's MSC4143-shaped answer is still accepted
-    await waitFor("peer key", () => manager.keyMap().some((k) => k.memberId === peerA.memberId));
-  });
-
   it("manageMediaKeys decides when the slot is unknown, and the slot decides when it is known", async () => {
     // Slot unreadable: nothing negotiated, the local default applies.
-    const unknown = newManager({ compat: FfiElementCallCompat.StickyEvents, roomState: [], manageMediaKeys: false });
+    const unknown = newManager({ roomState: [], manageMediaKeys: false });
     unknown.driver.failSlotReads = true;
     unknown.driver.peerJoins(unknown.driver.addPeer(peerA));
     await manager_join(unknown.manager);
@@ -65,7 +47,7 @@ describe("encryption", () => {
     expect(unknown.manager.keyMap()).toEqual([]);
 
     // An open, unencrypted slot: no keys, whatever the local default says.
-    const plain = newManager({ compat: FfiElementCallCompat.StickyEvents, manageMediaKeys: true });
+    const plain = newManager({ manageMediaKeys: true });
     plain.driver.peerJoins(plain.driver.addPeer(peerA));
     await manager_join(plain.manager);
     await new Promise((r) => setTimeout(r, 50));

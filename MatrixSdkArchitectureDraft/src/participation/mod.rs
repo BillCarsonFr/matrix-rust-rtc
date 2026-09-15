@@ -648,7 +648,7 @@ impl ParticipationManager {
             ElementCallCompat::StateEvents => {
                 connections::legacy_participant_identity(&own.user_id, &own.device_id)
             }
-            ElementCallCompat::Off | ElementCallCompat::StickyEvents => {
+            ElementCallCompat::Off => {
                 connections::participant_identity(&own.user_id, &own.device_id, &member_id)
             }
         })
@@ -1502,6 +1502,7 @@ mod tests {
             delegated_at_ts: T0,
             // Long in the past — for a delegated switch this is health.
             earliest_fire_ts: T0 + 3_600_000,
+            via: own_membership::DelegationRoute::Homeserver,
         });
         assert!(from_own(&delegated).is_empty());
     }
@@ -1594,6 +1595,7 @@ mod tests {
             holds_our_key: true,
             have_their_key: true,
             rejection: None,
+            sender_cross_signed: None,
         };
         assert!(from_keys(&[membership("b", Some(settled.clone()))]).is_empty());
 
@@ -1628,6 +1630,7 @@ mod tests {
             holds_our_key: true,
             have_their_key: false,
             rejection: Some(KeyRejection::NotCrossSigned),
+            sender_cross_signed: None,
         };
         let raised = from_keys(&[membership("b", Some(rejected))]);
         assert!(raised.contains(&Impairment::MediaKeyRejected {
@@ -1640,6 +1643,7 @@ mod tests {
             holds_our_key: true,
             have_their_key: true,
             rejection: None,
+            sender_cross_signed: None,
         };
         assert!(from_keys(&[membership("b", Some(accepted))]).is_empty());
     }
@@ -1655,6 +1659,7 @@ mod tests {
                 holds_our_key: false,
                 have_their_key: false,
                 rejection: None,
+                sender_cross_signed: None,
             }),
         );
         deviceless.member.device_id = None;
@@ -1765,6 +1770,7 @@ mod tests {
                             holds_our_key: false,
                             have_their_key: false,
                             rejection: Some(KeyRejection::Cleartext),
+                            sender_cross_signed: None,
                         }),
                     ),
                     membership(
@@ -1773,6 +1779,7 @@ mod tests {
                             holds_our_key: false,
                             have_their_key: false,
                             rejection: Some(KeyRejection::Outdated),
+                            sender_cross_signed: None,
                         }),
                     ),
                 ],

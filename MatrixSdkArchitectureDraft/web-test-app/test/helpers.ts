@@ -46,6 +46,7 @@ export const joinParams = {
   keepAliveTimeoutMs: 15_000n,
   degradedLifetimeMs: undefined,
   delegateDelayedLeave: false,
+  delegatedDelayMs: 3_600_000n,
 };
 
 export const receiveOnly = () => new FfiTransportIntent.ReceiveOnly({ canSubscribe: ["livekit"] });

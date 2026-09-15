@@ -6,7 +6,7 @@
 //!
 //! | event type | converted to |
 //! |---|---|
-//! | `m.rtc.member` (sticky; modern + 2025 dialect) | member candidate |
+//! | `m.rtc.member` (sticky, MSC4143) | member candidate |
 //! | `org.matrix.msc3401.call.member` (state; only with `StateEvents` compat) | member candidate, one per event |
 //! | `m.rtc.slot` (state) | slot condition |
 //! | `m.room.member` (state) | room-membership condition |
@@ -52,15 +52,14 @@ use std::collections::HashMap;
 /// Pre-2026 Element Call interop, selected per call.
 ///
 /// Consumed in two places: the session's *read* side (`StateEvents` enables
-/// the MSC3401 converter; the permissive 2025-dialect read is always on) and
-/// `own_membership`'s *write* side (the dialect our own events are rendered
-/// in — the opt-in half, since it changes what other clients see).
+/// the MSC3401 converter) and `own_membership`'s *write* side (the dialect
+/// our own events are rendered in — the opt-in half, since it changes what
+/// other clients see). The 2025 sticky dialect Element Call briefly used was
+/// never deployed and is not modelled.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum ElementCallCompat {
     #[default]
     Off,
-    /// 2025 format: already MSC4354-sticky, different member-content fields.
-    StickyEvents,
     /// Pre-MSC4354: `org.matrix.msc3401.call.member` room state,
     /// `{user}:{device}` identities, `/sfu/get` tokens. Not additive — such
     /// a call is visible to that generation and nobody else.

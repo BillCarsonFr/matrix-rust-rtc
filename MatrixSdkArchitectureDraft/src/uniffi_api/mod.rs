@@ -20,10 +20,10 @@ use crate::connections::{
     ConnectionData, ConnectionProblem, ConnectionProblemKind, ConnectionWithMembers,
 };
 use crate::driver::{
-    ConnectivityDriver, DelegatedDelayedLeaveRequest, DriverError, LivekitTokenRequest,
+    ConnectivityDriver, DriverError, HomeserverDelegationRequest, LivekitTokenRequest,
     LivekitTokenResponse, OwnMembershipDriver, RoomEventsDriver, SendEventResponse,
     StateKeySelector, ToDeviceDelivery, ToDeviceDriver, ToDeviceMessage, ToDeviceRecipient,
-    ToDeviceSendDriver, TokenDriver,
+    ToDeviceSendDriver, TokenDriver, TransportDelegationRequest,
 };
 use crate::encryption::{
     EncryptionConfig, KeyMap, KeyRejection, MediaKey, MediaKeyChange, MediaKeyState,
@@ -340,6 +340,10 @@ pub struct FfiMediaKeyState {
     pub have_their_key: bool,
     /// Why their most recent key was discarded, while we still lack one.
     pub rejection: Option<FfiKeyRejection>,
+    /// MSC4153: whether the device that sent the key we hold from them is
+    /// cross-signed by its owner; `None` while we hold none or the host
+    /// could not tell. Reported whether or not the check is enforced.
+    pub sender_cross_signed: Option<bool>,
 }
 
 impl From<&MediaKeyState> for FfiMediaKeyState {
@@ -348,6 +352,7 @@ impl From<&MediaKeyState> for FfiMediaKeyState {
             holds_our_key: k.holds_our_key,
             have_their_key: k.have_their_key,
             rejection: k.rejection.as_ref().map(FfiKeyRejection::from),
+            sender_cross_signed: k.sender_cross_signed,
         }
     }
 }
@@ -506,7 +511,6 @@ impl From<FfiEventOrigin> for EventOrigin {
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiElementCallCompat {
     Off,
-    StickyEvents,
     StateEvents,
 }
 
@@ -514,7 +518,6 @@ impl From<FfiElementCallCompat> for ElementCallCompat {
     fn from(compat: FfiElementCallCompat) -> Self {
         match compat {
             FfiElementCallCompat::Off => ElementCallCompat::Off,
-            FfiElementCallCompat::StickyEvents => ElementCallCompat::StickyEvents,
             FfiElementCallCompat::StateEvents => ElementCallCompat::StateEvents,
         }
     }
@@ -568,6 +571,21 @@ pub struct FfiLivekitTokenRequest {
     pub legacy_sfu_get: bool,
 }
 
+/// See `driver::TransportDelegationRequest`: the token request with the
+/// MSC4195 delay fields, sent to `{livekit_service_url}/get_token` (or
+/// `/sfu/get` with `legacy_sfu_get`).
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTransportDelegationRequest {
+    pub livekit_service_url: String,
+    pub room_id: String,
+    pub slot_id: String,
+    /// MSC4195 member claims `{ id, claimed_user_id, claimed_device_id }`.
+    pub member_json: String,
+    pub delay_id: String,
+    pub delay_timeout_ms: u64,
+    pub legacy_sfu_get: bool,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiLivekitToken {
     pub jwt: String,
@@ -602,7 +620,13 @@ pub struct FfiJoinParams {
     pub keep_alive_timeout_ms: u64,
     /// Lifetime when the homeserver refuses delayed events (default 5 min).
     pub degraded_lifetime_ms: Option<u64>,
+    /// Hand the delayed leave to the SFU (MSC4195): the crate tries the
+    /// homeserver, then the authorisation service, then keeps restarting the
+    /// leave itself.
     pub delegate_delayed_leave: bool,
+    /// The delay of the delegated leave (MSC4195 asks for ≥ 1 h); the short
+    /// `keep_alive_timeout_ms` leave stays armed until delegation is confirmed.
+    pub delegated_delay_ms: u64,
 }
 
 impl From<FfiJoinParams> for JoinParams {
@@ -614,6 +638,7 @@ impl From<FfiJoinParams> for JoinParams {
             keep_alive_timeout_ms: p.keep_alive_timeout_ms,
             degraded_lifetime_ms: p.degraded_lifetime_ms,
             delegate_delayed_leave: p.delegate_delayed_leave,
+            delegated_delay_ms: p.delegated_delay_ms,
         }
     }
 }
@@ -702,6 +727,7 @@ pub enum FfiKeepAlive {
     Delegated {
         delegated_at_ts: u64,
         earliest_fire_ts: u64,
+        via: FfiDelegationRoute,
     },
     /// Armed, but restarts are failing — we drop out at `fires_at_ts`
     /// unless one succeeds.
@@ -736,9 +762,16 @@ impl From<&own_membership::KeepAlive> for FfiKeepAlive {
             own_membership::KeepAlive::Delegated {
                 delegated_at_ts,
                 earliest_fire_ts,
+                via,
             } => Self::Delegated {
                 delegated_at_ts: *delegated_at_ts,
                 earliest_fire_ts: *earliest_fire_ts,
+                via: match via {
+                    own_membership::DelegationRoute::Homeserver => FfiDelegationRoute::Homeserver,
+                    own_membership::DelegationRoute::AuthorisationService => {
+                        FfiDelegationRoute::AuthorisationService
+                    }
+                },
             },
             own_membership::KeepAlive::RestartFailing {
                 since_ts,
@@ -761,6 +794,15 @@ impl From<&own_membership::KeepAlive> for FfiKeepAlive {
             },
         }
     }
+}
+
+/// How the delayed leave was handed to the SFU (MSC4195).
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FfiDelegationRoute {
+    /// The homeserver's CS API endpoint.
+    Homeserver,
+    /// The authorisation service's token endpoint with the delay fields.
+    AuthorisationService,
 }
 
 /// Our sticky membership event on the server (MSC4354).
@@ -1556,14 +1598,26 @@ pub trait MatrixDriverCallback: Send + Sync {
     /// the transport we publish on (`None` for a receive-only member) and
     /// `delay_ms` the armed delay — what an adapter that delegates through
     /// the authorisation service's token endpoint needs.
-    async fn delegate_livekit_delayed_leave(
+    /// MSC4195 via the homeserver: one authenticated
+    /// `POST /_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave`
+    /// with `{ room_id, slot_id, member, delay_id }`. A client that cannot make
+    /// authenticated homeserver calls (a widget) throws `Unsupported`; the
+    /// crate then tries the authorisation service.
+    async fn delegate_delayed_leave_via_homeserver(
         &self,
         room_id: String,
         slot_id: String,
         member_json: String,
         delay_id: String,
-        livekit_service_url: Option<String>,
-        delay_ms: u64,
+    ) -> Result<(), RtcError>;
+
+    /// MSC4195 via the authorisation service: the `get_token` (or, with
+    /// `legacy_sfu_get`, `sfu/get`) request the adapter already makes, with
+    /// `delay_id`, `delay_timeout` (= `delay_timeout_ms`) and the adapter's
+    /// own CS API URL (`delay_cs_api_url`) added. Discard the token.
+    async fn delegate_delayed_leave_via_transport(
+        &self,
+        request: FfiTransportDelegationRequest,
     ) -> Result<(), RtcError>;
 
     async fn send_to_device(
@@ -1787,20 +1841,36 @@ impl OwnMembershipDriver for FfiMatrixDriver {
             .await?)
     }
 
-    async fn delegate_livekit_delayed_leave(
+    async fn delegate_delayed_leave_via_homeserver(
         &self,
-        request: DelegatedDelayedLeaveRequest,
+        request: HomeserverDelegationRequest,
     ) -> Result<(), DriverError> {
         Ok(self
             .callback
-            .delegate_livekit_delayed_leave(
+            .delegate_delayed_leave_via_homeserver(
                 request.room_id,
                 request.slot_id,
                 request.member.to_string(),
                 request.delay_id,
-                request.livekit_service_url,
-                request.delay_ms,
             )
+            .await?)
+    }
+
+    async fn delegate_delayed_leave_via_transport(
+        &self,
+        request: TransportDelegationRequest,
+    ) -> Result<(), DriverError> {
+        Ok(self
+            .callback
+            .delegate_delayed_leave_via_transport(FfiTransportDelegationRequest {
+                livekit_service_url: request.livekit_service_url,
+                room_id: request.room_id,
+                slot_id: request.slot_id,
+                member_json: request.member.to_string(),
+                delay_id: request.delay_id,
+                delay_timeout_ms: request.delay_timeout_ms,
+                legacy_sfu_get: request.legacy_sfu_get,
+            })
             .await?)
     }
 }

@@ -12,7 +12,6 @@
 //! Policy is the pure [`machine`] (no clock, no I/O); [`pump`] is the one
 //! task owning time (`crate::executor`) and the driver calls.
 
-mod compat_2025;
 mod compat_msc3401;
 pub(crate) mod machine;
 mod pump;
@@ -41,7 +40,7 @@ pub const MAX_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_DEGRADED_LIFETIME_MS: u64 = 5 * 60 * 1000;
 
 /// Who we are — the write side of compat needs it (`member.user_id` /
-/// `member.device_id` in the 2025 dialect, the `{user}:{device}` id and state
+/// the `{user}:{device}` id and state
 /// key in MSC3401).
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnIdentity {
@@ -56,7 +55,7 @@ pub struct OwnIdentity {
 pub fn new_member_id(compat: ElementCallCompat, own: &OwnIdentity) -> String {
     match compat {
         ElementCallCompat::StateEvents => compat_msc3401::member_id(own),
-        ElementCallCompat::Off | ElementCallCompat::StickyEvents => generate_member_id(),
+        ElementCallCompat::Off => generate_member_id(),
     }
 }
 
@@ -74,8 +73,14 @@ pub struct JoinParams {
     /// Lifetime used instead when the delayed leave is refused before the
     /// first publish (default [`DEFAULT_DEGRADED_LIFETIME_MS`]).
     pub degraded_lifetime_ms: Option<u64>,
-    /// Hand the delayed leave to the SFU (MSC4195) once joined.
+    /// Hand the delayed leave to the SFU (MSC4195) once joined: the crate
+    /// tries the homeserver, then the authorisation service, and keeps
+    /// restarting the leave itself if both refuse.
     pub delegate_delayed_leave: bool,
+    /// The delay of the *delegated* leave (MSC4195 asks for at least an
+    /// hour). The short `keep_alive_timeout_ms` leave stays armed until the
+    /// delegation is confirmed.
+    pub delegated_delay_ms: u64,
 }
 
 impl JoinParams {
@@ -87,6 +92,7 @@ impl JoinParams {
             keep_alive_timeout_ms: DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
             degraded_lifetime_ms: None,
             delegate_delayed_leave: false,
+            delegated_delay_ms: machine::DELEGATION_MIN_DELAY_MS,
         }
     }
 
@@ -165,6 +171,8 @@ pub enum KeepAlive {
         /// The earliest the homeserver could fire it. The SFU keeps it
         /// alive while we are connected, so this passing is not a problem.
         earliest_fire_ts: u64,
+        /// Which route accepted the delegation.
+        via: DelegationRoute,
     },
     /// Armed, but restarts are failing — unless one succeeds, the homeserver
     /// publishes our leave at `fires_at_ts` and we drop out of the call.
@@ -291,6 +299,16 @@ pub enum LeaveError {
     Driver(#[from] DriverError),
 }
 
+/// How the delayed leave was handed to the SFU (MSC4195).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DelegationRoute {
+    /// The homeserver's CS API endpoint.
+    Homeserver,
+    /// The MatrixRTC authorisation service's token endpoint, with the delay
+    /// fields — the route Element Call has always used.
+    AuthorisationService,
+}
+
 /// Why [`OwnMembershipManager::update_application`] was refused.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum UpdateApplicationError {
@@ -410,6 +428,7 @@ impl OwnMembershipManager {
                 commands: command_rx,
                 room_id,
                 slot_id,
+                compat,
             }
             .run(),
         );

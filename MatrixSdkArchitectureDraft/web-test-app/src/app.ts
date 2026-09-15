@@ -258,6 +258,7 @@ async function main() {
       keepAliveTimeoutMs: BigInt($<HTMLInputElement>("keep-alive").value || "15000"),
       degradedLifetimeMs: undefined,
       delegateDelayedLeave: $<HTMLInputElement>("delegate").checked,
+      delegatedDelayMs: 3_600_000n,
     });
     ownMemberId = JSON.parse(manager.debugSnapshot()).own_membership.member_id;
     renderKeyMap();

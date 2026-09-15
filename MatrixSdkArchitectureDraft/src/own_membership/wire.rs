@@ -3,7 +3,7 @@
 //! this module that knows event-type strings; the compat renderers are
 //! dispatched from [`route`] so `machine.rs` never sees a dialect.
 
-use super::{OwnIdentity, compat_2025, compat_msc3401};
+use super::{OwnIdentity, compat_msc3401};
 use crate::session::ElementCallCompat;
 use crate::types::{LeaveReason, RtcTransport, TransportIntent, wire_event_type};
 use serde_json::{Map, Value, json};
@@ -108,11 +108,6 @@ pub(crate) fn route(ctx: &WireContext<'_>, spec: &Value, lifetime_ms: u64, now: 
         ElementCallCompat::Off => Route::Sticky {
             event_type,
             content: spec.clone(),
-            duration_ms: lifetime_ms,
-        },
-        ElementCallCompat::StickyEvents => Route::Sticky {
-            event_type,
-            content: compat_2025::rewrite(spec, ctx.own),
             duration_ms: lifetime_ms,
         },
         ElementCallCompat::StateEvents => Route::State {
