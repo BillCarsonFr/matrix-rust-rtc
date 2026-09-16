@@ -113,6 +113,13 @@ mkdir -p "$BUILD_DIR"
 echo "Ensuring Rust targets are installed..."
 rustup target add "$DEVICE_TARGET" "${SIM_TARGETS[@]}"
 
+# The C/C++ objects (ring, the webrtc-sys cxx bridge, ...) take the host SDK's
+# version as their minimum OS when this is unset, and the app's linker then
+# warns for every one of them ("built for newer iOS-simulator version").
+# Keep in step with `platforms` in Package.swift.
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
+echo "iOS deployment target: $IPHONEOS_DEPLOYMENT_TARGET"
+
 for t in "$DEVICE_TARGET" "${SIM_TARGETS[@]}"; do
     echo "Building for $t..."
     cargo build -p matrix-rtc-ffi --profile "$PROFILE" --target "$t" "${FEATURE_ARGS[@]}"

@@ -7,10 +7,12 @@ had a tagged release yet, so everything so far lives under Unreleased.
 Entries begin with the Android integration work — earlier history is in the git
 log only.
 
-## v0.2.0-rc.1
+## v0.2.0-rc.2
 
-Release candidate of 0.2.0, cut to exercise the release pipeline and the
-Swift package end to end. Everything it contains is described under
+Second release candidate of 0.2.0. Over rc.1, which validated the pipeline and
+the Swift package end to end: the package now declares the system frameworks
+and `libc++` that libwebrtc needs, and the iOS archives are built for an iOS 16
+deployment target instead of the host SDK's. Everything else is described under
 [Unreleased](#unreleased); the final 0.2.0 notes will replace this section.
 
 ## Unreleased
@@ -202,7 +204,9 @@ single integrator, rather than dripped out over several:
   `Package.swift` with the xcframework zip's checksum, and tags `v<version>`
   with the AAR, the zip, split Android debug symbols and `SHA256SUMS` attached
   to the GitHub Release. The xcframework now ships its header and module map,
-  so `import MatrixRtcFFI` resolves for SwiftPM consumers. The build scripts
+  so `import MatrixRtcFFI` resolves for SwiftPM consumers, the package declares
+  the system frameworks and `libc++` that libwebrtc needs, and the archives are
+  built for an iOS 16 deployment target rather than the host SDK's. The build scripts
   grew `--target`, `--profile`, `--split-debug`, `--skip-build`,
   `--skip-codegen`, `--version` (Android) and `--profile`, `--swift-out`,
   `--zip` (iOS) for the workflow; `make release-android` / `make release-ios`

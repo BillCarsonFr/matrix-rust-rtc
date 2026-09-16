@@ -85,12 +85,22 @@ In Xcode, *File > Add Package Dependencies…*, enter this repository's URL and
 pick a `v*` tag (the `MatrixRtc` product). Then add `-ObjC` to the app target's
 *Other Linker Flags* — libwebrtc's Objective-C categories are dead-stripped from
 the static archive otherwise and the app aborts at runtime with
-`+[NSString stringForAbslStringView:]: unrecognized selector`. The simulator
-slice is Apple Silicon only.
+`+[NSString stringForAbslStringView:]: unrecognized selector`.
 
 ```swift
 import MatrixRtc
 ```
+
+The package declares the system frameworks libwebrtc needs (AVFoundation,
+AudioToolbox, CoreMedia, CoreVideo, VideoToolbox, Metal, MetalKit, QuartzCore,
+CoreGraphics, Network, UIKit) and `libc++` as linker settings, so nothing has
+to be added to the app's *Link Binary With Libraries*.
+
+The simulator slice is Apple Silicon only. Building for a specific arm64
+simulator, as Xcode does on an Apple Silicon Mac, is fine; a build for
+"Any iOS Simulator Device" (`generic/platform=iOS Simulator`) also wants
+x86_64 and fails to link. Set `EXCLUDED_ARCHS[sdk=iphonesimulator*] = x86_64`
+on the app target if you build that way, for example on CI.
 
 The package's `Package.swift` downloads `MatrixRtcFFI.xcframework.zip` from the
 tag's GitHub Release (checksum pinned in the manifest) and compiles the generated
@@ -229,7 +239,7 @@ print them):
 | android AAR | _measure_ | — | 26 MB (2026-09-06) |
 | ios arm64 (device) | _measure_ | 519 MB `.a` — **pre-link archive, see note** (2026-07-31) | 257 MB `.a` after `strip -S` (849 MB with DWARF) (2026-09-06) |
 | ios arm64 (simulator) | _measure_ | 520 MB `.a` — pre-link archive (2026-07-31) | 257 MB `.a` after `strip -S` (2026-09-06) |
-| ios xcframework zip | — | — | 129 MB (400 MB with DWARF, `--keep-debug`) (2026-09-06) |
+| ios xcframework zip | — | — | 117 MB (400 MB with DWARF, `--keep-debug`) (2026-09-07) |
 
 ### Reading the iOS sizes (why the `.a` is ~520 MB and why that's fine)
 
