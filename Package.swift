@@ -33,6 +33,26 @@ let version = "0.2.0-rc.1"
 let checksum = "474719b507c0d99eecfa0b7ed92c3b267b266cc854391def8e0ecd2151b627f4"
 let url = "https://github.com/BillCarsonFr/matrix-rust-rtc/releases/download/v\(version)/MatrixRtcFFI.xcframework.zip"
 
+// What the statically linked libwebrtc inside MatrixRtcFFI.xcframework needs
+// from the system. Declared here so a consumer's link succeeds without knowing
+// libwebrtc's internals; SwiftPM propagates these to the app's link step.
+// (Must precede `package`: a manifest is script-mode Swift, and a top-level
+// constant read before its declaration is silently empty.)
+let matrixRtcLinkerSettings: [LinkerSetting] = [
+    .linkedFramework("AVFoundation"),
+    .linkedFramework("AudioToolbox"),
+    .linkedFramework("CoreMedia"),
+    .linkedFramework("CoreVideo"),
+    .linkedFramework("VideoToolbox"),
+    .linkedFramework("Metal"),
+    .linkedFramework("MetalKit"),
+    .linkedFramework("QuartzCore"),
+    .linkedFramework("CoreGraphics"),
+    .linkedFramework("Network"),
+    .linkedFramework("UIKit"),
+    .linkedLibrary("c++"),
+]
+
 let package = Package(
     name: "MatrixRtc",
     platforms: [
@@ -46,6 +66,10 @@ let package = Package(
     ],
     targets: [
         .binaryTarget(name: "MatrixRtcFFI", url: url, checksum: checksum),
-        .target(name: "MatrixRtc", dependencies: ["MatrixRtcFFI"]),
+        .target(
+            name: "MatrixRtc",
+            dependencies: ["MatrixRtcFFI"],
+            linkerSettings: matrixRtcLinkerSettings
+        ),
     ]
 )

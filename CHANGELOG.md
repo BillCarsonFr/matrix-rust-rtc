@@ -202,7 +202,9 @@ single integrator, rather than dripped out over several:
   `Package.swift` with the xcframework zip's checksum, and tags `v<version>`
   with the AAR, the zip, split Android debug symbols and `SHA256SUMS` attached
   to the GitHub Release. The xcframework now ships its header and module map,
-  so `import MatrixRtcFFI` resolves for SwiftPM consumers. The build scripts
+  so `import MatrixRtcFFI` resolves for SwiftPM consumers, the package declares
+  the system frameworks and `libc++` that libwebrtc needs, and the archives are
+  built for an iOS 16 deployment target rather than the host SDK's. The build scripts
   grew `--target`, `--profile`, `--split-debug`, `--skip-build`,
   `--skip-codegen`, `--version` (Android) and `--profile`, `--swift-out`,
   `--zip` (iOS) for the workflow; `make release-android` / `make release-ios`
