@@ -71,8 +71,8 @@ describe("own membership", () => {
 
   it("delegation arms a long leave after the join, tries the homeserver, then swaps out the short leave", async () => {
     const { driver, manager } = newManager();
-    await manager.join(receiveOnly(), { ...joinParams, delegateDelayedLeave: true });
-    const kinds = driver.outbound.map((c) => c.kind);
+    await manager.join(publishLk(), { ...joinParams, delegateDelayedLeave: true });
+    const kinds = driver.outbound.map((c) => c.kind).filter((k) => k !== "getLivekitToken");
     // short leave · join · long leave · homeserver delegation · cancel of the short one
     expect(kinds).toEqual(["delayedEvent", "stickyEvent", "delayedEvent", "delegateViaHomeserver", "cancelDelayed"]);
     const [short, long] = driver.calls("delayedEvent");
@@ -83,6 +83,16 @@ describe("own membership", () => {
     const status = manager.status();
     if (!FfiStatus.Connected.instanceOf(status)) throw new Error("expected Connected");
     expect(status.inner.keepAlive.tag).toBe("Delegated");
+    await manager.leave(undefined, undefined);
+  });
+
+  it("a receive-only member has no transport to delegate to and keeps its own leave", async () => {
+    const { driver, manager } = newManager();
+    await manager.join(receiveOnly(), { ...joinParams, delegateDelayedLeave: true });
+    expect(driver.outbound.map((c) => c.kind)).toEqual(["delayedEvent", "stickyEvent"]);
+    const status = manager.status();
+    if (!FfiStatus.Connected.instanceOf(status)) throw new Error("expected Connected");
+    expect(status.inner.keepAlive.tag).toBe("Armed");
     await manager.leave(undefined, undefined);
   });
 

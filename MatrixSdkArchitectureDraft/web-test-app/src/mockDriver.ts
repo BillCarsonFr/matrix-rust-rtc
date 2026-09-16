@@ -13,7 +13,7 @@ import type {
   FfiSendEventResponse,
   FfiToDeviceDelivery,
   FfiToDeviceRecipient,
-  FfiTransportDelegationRequest,
+  FfiHomeserverDelegationRequest, FfiTransportDelegationRequest,
   MatrixDriverCallback,
   ConnectivitySinkInterface,
   RoomEventSinkInterface,
@@ -210,7 +210,8 @@ export class MockMatrixDriver implements MatrixDriverCallback {
     this.record({ kind: "cancelDelayed", roomId, delayId });
   }
 
-  async delegateDelayedLeaveViaHomeserver(roomId: string, slotId: string, _memberJson: string, delayId: string): Promise<void> {
+  async delegateDelayedLeaveViaHomeserver(request: FfiHomeserverDelegationRequest): Promise<void> {
+    const { roomId, slotId, delayId } = request;
     this.record({ kind: "delegateViaHomeserver", roomId, slotId, delayId });
     if (this.refuseHomeserverDelegation) throw new RtcError.Unsupported("M_UNRECOGNIZED: no delegation endpoint");
   }

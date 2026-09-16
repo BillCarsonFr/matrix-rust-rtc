@@ -75,16 +75,28 @@ pub struct LivekitTokenResponse {
 }
 
 /// MSC4195 through the homeserver's CS API: one authenticated
-/// `POST .../rtc/livekit/delegate_delayed_leave`. The crate tries this route
-/// first; an adapter that cannot make authenticated homeserver calls (a
-/// widget client) answers [`DriverError::Unsupported`].
+/// `POST /_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave`
+/// with body `{ url, room_id, slot_id, member, delay_id, delay_timeout }`
+/// (the shape lk-jwt-service 0.7 accepts when a homeserver proxies
+/// `rtc/livekit/*` to it, MSC4512). The crate tries this route first; an
+/// adapter that cannot make authenticated homeserver calls (a widget
+/// client) answers [`DriverError::Unsupported`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct HomeserverDelegationRequest {
+    /// `url`: the SFU websocket URL our token named — how the service
+    /// recognises which SFU (its own) the delegation is about.
+    pub sfu_url: String,
+    /// The authorisation service of the transport we publish on, for an
+    /// adapter that wants to know which service the homeserver fronts.
+    pub livekit_service_url: String,
     pub room_id: String,
     pub slot_id: String,
     /// MSC4195 member claims `{ id, claimed_user_id, claimed_device_id }`.
     pub member: Value,
     pub delay_id: String,
+    /// `delay_timeout`: the long leave's delay. Optional on the wire once
+    /// homeservers can be asked for a delayed event by id; sent until then.
+    pub delay_timeout_ms: u64,
 }
 
 /// MSC4195 through the MatrixRTC authorisation service's token endpoint —

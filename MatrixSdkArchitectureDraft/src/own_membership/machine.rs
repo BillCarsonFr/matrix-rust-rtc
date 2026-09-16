@@ -4,20 +4,18 @@
 //! (restart cadence, half-life refresh, "must have fired", re-probe,
 //! self-heal, delegation fallback) is a unit test below.
 
-use super::ResolveTransportError;
 use super::wire::{self, Route, WireContext};
 use super::{
     ConnectedStatus, DEFAULT_DEGRADED_LIFETIME_MS, DelayedLeaveOutcome, DelegationRoute, JoinError,
     JoinParams, JoinStatus, KeepAlive, LeaveError, LeaveStatus, MAX_STICKY_DURATION_MS,
     MembershipPublication, OwnIdentity, RosterPresence, Status, UpdateApplicationError,
 };
+use super::{ResolveTransportError, ResolvedTransport};
 use crate::driver::{DriverError, SendEventResponse};
 use crate::session::{
     ElementCallCompat, JoinExclusionReason, LEGACY_SLOT_ID, SessionSnapshot, SlotState,
 };
-use crate::types::{
-    DeviceAttribution, LeaveReason, Member, MemberTransports, RtcTransport, TransportIntent,
-};
+use crate::types::{DeviceAttribution, LeaveReason, Member, MemberTransports, TransportIntent};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -84,6 +82,11 @@ pub(crate) enum Action {
     DelegateViaHomeserver {
         delay_id: String,
         member: Value,
+        /// The authorisation service of the transport we publish on.
+        livekit_service_url: String,
+        /// The SFU websocket URL our token named (MSC4195's `url`).
+        sfu_url: String,
+        delay_ms: u64,
     },
     /// MSC4195 through the authorisation service of the transport we publish on.
     DelegateViaTransport {
@@ -96,7 +99,7 @@ pub(crate) enum Action {
 
 #[derive(Debug)]
 pub(crate) enum Outcome {
-    TransportResolved(Result<RtcTransport, ResolveTransportError>),
+    TransportResolved(Result<ResolvedTransport, ResolveTransportError>),
     DelayedArmed(Result<String, DriverError>),
     MembershipSent {
         kind: SendKind,
@@ -203,6 +206,8 @@ struct Joining {
     intent: TransportIntent,
     params: JoinParams,
     plan: Option<JoinPlan>,
+    /// The SFU websocket URL the transport's token named, once resolved.
+    sfu_url: Option<String>,
     /// The short leave, armed before the join event and kept until a
     /// delegation is confirmed.
     delayed: Option<DelayedLeave>,
@@ -594,6 +599,7 @@ impl Machine {
             intent: intent.clone(),
             params,
             plan: None,
+            sfu_url: None,
             delayed: None,
             delegated: None,
             delegation_route: None,
@@ -757,6 +763,18 @@ impl Machine {
 
     pub(crate) fn last_join_progress(&self) -> JoinStatus {
         self.last_join_progress
+    }
+
+    /// The MSC4195 `member` claims object the authorisation service (or the
+    /// homeserver proxying to it) matches against our transport identity:
+    /// `{ id, claimed_user_id, claimed_device_id }` — the same object the
+    /// token request carries, not the `member` block of the member event.
+    fn member_claims(&self, member_id: &str) -> Value {
+        json!({
+            "id": member_id,
+            "claimed_user_id": self.own.user_id,
+            "claimed_device_id": self.own.device_id,
+        })
     }
 
     fn abort_join(&mut self, joining: Joining, error: JoinError) -> Vec<Action> {
@@ -1039,9 +1057,10 @@ impl Machine {
 
     fn on_join_outcome(&mut self, mut joining: Joining, outcome: Outcome, now: u64) -> Vec<Action> {
         match (joining.stage, outcome) {
-            (JoinStage::Resolving, Outcome::TransportResolved(Ok(transport))) => {
+            (JoinStage::Resolving, Outcome::TransportResolved(Ok(resolved))) => {
                 joining.flags.has_created_transport_token = true;
-                joining.intent = TransportIntent::Publish(transport);
+                joining.intent = TransportIntent::Publish(resolved.transport);
+                joining.sfu_url = resolved.sfu_url;
                 let actions = self.plan_and_arm(&mut joining, now);
                 self.state = State::Joining(joining);
                 actions
@@ -1086,9 +1105,12 @@ impl Machine {
                     joining.flags.has_started_heartbeat = true;
                     let plan = joining.plan.as_mut().expect("plan exists while sending");
                     plan.join_event_id = response.event_id;
+                    // Both MSC4195 routes name the transport we publish on;
+                    // a receive-only member has nothing to delegate to.
                     let delegate = plan.params.delegate_delayed_leave
                         && joining.delayed.is_some()
-                        && self.compat != ElementCallCompat::StateEvents;
+                        && self.compat != ElementCallCompat::StateEvents
+                        && published_service_url(plan).is_some();
                     if delegate {
                         // Arm-after-confirm: a second, long leave is armed
                         // and delegated while the short one keeps guarding
@@ -1119,10 +1141,34 @@ impl Machine {
                         plan.params.delegated_delay_ms,
                         now,
                     ));
-                    joining.stage = JoinStage::DelegatingViaHomeserver;
-                    let action = Action::DelegateViaHomeserver {
-                        delay_id,
-                        member: plan.join_content["member"].clone(),
+                    let livekit_service_url =
+                        published_service_url(plan).expect("delegating implies a transport");
+                    let action = match joining.sfu_url.clone() {
+                        Some(sfu_url) => {
+                            joining.stage = JoinStage::DelegatingViaHomeserver;
+                            Action::DelegateViaHomeserver {
+                                delay_id,
+                                member: self.member_claims(&joining.member_id),
+                                livekit_service_url,
+                                sfu_url,
+                                delay_ms: plan.params.delegated_delay_ms,
+                            }
+                        }
+                        None => {
+                            // The homeserver route names the SFU by the URL
+                            // our token gave us; without one, ask the service.
+                            log::info!(
+                                "[{}] no SFU url from the token; asking the authorisation service to take the delayed leave",
+                                self.room_id
+                            );
+                            joining.stage = JoinStage::DelegatingViaTransport;
+                            Action::DelegateViaTransport {
+                                delay_id,
+                                member: self.member_claims(&joining.member_id),
+                                livekit_service_url,
+                                delay_ms: plan.params.delegated_delay_ms,
+                            }
+                        }
                     };
                     self.state = State::Joining(joining);
                     vec![action]
@@ -1140,14 +1186,7 @@ impl Machine {
             }
             (JoinStage::DelegatingViaHomeserver, Outcome::Delegated(Err(e))) => {
                 let plan = joining.plan.as_ref().expect("plan exists while delegating");
-                let service_url = plan
-                    .member
-                    .transports
-                    .published
-                    .iter()
-                    .find_map(crate::connections::service_url)
-                    .map(str::to_owned);
-                match service_url {
+                match published_service_url(plan) {
                     Some(livekit_service_url) => {
                         log::info!(
                             "[{}] the homeserver did not take the delayed leave ({e}); asking the authorisation service",
@@ -1161,7 +1200,7 @@ impl Machine {
                                 .expect("armed before delegating")
                                 .delay_id
                                 .clone(),
-                            member: plan.join_content["member"].clone(),
+                            member: self.member_claims(&joining.member_id),
                             livekit_service_url,
                             delay_ms: plan.params.delegated_delay_ms,
                         };
@@ -1373,10 +1412,21 @@ impl Machine {
     }
 }
 
+/// The authorisation service of the transport the plan publishes on, if any.
+fn published_service_url(plan: &JoinPlan) -> Option<String> {
+    plan.member
+        .transports
+        .published
+        .iter()
+        .find_map(crate::connections::service_url)
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::driver::SendEventResponse;
+    use crate::types::RtcTransport;
     use serde_json::json;
 
     const ROOM: &str = "!room:x";
@@ -1711,7 +1761,7 @@ mod tests {
                 ..
             })
         ));
-        let a = h.outcome(Outcome::TransportResolved(Ok(lk())), T0);
+        let a = h.outcome(Outcome::TransportResolved(Ok(resolved())), T0);
         assert!(matches!(a[0], Action::ArmDelayedLeave { .. }));
         assert!(matches!(
             h.m.status(),
@@ -1738,7 +1788,7 @@ mod tests {
             params(),
             T0,
         );
-        h.outcome(Outcome::TransportResolved(Ok(lk())), T0);
+        h.outcome(Outcome::TransportResolved(Ok(resolved())), T0);
         let a = h.outcome(Outcome::DelayedArmed(Ok("d".into())), T0);
         assert_eq!(
             content(&a[0])["transports"]["published"][0]["livekit_service_url"],
@@ -2070,13 +2120,22 @@ mod tests {
     }
 
     fn member_claims() -> Value {
-        json!({ "id": "m-1", "membership": "join" })
+        json!({ "id": "m-1", "claimed_user_id": "@me:x", "claimed_device_id": "DEV" })
+    }
+
+    fn resolved() -> ResolvedTransport {
+        ResolvedTransport {
+            transport: lk(),
+            sfu_url: Some("wss://sfu".into()),
+        }
     }
 
     #[test]
     fn delegation_arms_a_long_leave_after_the_join_and_swaps_the_short_one_on_success() {
         let mut h = H::new(ElementCallCompat::Off);
-        let (a, mut rx) = h.join(receive_only(), delegating(), T0);
+        let (a, mut rx) = h.join(TransportIntent::Publish(lk()), delegating(), T0);
+        assert!(matches!(a[0], Action::ResolveTransport { .. }));
+        let a = h.outcome(Outcome::TransportResolved(Ok(resolved())), T0);
         // The short leave is armed as always: nothing is raised in advance.
         assert!(matches!(
             a[0],
@@ -2107,6 +2166,9 @@ mod tests {
             vec![Action::DelegateViaHomeserver {
                 delay_id: "long".into(),
                 member: member_claims(),
+                livekit_service_url: "https://lk".into(),
+                sfu_url: "wss://sfu".into(),
+                delay_ms: DELEGATION_MIN_DELAY_MS,
             }]
         );
         let a = h.outcome(Outcome::Delegated(Ok(())), T0 + 1);
@@ -2137,12 +2199,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn without_an_sfu_url_the_homeserver_route_is_skipped() {
+        let mut h = H::new(ElementCallCompat::Off);
+        h.join(TransportIntent::Publish(lk()), delegating(), T0);
+        h.outcome(
+            Outcome::TransportResolved(Ok(ResolvedTransport {
+                transport: lk(),
+                sfu_url: None,
+            })),
+            T0,
+        );
+        h.outcome(Outcome::DelayedArmed(Ok("short".into())), T0);
+        h.outcome(
+            Outcome::MembershipSent {
+                kind: SendKind::Join,
+                result: ok_sent(),
+            },
+            T0,
+        );
+        let a = h.outcome(Outcome::DelayedArmed(Ok("long".into())), T0);
+        assert_eq!(
+            a,
+            vec![Action::DelegateViaTransport {
+                delay_id: "long".into(),
+                member: member_claims(),
+                livekit_service_url: "https://lk".into(),
+                delay_ms: DELEGATION_MIN_DELAY_MS,
+            }]
+        );
+    }
+
     /// Up to the point where the homeserver has refused: a publishing join
     /// with the long leave armed.
     fn refused_by_homeserver(h: &mut H) -> (Vec<Action>, oneshot::Receiver<Result<(), JoinError>>) {
         let (a, rx) = h.join(TransportIntent::Publish(lk()), delegating(), T0);
         assert!(matches!(a[0], Action::ResolveTransport { .. }));
-        h.outcome(Outcome::TransportResolved(Ok(lk())), T0);
+        h.outcome(Outcome::TransportResolved(Ok(resolved())), T0);
         h.outcome(Outcome::DelayedArmed(Ok("short".into())), T0);
         h.outcome(
             Outcome::MembershipSent {
@@ -2217,26 +2310,22 @@ mod tests {
     #[test]
     fn a_receive_only_member_has_no_service_to_fall_back_to() {
         let mut h = H::new(ElementCallCompat::Off);
-        h.join(receive_only(), delegating(), T0);
+        let (_, mut rx) = h.join(receive_only(), delegating(), T0);
         h.outcome(Outcome::DelayedArmed(Ok("short".into())), T0);
-        h.outcome(
+        // Both MSC4195 routes name the transport we publish on, so no long
+        // leave is armed and the join completes on the short one.
+        let a = h.outcome(
             Outcome::MembershipSent {
                 kind: SendKind::Join,
                 result: ok_sent(),
             },
             T0,
         );
-        h.outcome(Outcome::DelayedArmed(Ok("long".into())), T0);
-        let a = h.outcome(
-            Outcome::Delegated(Err(DriverError::Unsupported("no endpoint".into()))),
-            T0,
+        assert!(
+            a.iter()
+                .all(|a| !matches!(a, Action::ArmDelayedLeave { .. }))
         );
-        assert_eq!(
-            a,
-            vec![Action::CancelDelayedLeave {
-                delay_id: "long".into()
-            }]
-        );
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
         assert!(matches!(
             h.m.status(),
             Status::Connected(c) if matches!(c.keep_alive, KeepAlive::Armed { .. })
@@ -2657,7 +2746,7 @@ mod tests {
         let mut h = H::new(ElementCallCompat::StateEvents);
         let (a, _) = h.join(TransportIntent::Publish(lk()), params(), T0);
         assert!(matches!(a[0], Action::ResolveTransport { .. }));
-        let a = h.outcome(Outcome::TransportResolved(Ok(lk())), T0);
+        let a = h.outcome(Outcome::TransportResolved(Ok(resolved())), T0);
         match &a[0] {
             Action::ArmDelayedLeave {
                 route:

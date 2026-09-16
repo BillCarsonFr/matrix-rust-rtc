@@ -7,7 +7,7 @@
 
 use crate::driver::{DriverError, LivekitTokenRequest, TokenDriver};
 use crate::executor::{self, now_ms, sleep_ms};
-use crate::own_membership::{OwnIdentity, ResolveTransportError};
+use crate::own_membership::{OwnIdentity, ResolveTransportError, ResolvedTransport};
 use crate::session::{ElementCallCompat, SessionSnapshot};
 use crate::types::{Member, RtcTransport, TransportIntent};
 use base64::Engine as _;
@@ -471,7 +471,7 @@ impl ConnectionsManager {
         &self,
         member_id: String,
         intent: TransportIntent,
-    ) -> Result<RtcTransport, ResolveTransportError> {
+    ) -> Result<ResolvedTransport, ResolveTransportError> {
         let transport = match intent {
             TransportIntent::Publish(t)
                 if service_url(&t).is_some() || t.transport_type != LIVEKIT =>
@@ -521,6 +521,7 @@ impl ConnectionsManager {
             )),
             None => None,
         };
+        let sfu_url = token.as_ref().map(|(_, t)| t.ws_url.clone());
         {
             let mut state = self.inner.lock();
             state.own_member_id = Some(member_id);
@@ -531,7 +532,7 @@ impl ConnectionsManager {
         }
         self.inner.publish();
         self.inner.wake.notify_one();
-        Ok(transport)
+        Ok(ResolvedTransport { transport, sfu_url })
     }
 
     /// Record our member id without a transport (receive-only join).
@@ -760,7 +761,9 @@ mod tests {
             m.add_own_transport("m-me".into(), TransportIntent::Publish(lk("https://own"))),
         )
         .unwrap();
-        assert_eq!(own, lk("https://own"));
+        // The token's SFU url comes back with the transport (MSC4195's `url`).
+        assert_eq!(own.transport, lk("https://own"));
+        assert_eq!(own.sfu_url.as_deref(), Some("wss://own"));
         // Our own connection is there right after the call returns.
         let ours = m.connections();
         assert!(
@@ -836,7 +839,7 @@ mod tests {
             }),
         ))
         .unwrap();
-        assert_eq!(own, lk("https://discovered"));
+        assert_eq!(own.transport, lk("https://discovered"));
         assert!(driver.requests.lock().unwrap()[0].legacy_sfu_get);
     }
 

@@ -318,12 +318,21 @@ pub enum UpdateApplicationError {
     Driver(#[from] DriverError),
 }
 
+/// What resolving a `Publish` intent yields: the transport we publish on
+/// and, when its token was minted, the SFU websocket URL that token named.
+/// MSC4195's homeserver route identifies the SFU by that URL.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedTransport {
+    pub transport: RtcTransport,
+    pub sfu_url: Option<String>,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub type ResolveTransportFuture =
-    Pin<Box<dyn Future<Output = Result<RtcTransport, ResolveTransportError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<ResolvedTransport, ResolveTransportError>> + Send>>;
 #[cfg(target_arch = "wasm32")]
 pub type ResolveTransportFuture =
-    Pin<Box<dyn Future<Output = Result<RtcTransport, ResolveTransportError>>>>;
+    Pin<Box<dyn Future<Output = Result<ResolvedTransport, ResolveTransportError>>>>;
 
 /// Resolves the transport we publish on: discovers one when the intent does
 /// not name it, mints its token (MSC4195 needs our member id), records it as

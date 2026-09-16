@@ -18,7 +18,7 @@ import type {
   FfiSendEventResponse,
   FfiToDeviceDelivery,
   FfiToDeviceRecipient,
-  FfiTransportDelegationRequest,
+  FfiHomeserverDelegationRequest, FfiTransportDelegationRequest,
   MatrixDriverCallback,
   ConnectivitySinkInterface,
   RoomEventSinkInterface,
@@ -114,15 +114,24 @@ export class JsSdkMatrixDriver implements MatrixDriverCallback {
     await guard(() => this.client._unstable_updateDelayedEvent(delayId, sdk.UpdateDelayedEventAction.Cancel));
   }
 
-  async delegateDelayedLeaveViaHomeserver(roomId: string, slotId: string, memberJson: string, delayId: string): Promise<void> {
-    // MSC4195 through the CS API. The crate tries this first and falls back
-    // to the authorisation service when it throws.
+  async delegateDelayedLeaveViaHomeserver(request: FfiHomeserverDelegationRequest): Promise<void> {
+    // MSC4195 through the CS API (a homeserver proxying `rtc/livekit/*` to the
+    // authorisation service, MSC4512). The crate tries this first and falls
+    // back to the authorisation service when it throws. `url` names the SFU
+    // our token pointed at, which the service checks is its own.
     await guard(() =>
       this.client.http.authedRequest(
         sdk.Method.Post,
         "/rtc/livekit/delegate_delayed_leave",
         undefined,
-        { room_id: roomId, slot_id: slotId, member: JSON.parse(memberJson), delay_id: delayId },
+        {
+          url: request.sfuUrl,
+          room_id: request.roomId,
+          slot_id: request.slotId,
+          member: JSON.parse(request.memberJson),
+          delay_id: request.delayId,
+          delay_timeout: Number(request.delayTimeoutMs),
+        },
         { prefix: "/_matrix/client/unstable/io.element.msc4195" },
       ),
     );

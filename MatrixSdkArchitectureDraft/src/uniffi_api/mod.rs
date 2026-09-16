@@ -572,6 +572,25 @@ pub struct FfiLivekitTokenRequest {
 }
 
 /// See `driver::TransportDelegationRequest`: the token request with the
+/// MSC4195 through the homeserver: `POST
+/// /_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave`
+/// with the body `{ url, room_id, slot_id, member, delay_id, delay_timeout }`
+/// — `url` is `sfu_url`, `member` is `member_json` parsed, `delay_timeout`
+/// is `delay_timeout_ms`.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiHomeserverDelegationRequest {
+    /// The SFU websocket URL our token named: the service checks it is its own.
+    pub sfu_url: String,
+    /// The authorisation service of the transport we publish on.
+    pub livekit_service_url: String,
+    pub room_id: String,
+    pub slot_id: String,
+    /// MSC4195 member claims `{ id, claimed_user_id, claimed_device_id }`.
+    pub member_json: String,
+    pub delay_id: String,
+    pub delay_timeout_ms: u64,
+}
+
 /// MSC4195 delay fields, sent to `{livekit_service_url}/get_token` (or
 /// `/sfu/get` with `legacy_sfu_get`).
 #[derive(Clone, Debug, uniffi::Record)]
@@ -1600,15 +1619,13 @@ pub trait MatrixDriverCallback: Send + Sync {
     /// the authorisation service's token endpoint needs.
     /// MSC4195 via the homeserver: one authenticated
     /// `POST /_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave`
-    /// with `{ room_id, slot_id, member, delay_id }`. A client that cannot make
+    /// with `{ url, room_id, slot_id, member, delay_id, delay_timeout }` (see
+    /// `FfiHomeserverDelegationRequest`). A client that cannot make
     /// authenticated homeserver calls (a widget) throws `Unsupported`; the
     /// crate then tries the authorisation service.
     async fn delegate_delayed_leave_via_homeserver(
         &self,
-        room_id: String,
-        slot_id: String,
-        member_json: String,
-        delay_id: String,
+        request: FfiHomeserverDelegationRequest,
     ) -> Result<(), RtcError>;
 
     /// MSC4195 via the authorisation service: the `get_token` (or, with
@@ -1847,12 +1864,15 @@ impl OwnMembershipDriver for FfiMatrixDriver {
     ) -> Result<(), DriverError> {
         Ok(self
             .callback
-            .delegate_delayed_leave_via_homeserver(
-                request.room_id,
-                request.slot_id,
-                request.member.to_string(),
-                request.delay_id,
-            )
+            .delegate_delayed_leave_via_homeserver(FfiHomeserverDelegationRequest {
+                sfu_url: request.sfu_url,
+                livekit_service_url: request.livekit_service_url,
+                room_id: request.room_id,
+                slot_id: request.slot_id,
+                member_json: request.member.to_string(),
+                delay_id: request.delay_id,
+                delay_timeout_ms: request.delay_timeout_ms,
+            })
             .await?)
     }
 
@@ -1998,6 +2018,13 @@ pub trait MembershipsListener: Send + Sync {
     /// tile's media (`membership.connections` -> LK room,
     /// `membership.transport_identity` -> participant).
     fn on_memberships_change(&self, memberships: Vec<FfiMembership>);
+}
+
+#[uniffi::export(with_foreign)]
+pub trait SessionListener: Send + Sync {
+    /// The room's view of the session changed (seed done, slot opened or
+    /// closed, roster moved): what `session()` answers now.
+    fn on_session_change(&self, session: FfiSessionSnapshot);
 }
 
 #[uniffi::export(with_foreign)]
@@ -2181,6 +2208,12 @@ impl FfiParticipationManager {
                 listener
                     .on_memberships_change(memberships.iter().map(FfiMembership::from).collect())
             }));
+    }
+
+    pub fn set_session_listener(&self, listener: Arc<dyn SessionListener>) {
+        self.inner.on_session_change(Box::new(move |session| {
+            listener.on_session_change(session.into())
+        }));
     }
 
     pub fn set_connections_listener(&self, listener: Arc<dyn ConnectionsListener>) {

@@ -157,13 +157,22 @@ impl Pump {
             Action::CancelDelayedLeave { delay_id } => {
                 Outcome::Cancelled(self.driver.cancel_delayed_event(room_id, delay_id).await)
             }
-            Action::DelegateViaHomeserver { delay_id, member } => Outcome::Delegated(
+            Action::DelegateViaHomeserver {
+                delay_id,
+                member,
+                livekit_service_url,
+                sfu_url,
+                delay_ms,
+            } => Outcome::Delegated(
                 self.driver
                     .delegate_delayed_leave_via_homeserver(HomeserverDelegationRequest {
+                        sfu_url,
+                        livekit_service_url,
                         room_id,
                         slot_id: self.slot_id.clone(),
                         member,
                         delay_id,
+                        delay_timeout_ms: delay_ms,
                     })
                     .await,
             ),
@@ -362,9 +371,12 @@ mod tests {
                 assert_eq!(member_id, "m-1");
                 calls.lock().unwrap().push("resolve");
                 match intent {
-                    TransportIntent::Publish(t) => Ok(RtcTransport {
-                        transport_type: t.transport_type,
-                        properties: json!({ "livekit_service_url": "https://resolved" }),
+                    TransportIntent::Publish(t) => Ok(super::super::ResolvedTransport {
+                        transport: RtcTransport {
+                            transport_type: t.transport_type,
+                            properties: json!({ "livekit_service_url": "https://resolved" }),
+                        },
+                        sfu_url: Some("wss://resolved-sfu".into()),
                     }),
                     TransportIntent::ReceiveOnly { .. } => {
                         Err(super::super::ResolveTransportError::NoTransport(

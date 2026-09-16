@@ -382,12 +382,14 @@ pub struct SessionMembership {
 pub type MembershipsCallback = Box<dyn Fn(&[SessionMembership]) + Send + Sync>;
 pub type ConnectionsCallback = Box<dyn Fn(&[ConnectionWithMembers]) + Send + Sync>;
 pub type StatusCallback = Box<dyn Fn(&Status) + Send + Sync>;
+pub type SessionCallback = Box<dyn Fn(&crate::session::SessionSnapshot) + Send + Sync>;
 /// `(member_id, why)` — the member whose key was discarded, and the reason.
 pub type KeyRejectedCallback = Box<dyn Fn(&str, &encryption::KeyRejection) + Send + Sync>;
 
 #[derive(Default)]
 struct Callbacks {
     memberships: Option<MembershipsCallback>,
+    session: Option<SessionCallback>,
     connections: Option<ConnectionsCallback>,
     // TODO rename to encryption key map
     key_map: Option<KeyMapCallback>,
@@ -399,6 +401,7 @@ struct Callbacks {
 #[derive(Default)]
 struct Published {
     memberships: Vec<SessionMembership>,
+    session: Option<crate::session::SessionSnapshot>,
     connections: Vec<ConnectionWithMembers>,
     status: Option<Status>,
     own_status: Option<own_membership::Status>,
@@ -771,6 +774,17 @@ impl ParticipationManager {
             .memberships = Some(callback);
     }
 
+    /// Fires when the room's view of the session changes: the seed
+    /// completing, the slot opening or closing, the roster — whatever
+    /// `session()` would answer differently now.
+    pub fn on_session_change(&self, callback: SessionCallback) {
+        self.inner
+            .callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session = Some(callback);
+    }
+
     pub fn connections(&self) -> Vec<ConnectionWithMembers> {
         self.inner.connections.connections()
     }
@@ -1112,15 +1126,20 @@ impl Inner {
     fn refresh_outputs(&self) {
         self.reap_ended_participation();
         let memberships = self.memberships();
+        let session = self.session.snapshot();
         let connections = self.connections.connections();
         let status = self.status();
-        let (fire_memberships, fire_connections, fire_status) = {
+        let (fire_memberships, fire_session, fire_connections, fire_status) = {
             let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
             let m = published.memberships != memberships;
+            let n = published.session.as_ref() != Some(&session);
             let c = published.connections != connections;
             let s = published.status.as_ref() != Some(&status);
             if m {
                 published.memberships = memberships.clone();
+            }
+            if n {
+                published.session = Some(session.clone());
             }
             if c {
                 published.connections = connections.clone();
@@ -1128,11 +1147,14 @@ impl Inner {
             if s {
                 published.status = Some(status.clone());
             }
-            (m, c, s)
+            (m, n, c, s)
         };
         let callbacks = self.callbacks.lock().unwrap_or_else(|e| e.into_inner());
         if fire_memberships && let Some(cb) = &callbacks.memberships {
             cb(&memberships);
+        }
+        if fire_session && let Some(cb) = &callbacks.session {
+            cb(&session);
         }
         if fire_connections && let Some(cb) = &callbacks.connections {
             cb(&connections);
