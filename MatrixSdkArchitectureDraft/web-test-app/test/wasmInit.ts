@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import initAsync from "../src/generated/wasm-bindgen/index.js";
 import bindings from "../src/generated/matrix_rtc.js";
+import { FfiLogLevel } from "../src/generated/matrix_rtc.js";
+import { installConsoleLogSink } from "../src/logSink";
 
 let initialized = false;
 
@@ -14,5 +16,7 @@ export async function initWasm(): Promise<void> {
   );
   await initAsync({ module_or_path: readFileSync(wasmPath) });
   bindings.initialize();
+  // Warnings and errors only: the crate is chatty at info while a test runs.
+  installConsoleLogSink(FfiLogLevel.Warn);
   initialized = true;
 }

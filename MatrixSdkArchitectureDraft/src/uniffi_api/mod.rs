@@ -1106,6 +1106,98 @@ impl From<&Impairment> for FfiImpairment {
     }
 }
 
+// --- logging --------------------------------------------------------------------
+
+/// The `log` crate's levels, for a [`LogSink`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<log::Level> for FfiLogLevel {
+    fn from(level: log::Level) -> Self {
+        match level {
+            log::Level::Error => Self::Error,
+            log::Level::Warn => Self::Warn,
+            log::Level::Info => Self::Info,
+            log::Level::Debug => Self::Debug,
+            log::Level::Trace => Self::Trace,
+        }
+    }
+}
+
+impl From<FfiLogLevel> for log::LevelFilter {
+    fn from(level: FfiLogLevel) -> Self {
+        match level {
+            FfiLogLevel::Error => Self::Error,
+            FfiLogLevel::Warn => Self::Warn,
+            FfiLogLevel::Info => Self::Info,
+            FfiLogLevel::Debug => Self::Debug,
+            FfiLogLevel::Trace => Self::Trace,
+        }
+    }
+}
+
+/// Where the crate's log lines go. Nothing is logged until a host installs
+/// one with [`set_log_sink`]: the crate speaks through the `log` facade and
+/// has no output of its own, so that its lines land in the host's log (and
+/// its rageshakes) rather than on a console the host does not read.
+///
+/// `target` is the Rust module path (`matrix_rtc::own_membership::machine`),
+/// `message` the formatted line. Called synchronously from wherever the
+/// crate logs; keep it cheap and never call back into the crate from it.
+#[uniffi::export(with_foreign)]
+pub trait LogSink: Send + Sync {
+    fn log(&self, level: FfiLogLevel, target: String, message: String);
+}
+
+struct SinkLogger {
+    sink: std::sync::RwLock<Option<Arc<dyn LogSink>>>,
+}
+
+static SINK_LOGGER: SinkLogger = SinkLogger {
+    sink: std::sync::RwLock::new(None),
+};
+
+impl log::Log for SinkLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let sink = self.sink.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(sink) = sink {
+            sink.log(
+                record.level().into(),
+                record.target().to_owned(),
+                record.args().to_string(),
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Routes the crate's log lines to `sink`, at `max_level` and above. Call
+/// once after the bindings are initialised; calling again replaces the sink
+/// and the level. The `log` facade accepts one logger per process, so if the
+/// host already installed a Rust logger of its own (a native host with
+/// `tracing`), that one keeps the lines and the sink stays silent.
+#[uniffi::export]
+pub fn set_log_sink(sink: Arc<dyn LogSink>, max_level: FfiLogLevel) {
+    *SINK_LOGGER.sink.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    // Fails only if a logger is installed already, which is the documented case.
+    let _ = log::set_logger(&SINK_LOGGER);
+    log::set_max_level(max_level.into());
+}
+
 /// The severity of one impairment, so a host can sort or filter without
 /// re-deriving the table. (`impairments` already arrives sorted, most severe
 /// first.)

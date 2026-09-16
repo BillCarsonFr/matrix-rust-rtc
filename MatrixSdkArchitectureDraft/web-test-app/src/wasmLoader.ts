@@ -5,8 +5,10 @@
 import initAsync from "./generated/wasm-bindgen/index.js";
 import wasmUrl from "./generated/wasm-bindgen/index_bg.wasm?url";
 import bindings from "./generated/matrix_rtc.js";
+import { installConsoleLogSink } from "./logSink";
 
 export async function initWasm(): Promise<void> {
   await initAsync({ module_or_path: wasmUrl });
   bindings.initialize();
+  installConsoleLogSink();
 }
