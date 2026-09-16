@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "strict": true,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": [
+    "src/index.ts",
+    "src/init.ts",
+    "src/log-sink.ts",
+    "src/drivers",
+    "src/testing",
+    "src/generated/matrix_rtc.ts",
+    "src/generated/matrix_rtc-ffi.ts",
+    "src/generated/wasm-bindgen/index.d.ts"
+  ]
+}

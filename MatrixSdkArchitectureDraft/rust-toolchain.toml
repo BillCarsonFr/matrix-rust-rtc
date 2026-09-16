@@ -1,0 +1,8 @@
+# Pins the toolchain for this crate and for the ubrn-generated wasm shim
+# (web-test-app/rust_modules/wasm builds with this directory as its cwd), so
+# the published wasm is built the same way everywhere. Scoped to the draft
+# crate on purpose: the surrounding workspace keeps its own toolchain.
+[toolchain]
+channel = "stable"
+targets = ["wasm32-unknown-unknown"]
+components = ["clippy", "rustfmt"]
