@@ -86,6 +86,10 @@ impl SendMachine {
         self.own.as_ref()
     }
 
+    pub fn manages_media_keys(&self) -> bool {
+        self.manage_media_keys
+    }
+
     /// PR #5505: `60_000 * N * (N - 1) / contingent`. No floor: a rotation
     /// that falls due while the previous key is still propagating waits for
     /// that key's switch instead (see [`Self::on_wake`]).

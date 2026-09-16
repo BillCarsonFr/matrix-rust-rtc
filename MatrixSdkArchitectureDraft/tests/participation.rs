@@ -614,7 +614,9 @@ fn open_room() -> Vec<Value> {
 }
 
 async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Generous on purpose: a wait ends the moment its condition holds, and a
+    // loaded CI runner shares one executor thread between every test's pumps.
+    let deadline = Instant::now() + Duration::from_secs(20);
     while !cond() {
         assert!(Instant::now() < deadline, "timed out waiting for: {what}");
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1313,6 +1315,21 @@ async fn a_steady_impairment_does_not_flap_the_status_callback() {
         m.connections().is_empty(),
         "the connection itself stays absent"
     );
+    // The join is still settling while the impairment shows up: the join
+    // sequence finishing (`Joining` -> `Connected`), our echo reaching the
+    // roster (`AwaitingEcho` -> `Present`), the encryption machine reporting
+    // in. Each is a legitimate status change; only count after them. (This
+    // room is unencrypted, so no key exchange is involved.)
+    wait_for("status settled", || {
+        matches!(
+            m.status(),
+            Status::Connected(c)
+                if c.own_membership.roster == own_membership::RosterPresence::Present
+                    && matches!(c.encryption, matrix_rtc::encryption::Status::Connected { .. })
+                    && c.impairments.len() == 1
+        )
+    })
+    .await;
 
     let count = Arc::new(AtomicU64::new(0));
     let sink = count.clone();

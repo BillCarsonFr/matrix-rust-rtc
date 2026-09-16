@@ -435,7 +435,11 @@ impl Machine {
         if state.connected {
             Status::Connected {
                 left_members_with_keys: state.send.left_members_with_keys(),
-                fully_settled: state.send.is_settled() && has_received_all_member_keys,
+                // In an unencrypted call nobody ever sends a key, so "every
+                // member has sent us one" would stay false for good; there
+                // is nothing to settle there.
+                fully_settled: state.send.is_settled()
+                    && (!state.send.manages_media_keys() || has_received_all_member_keys),
                 last_rotation_ts: state.send.last_rotation_ts(),
             }
         } else {

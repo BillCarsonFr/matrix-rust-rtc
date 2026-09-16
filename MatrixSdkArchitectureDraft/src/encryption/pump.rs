@@ -211,7 +211,9 @@ mod tests {
     }
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Generous on purpose: ends as soon as the condition holds, and the
+        // shared executor thread is contended when the whole suite runs.
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !cond() {
             assert!(Instant::now() < deadline, "timed out waiting for: {what}");
             std::thread::sleep(Duration::from_millis(5));
@@ -224,11 +226,16 @@ mod tests {
             sent: Mutex::new(Vec::new()),
             inbound: Mutex::new(None),
         });
-        let (session_tx, session_rx) = watch::channel(snapshot(Vec::new()));
-        let changes: Arc<Mutex<Vec<MediaKeyChange>>> = Arc::default();
-        let changes_cb = changes.clone();
         let own = member("@own:x", "OWN");
         let bob = member("@bob:x", "BOB");
+        // Bob is in the session from the first snapshot. Starting empty was a
+        // race: if the pump saw the empty snapshot before the test replaced
+        // it, the machine had nobody to distribute to and nobody to hear
+        // from, went `Connected` at once, and the "initial keys distributed"
+        // wait below (which expects `Joining`) timed out.
+        let (session_tx, session_rx) = watch::channel(snapshot(vec![own.clone(), bob.clone()]));
+        let changes: Arc<Mutex<Vec<MediaKeyChange>>> = Arc::default();
+        let changes_cb = changes.clone();
         let machine = Machine::new(
             driver.clone(),
             "!room:x".into(),
@@ -239,8 +246,12 @@ mod tests {
             true,
             EncryptionConfig::default(),
             SendMachineConfig {
+                // grace(2) = 200 ms; pinned jitter so the block is exactly
+                // that, and bob's leave below lands inside it (one rotation,
+                // to nobody).
                 shared_per_minute_to_device_contingent: 600,
                 use_key_delay_ms: 30,
+                rotation_jitter: Some(1.0),
                 ..Default::default()
             },
             Box::new(move |_, change| changes_cb.lock().unwrap().push(change.clone())),
@@ -248,9 +259,6 @@ mod tests {
         .unwrap();
 
         // 1. A session with bob: our first key goes to bob's device and is in use.
-        session_tx
-            .send(snapshot(vec![own.clone(), bob.clone()]))
-            .unwrap();
         wait_until("first key sent", || !driver.sent.lock().unwrap().is_empty());
         {
             let sent = driver.sent.lock().unwrap();

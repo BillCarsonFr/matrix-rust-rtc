@@ -36,6 +36,7 @@ use crate::types::{
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// How long `join` waits for the session to finish seeding before joining
 /// anyway (a driver whose `read_*` never answer must not block the call).
@@ -486,6 +487,12 @@ impl ParticipationManager {
             }),
         );
         let key_map_changed = Arc::new(Notify::new());
+        // Subscribe *here*, not in the pump task: a verdict the driver emits
+        // between construction and the pump's first poll would otherwise be
+        // lost for good (an mpsc stream has no "current value" to catch up
+        // on). Subscribing before reading the initial verdict closes the gap
+        // from the other side too.
+        let connectivity = driver.subscribe_connectivity();
         let homeserver_disconnected_since = if driver.is_homeserver_connected() {
             None
         } else {
@@ -510,7 +517,12 @@ impl ParticipationManager {
             homeserver_disconnected_since: Mutex::new(homeserver_disconnected_since),
         });
         let notify = Arc::new(Notify::new());
-        executor::spawn(run(Arc::downgrade(&inner), notify.clone(), key_map_changed));
+        executor::spawn(run(
+            Arc::downgrade(&inner),
+            notify.clone(),
+            key_map_changed,
+            connectivity,
+        ));
         Self { inner, notify }
     }
 
@@ -1371,7 +1383,12 @@ impl Drop for LivenessGuard {
 }
 
 /// The facade's pump: wake on any input change, recompute, fire callbacks.
-async fn run(inner: Weak<Inner>, notify: Arc<Notify>, key_map_changed: Arc<Notify>) {
+async fn run(
+    inner: Weak<Inner>,
+    notify: Arc<Notify>,
+    key_map_changed: Arc<Notify>,
+    mut connectivity: UnboundedReceiver<bool>,
+) {
     let Some(strong) = inner.upgrade() else {
         return;
     };
@@ -1382,7 +1399,6 @@ async fn run(inner: Weak<Inner>, notify: Arc<Notify>, key_map_changed: Arc<Notif
     // impairment that reports it.
     let mut problems = strong.connections.subscribe_problems();
     let mut own_status = strong.own_membership.subscribe_status();
-    let mut connectivity = strong.driver.subscribe_connectivity();
     // Once the driver closes its stream the last verdict stands; the arm is
     // disabled rather than polled.
     let mut connectivity_open = true;
