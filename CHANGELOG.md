@@ -7,12 +7,10 @@ had a tagged release yet, so everything so far lives under Unreleased.
 Entries begin with the Android integration work — earlier history is in the git
 log only.
 
-## v0.2.0-rc.2
+## v0.2.0-rc.1
 
-Second release candidate of 0.2.0. Over rc.1, which validated the pipeline and
-the Swift package end to end: the package now declares the system frameworks
-and `libc++` that libwebrtc needs, and the iOS archives are built for an iOS 16
-deployment target instead of the host SDK's. Everything else is described under
+Release candidate of 0.2.0, cut to exercise the release pipeline and the
+Swift package end to end. Everything it contains is described under
 [Unreleased](#unreleased); the final 0.2.0 notes will replace this section.
 
 ## Unreleased
