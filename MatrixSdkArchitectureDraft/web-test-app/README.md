@@ -15,8 +15,13 @@ model and the LiveKit reconciliation loop a host runs on top.
 ## Install
 
 The package is published to the **GitHub Packages** npm registry, not
-npmjs.com. Point the `@element-hq` scope at it once, in the consuming project's
-`.npmrc` (or `~/.npmrc`):
+npmjs.com. GitHub Packages only lets a workflow publish into the scope of the
+repository's owner, so the scope is the owner of the repository CI ran in:
+`@element-hq/matrix-rtc` from `element-hq/matrix-rust-rtc`,
+`@billcarsonfr/matrix-rtc` from the `BillCarsonFr` fork (the source tree keeps
+the canonical `@element-hq` name; `scripts/scope-to-repo.mjs` rewrites it at
+publish time). Point that scope at the registry once, in the consuming
+project's `.npmrc` (or `~/.npmrc`):
 
 ```ini
 @element-hq:registry=https://npm.pkg.github.com

@@ -19,15 +19,24 @@ const patchToml = read(resolve(pkgDir, "Cargo.patch.toml"));
 
 const ubrnDir = dirname(require.resolve("uniffi-bindgen-react-native/package.json"));
 const ubrnPkg = JSON.parse(read(resolve(ubrnDir, "package.json")));
-const ubrnLock = read(resolve(ubrnDir, "Cargo.lock"));
+// The npm tarball ships ubrn's workspace Cargo.toml but no Cargo.lock (one
+// appears only after the CLI has compiled itself once), so the versions
+// ubrn was built against come from its `[workspace.dependencies]`.
+const ubrnToml = read(resolve(ubrnDir, "Cargo.toml"));
 
 const must = (re, text, what) => {
   const m = text.match(re);
   if (!m) throw new Error(`could not find ${what}`);
   return m[1];
 };
-const lockVersion = (name) =>
-  must(new RegExp(`name = "${name}"\\nversion = "([^"]+)"`), ubrnLock, `${name} in ubrn's Cargo.lock`);
+const ubrnDep = (name) =>
+  must(new RegExp(`^${name} = "=([^"]+)"`, "m"), ubrnToml, `${name} pin in ubrn's Cargo.toml`);
+// ubrn pins `uniffi = "=0.31"`, i.e. any 0.31.x: compare on as many components
+// as the shorter side states.
+const samePrefix = (a, b) => {
+  const n = Math.min(a.split(".").length, b.split(".").length);
+  return a.split(".").slice(0, n).join(".") === b.split(".").slice(0, n).join(".");
+};
 
 const crateVersion = must(/^version = "([^"]+)"/m, crateToml, "crate version");
 const crateUniffi = must(/uniffi = \{ version = "=([^"]+)"/, crateToml, "uniffi pin in Cargo.toml");
@@ -38,13 +47,13 @@ const checks = [
   ["package.json version", pkg.version, "Cargo.toml version", crateVersion],
   ["dependencies[@ubjs/core]", pkg.dependencies?.["@ubjs/core"], "devDependencies[uniffi-bindgen-react-native]", pkg.devDependencies?.["uniffi-bindgen-react-native"]],
   ["devDependencies[uniffi-bindgen-react-native]", pkg.devDependencies?.["uniffi-bindgen-react-native"], "installed ubrn", ubrnPkg.version],
-  ["Cargo.toml uniffi", crateUniffi, "ubrn's uniffi", lockVersion("uniffi")],
-  ["Cargo.patch.toml wasm-bindgen", patchWasmBindgen, "ubrn's wasm-bindgen-cli-support", lockVersion("wasm-bindgen-cli-support")],
+  ["Cargo.toml uniffi", crateUniffi, "ubrn's uniffi", ubrnDep("uniffi"), samePrefix],
+  ["Cargo.patch.toml wasm-bindgen", patchWasmBindgen, "ubrn's wasm-bindgen-cli-support", ubrnDep("wasm-bindgen-cli-support")],
 ];
 
 let failed = false;
-for (const [aName, a, bName, b] of checks) {
-  const ok = a !== undefined && a === b;
+for (const [aName, a, bName, b, eq = (x, y) => x === y] of checks) {
+  const ok = a !== undefined && b !== undefined && eq(a, b);
   console.log(`${ok ? "ok  " : "FAIL"} ${aName} = ${a}  ${ok ? "==" : "!="}  ${bName} = ${b}`);
   if (!ok) failed = true;
 }

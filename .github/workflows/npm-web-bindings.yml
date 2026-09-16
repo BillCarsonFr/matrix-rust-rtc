@@ -19,7 +19,10 @@
 # (MatrixSdkArchitectureDraft) compiled to wasm with uniffi-bindgen-react-native
 # bindings. Built and tested on every push and PR; published to the GitHub
 # Packages npm registry as a `next` pre-release from the tracked branches and
-# as `latest` from `matrix-rtc-v*` tags.
+# as `latest` from `matrix-rtc-v*` tags. GitHub Packages only lets a workflow's
+# GITHUB_TOKEN publish into its own repository's owner scope, so the package
+# is published as `@<repository owner>/matrix-rtc` (scripts/scope-to-repo.mjs):
+# `@element-hq/matrix-rtc` from element-hq, `@billcarsonfr/matrix-rtc` from a fork.
 name: Web bindings (npm)
 
 on:
@@ -112,7 +115,6 @@ jobs:
           cache: npm
           cache-dependency-path: ${{ env.PKG_DIR }}/package-lock.json
           registry-url: https://npm.pkg.github.com
-          scope: "@element-hq"
 
       - name: Install
         run: npm ci
@@ -161,7 +163,8 @@ jobs:
         run: |
           set +e
           mkdir -p "$RUNNER_TEMP/prev" && cd "$RUNNER_TEMP/prev"
-          npm pack @element-hq/matrix-rtc@latest --silent >/dev/null 2>&1 || { echo "no published latest yet" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          name="@${GITHUB_REPOSITORY_OWNER,,}/matrix-rtc"
+          npm pack "${name}@latest" --silent >/dev/null 2>&1 || { echo "no published ${name}@latest yet" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
           tar xzf ./*.tgz
           cd "$GITHUB_WORKSPACE/$PKG_DIR"
           {
@@ -178,6 +181,7 @@ jobs:
             ${{ env.PKG_DIR }}/package.json
             ${{ env.PKG_DIR }}/README.md
             ${{ env.PKG_DIR }}/LICENSE
+            ${{ env.PKG_DIR }}/scripts/scope-to-repo.mjs
           if-no-files-found: error
 
   publish-next:
@@ -203,7 +207,9 @@ jobs:
         with:
           node-version: 22
           registry-url: https://npm.pkg.github.com
-          scope: "@element-hq"
+
+      - name: Scope the package to this repository
+        run: node scripts/scope-to-repo.mjs "${GITHUB_REPOSITORY}"
 
       # 0.1.0 -> 0.1.0-next.<run>.<sha>: sorts below the release it precedes,
       # strictly increasing across runs, and names the commit.
@@ -240,7 +246,9 @@ jobs:
         with:
           node-version: 22
           registry-url: https://npm.pkg.github.com
-          scope: "@element-hq"
+
+      - name: Scope the package to this repository
+        run: node scripts/scope-to-repo.mjs "${GITHUB_REPOSITORY}"
 
       - name: Tag matches package version
         run: |
