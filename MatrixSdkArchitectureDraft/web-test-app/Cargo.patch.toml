@@ -1,6 +1,21 @@
 # Merged into the generated rust_modules/wasm/Cargo.toml by ubrn
 # (`web.manifestPatchFile`). ubrn's bundled wasm-bindgen CLI is 0.2.100 and
 # the wasm-bindgen schema must match exactly, so the crate side is pinned to
-# the same version. Bump together with uniffi-bindgen-react-native.
+# the same version. Bump together with uniffi-bindgen-react-native
+# (`npm run check-pins` verifies).
 [dependencies]
 wasm-bindgen = "=0.2.100"
+
+# The shim is its own workspace root, so its profiles are honoured. A custom
+# profile rather than editing `release`: ubrn's TOML merge refuses to change
+# the generated `release.opt-level = 3` (integer) to `"z"` (string). Size over
+# speed: the crate does bookkeeping per Matrix event, not media work, and the
+# binary is a download on every page load. `wasm-opt -Oz` runs afterwards
+# (scripts/build.mjs). Selected with `ubrn build web --profile web`.
+[profile.web]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,7 +1,7 @@
 // The crate logs through Rust's `log` facade and has no output of its own:
 // a host installs a LogSink. This one writes to the console, prefixed with
 // the Rust module the line came from.
-import { FfiLogLevel, type LogSink, setLogSink } from "./generated/matrix_rtc";
+import { FfiLogLevel, type LogSink, setLogSink } from "./generated/matrix_rtc.js";
 
 export class ConsoleLogSink implements LogSink {
   log(level: FfiLogLevel, target: string, message: string): void {

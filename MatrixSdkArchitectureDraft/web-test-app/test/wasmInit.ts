@@ -1,22 +1,15 @@
-// Loads the wasm module in Node (vitest) — the browser entrypoint
-// (src/index.web.ts) fetches the .wasm by URL, which Node cannot do.
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import initAsync from "../src/generated/wasm-bindgen/index.js";
-import bindings from "../src/generated/matrix_rtc.js";
-import { FfiLogLevel } from "../src/generated/matrix_rtc.js";
-import { installConsoleLogSink } from "../src/logSink";
+// Loads the published build (`dist/`) for the acceptance suites, through the
+// package's own Node entry point. Warnings and errors only: the crate is
+// chatty at info while a test runs.
+import { FfiLogLevel, initAsync } from "@element-hq/matrix-rtc";
+import { installConsoleLogSink } from "@element-hq/matrix-rtc/log-sink";
 
-let initialized = false;
+let sinkInstalled = false;
 
 export async function initWasm(): Promise<void> {
-  if (initialized) return;
-  const wasmPath = fileURLToPath(
-    new URL("../src/generated/wasm-bindgen/index_bg.wasm", import.meta.url),
-  );
-  await initAsync({ module_or_path: readFileSync(wasmPath) });
-  bindings.initialize();
-  // Warnings and errors only: the crate is chatty at info while a test runs.
-  installConsoleLogSink(FfiLogLevel.Warn);
-  initialized = true;
+  await initAsync();
+  if (!sinkInstalled) {
+    installConsoleLogSink(FfiLogLevel.Warn);
+    sinkInstalled = true;
+  }
 }

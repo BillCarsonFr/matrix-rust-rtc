@@ -8,11 +8,16 @@
 //   3. timers (`executor::sleep_ms` -> `setTimeout`) fire, inside an exported
 //      future and inside a detached task.
 import { beforeAll, describe, expect, it } from "vitest";
-import { RuntimeProbe, type ProbeListener } from "../src/generated/matrix_rtc";
-import { initWasm } from "./wasmInit";
+import type { ProbeListener } from "../src/generated-dev/matrix_rtc";
+import { type DevBindings, devBuildPresent, initWasm } from "./wasmInitDev";
+
+// Resolved in beforeAll: a static import would fail the whole file when the
+// dev build is absent, before `skipIf` gets a say.
+let RuntimeProbe: DevBindings["RuntimeProbe"];
 
 beforeAll(async () => {
-  await initWasm();
+  if (!devBuildPresent) return;
+  ({ RuntimeProbe } = await initWasm());
 });
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -28,7 +33,7 @@ class Recorder implements ProbeListener {
   }
 }
 
-describe("runtime probe (wasm)", () => {
+describe.skipIf(!devBuildPresent)("runtime probe (wasm)", () => {
   it("clock works (SystemTime via web-time)", () => {
     const probe = new RuntimeProbe();
     const now = Number(probe.nowMs());

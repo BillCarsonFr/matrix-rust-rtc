@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false,
+    "types": [],
+    "paths": {
+      "@element-hq/matrix-rtc": ["../../dist/index.d.ts"],
+      "@element-hq/matrix-rtc/log-sink": ["../../dist/log-sink.d.ts"],
+      "@element-hq/matrix-rtc/driver/matrix-js-sdk": ["../../dist/drivers/matrix-js-sdk.d.ts"],
+      "@element-hq/matrix-rtc/testing": ["../../dist/testing/mock-driver.d.ts"]
+    }
+  },
+  "include": ["consumer.ts"]
+}

@@ -13,6 +13,16 @@
 #[cfg(feature = "runtime-probe")]
 pub mod runtime_probe;
 
+/// Route Rust panics to the JS console (wasm32 only; a no-op on native, where
+/// the default hook already prints). Idempotent. The npm package calls this
+/// from `initAsync`; hosts loading the bindings by hand should call it once
+/// after `initialize()`.
+#[uniffi::export]
+pub fn install_panic_hook() {
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 

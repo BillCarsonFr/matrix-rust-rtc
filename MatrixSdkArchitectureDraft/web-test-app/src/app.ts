@@ -6,7 +6,8 @@
 // homeserver with simulated peers) and a matrix-js-sdk driver against a real
 // homeserver (demo/backend). A real app would also hold LiveKit Room objects
 // — here they are rendered as text.
-import { initWasm } from "./wasmLoader";
+import { initAsync } from "./index.js";
+import { installConsoleLogSink } from "./log-sink.js";
 import {
   FfiElementCallCompat,
   FfiMatrixDriver,
@@ -20,7 +21,7 @@ import {
   type FfiMediaKey,
   type FfiMembership,
   type MatrixDriverCallback,
-} from "./generated/matrix_rtc";
+} from "./index.js";
 import {
   LK_SERVICE_URL,
   MockMatrixDriver,
@@ -32,8 +33,8 @@ import {
   slotClosedEvent,
   slotEvent,
   type RemotePeer,
-} from "./mockDriver";
-import { createJsSdkBackend, type JsSdkBackend } from "./jsSdkDriver";
+} from "./testing/mock-driver.js";
+import { createJsSdkBackend, type JsSdkBackend } from "./drivers/matrix-js-sdk.js";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const logError = (e: unknown) => {
@@ -212,7 +213,8 @@ function mockBackend(): Backend {
 }
 
 async function main() {
-  await initWasm();
+  await initAsync();
+  installConsoleLogSink();
   setStatus("wasm loaded — pick a backend");
 
   const joinIntent = () =>

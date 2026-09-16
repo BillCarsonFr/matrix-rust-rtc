@@ -39,16 +39,18 @@ events, scripted peers answer our media key).
 
 ## Web
 
-[`web-test-app/`](web-test-app/README.md) holds the uniffi-generated npm
-bindings (via uniffi-bindgen-react-native's wasm target), the acceptance
-suites through the real bindings, a demo page, a `MatrixDriver` mock and a
-matrix-js-sdk driver for a real homeserver (`../demo/backend`).
+[`web-test-app/`](web-test-app/README.md) is the npm package
+`@element-hq/matrix-rtc` (uniffi-bindgen-react-native wasm bindings, published
+to the GitHub Packages registry by `.github/workflows/npm-web-bindings.yml`),
+with the acceptance suites through the real bindings, a demo page, a
+`MatrixDriver` mock and a matrix-js-sdk driver for a real homeserver
+(`../demo/backend`).
 
 ```sh
 cd web-test-app
 npm install
-npm run ubrn:web   # build the crate for wasm32 + generate TS bindings
-npm test           # acceptance suites (vitest)
+npm run build      # crate -> wasm32 + TS bindings -> dist/ (what gets published)
+npm test           # acceptance suites (vitest) against dist/
 npm run dev        # demo page
 ```
 

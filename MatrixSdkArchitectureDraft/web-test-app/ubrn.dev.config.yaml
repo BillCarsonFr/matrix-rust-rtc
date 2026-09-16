@@ -1,0 +1,15 @@
+# Test-only build: `npm run build:dev`. Adds the runtime-assumptions probe
+# (test/runtimeProbe.test.ts), which must never ship. Shares the shim crate
+# and its target dir with the published build, so only the crate and the shim
+# recompile when switching.
+rust:
+  directory: ..
+  manifestPath: Cargo.toml
+web:
+  wasmCrateName: matrix-rtc-wasm-shim
+  ts: src/generated-dev
+  entrypoint: src/index.dev.web.ts
+  manifestPatchFile: Cargo.patch.toml
+  features:
+    - uniffi
+    - runtime-probe

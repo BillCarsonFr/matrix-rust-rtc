@@ -12,8 +12,8 @@ import {
   FfiStatus,
   impairmentSeverity,
   type FfiMembership,
-} from "../src/generated/matrix_rtc";
-import { LK_SERVICE_URL, OWN_USER_ID, ROOM_ID, memberJoinEvent, tick, waitFor } from "../src/mockDriver";
+} from "@element-hq/matrix-rtc";
+import { LK_SERVICE_URL, OWN_USER_ID, ROOM_ID, memberJoinEvent, tick, waitFor } from "@element-hq/matrix-rtc/testing";
 import { encryptedRoomState, joinParams, newManager, publishLk, receiveOnly } from "./helpers";
 import { initWasm } from "./wasmInit";
 

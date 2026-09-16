@@ -15,9 +15,9 @@ import {
   FfiParticipationManager,
   FfiStatus,
   FfiTransportIntent,
-} from "../src/generated/matrix_rtc";
-import { createJsSdkBackend, type JsSdkBackend } from "../src/jsSdkDriver";
-import { waitFor } from "../src/mockDriver";
+} from "@element-hq/matrix-rtc";
+import { createJsSdkBackend, type JsSdkBackend } from "@element-hq/matrix-rtc/driver/matrix-js-sdk";
+import { waitFor } from "@element-hq/matrix-rtc/testing";
 import { initWasm } from "./wasmInit";
 
 const HOMESERVER_URL = process.env.HOMESERVER_URL ?? "http://localhost:8008";
@@ -32,6 +32,7 @@ const joinParams = {
   keepAliveTimeoutMs: 15_000n,
   degradedLifetimeMs: undefined,
   delegateDelayedLeave: false,
+  delegatedDelayMs: 3_600_000n,
 };
 
 const publish = () =>

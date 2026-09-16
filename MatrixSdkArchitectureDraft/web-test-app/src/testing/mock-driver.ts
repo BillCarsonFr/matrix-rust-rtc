@@ -1,5 +1,5 @@
 // A MatrixDriver implemented in TypeScript — the same seam a
-// matrix-js-sdk-backed driver implements (see jsSdkDriver.ts). This mock
+// matrix-js-sdk-backed driver implements (see drivers/matrix-js-sdk.ts). This mock
 // models a homeserver: it records every outbound call for assertions, returns
 // canned responses, **echoes** accepted sticky/state events back through the
 // room-event sink (as sync would, so our own membership reaches the roster
@@ -19,8 +19,8 @@ import type {
   RoomEventSinkInterface,
   StateUpdateSinkInterface,
   ToDeviceSinkInterface,
-} from "./generated/matrix_rtc";
-import { FfiEventOrigin as Origin, RtcError } from "./generated/matrix_rtc";
+} from "../generated/matrix_rtc.js";
+import { FfiEventOrigin as Origin, RtcError } from "../generated/matrix_rtc.js";
 
 export const LK_SERVICE_URL = "https://lk.example.org";
 export const ROOM_ID = "!room:example.org";

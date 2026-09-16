@@ -1,5 +1,5 @@
 // A MatrixDriver backed by matrix-js-sdk — the real-homeserver twin of
-// mockDriver.ts. Outbound: MSC4354 sticky events, MSC4140 delayed events
+// testing/mock-driver.ts. Outbound: MSC4354 sticky events, MSC4140 delayed events
 // (restart, never cancel+resend), room state, to-device messages (Olm when
 // crypto is on), MSC4195 token exchange with the OpenID hop, transport
 // discovery. Inbound: the three sinks fed from js-sdk's timeline, state and
@@ -9,7 +9,7 @@
 // host). Requires matrix-js-sdk v42+ (`_unstable_` sticky/delayed APIs).
 import * as sdk from "matrix-js-sdk";
 import type { MatrixClient, MatrixEvent, Room } from "matrix-js-sdk";
-import { RtcError, FfiEventOrigin as Origin } from "./generated/matrix_rtc";
+import { RtcError, FfiEventOrigin as Origin } from "../generated/matrix_rtc.js";
 import type {
   FfiEventOrigin,
   FfiLivekitToken,
@@ -24,7 +24,7 @@ import type {
   RoomEventSinkInterface,
   StateUpdateSinkInterface,
   ToDeviceSinkInterface,
-} from "./generated/matrix_rtc";
+} from "../generated/matrix_rtc.js";
 
 type Log = (line: string) => void;
 

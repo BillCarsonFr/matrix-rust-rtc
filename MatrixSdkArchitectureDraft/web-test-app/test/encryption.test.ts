@@ -2,8 +2,8 @@
 // list): distribution to members, verification of inbound keys, buffering of
 // early keys, and the unencrypted case.
 import { beforeAll, describe, expect, it } from "vitest";
-import { FfiEventOrigin, FfiSessionRead, type FfiMediaKey } from "../src/generated/matrix_rtc";
-import { OWN_DEVICE_ID, encryptionKeyContent, waitFor } from "../src/mockDriver";
+import { FfiEventOrigin, FfiSessionRead, type FfiMediaKey } from "@element-hq/matrix-rtc";
+import { OWN_DEVICE_ID, encryptionKeyContent, waitFor } from "@element-hq/matrix-rtc/testing";
 import { encryptedRoomState, joinParams, newManager, receiveOnly } from "./helpers";
 import { initWasm } from "./wasmInit";
 

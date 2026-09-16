@@ -1,11 +1,11 @@
+# The published build: `npm run build`. Feature set is exactly what ships.
 rust:
   directory: ..
   manifestPath: Cargo.toml
 web:
   wasmCrateName: matrix-rtc-wasm-shim
   ts: src/generated
+  entrypoint: src/index.web.ts
   manifestPatchFile: Cargo.patch.toml
   features:
     - uniffi
-    # test-only: runtime assumptions probe (test/runtimeProbe.test.ts)
-    - runtime-probe

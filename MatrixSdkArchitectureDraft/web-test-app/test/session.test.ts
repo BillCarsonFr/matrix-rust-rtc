@@ -9,7 +9,7 @@ import {
   FfiTransportIntent,
   computeSessionsFromEvents,
   type FfiMembership,
-} from "../src/generated/matrix_rtc";
+} from "@element-hq/matrix-rtc";
 import {
   memberJoinEvent,
   roomMemberEvent,
@@ -17,7 +17,7 @@ import {
   slotOpenEvent,
   tick,
   waitFor,
-} from "../src/mockDriver";
+} from "@element-hq/matrix-rtc/testing";
 import { joinParams, newManager } from "./helpers";
 import { initWasm } from "./wasmInit";
 

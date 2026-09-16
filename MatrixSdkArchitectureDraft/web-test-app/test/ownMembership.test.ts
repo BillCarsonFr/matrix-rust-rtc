@@ -2,8 +2,8 @@
 // §9.4): compat dialects, timers on the JS clock, leave, delegation, the
 // automatic slot_closed leave, and the own transport in connections().
 import { beforeAll, describe, expect, it } from "vitest";
-import { FfiElementCallCompat, FfiStatus } from "../src/generated/matrix_rtc";
-import { LK_SERVICE_URL, OWN_DEVICE_ID, OWN_USER_ID, slotClosedEvent, waitFor } from "../src/mockDriver";
+import { FfiElementCallCompat, FfiStatus } from "@element-hq/matrix-rtc";
+import { LK_SERVICE_URL, OWN_DEVICE_ID, OWN_USER_ID, slotClosedEvent, waitFor } from "@element-hq/matrix-rtc/testing";
 import { joinParams, newManager, publishLk, receiveOnly } from "./helpers";
 import { initWasm } from "./wasmInit";
 

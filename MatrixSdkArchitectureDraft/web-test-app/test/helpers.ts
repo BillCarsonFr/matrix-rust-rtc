@@ -4,7 +4,7 @@ import {
   FfiMatrixDriver,
   FfiParticipationManager,
   FfiTransportIntent,
-} from "../src/generated/matrix_rtc";
+} from "@element-hq/matrix-rtc";
 import {
   LK_SERVICE_URL,
   MockMatrixDriver,
@@ -15,7 +15,7 @@ import {
   roomEncryptionEvent,
   slotEvent,
   slotOpenEvent,
-} from "../src/mockDriver";
+} from "@element-hq/matrix-rtc/testing";
 
 export function newManager(
   opts: {

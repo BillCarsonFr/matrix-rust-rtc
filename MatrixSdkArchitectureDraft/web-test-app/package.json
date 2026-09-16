@@ -1,29 +1,79 @@
 {
-  "name": "matrix-rtc-web",
+  "name": "@element-hq/matrix-rtc",
   "version": "0.1.0",
-  "private": true,
-  "description": "uniffi-generated npm bindings + demo webapp for the matrix-rtc draft crate",
+  "description": "MatrixRTC (MSC4143) participation SDK: uniffi-generated web and Node bindings of the matrix-rtc Rust crate.",
+  "license": "AGPL-3.0-only",
   "type": "module",
-  "browser": "src/index.web.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/element-hq/matrix-rust-rtc.git",
+    "directory": "MatrixSdkArchitectureDraft/web-test-app"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "node": "./dist/index.node.js",
+      "default": "./dist/index.js"
+    },
+    "./wasm": "./dist/generated/wasm-bindgen/index_bg.wasm",
+    "./log-sink": {
+      "types": "./dist/log-sink.d.ts",
+      "default": "./dist/log-sink.js"
+    },
+    "./driver/matrix-js-sdk": {
+      "types": "./dist/drivers/matrix-js-sdk.d.ts",
+      "default": "./dist/drivers/matrix-js-sdk.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/mock-driver.d.ts",
+      "default": "./dist/testing/mock-driver.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "ubrn:web": "ubrn build web --config ubrn.config.yaml",
+    "build": "node scripts/build.mjs",
+    "build:dev": "node scripts/build.mjs --dev",
+    "ubrn:web": "ubrn build web --profile web --config ubrn.config.yaml",
+    "check-pins": "node scripts/check-pins.mjs",
+    "sync-version": "node scripts/sync-version.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:types": "tsc -p test/types/tsconfig.json",
+    "test:pack": "bash scripts/pack-test.sh",
     "dev": "vite",
-    "build": "vite build",
-    "test": "vitest run"
+    "demo:build": "vite build --outDir demo-dist"
+  },
+  "dependencies": {
+    "@ubjs/core": "0.31.0-5"
+  },
+  "peerDependencies": {
+    "matrix-js-sdk": ">=42"
+  },
+  "peerDependenciesMeta": {
+    "matrix-js-sdk": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@types/node": "^22.20.3",
+    "binaryen": "^132.0.0",
+    "matrix-js-sdk": "^42.3.0",
     "typescript": "^7.0.2",
     "uniffi-bindgen-react-native": "0.31.0-5",
     "vite": "^8.2.2",
-    "vitest": "^4.1.11",
-    "wasm-pack": "^0.15.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/element-hq/matrix-rust-rtc.git"
-  },
-  "dependencies": {
-    "@ubjs/core": "^0.31.0-5",
-    "matrix-js-sdk": "^42.3.0"
+    "vitest": "^4.1.11"
   }
 }
