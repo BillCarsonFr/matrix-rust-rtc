@@ -35,6 +35,10 @@ export function newManager(
     manageMediaKeys: opts.manageMediaKeys ?? true,
     requireCrossSignedSender: opts.requireCrossSignedSender ?? true,
     useKeyDelayMs: 1000n,
+    // grace(2) = 120 ms with the jitter pinned: a join and a leave a few
+    // milliseconds apart share one rotation block (see the Rust fixture).
+    sharedPerMinuteToDeviceContingent: 1000,
+    rotationJitter: 1.0,
   });
   return { driver, matrixDriver, manager };
 }

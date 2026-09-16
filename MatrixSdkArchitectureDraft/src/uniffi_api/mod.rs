@@ -549,6 +549,15 @@ pub struct FfiParticipationConfig {
     /// Wait this long after sending a rotated key before encrypting with it,
     /// so slow peers have it before the first frame arrives.
     pub use_key_delay_ms: u64,
+    /// To-device messages the whole call may spend per minute; every client
+    /// derives its rotation spacing from it (`60 s · N · (N − 1) / contingent`).
+    /// `None` is the crate default (3000).
+    #[uniffi(default = None)]
+    pub shared_per_minute_to_device_contingent: Option<u32>,
+    /// **Tests only.** Pins the jitter factor of a rotation block instead of
+    /// drawing it from `[0, 2)`; production hosts leave it unset.
+    #[uniffi(default = None)]
+    pub rotation_jitter: Option<f64>,
 }
 
 impl From<FfiParticipationConfig> for ParticipationConfig {
@@ -561,6 +570,10 @@ impl From<FfiParticipationConfig> for ParticipationConfig {
             },
             rotation: SendMachineConfig {
                 use_key_delay_ms: config.use_key_delay_ms,
+                shared_per_minute_to_device_contingent: config
+                    .shared_per_minute_to_device_contingent
+                    .unwrap_or(SendMachineConfig::default().shared_per_minute_to_device_contingent),
+                rotation_jitter: config.rotation_jitter,
                 ..SendMachineConfig::default()
             },
         }

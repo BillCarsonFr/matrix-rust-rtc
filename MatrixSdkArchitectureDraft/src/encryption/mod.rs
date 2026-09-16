@@ -177,6 +177,12 @@ pub struct SendMachineConfig {
     /// Rotate at the latest this long after minting, even in a quiet call
     /// (our addition, from the shipped core; the PR has none). Off by default.
     pub max_key_lifetime_ms: Option<u64>,
+    /// Pins the jitter factor that scales a rotation block (`grace · jitter`)
+    /// instead of drawing it uniformly from `[0, 2)`. **Tests only**: the
+    /// jitter is what keeps a call's clients from rotating in lockstep, so a
+    /// production host leaves this `None`. Pinned to 1.0, a block is exactly
+    /// one grace period and a membership change inside it is deterministic.
+    pub rotation_jitter: Option<f64>,
 }
 
 impl Default for SendMachineConfig {
@@ -185,6 +191,7 @@ impl Default for SendMachineConfig {
             shared_per_minute_to_device_contingent: 3000,
             use_key_delay_ms: 1000,
             max_key_lifetime_ms: None,
+            rotation_jitter: None,
         }
     }
 }
@@ -475,7 +482,8 @@ impl Machine {
             state.members = snapshot.members;
             let members = state.members.clone();
             let changes = state.inbound.on_members(&members, now);
-            let actions = state.send.on_session(&members, now, jitter());
+            let jitter = state.send.config().rotation_jitter.unwrap_or_else(jitter);
+            let actions = state.send.on_session(&members, now, jitter);
             (changes, actions)
         };
         Self::emit(inner, changes);

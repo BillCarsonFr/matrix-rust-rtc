@@ -558,10 +558,15 @@ fn peer(n: u32) -> Peer {
 fn config(compat: ElementCallCompat) -> ParticipationConfig {
     ParticipationConfig {
         compat,
-        // Fast rotations so `LeftWithKeys` settles within a test.
+        // Fast but *deterministic* rotations: grace(2) = 120 ms, and with the
+        // jitter pinned to 1.0 a block is exactly that long, so a join and a
+        // leave a few milliseconds apart land in one block (one rotation).
+        // A contingent of 1_000_000 truncated grace(2) to 0 ms, which made
+        // the join's rotation fire before the test could emit the leave.
         rotation: SendMachineConfig {
-            shared_per_minute_to_device_contingent: 1_000_000,
+            shared_per_minute_to_device_contingent: 1_000,
             use_key_delay_ms: 50,
+            rotation_jitter: Some(1.0),
             ..Default::default()
         },
         ..Default::default()

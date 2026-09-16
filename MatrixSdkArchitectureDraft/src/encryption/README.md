@@ -128,6 +128,13 @@ happens only if another change lands during the fresh block.
 
 Two further rules survive from before the PR:
 
+- **`rotation_jitter`** (ours, `None` by default): pins the jitter factor a
+  rotation block is scaled by (`grace · jitter`) instead of drawing it from
+  `[0, 2)`. Tests only — the random jitter is what keeps clients from rotating
+  in lockstep. With it pinned, a membership change inside a block is
+  deterministic; the black-box fixtures set it to 1.0 with a contingent of
+  1000 (grace(2) = 120 ms). A contingent of 1 000 000 had truncated grace(2)
+  to 0 ms, so a join's owed rotation fired before the test's leave landed.
 - **`useKeyDelay`** (1 s in `join()`): after sending a rotated key, wait before
   encrypting with it, so recipients have it installed. The first key is used
   immediately.
