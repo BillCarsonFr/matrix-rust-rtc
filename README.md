@@ -1,6 +1,12 @@
-# matrix-rust-rtc
+# matrix-rust-rtc [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+ > [!IMPORTANT]
+ > **matrix-rust-rtc is now actively maintained at
+ > [element-hq/matrix-rust-rtc](https://github.com/element-hq/matrix-rust-rtc).**
+ >
+ > This repository is archived and read-only: no issues, pull requests or releases.
+
+---
 
 > **Note:** This project is developed with AI assistance.
 
