@@ -1,0 +1,19 @@
+// Project-local Zed settings.
+//
+// rust-analyzer only discovers the root Cargo.toml on its own. The draft SDK in
+// MatrixSdkArchitectureDraft/ detaches itself from the root workspace with an
+// empty `[workspace]` table (its uniffi pin differs from the root's), so it
+// has to be linked explicitly or its files are outside the crate graph and
+// go-to-definition / rename do nothing there.
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "linkedProjects": [
+          "Cargo.toml",
+          "MatrixSdkArchitectureDraft/Cargo.toml"
+        ]
+      }
+    }
+  }
+}

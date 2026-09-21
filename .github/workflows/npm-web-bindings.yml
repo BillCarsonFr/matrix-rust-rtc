@@ -1,0 +1,261 @@
+# Copyright 2026 Valere Fedronic
+#
+# This file is part of matrix-rust-rtc.
+#
+# matrix-rust-rtc is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# matrix-rust-rtc is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+
+# The @element-hq/matrix-rtc npm package: the matrix-rtc crate
+# (MatrixSdkArchitectureDraft) compiled to wasm with uniffi-bindgen-react-native
+# bindings. Built and tested on every push and PR; published to the GitHub
+# Packages npm registry as a `next` pre-release from the tracked branches and
+# as `latest` from `matrix-rtc-v*` tags. GitHub Packages only lets a workflow's
+# GITHUB_TOKEN publish into its own repository's owner scope, so the package
+# is published as `@<repository owner>/matrix-rtc` (scripts/scope-to-repo.mjs):
+# `@element-hq/matrix-rtc` from element-hq, `@billcarsonfr/matrix-rtc` from a fork.
+name: Web bindings (npm)
+
+on:
+  push:
+    branches: [main, develop, toger5/architecture]
+    tags: ["matrix-rtc-v*"]
+  pull_request:
+    branches: [main, develop, toger5/architecture]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  PKG_DIR: MatrixSdkArchitectureDraft/web-test-app
+  CRATE_DIR: MatrixSdkArchitectureDraft
+
+defaults:
+  run:
+    working-directory: MatrixSdkArchitectureDraft/web-test-app
+
+jobs:
+  crate:
+    name: Crate (native + wasm32 check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain and targets come from MatrixSdkArchitectureDraft/rust-toolchain.toml.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: MatrixSdkArchitectureDraft -> target
+
+      - name: Format
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo clippy --all-targets --features uniffi -- -D warnings
+
+      - name: Test
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo test --features uniffi
+
+      # What the npm package is built from; the shim itself is built in `package`.
+      - name: Check (wasm32, published feature set)
+        working-directory: ${{ env.CRATE_DIR }}
+        run: cargo check --features uniffi --target wasm32-unknown-unknown
+
+  package:
+    name: Build, test, pack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The crate's native build (ubrn extracts the uniffi metadata from it).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: MatrixSdkArchitectureDraft -> target
+
+      # The wasm build lives in the ubrn-generated shim crate, which does not
+      # exist at checkout, so rust-cache cannot key on it; cache its target
+      # directory on the inputs that determine it.
+      - uses: actions/cache@v4
+        with:
+          path: MatrixSdkArchitectureDraft/web-test-app/rust_modules/wasm/target
+          key: wasm-shim-${{ runner.os }}-${{ hashFiles('MatrixSdkArchitectureDraft/Cargo.lock', 'MatrixSdkArchitectureDraft/Cargo.toml', 'MatrixSdkArchitectureDraft/web-test-app/Cargo.patch.toml', 'MatrixSdkArchitectureDraft/web-test-app/package-lock.json', 'MatrixSdkArchitectureDraft/rust-toolchain.toml') }}
+          restore-keys: wasm-shim-${{ runner.os }}-
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ env.PKG_DIR }}/package-lock.json
+          registry-url: https://npm.pkg.github.com
+
+      - name: Install
+        run: npm ci
+
+      - name: Build (published feature set)
+        run: npm run build
+
+      - name: Build (test-only probe variant)
+        run: npm run build:dev
+
+      - name: Type-check sources and suites
+        run: npm run typecheck
+
+      - name: Acceptance suites (against dist/)
+        run: npm test
+
+      - name: Shipped .d.ts are valid
+        run: npm run test:types
+
+      - name: Tarball install test (Node + Vite consumer)
+        run: npm run test:pack
+
+      - name: Pack
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+
+      - name: Size summary
+        run: |
+          wasm=dist/generated/wasm-bindgen/index_bg.wasm
+          raw=$(stat -c %s "$wasm"); gz=$(gzip -c "$wasm" | wc -c)
+          {
+            echo "### @element-hq/matrix-rtc $(node -p "require('./package.json').version")"
+            echo
+            echo "| artifact | size | gzipped |"
+            echo "|---|---|---|"
+            echo "| index_bg.wasm | $((raw/1024)) KB | $((gz/1024)) KB |"
+            echo "| tarball | $(du -k "$RUNNER_TEMP"/*.tgz | cut -f1) KB | |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The generated TypeScript *is* the public API. Diff it against the last
+      # published `latest` so a surface change is visible in review. Tolerates
+      # there being no published version yet.
+      - name: Public API diff vs latest published
+        continue-on-error: true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/prev" && cd "$RUNNER_TEMP/prev"
+          name="@${GITHUB_REPOSITORY_OWNER,,}/matrix-rtc"
+          npm pack "${name}@latest" --silent >/dev/null 2>&1 || { echo "no published ${name}@latest yet" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          tar xzf ./*.tgz
+          cd "$GITHUB_WORKSPACE/$PKG_DIR"
+          {
+            echo; echo "<details><summary>API diff vs latest (dist/generated/matrix_rtc.d.ts)</summary>"; echo; echo '```diff'
+            diff -u "$RUNNER_TEMP/prev/package/dist/generated/matrix_rtc.d.ts" dist/generated/matrix_rtc.d.ts | head -400 || true
+            echo '```'; echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: |
+            ${{ env.PKG_DIR }}/dist
+            ${{ env.PKG_DIR }}/package.json
+            ${{ env.PKG_DIR }}/README.md
+            ${{ env.PKG_DIR }}/LICENSE
+            ${{ env.PKG_DIR }}/scripts/scope-to-repo.mjs
+          if-no-files-found: error
+
+  publish-next:
+    name: Publish pre-release (next)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+    needs: [crate, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ env.PKG_DIR }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: ${{ env.PKG_DIR }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+
+      - name: Scope the package to this repository
+        run: node scripts/scope-to-repo.mjs "${GITHUB_REPOSITORY}"
+
+      # 0.1.0 -> 0.1.0-next.<run>.<sha>: sorts below the release it precedes,
+      # strictly increasing across runs, and names the commit.
+      - name: Version
+        run: |
+          base=$(node -p "require('./package.json').version")
+          npm version --no-git-tag-version "${base}-next.${GITHUB_RUN_NUMBER}.${GITHUB_SHA::7}"
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --tag next --ignore-scripts
+
+  publish-release:
+    name: Publish release (latest)
+    if: startsWith(github.ref, 'refs/tags/matrix-rtc-v')
+    needs: [crate, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ env.PKG_DIR }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: ${{ env.PKG_DIR }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+
+      - name: Scope the package to this repository
+        run: node scripts/scope-to-repo.mjs "${GITHUB_REPOSITORY}"
+
+      - name: Tag matches package version
+        run: |
+          v=$(node -p "require('./package.json').version")
+          [ "${GITHUB_REF_NAME}" = "matrix-rtc-v${v}" ] || { echo "tag ${GITHUB_REF_NAME} != matrix-rtc-v${v}"; exit 1; }
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --ignore-scripts

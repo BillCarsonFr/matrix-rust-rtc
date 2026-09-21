@@ -1,0 +1,11 @@
+# The bindings Element Call vendors (scripts/sync-matrix-rtc-sdk.sh there):
+# same crate, same output layout, without the test-only runtime probe.
+rust:
+  directory: ..
+  manifestPath: Cargo.toml
+web:
+  wasmCrateName: matrix-rtc-wasm-shim
+  ts: src/generated-element-call
+  manifestPatchFile: Cargo.patch.toml
+  features:
+    - uniffi
